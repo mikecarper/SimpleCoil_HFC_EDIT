@@ -126,8 +126,10 @@ public class Globals {
     }
 
     public static boolean isValidCoordinates(double longitude, double latitude) {
+        // Game policy: a zero on either axis means the GPS fix is not usable.
         return !Double.isNaN(longitude) && !Double.isInfinite(longitude)
                 && !Double.isNaN(latitude) && !Double.isInfinite(latitude)
+                && longitude != 0.0 && latitude != 0.0
                 && longitude >= -180.0 && longitude <= 180.0
                 && latitude >= -90.0 && latitude <= 90.0;
     }

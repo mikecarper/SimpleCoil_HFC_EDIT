@@ -917,10 +917,16 @@ public class TcpClient extends Service {
                 return;
             Log.e(TAG, action);
             if (NetMsg.NETMSG_GPSLOCUPDATE.equals(action)) {
+                double longitude = intent.getDoubleExtra(NetMsg.INTENT_LONGITUDE, Double.NaN);
+                double latitude = intent.getDoubleExtra(NetMsg.INTENT_LATITUDE, Double.NaN);
+                if (!Globals.isValidCoordinates(longitude, latitude)) {
+                    Log.w(TAG, "Ignoring local GPS update without a usable fix");
+                    return;
+                }
                 JSONObject gpsUpdate = new JSONObject();
                 try {
-                    gpsUpdate.put(TcpServer.JSON_GPSLONGITUDE, intent.getDoubleExtra(NetMsg.INTENT_LONGITUDE, 0));
-                    gpsUpdate.put(TcpServer.JSON_GPSLATITUDE, intent.getDoubleExtra(NetMsg.INTENT_LATITUDE, 0));
+                    gpsUpdate.put(TcpServer.JSON_GPSLONGITUDE, longitude);
+                    gpsUpdate.put(TcpServer.JSON_GPSLATITUDE, latitude);
                     sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + gpsUpdate.toString());
                 } catch (JSONException e) {
                     e.printStackTrace();

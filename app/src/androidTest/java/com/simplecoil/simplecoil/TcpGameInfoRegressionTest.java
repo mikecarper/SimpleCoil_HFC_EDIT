@@ -543,6 +543,19 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void zeroCoordinatePlaceholderDoesNotReplaceTheGpsSnapshot() throws Exception {
+        Globals.GPSData original = putGPS(5, 1);
+        double[][] placeholders = {{0, 0}, {10, 0}, {0, 20}};
+        for (double[] coordinates : placeholders) {
+            JSONObject placeholder = gps(5, 2).put(TcpServer.JSON_GPSLONGITUDE, coordinates[0])
+                    .put(TcpServer.JSON_GPSLATITUDE, coordinates[1]);
+            parse(gpsUpdate(true, placeholder));
+            assertSame(original, globals.mGPSData.get((byte) 5));
+            assertTrue(client.events.isEmpty());
+        }
+    }
+
+    @Test
     public void validFullGpsSnapshotReplacesLocationsAndCanClearAllMarkers() throws Exception {
         putGPS(9, 2);
         parse(gpsUpdate(true, gps(5, 1)));

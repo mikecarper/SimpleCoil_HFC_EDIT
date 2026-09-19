@@ -71,16 +71,24 @@ public class MapFragment extends GlobeMapFragment {
     private double mLatitude = 0;
 
     private void sendLocation(Location location) {
-        if (location == null) return;
-        if (location.getLatitude() == mLatitude && location.getLongitude() == mLongitude)
+        sendLocation(location, false);
+    }
+
+    private static boolean isValidLocation(Location location) {
+        return location != null && Globals.isValidCoordinates(location.getLongitude(), location.getLatitude());
+    }
+
+    private void sendLocation(Location location, boolean force) {
+        Context activity = getActivity();
+        if (!isValidLocation(location) || activity == null) return;
+        if (!force && location.getLatitude() == mLatitude && location.getLongitude() == mLongitude)
             return;
         mLongitude = location.getLongitude();
         mLatitude = location.getLatitude();
         Intent intent = new Intent(NetMsg.NETMSG_GPSLOCUPDATE);
         intent.putExtra(NetMsg.INTENT_LATITUDE, mLatitude);
         intent.putExtra(NetMsg.INTENT_LONGITUDE, mLongitude);
-        if (getActivity() == null) return;
-        getActivity().sendBroadcast(intent);
+        activity.sendBroadcast(intent);
     }
 
     /**
@@ -95,30 +103,21 @@ public class MapFragment extends GlobeMapFragment {
             if (hasLocationPermission != PackageManager.PERMISSION_GRANTED)
                 return null;
         }
-        Location locationGPS;
-        Location locationNet;
+        Location locationGPS = getLastKnownLocation(LocationManager.GPS_PROVIDER);
+        Location locationNet = getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+        if (locationGPS == null) return locationNet;
+        if (locationNet == null || locationGPS.getTime() > locationNet.getTime()) return locationGPS;
+        return locationNet;
+    }
+
+    private Location getLastKnownLocation(String provider) {
         try {
-            locationGPS = mLocationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            locationNet = mLocationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            Location location = mLocationManager.getLastKnownLocation(provider);
+            return isValidLocation(location) ? new Location(location) : null;
         } catch (SecurityException | IllegalArgumentException e) {
-            Log.w(TAG, "Location provider is unavailable", e);
+            // One missing provider must not discard the other provider's usable fix.
+            Log.w(TAG, "Location provider is unavailable: " + provider, e);
             return null;
-        }
-
-        long GPSLocationTime = 0;
-        if (null != locationGPS) { GPSLocationTime = locationGPS.getTime(); }
-
-        long NetLocationTime = 0;
-
-        if (null != locationNet) {
-            NetLocationTime = locationNet.getTime();
-        }
-
-        if ( 0 < GPSLocationTime - NetLocationTime ) {
-            return locationGPS;
-        }
-        else {
-            return locationNet;
         }
     }
 
@@ -127,7 +126,7 @@ public class MapFragment extends GlobeMapFragment {
 
         @Override
         public void onLocationChanged(Location loc) {
-            if (mLocationListener != this || !isGPSActive())
+            if (mLocationListener != this || !isGPSActive() || !isValidLocation(loc))
                 return;
             String longitude = "Longitude: " + loc.getLongitude();
             Log.v(TAG, longitude);
@@ -155,8 +154,9 @@ public class MapFragment extends GlobeMapFragment {
      */
     void makeUseOfNewLocation(Location location) {
         if ( isBetterLocation(location, currentBestLocation) ) {
-            currentBestLocation = location;
-            sendLocation(location);
+            // Providers expose mutable Location objects; keep our own accepted snapshot.
+            currentBestLocation = new Location(location);
+            sendLocation(currentBestLocation);
         }
     }
 
@@ -165,7 +165,9 @@ public class MapFragment extends GlobeMapFragment {
      * @param currentBestLocation  The current location fix, to which you want to compare the new one.
      */
     protected boolean isBetterLocation(Location location, Location currentBestLocation) {
-        if (currentBestLocation == null) {
+        if (!isValidLocation(location))
+            return false;
+        if (!isValidLocation(currentBestLocation)) {
             // A new location is always better than no location
             return true;
         }
@@ -312,9 +314,11 @@ public class MapFragment extends GlobeMapFragment {
                     return;
                 }
                 currentBestLocation = getLastBestLocation();
-                sendLocation(currentBestLocation);
                 insertYourMarker();
             }
+            // Joining/rejoining or changing GPS settings may require republishing a stationary
+            // fix whose earlier broadcast was sent before the TCP connection was ready.
+            sendLocation(currentBestLocation, true);
         } else {
             LocationListener listener = mLocationListener;
             mLocationListener = null;
@@ -381,7 +385,7 @@ public class MapFragment extends GlobeMapFragment {
     public void mapDidStopMoving(MapController mapControl,
                                  Point3d[] corners,
                                  boolean userMotion) {
-        if (userMotion && currentBestLocation != null)
+        if (userMotion && isValidLocation(currentBestLocation))
             mapControl.setPositionGeo(currentBestLocation.getLongitude() * PI180, currentBestLocation.getLatitude() * PI180, ZOOM_LEVEL);
     }
 
@@ -396,7 +400,7 @@ public class MapFragment extends GlobeMapFragment {
         }
         removeYourMarker();
 
-        if (currentBestLocation == null) return;
+        if (!isValidLocation(currentBestLocation)) return;
         MarkerInfo markerInfo = new MarkerInfo();
         Bitmap icon = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_you);
         Point2d markerSize = new Point2d(72, 72);
@@ -451,6 +455,8 @@ public class MapFragment extends GlobeMapFragment {
                         && (fullRefresh || entry.getValue().hasUpdate)) {
                     entry.getValue().hasUpdate = false;
                     removePlayerMarker(entry.getKey());
+                    if (!Globals.isValidCoordinates(entry.getValue().longitude, entry.getValue().latitude))
+                        continue;
                     ScreenMarker player = new ScreenMarker();
                     player.loc = Point2d.FromDegrees(entry.getValue().longitude, entry.getValue().latitude);
                     player.size = markerSize;

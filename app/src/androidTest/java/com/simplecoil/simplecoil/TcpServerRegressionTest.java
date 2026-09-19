@@ -263,6 +263,24 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void zeroCoordinatePlaceholderDoesNotMoveThePlayer() throws Exception {
+        Object player = client(1, 5);
+        parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 10.0)
+                .put(TcpServer.JSON_GPSLATITUDE, 20.0));
+        Globals.GPSData saved = Globals.getInstance().mGPSData.get((byte) 5);
+        saved.hasUpdate = false;
+        double[][] placeholders = {{0, 0}, {10, 0}, {0, 20}};
+        for (double[] coordinates : placeholders) {
+            parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, coordinates[0])
+                    .put(TcpServer.JSON_GPSLATITUDE, coordinates[1]));
+            assertSame(saved, Globals.getInstance().mGPSData.get((byte) 5));
+            assertEquals(10, saved.longitude, 0);
+            assertEquals(20, saved.latitude, 0);
+            assertFalse(saved.hasUpdate);
+        }
+    }
+
+    @Test
     public void serverEnforcesIndividualScoreLimitWithoutClientRequest() throws Exception {
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_SCORE;
         Globals.getInstance().mScoreLimit = 1;

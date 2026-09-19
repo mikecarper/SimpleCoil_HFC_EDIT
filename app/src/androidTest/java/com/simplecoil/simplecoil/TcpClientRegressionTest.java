@@ -1,5 +1,8 @@
 package com.simplecoil.simplecoil;
 
+import android.content.BroadcastReceiver;
+import android.content.Intent;
+
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 
 import org.json.JSONObject;
@@ -171,6 +174,56 @@ public class TcpClientRegressionTest {
         assertEquals(1, flushes[0]);
         assertEquals(1, pending.size());
         assertNull(field("out").get(client));
+    }
+
+    @Test
+    public void invalidLocalGpsBroadcastsAreNotSent() throws Exception {
+        ByteArrayOutputStream delivered = new ByteArrayOutputStream();
+        field("out").set(client, new DataOutputStream(delivered));
+        double[][] invalid = {{0, 0}, {0, 20}, {10, 0}, {Double.NaN, 20}, {10, Double.POSITIVE_INFINITY},
+                {181, 20}, {-181, 20}, {10, 91}, {10, -91}};
+        for (double[] coordinates : invalid)
+            receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, coordinates[0])
+                    .putExtra(NetMsg.INTENT_LATITUDE, coordinates[1]));
+        awaitSender();
+        assertEquals(0, delivered.size());
+    }
+
+    @Test
+    public void incompleteLocalGpsBroadcastsDoNotInventZeroCoordinates() throws Exception {
+        ByteArrayOutputStream delivered = new ByteArrayOutputStream();
+        field("out").set(client, new DataOutputStream(delivered));
+        receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE));
+        receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE).putExtra(NetMsg.INTENT_LATITUDE, 20.0));
+        receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE).putExtra(NetMsg.INTENT_LONGITUDE, 10.0));
+        awaitSender();
+        assertEquals(0, delivered.size());
+    }
+
+    @Test
+    public void validLocalGpsBroadcastsPreserveTheirCoordinates() throws Exception {
+        ByteArrayOutputStream delivered = new ByteArrayOutputStream();
+        field("out").set(client, new DataOutputStream(delivered));
+        double[][] valid = {{10, 20}, {-10, -20}};
+        for (double[] coordinates : valid)
+            receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, coordinates[0])
+                    .putExtra(NetMsg.INTENT_LATITUDE, coordinates[1]));
+        awaitSender();
+        DataInputStream messages = messages(delivered);
+        for (double[] coordinates : valid) {
+            String message = messages.readUTF();
+            JSONObject gps = new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                    + TcpServer.TCPPREFIX_JSON.length()));
+            assertEquals(coordinates[0], gps.getDouble(TcpServer.JSON_GPSLONGITUDE), 0);
+            assertEquals(coordinates[1], gps.getDouble(TcpServer.JSON_GPSLATITUDE), 0);
+        }
+        assertEquals(0, messages.available());
+    }
+
+    private void receiveLocation(Intent intent) throws Exception {
+        ((BroadcastReceiver) field("mGPSUpdateReceiver").get(client)).onReceive(null, intent);
     }
 
     private void register() throws Exception {

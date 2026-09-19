@@ -2,7 +2,9 @@ package com.simplecoil.simplecoil;
 
 import android.Manifest;
 import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationListener;
@@ -15,6 +17,7 @@ import android.view.WindowManager;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
+import androidx.core.content.ContextCompat;
 
 import com.mousebird.maply.ComponentObject;
 
@@ -24,10 +27,14 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.io.InputStream;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
@@ -47,6 +54,13 @@ public class MapRegressionTest {
     private int originalGPSMode;
     private int originalGameState;
     private Map<Byte, Globals.GPSData> originalLocations;
+    private final List<Intent> locationUpdates = new CopyOnWriteArrayList<>();
+    private Context receiverContext;
+    private final BroadcastReceiver locationReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            locationUpdates.add(new Intent(intent));
+        }
+    };
 
     @Before
     public void setUp() throws Exception {
@@ -108,10 +122,14 @@ public class MapRegressionTest {
             useDummyLocationListener();
             map.enableGPS(true);
         });
+        receiverContext = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        ContextCompat.registerReceiver(receiverContext, locationReceiver,
+                new IntentFilter(NetMsg.NETMSG_GPSLOCUPDATE), ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
     @After
     public void tearDown() {
+        if (receiverContext != null) receiverContext.unregisterReceiver(locationReceiver);
         Globals globals = Globals.getInstance();
         globals.mUseGPS = false;
         if (scenario != null) {
@@ -284,6 +302,190 @@ public class MapRegressionTest {
             assertNotSame(teammate, marker(2));
             assertSame(enemy, marker(9));
         });
+    }
+
+    @Test
+    public void rosterUpdateRepublishesAStationaryPlayersLocation() throws Exception {
+        assertStationaryLocationRepublished(NetMsg.NETMSG_LISTPLAYERS);
+    }
+
+    @Test
+    public void gpsSettingsUpdateRepublishesAStationaryPlayersLocation() throws Exception {
+        assertStationaryLocationRepublished(NetMsg.NETMSG_GPSSETTING);
+    }
+
+    private void assertStationaryLocationRepublished(String action) throws Exception {
+        scenario.onActivity(current -> map.makeUseOfNewLocation(location(10, 20, 1000)));
+        awaitLocationUpdates(1);
+        scenario.onActivity(current -> receive(new Intent(action)));
+        awaitLocationUpdates(2);
+        assertEquals(10, locationUpdates.get(1).getDoubleExtra(NetMsg.INTENT_LONGITUDE, -1), 0);
+        assertEquals(20, locationUpdates.get(1).getDoubleExtra(NetMsg.INTENT_LATITUDE, -1), 0);
+    }
+
+    @Test
+    public void defaultZeroCoordinatesAreNotAcceptedAsAGpsFix() {
+        scenario.onActivity(current -> {
+            map.makeUseOfNewLocation(location(0, 0, 1000));
+            assertNull(get("currentBestLocation"));
+        });
+    }
+
+    @Test
+    public void zeroLatitudeOrLongitudeIsRejectedAsAnInvalidFix() {
+        assertFalse(Globals.isValidCoordinates(10, 0));
+        assertFalse(Globals.isValidCoordinates(0, 20));
+        assertFalse(Globals.isValidCoordinates(-0.0, 20));
+        assertFalse(Globals.isValidCoordinates(10, -0.0));
+        assertFalse(Globals.isValidCoordinates(0, 0));
+    }
+
+    @Test
+    public void unchangedLocationCallbacksDoNotFloodTheNetwork() throws Exception {
+        scenario.onActivity(current -> map.makeUseOfNewLocation(location(10, 20, 1000)));
+        awaitLocationUpdates(1);
+        scenario.onActivity(current -> {
+            for (int i = 1; i <= 5; i++)
+                map.makeUseOfNewLocation(location(10, 20, 1000 + i));
+        });
+        assertNoAdditionalLocationUpdates();
+    }
+
+    @Test
+    public void disabledGpsDoesNotRepublishACachedLocation() throws Exception {
+        scenario.onActivity(current -> map.makeUseOfNewLocation(location(10, 20, 1000)));
+        awaitLocationUpdates(1);
+        scenario.onActivity(current -> {
+            Globals.getInstance().mUseGPS = false;
+            receive(new Intent(NetMsg.NETMSG_GPSSETTING));
+            receive(new Intent(NetMsg.NETMSG_LISTPLAYERS));
+        });
+        assertNoAdditionalLocationUpdates();
+    }
+
+    @Test
+    public void cachedPlayerUpdateWithAZeroCoordinateDoesNotCreateAMarker() {
+        scenario.onActivity(current -> {
+            showPlayers();
+            double[][] placeholders = {{0, 0}, {10, 0}, {0, 20}};
+            for (double[] coordinates : placeholders) {
+                Globals.GPSData location = Globals.getInstance().mGPSData.get((byte) 2);
+                location.longitude = coordinates[0];
+                location.latitude = coordinates[1];
+                location.hasUpdate = true;
+                receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
+                assertNull(marker(2));
+                assertNotNull(marker(9));
+            }
+        });
+    }
+
+    @Test
+    public void nullFixCannotReplaceTheCurrentLocation() {
+        scenario.onActivity(current -> {
+            map.makeUseOfNewLocation(location(10, 20, 1000));
+            Object before = get("currentBestLocation");
+            map.makeUseOfNewLocation(null);
+            assertSame(before, get("currentBestLocation"));
+        });
+    }
+
+    @Test
+    public void nullFirstFixIsNotConsideredBetterThanNoFix() {
+        scenario.onActivity(current -> assertFalse(map.isBetterLocation(null, null)));
+    }
+
+    @Test
+    public void invalidCoordinatesCannotReplaceTheCurrentLocation() {
+        scenario.onActivity(current -> {
+            map.makeUseOfNewLocation(location(10, 20, 1000));
+            Object before = get("currentBestLocation");
+            for (double[] coordinates : invalidCoordinates()) {
+                // Even a significantly newer fix must not poison the native map's position.
+                map.makeUseOfNewLocation(location(coordinates[0], coordinates[1], 200000));
+                assertSame(before, get("currentBestLocation"));
+            }
+        });
+    }
+
+    @Test
+    public void invalidFirstFixDoesNotBecomeTheCurrentLocation() {
+        scenario.onActivity(current -> {
+            for (double[] coordinates : invalidCoordinates()) {
+                map.makeUseOfNewLocation(location(coordinates[0], coordinates[1], 1000));
+                assertNull(get("currentBestLocation"));
+            }
+        });
+    }
+
+    @Test
+    public void invalidCachedFixDoesNotRejectAValidReplacement() {
+        scenario.onActivity(current -> assertTrue(map.isBetterLocation(
+                location(10, 20, 1000), location(Double.NaN, 20, 200000))));
+    }
+
+    @Test
+    public void locationCacheOwnsASnapshotOfTheCallbackValue() {
+        scenario.onActivity(current -> {
+            Location callbackValue = location(10, 20, 1000);
+            map.makeUseOfNewLocation(callbackValue);
+            callbackValue.setLongitude(90);
+            callbackValue.setLatitude(80);
+            Location saved = (Location) get("currentBestLocation");
+            assertEquals(10, saved.getLongitude(), 0);
+            assertEquals(20, saved.getLatitude(), 0);
+        });
+    }
+
+    @Test
+    public void nullLocationCallbackDoesNotCrashOrEraseTheMarker() {
+        scenario.onActivity(current -> {
+            map.makeUseOfNewLocation(location(10, 20, 1000));
+            receive(new Intent(NetMsg.NETMSG_LISTPLAYERS));
+            ComponentObject before = marker(1);
+            assertNotNull(before);
+            realLocationListener().onLocationChanged((Location) null);
+            assertSame(before, marker(1));
+        });
+    }
+
+    private LocationListener realLocationListener() {
+        try {
+            Class<?> listenerClass = Class.forName(MapFragment.class.getName() + "$MyLocationListener");
+            Constructor<?> constructor = listenerClass.getDeclaredConstructor(MapFragment.class);
+            constructor.setAccessible(true);
+            LocationListener listener = (LocationListener) constructor.newInstance(map);
+            set("mLocationListener", listener);
+            return listener;
+        } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
+    }
+
+    private static Location location(double longitude, double latitude, long time) {
+        Location location = new Location("gps");
+        location.setLongitude(longitude);
+        location.setLatitude(latitude);
+        location.setTime(time);
+        location.setAccuracy(5);
+        return location;
+    }
+
+    private static double[][] invalidCoordinates() {
+        return new double[][]{{0, 0}, {0, 20}, {10, 0}, {Double.NaN, 20}, {10, Double.NaN},
+                {Double.POSITIVE_INFINITY, 20}, {10, Double.NEGATIVE_INFINITY},
+                {181, 20}, {-181, 20}, {10, 91}, {10, -91}};
+    }
+
+    private void awaitLocationUpdates(int expected) throws Exception {
+        long deadline = SystemClock.elapsedRealtime() + 3000;
+        while (locationUpdates.size() < expected && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(20);
+        assertEquals("Wrong number of local location broadcasts", expected, locationUpdates.size());
+    }
+
+    private void assertNoAdditionalLocationUpdates() throws Exception {
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        Thread.sleep(100);
+        assertEquals(1, locationUpdates.size());
     }
 
     private void whilePaused(Runnable action) {
