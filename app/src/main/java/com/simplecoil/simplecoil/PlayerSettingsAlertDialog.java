@@ -322,8 +322,8 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         //aplying settings to player
         mAllowPlayerSettingsSwitch = view.findViewById(R.id.allow_player_settings_switch);
         mApplyAllSwitch = view.findViewById(R.id.apply_to_all_switch);
-        setButton(DialogInterface.BUTTON_POSITIVE, mContext.getString(R.string.ok),
-                (dialog, which) -> {
+        View.OnClickListener saveSettings =
+                button -> {
                     if (!mShotModeSingle.isChecked() && !mShotModeBurst3.isChecked() && !mShotModeAuto.isChecked()) {
                         Toast.makeText(getContext(), getContext().getString(R.string.player_settings_shot_mode_error), Toast.LENGTH_SHORT).show();
                         return;
@@ -493,8 +493,10 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                         mContext.sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                     }
                     dismiss();
-                });
+                };
 
+        setButton(DialogInterface.BUTTON_POSITIVE, mContext.getString(R.string.ok),
+                (DialogInterface.OnClickListener) null);
         setButton(DialogInterface.BUTTON_NEGATIVE, mContext.getString(R.string.cancel),
                 (dialog, which) -> dismiss());
         if (isServer)
@@ -502,6 +504,9 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         else
             getLocalSettings();
         super.onCreate(savedInstanceState);
+        // The default dialog listener dismisses even when validation returns
+        // early. Dismiss explicitly only after settings have been saved.
+        getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener(saveSettings);
     }
 
     @SuppressLint("SetTextI18n")

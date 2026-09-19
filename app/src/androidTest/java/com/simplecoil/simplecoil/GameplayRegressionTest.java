@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.graphics.drawable.AnimationDrawable;
 import android.os.CountDownTimer;
 import android.view.View;
+import android.widget.TextView;
 
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -372,6 +373,152 @@ public class GameplayRegressionTest {
             assertEquals(false, get(activity, "mHasLivesLimit"));
             assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
         });
+    }
+
+    @Test
+    public void unchangedSettingsPreserveRemainingLivesInTheHud() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 5, 2);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
+            assertLifeCount(activity, 3);
+        });
+    }
+
+    @Test
+    public void increasingLifeLimitPreservesDeathsAlreadyTaken() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 5, 2);
+            changeLifeOverride(activity, 8);
+            assertLifeCount(activity, 6);
+            assertEquals(8, get(activity, "mLives"));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
+            assertLifeCount(activity, 6);
+        });
+    }
+
+    @Test
+    public void decreasingLifeLimitPreservesDeathsAlreadyTaken() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 5, 2);
+            changeLifeOverride(activity, 4);
+            assertLifeCount(activity, 2);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+    }
+
+    @Test
+    public void addingLifeLimitConvertsDeathsToRemainingLives() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 0, 2);
+            changeLifeOverride(activity, 5);
+            assertLifeCount(activity, 3);
+            assertEquals(true, get(activity, "mHasLivesLimit"));
+        });
+    }
+
+    @Test
+    public void unlimitedOverrideConvertsRemainingLivesBackToDeaths() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 5, 2);
+            changeLifeOverride(activity, 0);
+            assertLifeCount(activity, 2);
+            assertEquals(false, get(activity, "mHasLivesLimit"));
+            changeLifeOverride(activity, 6);
+            assertLifeCount(activity, 4);
+        });
+    }
+
+    @Test
+    public void removingOverrideRestoresGlobalLimitWithoutRestoringSpentLives() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 8, 2);
+            Globals.getInstance().mLivesLimit = 5;
+            Globals.getInstance().mOverrideLives = false;
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
+            assertLifeCount(activity, 3);
+        });
+    }
+
+    @Test
+    public void exhaustedNewLimitCancelsRespawnAndLeavesDedicatedRound() {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = true;
+            prepareRoundLives(activity, 5, 3);
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Player 9");
+            CountDownTimer pendingSpawn = (CountDownTimer) get(activity, "mSpawnTimer");
+            changeLifeOverride(activity, 3);
+            assertLifeCount(activity, 0);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+            assertEquals(Collections.singletonList(TcpServer.TCPMESSAGE_PREFIX
+                    + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_LEAVE), tcp.messages);
+            pendingSpawn.onFinish();
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
+            assertEquals("Repeated settings must not leave again", 1, tcp.messages.size());
+        });
+    }
+
+    @Test
+    public void exhaustedNewLimitLeavesPeerRoundWithoutEndingOtherPlayersGame() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 0, 4);
+            changeLifeOverride(activity, 3);
+            assertLifeCount(activity, 0);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertEquals(Collections.singletonList(NetMsg.NETMSG_LEAVE + ":all"), udp.messages);
+            assertEquals(0, udp.endRequests);
+        });
+    }
+
+    @Test
+    public void exhaustedNewLimitEndsOfflineRoundWithoutSendingNetworkMessages() {
+        scenario.onActivity(activity -> {
+            set(activity, "mUseNetwork", false);
+            prepareRoundLives(activity, 5, 3);
+            changeLifeOverride(activity, 2);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertLifeCount(activity, 0);
+            assertTrue(udp.messages.isEmpty());
+            assertTrue(tcp.messages.isEmpty());
+        });
+    }
+
+    @Test
+    public void changingLivesInTheLobbyDoesNotSpendThePreviousRoundsLives() {
+        scenario.onActivity(activity -> {
+            prepareRoundLives(activity, 5, 3);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            changeLifeOverride(activity, 2);
+            assertEquals("2", ((TextView) get(activity, "mEliminationCountTV")).getText().toString());
+            assertEquals(2, get(activity, "mLives"));
+            assertTrue(tcp.messages.isEmpty());
+            assertTrue(udp.messages.isEmpty());
+        });
+    }
+
+    private void prepareRoundLives(FullscreenActivity activity, int limit, int deaths) {
+        Globals globals = Globals.getInstance();
+        globals.mGameState = Globals.GAME_STATE_RUNNING;
+        globals.mGameLimit = limit == 0 ? Globals.GAME_LIMIT_NONE : Globals.GAME_LIMIT_LIVES;
+        globals.mLivesLimit = limit;
+        globals.mOverrideLives = false;
+        set(activity, "mHasLivesLimit", limit != 0);
+        set(activity, "mLives", limit);
+        set(activity, "mEliminationCount", limit == 0 ? deaths : limit - deaths);
+        ((TextView) get(activity, "mEliminationCountTV")).setText(
+                String.valueOf(limit == 0 ? deaths : limit - deaths));
+    }
+
+    private void changeLifeOverride(FullscreenActivity activity, int limit) {
+        Globals.getInstance().mOverrideLives = true;
+        Globals.getInstance().mOverrideLivesVal = limit;
+        receiveNetwork(activity, new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
+    }
+
+    private void assertLifeCount(FullscreenActivity activity, int count) {
+        assertEquals(count, get(activity, "mEliminationCount"));
+        assertEquals(String.valueOf(count), ((TextView) get(activity, "mEliminationCountTV")).getText().toString());
     }
 
     @Test

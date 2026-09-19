@@ -1103,6 +1103,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void setGameLimit() {
+        boolean roundInProgress = Globals.getInstance().mGameState != Globals.GAME_STATE_NONE;
+        // The HUD stores remaining lives in limited games and deaths otherwise.
+        // Preserve deaths before changing that interpretation or the life budget.
+        int deaths = mHasLivesLimit ? Math.max(0, mLives - mEliminationCount)
+                : Math.max(0, mEliminationCount);
         if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
             mGameCountDownTV.setVisibility(View.VISIBLE);
             String display = String.format(Locale.getDefault(),"%02d:00", Globals.getInstance().mTimeLimit);
@@ -1113,17 +1118,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mGameTimer.setVisibility(View.VISIBLE);
         }
         TextView eliminationLabel = findViewById(R.id.eliminations_count_label_tv);
-        if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_LIVES) != 0) {
-            eliminationLabel.setText(R.string.lives_count_label);
-            mEliminationCountTV.setText(getString(R.string.integer,Globals.getInstance().mLivesLimit));
-            mHasLivesLimit = true;
-            mLives = Globals.getInstance().mLivesLimit;
-        } else {
-            eliminationLabel.setText(R.string.eliminations_count_label);
-            mEliminationCountTV.setText(getString(R.string.integer,mEliminationCount));
-            mHasLivesLimit = false;
-            mLives = 0;
-        }
+        mLives = (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_LIVES) != 0
+                ? Globals.getInstance().mLivesLimit : 0;
+        if (Globals.getInstance().mOverrideLives)
+            mLives = Globals.getInstance().mOverrideLivesVal;
+        mHasLivesLimit = mLives > 0;
+        if (roundInProgress)
+            mEliminationCount = mHasLivesLimit ? Math.max(0, mLives - deaths) : deaths;
+        eliminationLabel.setText(mHasLivesLimit ? R.string.lives_count_label : R.string.eliminations_count_label);
+        int displayedCount = !roundInProgress && mHasLivesLimit ? mLives : mEliminationCount;
+        mEliminationCountTV.setText(getString(R.string.integer, displayedCount));
         if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_SCORE) != 0) {
             mScoreLabelTV.setText(getString(R.string.score_limit_label, Globals.getInstance().mScoreLimit));
             mTeamScoreLabelTV.setText(getString(R.string.team_score_limit_label, Globals.getInstance().mScoreLimit));
@@ -1136,19 +1140,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         editor.putInt(PREF_LIMIT_SCORE, Globals.getInstance().mScoreLimit);
         editor.putInt(PREF_LIMIT_LIVES, Globals.getInstance().mLivesLimit);
         editor.apply();
-        if (Globals.getInstance().mOverrideLives) {
-            if (Globals.getInstance().mOverrideLivesVal != 0) {
-                eliminationLabel.setText(R.string.lives_count_label);
-                mEliminationCountTV.setText(getString(R.string.integer,Globals.getInstance().mOverrideLivesVal));
-                mHasLivesLimit = true;
-                mLives = Globals.getInstance().mOverrideLivesVal;
-            } else {
-                eliminationLabel.setText(R.string.eliminations_count_label);
-                mEliminationCountTV.setText(getString(R.string.integer,mEliminationCount));
-                mHasLivesLimit = false;
-                mLives = 0;
-            }
-        }
+        if (roundInProgress && mHasLivesLimit && mEliminationCount == 0)
+            finishOutOfLives();
     }
 
     private void setReady() { setReady(true); }
@@ -1394,6 +1387,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mFiringModeButton.setVisibility(View.VISIBLE);
         mGameLimitButton.setVisibility(View.VISIBLE);
         setNetworkMenu(NETWORK_TYPE_ENABLED);
+    }
+
+    private void finishOutOfLives() {
+        if (mUseNetwork) {
+            if (isDedicatedServerConnection())
+                mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_LEAVE);
+            else
+                sendUDPMessageAll(NetMsg.NETMSG_LEAVE);
+        }
+        Toast.makeText(getApplicationContext(), getString(R.string.dialog_out_of_lives), Toast.LENGTH_LONG).show();
+        endGame();
     }
 
     /* Sending to Command a packet with 10 00 80 00 PLAYER# then 15 more 00's sets the player ID.
@@ -2632,17 +2636,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                         else
                                             sendUDPMessage(NetMsg.NETMSG_ELIMINATED, hit_by_id);
                                     }
-                                    if (outOfLives) {
-                                        if (isDedicatedServerConnection())
-                                            mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_LEAVE);
-                                        else
-                                            sendUDPMessageAll(NetMsg.NETMSG_LEAVE);
-                                    }
                                 }
-                                if (outOfLives) {
-                                    Toast.makeText(getApplicationContext(), getString(R.string.dialog_out_of_lives), Toast.LENGTH_LONG).show();
-                                    endGame();
-                                }
+                                if (outOfLives)
+                                    finishOutOfLives();
                             }
                         }
                     }
@@ -2901,12 +2897,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             mTeamScoreTV.setText(score);
                         }
                         if (outOfLives && roundInProgress && !serverRoundEnded) {
-                            Toast.makeText(getApplicationContext(), getString(R.string.dialog_out_of_lives), Toast.LENGTH_LONG).show();
-                            if (dedicatedServer)
-                                mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_LEAVE);
-                            else
-                                sendUDPMessageAll(NetMsg.NETMSG_LEAVE);
-                            endGame();
+                            finishOutOfLives();
                         } else if (timeRemaining >= 0 && roundInProgress && !serverRoundEnded) {
                             if (timeRemaining == 0)
                                 finishTimedGame();
