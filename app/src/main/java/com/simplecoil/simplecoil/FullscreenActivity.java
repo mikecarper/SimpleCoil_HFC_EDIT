@@ -1621,9 +1621,41 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         endGame();
     }
 
+    private int resolveShotMode(int shotMode) {
+        Globals globals = Globals.getInstance();
+        switch (shotMode) {
+            case Globals.SHOT_MODE_SINGLE:
+                if (globals.mAllowSingleShotMode) return Globals.SHOT_MODE_SINGLE;
+                if (globals.mAllowBurst3ShotMode) return Globals.SHOT_MODE_BURST;
+                break;
+            case Globals.SHOT_MODE_BURST:
+                if (globals.mAllowBurst3ShotMode) return Globals.SHOT_MODE_BURST;
+                if (globals.mAllowAutoShotMode) return Globals.SHOT_MODE_FULL_AUTO;
+                break;
+            case Globals.SHOT_MODE_FULL_AUTO:
+                if (globals.mAllowAutoShotMode) return Globals.SHOT_MODE_FULL_AUTO;
+                break;
+        }
+        if (globals.mAllowSingleShotMode) return Globals.SHOT_MODE_SINGLE;
+        if (globals.mAllowBurst3ShotMode) return Globals.SHOT_MODE_BURST;
+        return Globals.SHOT_MODE_FULL_AUTO;
+    }
+
     // Config 00 00 09 xx yy ff c8 ff ff 80 01 34 - xx is the number of shots and if you set yy to 01 for full auto for xx shots or 00 for single shot mode, increasing yy decreases RoF
     // setting 03 03 for shots and RoF gives a good 3 shot burst, 03 01 is so fast that you feel 1 recoil for 3 shots
     private void setShotMode(int shotMode) {
+        shotMode = resolveShotMode(shotMode);
+        mCurrentShotMode = shotMode;
+        if (shotMode == Globals.SHOT_MODE_SINGLE)
+            mShotModeTV.setText(R.string.shot_mode_single);
+        else if (shotMode == Globals.SHOT_MODE_BURST)
+            mShotModeTV.setText(R.string.shot_mode_burst3);
+        else
+            mShotModeTV.setText(R.string.shot_mode_auto);
+        SharedPreferences.Editor editor = sharedPreferences.edit();
+        editor.putInt(PREF_SHOT_MODE, mCurrentShotMode);
+        editor.apply();
+        // Keep the permitted selection even while disconnected so reconnects cannot restore a banned mode.
         if (mConfigCharacteristic == null || mBluetoothLeService == null)
             return;
         byte[] config = new byte[20];
@@ -1637,24 +1669,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (shotMode == Globals.SHOT_MODE_SINGLE) {
             config[3] = (byte)0xFE;
             config[4] = (byte)0x00;
-            mCurrentShotMode = Globals.SHOT_MODE_SINGLE;
-            mShotModeTV.setText(R.string.shot_mode_single);
         } else if (shotMode == Globals.SHOT_MODE_BURST) {
             config[3] = (byte)0x03;
             config[4] = (byte)0x03;
             if (mBlasterType == BLASTER_TYPE_RIFLE)
                 config[9] = (byte)0x78; // Reduce recoil strength on the rifle to make 3 shot mode recoil the correct number of times
-            mCurrentShotMode = Globals.SHOT_MODE_BURST;
-            mShotModeTV.setText(R.string.shot_mode_burst3);
         } else if (shotMode == Globals.SHOT_MODE_FULL_AUTO) {
             config[3] = (byte)0xFE;
             config[4] = (byte)0x01;
-            mCurrentShotMode = Globals.SHOT_MODE_FULL_AUTO;
-            mShotModeTV.setText(R.string.shot_mode_auto);
         }
-        SharedPreferences.Editor editor = sharedPreferences.edit();
-        editor.putInt(PREF_SHOT_MODE, mCurrentShotMode);
-        editor.apply();
         int firingMode = Globals.getInstance().mCurrentFiringMode;
         if (!Globals.isValidFiringMode(firingMode)) {
             Log.w(TAG, "Invalid firing mode " + firingMode + "; using the default mode");
@@ -2218,6 +2241,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     // We'll automatically assume that this is a pistol
                     Toast.makeText(getApplicationContext(), getString(R.string.pistol_detected_toast, mDeviceAddress), Toast.LENGTH_LONG).show();
                 }
+                // Telemetry may have already configured the blaster before its type was known.
+                setShotMode(mCurrentShotMode);
             } else if (BluetoothLeService.CHARACTERISTIC_WRITE_FINISHED.equals(action)) {
                 byte[] completedCommand = intent.getByteArrayExtra(BluetoothLeService.EXTRA_DATA);
                 if (!GattAttributes.RECOIL_COMMAND_UUID.equals(intent.getStringExtra(BluetoothLeService.EXTRA_UUID))
@@ -3140,39 +3165,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mShotsRemainingLabelTV.setText(getString(R.string.shots_remaining_label,
                 Globals.getInstance().mFullReload & 0xff, (Globals.getInstance().mDamage * -1)));
         setGameLimit();
-        switch (mCurrentShotMode) {
-            case Globals.SHOT_MODE_SINGLE:
-                if (!Globals.getInstance().mAllowSingleShotMode) {
-                    if (Globals.getInstance().mAllowBurst3ShotMode)
-                        setShotMode(Globals.SHOT_MODE_BURST);
-                    else
-                        setShotMode(Globals.SHOT_MODE_FULL_AUTO);
-                }
-                break;
-            case Globals.SHOT_MODE_BURST:
-                if (!Globals.getInstance().mAllowBurst3ShotMode) {
-                    if (Globals.getInstance().mAllowAutoShotMode)
-                        setShotMode(Globals.SHOT_MODE_FULL_AUTO);
-                    else
-                        setShotMode(Globals.SHOT_MODE_SINGLE);
-                }
-                break;
-            case Globals.SHOT_MODE_FULL_AUTO:
-                if (!Globals.getInstance().mAllowAutoShotMode) {
-                    if (Globals.getInstance().mAllowSingleShotMode)
-                        setShotMode(Globals.SHOT_MODE_SINGLE);
-                    else
-                        setShotMode(Globals.SHOT_MODE_BURST);
-                }
-                break;
-            default:
-                if (Globals.getInstance().mAllowSingleShotMode)
-                    setShotMode(Globals.SHOT_MODE_SINGLE);
-                else if (Globals.getInstance().mAllowBurst3ShotMode)
-                    setShotMode(Globals.SHOT_MODE_BURST);
-                else
-                    setShotMode(Globals.SHOT_MODE_FULL_AUTO);
-        }
+        // Firing range can change even when the current shot mode is still permitted.
+        setShotMode(mCurrentShotMode);
         getFiringMode();
     }
 }
