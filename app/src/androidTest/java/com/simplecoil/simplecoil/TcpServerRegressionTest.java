@@ -385,6 +385,7 @@ public class TcpServerRegressionTest {
         set(player, "eliminated", 5);
         remove(player, 1);
         server.performRealEnd = true;
+        set(server, "keepListening", true);
         server.endGame();
         assertTrue(server.roundEnded.await(3, TimeUnit.SECONDS));
         assertNull(server.getScore((byte) 1));

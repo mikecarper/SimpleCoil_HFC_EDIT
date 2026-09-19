@@ -37,11 +37,15 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -116,6 +120,8 @@ public class TcpServer extends Service {
     private volatile Thread mServerThread = null;
     private volatile Thread mClientThread = null;
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
+    // Guarded by mServerStateLock, including registration before Thread.start().
+    private final Set<Thread> mClientTasks = new HashSet<>();
     private volatile Map<Integer, ClientData> mClientData = null;
     // Explicitly leaving must not reset a player's score or spent lives in this round.
     private final Map<Byte, ScoreData> mDepartedScores = new ConcurrentHashMap<>();
@@ -144,12 +150,6 @@ public class TcpServer extends Service {
             mDestroyed = true;
         }
         stopTcpServer();
-        // Close sockets without waiting for a writer's ClientData monitor. A
-        // stalled peer must not keep service destruction blocked on the UI thread.
-        if (mClientData != null) {
-            for (ClientData client : mClientData.values())
-                closeSocket(client.clientSocket);
-        }
         super.onDestroy();
     }
 
@@ -161,6 +161,46 @@ public class TcpServer extends Service {
 
     private final IBinder mBinder = new LocalBinder();
 
+    private boolean isClientTaskActive() {
+        synchronized (mServerStateLock) {
+            return keepListening && !mDestroyed && !Thread.currentThread().isInterrupted();
+        }
+    }
+
+    private boolean runClientTask(Runnable action) {
+        synchronized (mServerStateLock) {
+            if (!keepListening || mDestroyed)
+                return false;
+            Thread task = new Thread(() -> {
+                boolean acquired = false;
+                try {
+                    // These are new threads. Even a caller that already holds
+                    // the client lock cannot lend its ownership to a sender.
+                    mClientDataSemaphore.acquire();
+                    acquired = true;
+                    if (isClientTaskActive())
+                        action.run();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (RuntimeException e) {
+                    // The shared-state lock helpers propagate interruption as
+                    // an exception. Shutdown must cancel, not crash, this task.
+                    if (!Thread.currentThread().isInterrupted())
+                        Log.e(TAG, "TCP client task failed", e);
+                } finally {
+                    if (acquired)
+                        mClientDataSemaphore.release();
+                    synchronized (mServerStateLock) {
+                        mClientTasks.remove(Thread.currentThread());
+                    }
+                }
+            }, "SimpleCoil TCP send");
+            mClientTasks.add(task);
+            task.start();
+            return true;
+        }
+    }
+
     public void sendTCPMessageAll(final String message) {
         sendTCPMessageAll(message, false);
     }
@@ -168,62 +208,38 @@ public class TcpServer extends Service {
     public void sendTCPMessageAll(final String message, final boolean queueMessage) {
         if (mClientData == null || mClientData.size() == 0)
             return;
-        Thread sendThread = new Thread(() -> {
-            try {
-                mClientDataSemaphore.acquire();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+        runClientTask(() -> {
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                if (!isClientTaskActive())
+                    return;
                 entry.getValue().sendTCPMessage(message, queueMessage);
             }
-            mClientDataSemaphore.release();
         });
-        sendThread.start();
     }
 
-    private void sendTCPMessageID(final String message, final byte playerID, final boolean waitForAccess) {
-        sendTCPMessageID(message, playerID, waitForAccess, false);
-    }
-
-    private void sendTCPMessageID(final String message, final byte playerID, final boolean waitForAccess, final boolean queueMessage) {
+    private void sendTCPMessageID(final String message, final byte playerID, final boolean queueMessage) {
         if (mClientData == null || mClientData.size() == 0)
             return;
-        Thread sendThread = new Thread(() -> {
-            try {
-                if (waitForAccess)
-                    mClientDataSemaphore.acquire();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+        runClientTask(() -> {
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                if (!isClientTaskActive())
+                    return;
                 if (entry.getValue().mPlayerID == playerID) {
                     entry.getValue().sendTCPMessage(message, queueMessage);
                     break;
                 }
             }
-            if (waitForAccess)
-                mClientDataSemaphore.release();
         });
-        sendThread.start();
     }
 
-    private void sendTCPMessageTeam(final String message, final byte playerID, final boolean includePlayer, final boolean waitForAccess) {
-        sendTCPMessageTeam(message, playerID, includePlayer, waitForAccess, false);
-    }
-
-    private void sendTCPMessageTeam(final String message, final byte playerID, final boolean includePlayer, final boolean waitForAccess, final boolean queueMessage) {
+    private void sendTCPMessageTeam(final String message, final byte playerID, final boolean includePlayer, final boolean queueMessage) {
         if (mClientData == null || mClientData.size() == 0)
             return;
-        Thread sendThread = new Thread(() -> {
-            try {
-                if (waitForAccess)
-                    mClientDataSemaphore.acquire();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+        runClientTask(() -> {
             int team = -1;
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                if (!isClientTaskActive())
+                    return;
                 if (entry.getValue().mPlayerID == playerID) {
                     team = entry.getValue().getNetworkTeam();
                     if (includePlayer)
@@ -234,85 +250,103 @@ public class TcpServer extends Service {
             if (team != -1) {
                 Log.e(TAG, "team is " + team);
                 for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                    if (!isClientTaskActive())
+                        return;
                     if (entry.getValue().getNetworkTeam() == team && entry.getValue().mPlayerID != playerID)
                         entry.getValue().sendTCPMessage(message, queueMessage);
                 }
             }
-            if (waitForAccess)
-                mClientDataSemaphore.release();
         });
-        sendThread.start();
     }
 
     public boolean startGame() {
         if (mClientData == null || mClientData.size() == 0)
             return false;
-        Thread sendThread = new Thread(() -> {
+        return runClientTask(() -> {
             // we want to make sure that we have sent the start game message to all clients before broadcasting that the game has started locally
             String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME;
-            try {
-                mClientDataSemaphore.acquire();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                if (!isClientTaskActive())
+                    return;
                 entry.getValue().sendTCPMessage(message);
             }
-            mClientDataSemaphore.release();
-            sendBroadcast(new Intent(NetMsg.NETMSG_STARTGAME));
-            if (!mIsDedicated)
-                keepListening = false;
+            synchronized (mServerStateLock) {
+                if (!isClientTaskActive())
+                    return;
+                sendBroadcast(new Intent(NetMsg.NETMSG_STARTGAME));
+                if (!mIsDedicated)
+                    keepListening = false;
+            }
         });
-        sendThread.start();
-        return true;
     }
 
     public void endGame() {
-        Thread sendThread = new Thread(() -> {
+        runClientTask(() -> {
+            // Keep registration excluded until every shared roster has been
+            // cleared, not just until the old client sockets have been closed.
             if (mClientData != null) {
                 sendPlayerData(SEND_ALL);
                 // We want to send the end-game message before removing clients.
                 String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME;
-                boolean hasClientLock = false;
-                try {
-                    mClientDataSemaphore.acquire();
-                    hasClientLock = true;
-                    for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
-                        entry.getValue().sendTCPMessage(message);
-                        entry.getValue().close();
-                    }
-                    mClientData.clear();
-                    mDepartedScores.clear();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    Log.w(TAG, "Interrupted while ending game", e);
-                } finally {
-                    if (hasClientLock)
-                        mClientDataSemaphore.release();
+                for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                    if (!isClientTaskActive())
+                        return;
+                    entry.getValue().sendTCPMessage(message);
+                    entry.getValue().close();
                 }
+                if (!isClientTaskActive())
+                    return;
+                mClientData.clear();
+                mDepartedScores.clear();
             }
             Globals.getmGPSDataSemaphore();
             try {
+                if (!isClientTaskActive())
+                    return;
                 if (Globals.getInstance().mGPSData != null)
                     Globals.getInstance().mGPSData.clear();
             } finally {
                 Globals.getInstance().mGPSDataSemaphore.release();
             }
             Globals.getmTeamPlayerNameSemaphore();
-            Globals.getInstance().mTeamPlayerNameMap.clear();
-            Globals.getInstance().mTeamPlayerNameSemaphore.release();
+            try {
+                if (!isClientTaskActive())
+                    return;
+                Globals.getInstance().mTeamPlayerNameMap.clear();
+            } finally {
+                Globals.getInstance().mTeamPlayerNameSemaphore.release();
+            }
             Globals.getmTeamIPMapSemaphore();
-            Globals.getInstance().mTeamIPMap.clear();
-            Globals.getInstance().mTeamIPMapSemaphore.release();
+            try {
+                if (!isClientTaskActive())
+                    return;
+                Globals.getInstance().mTeamIPMap.clear();
+            } finally {
+                Globals.getInstance().mTeamIPMapSemaphore.release();
+            }
             Globals.getmIPTeamMapSemaphore();
-            Globals.getInstance().mIPTeamMap.clear();
-            Globals.getInstance().mIPTeamMapSemaphore.release();
+            try {
+                if (!isClientTaskActive())
+                    return;
+                Globals.getInstance().mIPTeamMap.clear();
+            } finally {
+                Globals.getInstance().mIPTeamMapSemaphore.release();
+            }
             // A player's physical grenade pairing remains valid across rounds, but the
             // server's ownership table must not leak into the next round.
-            Globals.ClearGrenadePairings(true);
-            sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
+            Globals.getmGrenadePairingsSemaphore();
+            try {
+                if (!isClientTaskActive())
+                    return;
+                Globals.ClearGrenadePairings(false);
+            } finally {
+                Globals.getInstance().mGrenadePairingsSemaphore.release();
+            }
+            synchronized (mServerStateLock) {
+                if (isClientTaskActive())
+                    sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
+            }
         });
-        sendThread.start();
     }
 
     private Map<Byte, InetAddress> getTeamIPMapSnapshot() {
@@ -440,21 +474,16 @@ public class TcpServer extends Service {
                 game.put(JSON_PLAYERGAMEUPDATE, playerGameUpdate);
                 final String idMessage = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
 
-                Thread sendThread = new Thread(() -> {
-                    try {
-                        mClientDataSemaphore.acquire();
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
+                runClientTask(() -> {
                     for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                        if (!isClientTaskActive())
+                            return;
                         if (entry.getValue().mPlayerID != id)
                             entry.getValue().sendTCPMessage(allMessage, false);
                         else
                             entry.getValue().sendTCPMessage(idMessage, false);
                     }
-                    mClientDataSemaphore.release();
                 });
-                sendThread.start();
             }
         } catch (JSONException e) {
             e.printStackTrace();
@@ -584,6 +613,8 @@ public class TcpServer extends Service {
             else {
                 // Using sendTCPMessageAll here does not work because the server ends before the messages get sent, mostly due to semaphore locking
                 for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                    if (!isClientTaskActive())
+                        return;
                     entry.getValue().sendTCPMessage(message);
                 }
             }
@@ -677,7 +708,8 @@ public class TcpServer extends Service {
             if (mDestroyed)
                 return;
             if ((mServerThread != null && mServerThread.isAlive())
-                    || (mClientThread != null && mClientThread.isAlive())) {
+                    || (mClientThread != null && mClientThread.isAlive())
+                    || !mClientTasks.isEmpty()) {
                 Log.d(TAG, "Server is still starting, listening, or shutting down");
                 return;
             }
@@ -1054,10 +1086,10 @@ public class TcpServer extends Service {
                                                 }
                                                 entry.getValue().eliminated++;
                                                 scoringPlayer.points++;
-                                                sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, false, true);
+                                                sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, true);
                                                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                                                     // Send a message to all teammates about the score increase
-                                                    sendTCPMessageTeam(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_TEAMELIMINATED, id, false, false, true);
+                                                    sendTCPMessageTeam(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_TEAMELIMINATED, id, false, true);
                                                 }
                                                 sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                                                 if (hasReachedScoreLimit(scoringPlayer))
@@ -1423,14 +1455,29 @@ public class TcpServer extends Service {
         final ServerSocket listener;
         final Thread worker;
         final Thread clients;
+        final Thread[] tasks;
+        final List<Socket> sockets = new ArrayList<>();
         synchronized (mServerStateLock) {
             keepListening = false;
             stopGPSDataLocked();
             listener = mListenSocket;
             worker = mServerThread;
             clients = mClientThread;
+            tasks = mClientTasks.toArray(new Thread[0]);
+            if (mClientData != null) {
+                for (ClientData client : mClientData.values())
+                    sockets.add(client.clientSocket);
+            }
         }
         closeListener(listener);
+        // Socket writes need not respond to interruption. Close only this
+        // session's sockets, without taking a blocked writer's client monitor.
+        for (Socket socket : sockets)
+            closeSocket(socket);
+        for (Thread task : tasks) {
+            if (task != Thread.currentThread())
+                task.interrupt();
+        }
         // Closing wakes accept(); interruption also cancels startup/registration
         // while it is waiting for a shared-state lock.
         if (worker != null && worker != Thread.currentThread())

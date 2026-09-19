@@ -64,6 +64,8 @@ public class MapFragment extends GlobeMapFragment {
     private static final int REQUEST_LOCATION_PERMISSION = 1;
 
     private LocationListener mLocationListener = null;
+    private boolean mResumed;
+    private boolean mGPSRequested;
 
     private double mLongitude = 0;
     private double mLatitude = 0;
@@ -125,7 +127,7 @@ public class MapFragment extends GlobeMapFragment {
 
         @Override
         public void onLocationChanged(Location loc) {
-            if (mLocationListener != this || !isAdded())
+            if (mLocationListener != this || !isGPSActive())
                 return;
             String longitude = "Longitude: " + loc.getLongitude();
             Log.v(TAG, longitude);
@@ -232,6 +234,7 @@ public class MapFragment extends GlobeMapFragment {
     @Override
     public void onResume() {
         super.onResume();
+        mResumed = true;
         IntentFilter filter = new IntentFilter(NetMsg.NETMSG_GPSDATAUPDATE);
         filter.addAction(NetMsg.NETMSG_LISTPLAYERS);
         filter.addAction(NetMsg.NETMSG_GPSSETTING);
@@ -241,6 +244,7 @@ public class MapFragment extends GlobeMapFragment {
 
     @Override
     public void onPause() {
+        mResumed = false;
         enableGPS(false);
         if (isAdded())
             requireActivity().unregisterReceiver(mGPSDataReceiver);
@@ -255,26 +259,37 @@ public class MapFragment extends GlobeMapFragment {
     private final BroadcastReceiver mGPSDataReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (!mResumed || !isAdded())
+                return;
             final String action = intent.getAction();
             if (action == null)
                 return;
 
             if (action.equals(NetMsg.NETMSG_GPSDATAUPDATE)) {
-                if (intent.getBooleanExtra(NetMsg.INTENT_FULLUPDATE, false)) {
-                    for (int x = 0; x <= Globals.MAX_PLAYER_ID; x++) {
-                        if (x != Globals.getInstance().mPlayerID)
-                            removePlayerMarker(x);
-                    }
-                }
-                insertPlayerMarkers();
+                if (!isGPSActive())
+                    return;
+                if (intent.getBooleanExtra(NetMsg.INTENT_FULLUPDATE, false))
+                    refreshPlayerMarkers();
+                else
+                    insertPlayerMarkers(false);
             } else if (action.equals(NetMsg.NETMSG_LISTPLAYERS) || action.equals(NetMsg.NETMSG_GPSSETTING)) {
                 enableGPS(Globals.getInstance().mUseGPS);
             }
         }
     };
 
+    private boolean isGPSActive() {
+        return mResumed && mGPSRequested && Globals.getInstance().mUseGPS && isAdded();
+    }
+
     public void enableGPS(boolean enabled) {
+        mGPSRequested = enabled;
         if (enabled) {
+            if (!isGPSActive())
+                return;
+            // Rebuild from the cached snapshot on resume and visibility/team
+            // changes. Stationary players may no longer have hasUpdate set.
+            refreshPlayerMarkers();
             if (mLocationListener == null) {
                 if (!isAdded() || mLocationManager == null)
                     return;
@@ -301,17 +316,19 @@ public class MapFragment extends GlobeMapFragment {
                 insertYourMarker();
             }
         } else {
-            if (mLocationListener != null) {
-                removeAllPlayerMarkers();
-                removeYourMarker();
+            LocationListener listener = mLocationListener;
+            mLocationListener = null;
+            // Remote markers do not depend on a local location subscription.
+            // Clear them even when permission or provider registration failed.
+            removeAllPlayerMarkers();
+            if (listener != null) {
                 if (mLocationManager != null) {
                     try {
-                        mLocationManager.removeUpdates(mLocationListener);
+                        mLocationManager.removeUpdates(listener);
                     } catch (SecurityException | IllegalArgumentException e) {
                         Log.w(TAG, "Unable to unregister location updates", e);
                     }
                 }
-                mLocationListener = null;
             }
         }
     }
@@ -321,13 +338,16 @@ public class MapFragment extends GlobeMapFragment {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_LOCATION_PERMISSION
                 && grantResults.length > 0
-                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                && isGPSActive()) {
             enableGPS(true);
         }
     }
 
     @Override
     protected void controlHasStarted() {
+        if (!isAdded() || mapControl == null)
+            return;
         // setup base layer tiles
         String cacheDirName = "empty";
         File cacheDir = new File(requireActivity().getCacheDir(), cacheDirName);
@@ -368,7 +388,7 @@ public class MapFragment extends GlobeMapFragment {
     private ComponentObject[] mPlayerMarkers = null;
 
     private void insertYourMarker() {
-        if (mapControl == null || mPlayerMarkers == null || !isAdded()) return;
+        if (mapControl == null || mPlayerMarkers == null || !isGPSActive()) return;
         int playerID = Globals.getInstance().mPlayerID;
         if (!Globals.isValidPlayerID(playerID) || playerID >= mPlayerMarkers.length) {
             Log.w(TAG, "Ignoring marker for invalid local player ID " + playerID);
@@ -403,8 +423,14 @@ public class MapFragment extends GlobeMapFragment {
         }
     }
 
-    private void insertPlayerMarkers() {
-        if (mapControl == null || mPlayerMarkers == null || !isAdded()) return;
+    private void refreshPlayerMarkers() {
+        removeAllPlayerMarkers();
+        insertYourMarker();
+        insertPlayerMarkers(true);
+    }
+
+    private void insertPlayerMarkers(boolean fullRefresh) {
+        if (mapControl == null || mPlayerMarkers == null || !isGPSActive()) return;
         MarkerInfo markerInfo = new MarkerInfo();
         Point2d markerSize = new Point2d(72, 72);
         // Add other players to the map
@@ -421,13 +447,14 @@ public class MapFragment extends GlobeMapFragment {
                     Log.w(TAG, "Ignoring GPS marker for invalid player ID " + playerID);
                     continue;
                 }
-                if (entry.getKey() != Globals.getInstance().mPlayerID && entry.getValue().hasUpdate) {
+                if (entry.getKey() != Globals.getInstance().mPlayerID
+                        && (fullRefresh || entry.getValue().hasUpdate)) {
                     entry.getValue().hasUpdate = false;
                     removePlayerMarker(entry.getKey());
                     ScreenMarker player = new ScreenMarker();
                     player.loc = Point2d.FromDegrees(entry.getValue().longitude, entry.getValue().latitude);
                     player.size = markerSize;
-                    if (entry.getValue().team == currentTeam) {
+                    if (Globals.getInstance().calcNetworkTeam(entry.getKey()) == currentTeam) {
                         player.image = teammate;
                         mPlayerMarkers[playerID] = mapControl.addScreenMarker(player, markerInfo, MaplyBaseController.ThreadMode.ThreadCurrent);
                     } else if (Globals.getInstance().mGPSMode == Globals.GPS_ALL) {
