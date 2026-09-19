@@ -2,6 +2,7 @@ package com.simplecoil.simplecoil;
 
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 
+import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -30,12 +31,14 @@ public class TcpClientRegressionTest {
     private TcpClient client;
     private ExecutorService sender;
     private Queue<?> pending;
+    private byte originalPairedGrenade;
 
     @Before
     public void setUp() throws Exception {
         client = new TcpClient();
         sender = (ExecutorService) field("sendExecutor").get(client);
         pending = (Queue<?>) field("messageQueue").get(client);
+        originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
         Globals.getInstance().mPairedGrenadeID = 0;
     }
 
@@ -43,6 +46,43 @@ public class TcpClientRegressionTest {
     public void tearDown() throws Exception {
         sender.shutdownNow();
         assertTrue(sender.awaitTermination(3, TimeUnit.SECONDS));
+        Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
+    }
+
+    @Test
+    public void registrationSynchronizesUnpairedGrenadeState() throws Exception {
+        ByteArrayOutputStream delivered = new ByteArrayOutputStream();
+        field("out").set(client, new DataOutputStream(delivered));
+        register();
+        awaitSender();
+        DataInputStream messages = messages(delivered);
+        assertRegistration(messages.readUTF());
+        assertGrenadePairing(messages.readUTF(), 0);
+    }
+
+    @Test
+    public void reconnectRepublishesUnpairingThatWasLostWhileOffline() throws Exception {
+        Globals.getInstance().mPairedGrenadeID = 3;
+        ByteArrayOutputStream firstConnection = new ByteArrayOutputStream();
+        field("out").set(client, new DataOutputStream(firstConnection));
+        register();
+        awaitSender();
+        DataInputStream initial = messages(firstConnection);
+        assertRegistration(initial.readUTF());
+        assertGrenadePairing(initial.readUTF(), 3);
+
+        field("out").set(client, null);
+        Globals.getInstance().mPairedGrenadeID = 0;
+        client.sendPlayerGrenade();
+        awaitSender();
+        ByteArrayOutputStream replacement = new ByteArrayOutputStream();
+        field("out").set(client, new DataOutputStream(replacement));
+        register();
+        awaitSender();
+        DataInputStream rejoined = messages(replacement);
+        assertRegistration(rejoined.readUTF());
+        assertGrenadePairing(rejoined.readUTF(), 0);
+        assertEquals(0, rejoined.available());
     }
 
     @Test
@@ -62,6 +102,7 @@ public class TcpClientRegressionTest {
         assertRegistration(messages.readUTF());
         assertEquals("first event", messages.readUTF());
         assertEquals("second event", messages.readUTF());
+        assertGrenadePairing(messages.readUTF(), 0);
         assertEquals(0, messages.available());
         assertTrue(pending.isEmpty());
     }
@@ -103,6 +144,8 @@ public class TcpClientRegressionTest {
         assertRegistration(messages.readUTF());
         assertTrue("Queued event must reach the replacement connection", messages.available() > 0);
         assertEquals("event during disconnect", messages.readUTF());
+        assertGrenadePairing(messages.readUTF(), 0);
+        assertEquals(0, messages.available());
         assertTrue(pending.isEmpty());
     }
 
@@ -161,5 +204,13 @@ public class TcpClientRegressionTest {
     private static void assertRegistration(String message) {
         assertTrue(message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
         assertTrue(message.contains(TcpServer.JSON_PLAYERNAME));
+    }
+
+    private static void assertGrenadePairing(String message, int expected) throws Exception {
+        assertTrue(message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
+        JSONObject pairing = new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                + TcpServer.TCPPREFIX_JSON.length()));
+        assertEquals(expected, pairing.getInt(TcpServer.JSON_PAIRED_GRENADE_ID));
+        assertEquals(Globals.getInstance().mPlayerID, pairing.getInt(TcpServer.JSON_PLAYERID));
     }
 }

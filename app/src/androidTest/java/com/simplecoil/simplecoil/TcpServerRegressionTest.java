@@ -23,6 +23,8 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,6 +45,7 @@ public class TcpServerRegressionTest {
     private Object clientHandler;
     private Class<?> clientType;
     private Map<Integer, Object> clients;
+    private int[] originalPairings;
 
     @Before
     public void setUp() throws Exception {
@@ -53,6 +56,8 @@ public class TcpServerRegressionTest {
         clientType = Class.forName(TcpServer.class.getName() + "$ClientData");
         clientHandler = innerInstance("ClientThread");
         Globals globals = Globals.getInstance();
+        originalPairings = globals.mGrenadePairings.clone();
+        Globals.ClearGrenadePairings(true);
         globals.mUseGPS = false;
         globals.mGameState = Globals.GAME_STATE_RUNNING;
         globals.mGameMode = Globals.GAME_MODE_FFA;
@@ -68,7 +73,90 @@ public class TcpServerRegressionTest {
             invoke(client, "close", new Class<?>[0]);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
+        System.arraycopy(originalPairings, 0, Globals.getInstance().mGrenadePairings, 0, originalPairings.length);
         clearPlayerMaps();
+    }
+
+    @Test
+    public void newGrenadePairingRemovesThatPlayersPreviousPairing() throws Exception {
+        Object player = client(1, 1);
+        Globals.getInstance().mGrenadePairings[2] = 1;
+        Globals.getInstance().mGrenadePairings[4] = 9;
+        pair(player, 1, 3);
+        assertEquals(Globals.INVALID_PLAYER_ID, Globals.getInstance().mGrenadePairings[2]);
+        assertEquals(1, Globals.getInstance().mGrenadePairings[3]);
+        assertEquals(9, Globals.getInstance().mGrenadePairings[4]);
+        assertEquals(2, lastPairings().length());
+    }
+
+    @Test
+    public void unpairClearsAllOfThePlayersStaleGrenadesAndPublishesEmptySnapshot() throws Exception {
+        Object player = client(1, 1);
+        Globals.getInstance().mGrenadePairings[2] = 1;
+        Globals.getInstance().mGrenadePairings[3] = 1;
+        pair(player, 1, 0);
+        for (int owner : Globals.getInstance().mGrenadePairings)
+            assertEquals(Globals.INVALID_PLAYER_ID, owner);
+        assertEquals(0, lastPairings().length());
+        assertEquals(1, Globals.getInstance().mGrenadePairingsSemaphore.availablePermits());
+    }
+
+    @Test
+    public void unpairDoesNotClearAnotherPlayersGrenade() throws Exception {
+        Object player = client(1, 1);
+        Globals.getInstance().mGrenadePairings[2] = 1;
+        Globals.getInstance().mGrenadePairings[3] = 9;
+        pair(player, 1, 0);
+        assertEquals(Globals.INVALID_PLAYER_ID, Globals.getInstance().mGrenadePairings[2]);
+        assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+        assertEquals(1, lastPairings().length());
+    }
+
+    @Test
+    public void invalidGrenadeOrSpoofedOwnerCannotRemoveExistingPairings() throws Exception {
+        Object player = client(1, 1);
+        Globals.getInstance().mGrenadePairings[2] = 1;
+        Globals.getInstance().mGrenadePairings[3] = 9;
+        int before = server.messages.size();
+        pair(player, 1, Globals.MAX_GRENADE_IDS);
+        pair(player, 9, 0);
+        assertEquals(1, Globals.getInstance().mGrenadePairings[2]);
+        assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+        assertEquals(before, server.messages.size());
+    }
+
+    private void pair(Object client, int player, int grenade) throws Exception {
+        parse(client, new JSONObject().put(TcpServer.JSON_PLAYERID, player)
+                .put(TcpServer.JSON_PAIRED_GRENADE_ID, grenade));
+    }
+
+    private org.json.JSONArray lastPairings() throws Exception {
+        String message = server.messages.get(server.messages.size() - 1);
+        return new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                + TcpServer.TCPPREFIX_JSON.length())).getJSONArray(TcpServer.JSON_GRENADE_PAIRINGS);
+    }
+
+    @Test
+    public void nonNumericEliminationDoesNotDropRegisteredPlayer() throws Exception {
+        assertMalformedEliminationIgnored("bad");
+    }
+
+    @Test
+    public void missingEliminationPlayerDoesNotDropRegisteredPlayer() throws Exception {
+        assertMalformedEliminationIgnored("");
+    }
+
+    @Test
+    public void overflowingEliminationPlayerDoesNotDropRegisteredPlayer() throws Exception {
+        assertMalformedEliminationIgnored("999999999999999999999");
+    }
+
+    private void assertMalformedEliminationIgnored(String id) throws Exception {
+        Object player = client(1, 1);
+        int before = server.playerUpdates;
+        processMessage(player, NetMsg.NETMSG_ELIMINATED + id);
+        assertEquals("Malformed message must not trigger a disconnect update", before, server.playerUpdates);
+        assertEquals(0, server.getScore((byte) 1).eliminated);
     }
 
     @Test
@@ -542,6 +630,7 @@ public class TcpServerRegressionTest {
         int startRequests;
         int playerUpdates;
         boolean performRealEnd;
+        final List<String> messages = new ArrayList<>();
         final CountDownLatch roundEnded = new CountDownLatch(1);
 
         @Override public void sendBroadcast(Intent intent) {
@@ -551,7 +640,7 @@ public class TcpServerRegressionTest {
                 playerUpdates++;
         }
         @Override public void sendAllGameInfo(int playerID) { }
-        @Override public void sendTCPMessageAll(String message) { }
+        @Override public void sendTCPMessageAll(String message) { messages.add(message); }
         @Override public boolean startGame() {
             startRequests++;
             return true;

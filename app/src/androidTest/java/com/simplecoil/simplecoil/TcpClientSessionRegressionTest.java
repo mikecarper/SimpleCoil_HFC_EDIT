@@ -7,6 +7,7 @@ import android.os.SystemClock;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -101,6 +102,42 @@ public class TcpClientSessionRegressionTest {
     }
 
     @Test
+    public void stoppedSessionCannotCommitGpsDataAlreadyReadFromTheSocket() throws Exception {
+        connect();
+        Globals globals = Globals.getInstance();
+        Globals.GPSData replacement = new Globals.GPSData();
+        replacement.longitude = 30;
+        replacement.latitude = 40;
+        globals.mGPSDataSemaphore.acquire();
+        try {
+            send(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + "{\"gpsupdate\":[],\"gpsfullupdate\":true}");
+            long deadline = SystemClock.elapsedRealtime() + 2000;
+            while (!globals.mGPSDataSemaphore.hasQueuedThreads() && SystemClock.elapsedRealtime() < deadline)
+                Thread.sleep(10);
+            assertTrue("Client did not parse the incoming GPS message", globals.mGPSDataSemaphore.hasQueuedThreads());
+            client.stopTcpClient();
+            // Simulate the replacement session publishing its location while the
+            // old TCP reader is still waiting to apply the previous host's data.
+            globals.mGPSData.clear();
+            globals.mGPSData.put((byte) 4, replacement);
+        } finally {
+            globals.mGPSDataSemaphore.release();
+        }
+        try {
+            assertTrue("Stopped client kept its reader alive", awaitStopped(2000));
+            assertEquals(1, globals.mGPSData.size());
+            assertEquals(replacement, globals.mGPSData.get((byte) 4));
+            assertFalse(client.actions.contains(NetMsg.NETMSG_GPSDATAUPDATE));
+            assertEquals(-1, peer.getInputStream().read());
+        } finally {
+            Globals.getmGPSDataSemaphore();
+            try { globals.mGPSData.clear(); }
+            finally { globals.mGPSDataSemaphore.release(); }
+        }
+    }
+
+    @Test
     public void serverCancellationStopsWithoutAnActivityReceiver() throws Exception {
         assertTerminalMessage(control(NetMsg.NETMSG_SERVERCANCEL), NetMsg.NETMSG_SERVERCANCEL);
     }
@@ -177,6 +214,26 @@ public class TcpClientSessionRegressionTest {
         peer.setSoTimeout(3000);
         received = new DataInputStream(peer.getInputStream());
         assertTrue(received.readUTF().contains(TcpServer.JSON_REJOIN));
+        expectGrenadePairing(0);
+        send(TcpServer.TCP_SERVER_PING);
+        expectPong();
+    }
+
+    @Test
+    public void reconnectSynchronizesGrenadeUnpairedDuringConnectionLoss() throws Exception {
+        Globals.getInstance().mPairedGrenadeID = 3;
+        connect();
+        Globals.getInstance().mPairedGrenadeID = 0;
+        Field output = TcpClient.class.getDeclaredField("out");
+        output.setAccessible(true);
+        output.set(client, null);
+        Socket replacement = listener.accept();
+        peer.close();
+        peer = replacement;
+        peer.setSoTimeout(3000);
+        received = new DataInputStream(peer.getInputStream());
+        assertTrue(received.readUTF().contains(TcpServer.JSON_REJOIN));
+        expectGrenadePairing(0);
         send(TcpServer.TCP_SERVER_PING);
         expectPong();
     }
@@ -301,6 +358,7 @@ public class TcpClientSessionRegressionTest {
         peer.setSoTimeout(3000);
         received = new DataInputStream(peer.getInputStream());
         assertTrue(received.readUTF().startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
+        expectGrenadePairing(0);
         assertNull(client.consumePendingTerminalEvent(oldId));
         assertNull(client.consumePendingTerminalEvent());
         send(TcpServer.TCP_SERVER_PING);
@@ -341,6 +399,16 @@ public class TcpClientSessionRegressionTest {
         peer.setSoTimeout(3000);
         received = new DataInputStream(peer.getInputStream());
         assertTrue(received.readUTF().startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
+        expectGrenadePairing(Globals.getInstance().mPairedGrenadeID);
+    }
+
+    private void expectGrenadePairing(int expected) throws Exception {
+        String message = received.readUTF();
+        assertTrue(message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
+        JSONObject pairing = new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                + TcpServer.TCPPREFIX_JSON.length()));
+        assertEquals(expected, pairing.getInt(TcpServer.JSON_PAIRED_GRENADE_ID));
+        assertEquals(Globals.getInstance().mPlayerID, pairing.getInt(TcpServer.JSON_PLAYERID));
     }
 
     private void send(String... messages) throws Exception {

@@ -322,10 +322,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void setupBLEServiceConnection() {
         if (mBLEServiceBound) return;
-        mBLEServiceConnection = new ServiceConnection() {
+        mBLEServiceConnection = createBLEServiceConnection();
+        Intent gattServiceIntent = new Intent(getBaseContext(), BluetoothLeService.class);
+        mBLEServiceBound = bindService(gattServiceIntent, mBLEServiceConnection, BIND_AUTO_CREATE);
+        if (!mBLEServiceBound)
+            mBLEServiceConnection = null;
+    }
+
+    private ServiceConnection createBLEServiceConnection() {
+        return new ServiceConnection() {
 
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
+                if (mBLEServiceConnection != this || !mBLEServiceBound || isFinishing() || isDestroyed())
+                    return;
                 mBluetoothLeService = ((BluetoothLeService.LocalBinder) service).getService();
                 if (!mBluetoothLeService.initialize()) {
                     Log.e(TAG, "Unable to initialize Bluetooth");
@@ -345,13 +355,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
             @Override
             public void onServiceDisconnected(ComponentName componentName) {
+                if (mBLEServiceConnection != this || !mBLEServiceBound)
+                    return;
                 mBluetoothLeService = null;
             }
         };
-        Intent gattServiceIntent = new Intent(getBaseContext(), BluetoothLeService.class);
-        mBLEServiceBound = bindService(gattServiceIntent, mBLEServiceConnection, BIND_AUTO_CREATE);
-        if (!mBLEServiceBound)
-            mBLEServiceConnection = null;
     }
 
     // Code to manage Service lifecycle.
@@ -1719,6 +1727,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        stopBLEScan();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
             mSpawnTimer = null;
@@ -1774,62 +1783,71 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         fragmentTransaction.commit();
     }
 
+    private ScanCallback mLeScanCallback;
+
     @SuppressLint("MissingPermission") // Permission is checked before scanning begins.
-    private final ScanCallback mLeScanCallback = new ScanCallback() {
-        @Override
-        public void onScanResult(int callbackType, ScanResult result) {
-            super.onScanResult(callbackType, result);
-            if (result != null)
-                checkDeviceName(result.getDevice());
-        }
-
-        @Override
-        public void onBatchScanResults(List<ScanResult> results) {
-            super.onBatchScanResults(results);
-            if (results == null) return;
-            for (ScanResult result : results) {
-                if (result != null && checkDeviceName(result.getDevice()))
-                    return;
+    private ScanCallback createLEScanCallback() {
+        return new ScanCallback() {
+            private boolean isCurrentScan() {
+                return mLeScanCallback == this && mScanning && !isFinishing() && !isDestroyed();
             }
-        }
 
-        @Override
-        public void onScanFailed(int errorCode) {
-            super.onScanFailed(errorCode);
-            Log.w(TAG, "Bluetooth scan failed: " + errorCode);
-            stopBLEScan();
-            handleDisconnect();
-        }
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                super.onScanResult(callbackType, result);
+                if (isCurrentScan() && result != null)
+                    checkDeviceName(result.getDevice());
+            }
 
-        private boolean checkDeviceName(BluetoothDevice device) {
-            if (device == null) return false;
-            final String deviceAddress;
-            final String deviceName;
-            try {
-                deviceAddress = device.getAddress();
-                deviceName = device.getName();
-            } catch (SecurityException e) {
-                Log.w(TAG, "Bluetooth permission was revoked while scanning", e);
+            @Override
+            public void onBatchScanResults(List<ScanResult> results) {
+                super.onBatchScanResults(results);
+                if (!isCurrentScan() || results == null) return;
+                for (ScanResult result : results) {
+                    if (result != null && checkDeviceName(result.getDevice()))
+                        return;
+                }
+            }
+
+            @Override
+            public void onScanFailed(int errorCode) {
+                super.onScanFailed(errorCode);
+                if (!isCurrentScan()) return;
+                Log.w(TAG, "Bluetooth scan failed: " + errorCode);
                 stopBLEScan();
+                handleDisconnect();
+            }
+
+            private boolean checkDeviceName(BluetoothDevice device) {
+                if (!isCurrentScan() || device == null) return false;
+                final String deviceAddress;
+                final String deviceName;
+                try {
+                    deviceAddress = device.getAddress();
+                    deviceName = device.getName();
+                } catch (SecurityException e) {
+                    Log.w(TAG, "Bluetooth permission was revoked while scanning", e);
+                    stopBLEScan();
+                    return false;
+                }
+                boolean hasSavedDevice = mDeviceAddress != null && !mDeviceAddress.isEmpty();
+                boolean isMatchingDevice = hasSavedDevice && mDeviceAddress.equals(deviceAddress);
+                boolean isAutoDetectedDevice = !hasSavedDevice && deviceName != null && deviceName.startsWith("SRG1");
+                if (isAutoDetectedDevice || isMatchingDevice) {
+                    Log.d(TAG, "Connecting to " + deviceName + " '" + deviceAddress + "'");
+                    TextView connectStatusTV = findViewById(R.id.connect_status_tv);
+                    if (connectStatusTV != null) {
+                        connectStatusTV.setText(R.string.connect_status_connecting);
+                    }
+                    mDeviceAddress = deviceAddress;
+                    stopBLEScan();
+                    setupBLEServiceConnection();
+                    return true;
+                }
                 return false;
             }
-            boolean hasSavedDevice = mDeviceAddress != null && !mDeviceAddress.isEmpty();
-            boolean isMatchingDevice = hasSavedDevice && mDeviceAddress.equals(deviceAddress);
-            boolean isAutoDetectedDevice = !hasSavedDevice && deviceName != null && deviceName.startsWith("SRG1");
-            if (isAutoDetectedDevice || isMatchingDevice) {
-                Log.d(TAG, "Connecting to " + deviceName + " '" + deviceAddress + "'");
-                TextView connectStatusTV = findViewById(R.id.connect_status_tv);
-                if (connectStatusTV != null) {
-                    connectStatusTV.setText(R.string.connect_status_connecting);
-                }
-                mDeviceAddress = deviceAddress;
-                stopBLEScan();
-                setupBLEServiceConnection();
-                return true;
-            }
-            return false;
-        }
-    };
+        };
+    }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
@@ -1894,6 +1912,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void connectWeapon() {
+        if (isFinishing() || isDestroyed())
+            return;
         if (TEST_NETWORK) {
             RelativeLayout connectLayout = findViewById(R.id.connect_layout);
             if (connectLayout != null) connectLayout.setVisibility(View.GONE);
@@ -1963,17 +1983,21 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return;
         }
         Log.d(TAG, "starting to scan");
+        // Give each scan its own callback identity. Android can deliver callbacks
+        // from the old scan after stopScan() or after a new scan has started.
+        mLeScanCallback = createLEScanCallback();
+        mScanning = true;
         try {
             mBluetoothLeScanner.startScan(mLeScanCallback);
         } catch (SecurityException | IllegalStateException e) {
             Log.w(TAG, "Unable to start Bluetooth scan", e);
+            stopBLEScan();
             return;
         }
         mConnectButton.setEnabled(false);
         mReconnectButton.setEnabled(false);
         mDedicatedServerButton.setEnabled(false);
         mQRConnectButton.setEnabled(false);
-        mScanning = true;
         TextView connectStatusTV = findViewById(R.id.connect_status_tv);
         if (connectStatusTV != null) {
             connectStatusTV.setText(R.string.connect_status_scanning);
@@ -2009,13 +2033,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @SuppressLint("MissingPermission") // Permission is checked before scanning begins.
     private void stopBLEScan() {
+        ScanCallback callback = mLeScanCallback;
+        BluetoothLeScanner scanner = mBluetoothLeScanner;
+        // Invalidate first, including callbacks dispatched during scanner cleanup.
+        mLeScanCallback = null;
+        mBluetoothLeScanner = null;
+        mScanning = false;
         try {
-            if (mBluetoothLeScanner != null)
-                mBluetoothLeScanner.stopScan(mLeScanCallback);
+            if (scanner != null && callback != null)
+                scanner.stopScan(callback);
         } catch (SecurityException | IllegalStateException e) {
             Log.w(TAG, "Unable to stop Bluetooth scan", e);
-        } finally {
-            mScanning = false;
         }
     }
 
@@ -2449,32 +2477,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 } else {
                     Log.e(TAG, "hitdata: " + Integer.toHexString(hit_by_player1) + " " + Integer.toHexString(data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0xFF));
                 }*/
-                if (hit_by_player1 == Globals.GRENADE_PLAYER_ID && (data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x0F) != GRENADE_DAMAGE) {
-                    if ((data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x0F) == GRENADE_PAIR_ID) {
-                        // This is a grenade trying to pair
-                        if (Globals.getInstance().mPairedGrenadeID == 0) {
-                            Globals.getInstance().mPairedGrenadeID = (byte)((data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0xF0) >> 4);
-                            if (mUseNetwork && isDedicatedServerConnection())
-                                mTcpClient.sendPlayerGrenade();
-                            Toast.makeText(getApplicationContext(), getString(R.string.grenade_paired_toast), Toast.LENGTH_SHORT).show();
-                        }
-                    } else if ((data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x0F) == GRENADE_NEW_PAIR || (data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x0F) == GRENADE_DISARM) {
-                        Globals.getInstance().mPairedGrenadeID = 0;
-                    }
-                }
-                if (hit_by_player2 == Globals.GRENADE_PLAYER_ID && (data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x0F) != GRENADE_DAMAGE) {
-                    if ((data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x0F) == GRENADE_PAIR_ID) {
-                        // This is a grenade trying to pair
-                        if (Globals.getInstance().mPairedGrenadeID == 0) {
-                            Globals.getInstance().mPairedGrenadeID = (byte)((data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0xF0) >> 4);
-                            if (mUseNetwork && isDedicatedServerConnection())
-                                mTcpClient.sendPlayerGrenade();
-                            Toast.makeText(getApplicationContext(), getString(R.string.grenade_paired_toast), Toast.LENGTH_SHORT).show();
-                        }
-                    } else if ((data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x0F) == GRENADE_NEW_PAIR || (data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x0F) == GRENADE_DISARM) {
-                        Globals.getInstance().mPairedGrenadeID = 0;
-                    }
-                }
+                if (hit_by_player1 == Globals.GRENADE_PLAYER_ID)
+                    processGrenadeCommand(data[RECOIL_OFFSET_HIT_BY1_SHOTID]);
+                if (hit_by_player2 == Globals.GRENADE_PLAYER_ID)
+                    processGrenadeCommand(data[RECOIL_OFFSET_HIT_BY2_SHOTID]);
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
                     if (hit_by_player1 != 0) {
                     if ((mLastHitData1.playerID == hit_by_player1 && mLastHitData1.shotID == shot_id1) || (mLastHitData2.playerID == hit_by_player1 && mLastHitData2.shotID == shot_id1)) {
@@ -2677,6 +2683,27 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } else if (data != null) {
             Log.w(TAG, "Ignoring short telemetry packet: " + data.length + " bytes");
         }
+    }
+
+    private void processGrenadeCommand(byte data) {
+        int command = data & 0x0F;
+        byte grenadeID = (byte) ((data & 0xF0) >> 4);
+        Globals globals = Globals.getInstance();
+        if (command == GRENADE_PAIR_ID) {
+            if (grenadeID == 0 || globals.mPairedGrenadeID != 0)
+                return;
+            globals.mPairedGrenadeID = grenadeID;
+            Toast.makeText(getApplicationContext(), getString(R.string.grenade_paired_toast), Toast.LENGTH_SHORT).show();
+        } else if (command == GRENADE_NEW_PAIR || command == GRENADE_DISARM) {
+            if (globals.mPairedGrenadeID == 0)
+                return;
+            globals.mPairedGrenadeID = 0;
+        } else {
+            return;
+        }
+        // Publish removals too, so the server cannot keep crediting the old owner.
+        if (mUseNetwork && isDedicatedServerConnection())
+            mTcpClient.sendPlayerGrenade();
     }
 
     private final BroadcastReceiver mUDPUpdateReceiver = new BroadcastReceiver() {

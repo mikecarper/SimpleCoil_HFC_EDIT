@@ -92,20 +92,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private boolean mUDPServiceBound = false;
 
     private void setupUDPServiceConnection() {
-        if (mUDPServiceBound) return;
-        mUDPServiceConnection = new ServiceConnection() {
-
-            @Override
-            public void onServiceConnected(ComponentName componentName, IBinder service) {
-                mUDPListenerService = ((UDPListenerService.LocalBinder) service).getService();
-                mUDPListenerService.createServer();
-            }
-
-            @Override
-            public void onServiceDisconnected(ComponentName componentName) {
-                mUDPListenerService = null;
-            }
-        };
+        if (mUDPServiceBound || isFinishing() || isDestroyed()) return;
+        mUDPServiceConnection = createUDPServiceConnection();
         Intent udpServiceIntent = new Intent(getBaseContext(), UDPListenerService.class);
         startService(udpServiceIntent);
         mUDPServiceBound = bindService(udpServiceIntent, mUDPServiceConnection, BIND_AUTO_CREATE);
@@ -113,16 +101,49 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mUDPServiceConnection = null;
     }
 
+    private ServiceConnection createUDPServiceConnection() {
+        return new ServiceConnection() {
+
+            @Override
+            public void onServiceConnected(ComponentName componentName, IBinder service) {
+                if (mUDPServiceConnection != this || !mUDPServiceBound || isFinishing() || isDestroyed())
+                    return;
+                mUDPListenerService = ((UDPListenerService.LocalBinder) service).getService();
+                mUDPListenerService.createServer();
+                mUDPListenerService.allowJoin(Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                        || mAllowJoinSwitch.isChecked());
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName componentName) {
+                if (mUDPServiceConnection != this || !mUDPServiceBound || isFinishing() || isDestroyed())
+                    return;
+                mUDPListenerService = null;
+            }
+        };
+    }
+
     private TcpServer mTcpServer = null;
     private ServiceConnection mTcpServerServiceConnection = null;
     private boolean mTcpServerServiceBound = false;
 
     private void setupTcpServerServiceConnection() {
-        if (mTcpServerServiceBound) return;
-        mTcpServerServiceConnection = new ServiceConnection() {
+        if (mTcpServerServiceBound || isFinishing() || isDestroyed()) return;
+        mTcpServerServiceConnection = createTcpServerServiceConnection();
+        Intent serviceIntent = new Intent(getBaseContext(), TcpServer.class);
+        startService(serviceIntent);
+        mTcpServerServiceBound = bindService(serviceIntent, mTcpServerServiceConnection, BIND_AUTO_CREATE);
+        if (!mTcpServerServiceBound)
+            mTcpServerServiceConnection = null;
+    }
+
+    private ServiceConnection createTcpServerServiceConnection() {
+        return new ServiceConnection() {
 
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
+                if (mTcpServerServiceConnection != this || !mTcpServerServiceBound || isFinishing() || isDestroyed())
+                    return;
                 mTcpServer = ((TcpServer.LocalBinder) service).getService();
                 mTcpServer.setDedicated(true);
                 mTcpServer.startTcpServer();
@@ -130,14 +151,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
 
             @Override
             public void onServiceDisconnected(ComponentName componentName) {
+                if (mTcpServerServiceConnection != this || !mTcpServerServiceBound || isFinishing() || isDestroyed())
+                    return;
                 mTcpServer = null;
             }
         };
-        Intent serviceIntent = new Intent(getBaseContext(), TcpServer.class);
-        startService(serviceIntent);
-        mTcpServerServiceBound = bindService(serviceIntent, mTcpServerServiceConnection, BIND_AUTO_CREATE);
-        if (!mTcpServerServiceBound)
-            mTcpServerServiceConnection = null;
     }
 
     private void unbindUDPService() {
@@ -496,6 +514,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
 
     private void startGame() {
+        if (isFinishing() || isDestroyed())
+            return;
         if (mTcpServer == null || mUDPListenerService == null) {
             Log.w(TAG, "Ignoring game start before dedicated server services are ready");
             return;
@@ -509,13 +529,22 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             Toast.makeText(getApplicationContext(), getString(R.string.not_enough_players_toast), Toast.LENGTH_SHORT).show();
             return;
         }
+        onGameStarted();
+    }
+
+    private void onGameStarted() {
+        // A STARTGAME notification confirms a start the server already sent.
+        // Applying it locally must not issue another start request to clients.
+        if (isFinishing() || isDestroyed() || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            return;
         Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
         mStartGameButton.setEnabled(false);
         mGameModeButton.setEnabled(false);
         mGameLimitButton.setEnabled(false);
         mGPSModeButton.setEnabled(false);
         mGameStatusTV.setText(R.string.dedicated_game_running);
-        mUDPListenerService.allowJoin(mAllowJoinSwitch.isChecked());
+        if (mUDPListenerService != null)
+            mUDPListenerService.allowJoin(mAllowJoinSwitch.isChecked());
         mEndGameButton.setEnabled(true);
         if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
             startGameCountdown();
@@ -566,6 +595,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private final BroadcastReceiver mServerUpdateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (isFinishing() || isDestroyed())
+                return;
             final String action = intent.getAction();
             if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)) {
                 mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount() - 1));
@@ -573,7 +604,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     endGame(); // Everyone else is out so game is over - this only works in FFA because we don't keep track of who and how many people are on each team
                 getPlayerDisplayData();
             } else if (NetMsg.NETMSG_STARTGAME.equals(action)) {
-                startGame();
+                onGameStarted();
             } else if (NetMsg.NETMSG_ENDGAME.equals(action)) {
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                     endGame();

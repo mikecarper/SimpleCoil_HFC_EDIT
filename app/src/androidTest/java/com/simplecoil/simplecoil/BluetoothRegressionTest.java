@@ -19,10 +19,45 @@ import java.util.UUID;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 /** Service regressions that never open a Bluetooth connection. */
 @RunWith(AndroidJUnit4.class)
 public class BluetoothRegressionTest {
+    @Test
+    public void closeWithoutGattStillClearsConnectionMetadata() throws Exception {
+        RecordingService service = new RecordingService();
+        field("mBluetoothDeviceAddress").set(service, "00:11:22:33:44:55");
+        field("mConnectionState").setInt(service, 2);
+        service.close();
+        assertNull(field("mBluetoothDeviceAddress").get(service));
+        assertEquals(0, field("mConnectionState").getInt(service));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void serviceDestructionDiscardsPendingGattOperations() throws Exception {
+        RecordingService service = new RecordingService();
+        BluetoothLeService.CharacteristicWrite write = new BluetoothLeService.CharacteristicWrite(
+                new BluetoothGattCharacteristic(UUID.fromString(GattAttributes.RECOIL_COMMAND_UUID), 0, 0),
+                new byte[]{16, 0, 2});
+        Queue<BluetoothLeService.CharacteristicWrite> queue =
+                (Queue<BluetoothLeService.CharacteristicWrite>) field("mCharacteristicWriteQueue").get(service);
+        queue.add(write);
+        field("mActiveCharacteristicWrite").set(service, write);
+        field("mActionAvailable").setBoolean(service, false);
+        field("mBluetoothDeviceAddress").set(service, "00:11:22:33:44:55");
+        field("mConnectionState").setInt(service, 2);
+        service.onDestroy();
+        assertTrue(queue.isEmpty());
+        assertNull(field("mActiveCharacteristicWrite").get(service));
+        assertTrue(field("mActionAvailable").getBoolean(service));
+        assertNull(field("mBluetoothDeviceAddress").get(service));
+        assertEquals(0, field("mConnectionState").getInt(service));
+        assertTrue(service.broadcasts.isEmpty());
+    }
+
     @Test
     public void queuedWritesKeepTheirOwnPayloadAndWriteType() {
         BluetoothGattCharacteristic characteristic = new BluetoothGattCharacteristic(
@@ -120,5 +155,11 @@ public class BluetoothRegressionTest {
         public void sendBroadcast(Intent intent) {
             broadcasts.add(intent);
         }
+    }
+
+    private static Field field(String name) throws Exception {
+        Field field = BluetoothLeService.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field;
     }
 }

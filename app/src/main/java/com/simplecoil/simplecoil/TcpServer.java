@@ -144,9 +144,6 @@ public class TcpServer extends Service {
             mDestroyed = true;
         }
         stopTcpServer();
-        Thread clients = mClientThread;
-        if (clients != null)
-            clients.interrupt();
         // Close sockets without waiting for a writer's ClientData monitor. A
         // stalled peer must not keep service destruction blocked on the UI thread.
         if (mClientData != null) {
@@ -473,62 +470,64 @@ public class TcpServer extends Service {
             // Save the callback before posting, so even its first run can be cancelled.
             mGPSRunnable = new Runnable() {
                 public void run() {
+                    final boolean fullUpdate;
                     synchronized (mServerStateLock) {
-                        if (mGPSRunnable != this)
+                        if (!isCurrentGPSCallbackLocked(this))
                             return;
-                        if (mDestroyed || !keepListening || !Globals.getInstance().mUseGPS) {
-                            stopGPSDataLocked();
-                            return;
-                        }
+                        // Reserve this tick's refresh before waiting on locations.
+                        // A later join/leave request must survive for the next tick.
+                        fullUpdate = mGPSIntervalCount >= SEND_ALL_GPS_INTERVAL;
+                        mGPSIntervalCount = fullUpdate ? 0 : mGPSIntervalCount + 1;
                     }
-                    boolean hasSemaphore = false;
                     try {
+                        JSONArray players = new JSONArray();
                         Globals.getmGPSDataSemaphore();
-                        hasSemaphore = true;
-                        if (Globals.getInstance().mGPSData != null && Globals.getInstance().mGPSData.size() != 0) {
-                            JSONArray players = new JSONArray();
-                            boolean hasUpdate = false;
-                            for (Map.Entry<Byte, Globals.GPSData> entry : Globals.getInstance().mGPSData.entrySet()) {
-                                if (entry.getValue().hasUpdate || mGPSIntervalCount >= SEND_ALL_GPS_INTERVAL) {
-                                    JSONObject player = new JSONObject();
-                                    player.put(JSON_PLAYERID, entry.getKey());
-                                    player.put(JSON_TEAM, entry.getValue().team);
-                                    player.put(JSON_GPSLONGITUDE, entry.getValue().longitude);
-                                    player.put(JSON_GPSLATITUDE, entry.getValue().latitude);
-                                    players.put(player);
-                                    hasUpdate = true;
+                        try {
+                            synchronized (mServerStateLock) {
+                                // Cancellation can happen while this tick waits for
+                                // the location lock. Never consume a newer session's
+                                // updates, even if the server is listening again.
+                                if (!isCurrentGPSCallbackLocked(this))
+                                    return;
+                                if (Globals.getInstance().mGPSData != null) {
+                                    for (Map.Entry<Byte, Globals.GPSData> entry : Globals.getInstance().mGPSData.entrySet()) {
+                                        if (entry.getValue().hasUpdate || fullUpdate) {
+                                            JSONObject player = new JSONObject();
+                                            player.put(JSON_PLAYERID, entry.getKey());
+                                            // A stationary player's cached GPS entry can predate
+                                            // a lobby game-mode change. Use the current team layout.
+                                            player.put(JSON_TEAM, Globals.getInstance().calcNetworkTeam(entry.getKey()));
+                                            player.put(JSON_GPSLONGITUDE, entry.getValue().longitude);
+                                            player.put(JSON_GPSLATITUDE, entry.getValue().latitude);
+                                            players.put(player);
+                                        }
+                                        entry.getValue().hasUpdate = false;
+                                    }
                                 }
-                                entry.getValue().hasUpdate = false;
                             }
+                        } finally {
                             Globals.getInstance().mGPSDataSemaphore.release();
-                            hasSemaphore = false;
-                            if (hasUpdate) {
-                                JSONObject game = new JSONObject();
-                                game.put(JSON_GPSUPDATE, players);
-                                if (mGPSIntervalCount >= SEND_ALL_GPS_INTERVAL) {
-                                    game.put(JSON_GPSFULLUPDATE, true);
-                                }
-                                String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
+                        }
+                        // An empty full snapshot removes departed players from clients.
+                        // Keep the periodic refresh advancing even with no locations.
+                        if (players.length() != 0 || fullUpdate) {
+                            JSONObject game = new JSONObject();
+                            game.put(JSON_GPSUPDATE, players);
+                            if (fullUpdate)
+                                game.put(JSON_GPSFULLUPDATE, true);
+                            String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
+                            synchronized (mServerStateLock) {
+                                if (!isCurrentGPSCallbackLocked(this))
+                                    return;
                                 sendTCPMessageAll(message, false);
                             }
-                            if (mGPSIntervalCount++ >= SEND_ALL_GPS_INTERVAL)
-                                mGPSIntervalCount = 0;
-                        } else {
-                            Globals.getInstance().mGPSDataSemaphore.release();
-                            hasSemaphore = false;
                         }
                     } catch (JSONException e) {
                         e.printStackTrace();
-                        if (hasSemaphore)
-                            Globals.getInstance().mGPSDataSemaphore.release();
                     }
                     synchronized (mServerStateLock) {
-                        if (mGPSRunnable != this)
-                            return;
-                        if (!mDestroyed && keepListening && Globals.getInstance().mUseGPS)
+                        if (isCurrentGPSCallbackLocked(this))
                             mGPSHandler.postDelayed(this, GPS_UPDATE_INTERVAL);
-                        else
-                            stopGPSDataLocked();
                     }
                 }
             };
@@ -536,11 +535,27 @@ public class TcpServer extends Service {
         }
     }
 
+    private boolean isCurrentGPSCallbackLocked(Runnable callback) {
+        if (mGPSRunnable != callback)
+            return false;
+        if (mDestroyed || !keepListening || !Globals.getInstance().mUseGPS) {
+            stopGPSDataLocked();
+            return false;
+        }
+        return true;
+    }
+
     private void stopGPSDataLocked() {
         if (mGPSRunnable != null)
             mGPSHandler.removeCallbacks(mGPSRunnable);
         mGPSRunnable = null;
         mGPSRunning = false;
+    }
+
+    private void requestFullGPSUpdate() {
+        synchronized (mServerStateLock) {
+            mGPSIntervalCount = SEND_ALL_GPS_INTERVAL;
+        }
     }
 
     public void sendPlayerData(int playerID) {
@@ -969,6 +984,8 @@ public class TcpServer extends Service {
                 }
                 long startTime = System.currentTimeMillis();
                 try {
+                    if (!keepListening)
+                        return;
                     for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
                         try {
                             if (entry.getValue().connectionFailed) {
@@ -1016,7 +1033,13 @@ public class TcpServer extends Service {
                                                 }
                                                 // A player was eliminated
                                                 message = message.substring(NetMsg.NETMSG_ELIMINATED.length());
-                                                int rawPlayerID = Integer.parseInt(message);
+                                                final int rawPlayerID;
+                                                try {
+                                                    rawPlayerID = Integer.parseInt(message);
+                                                } catch (NumberFormatException e) {
+                                                    Log.w(TAG, "Ignoring malformed elimination player ID");
+                                                    continue;
+                                                }
                                                 if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0) {
                                                     Log.w(TAG, "Ignoring elimination with invalid player ID " + rawPlayerID);
                                                     continue;
@@ -1154,7 +1177,15 @@ public class TcpServer extends Service {
                 }
                 Globals.getmGrenadePairingsSemaphore();
                 try {
-                    Globals.getInstance().mGrenadePairings[grenadeID] = playerID;
+                    int[] pairings = Globals.getInstance().mGrenadePairings;
+                    // A player can have only one paired grenade. ID zero means
+                    // unpaired, not a grenade that can be assigned an owner.
+                    for (int index = 0; index < pairings.length; index++) {
+                        if (pairings[index] == playerID)
+                            pairings[index] = Globals.INVALID_PLAYER_ID;
+                    }
+                    if (grenadeID != 0)
+                        pairings[grenadeID] = playerID;
                     sendGrenadePairings(false);
                 } finally {
                     Globals.getInstance().mGrenadePairingsSemaphore.release();
@@ -1272,7 +1303,7 @@ public class TcpServer extends Service {
                 sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                 return;
             }
-            mGPSIntervalCount = SEND_ALL_GPS_INTERVAL; // Send all GPS info because of the new client
+            requestFullGPSUpdate(); // Send all GPS info because of the new client
             boolean rejoin;
             byte id;
             String playerName;
@@ -1369,7 +1400,7 @@ public class TcpServer extends Service {
                     Globals.getmGPSDataSemaphore();
                     try {
                         Globals.getInstance().mGPSData.remove(client.mPlayerID);
-                        mGPSIntervalCount = SEND_ALL_GPS_INTERVAL; // Force a full GPS update when someone leaves
+                        requestFullGPSUpdate(); // Force a full GPS update when someone leaves
                     } finally {
                         Globals.getInstance().mGPSDataSemaphore.release();
                     }
@@ -1391,17 +1422,23 @@ public class TcpServer extends Service {
     public void stopTcpServer() {
         final ServerSocket listener;
         final Thread worker;
+        final Thread clients;
         synchronized (mServerStateLock) {
             keepListening = false;
             stopGPSDataLocked();
             listener = mListenSocket;
             worker = mServerThread;
+            clients = mClientThread;
         }
         closeListener(listener);
         // Closing wakes accept(); interruption also cancels startup/registration
         // while it is waiting for a shared-state lock.
         if (worker != null && worker != Thread.currentThread())
             worker.interrupt();
+        // The client loop may be waiting on registration or GPS state instead
+        // of its next socket read. Cancelling the listener alone cannot wake it.
+        if (clients != null && clients != Thread.currentThread())
+            clients.interrupt();
     }
 
     private static void closeListener(ServerSocket socket) {

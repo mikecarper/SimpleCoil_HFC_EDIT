@@ -346,6 +346,12 @@ public class BluetoothLeService extends Service {
         return super.onUnbind(intent);
     }
 
+    @Override
+    public void onDestroy() {
+        close();
+        super.onDestroy();
+    }
+
     private final IBinder mBinder = new LocalBinder();
 
     /**
@@ -463,14 +469,12 @@ public class BluetoothLeService extends Service {
      * released properly.
      */
     public synchronized void close() {
-        if (mBluetoothGatt == null) {
-            clearPendingGattOperations();
-            return;
-        }
-        try {
-            mBluetoothGatt.close();
-        } catch (SecurityException e) {
-            Log.w(TAG, "Bluetooth permission was revoked while closing", e);
+        if (mBluetoothGatt != null) {
+            try {
+                mBluetoothGatt.close();
+            } catch (SecurityException e) {
+                Log.w(TAG, "Bluetooth permission was revoked while closing", e);
+            }
         }
         mBluetoothGatt = null;
         mBluetoothDeviceAddress = null;

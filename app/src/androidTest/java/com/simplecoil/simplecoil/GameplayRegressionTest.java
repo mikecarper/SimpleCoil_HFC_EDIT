@@ -40,9 +40,12 @@ public class GameplayRegressionTest {
     private TcpClient originalTcpClient;
     private TcpServer originalTcpServer;
     private RecordingTcpClient tcp;
+    private byte originalPairedGrenade;
 
     @Before
     public void setUp() {
+        originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
+        Globals.getInstance().mPairedGrenadeID = 0;
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().mUseGPS = false;
         scenario = ActivityScenario.launch(FullscreenActivity.class);
@@ -116,6 +119,73 @@ public class GameplayRegressionTest {
             set(activity, "mHasLivesLimit", false);
         });
         scenario.close();
+        Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
+    }
+
+    @Test
+    public void firstGrenadeDisarmNotifiesDedicatedServer() {
+        assertGrenadeUnpairNotifiesServer(false, 0x3D);
+    }
+
+    @Test
+    public void secondGrenadeDisarmNotifiesDedicatedServer() {
+        assertGrenadeUnpairNotifiesServer(true, 0x3D);
+    }
+
+    @Test
+    public void firstGrenadeResetNotifiesDedicatedServer() {
+        assertGrenadeUnpairNotifiesServer(false, 0x3E);
+    }
+
+    @Test
+    public void secondGrenadeResetNotifiesDedicatedServer() {
+        assertGrenadeUnpairNotifiesServer(true, 0x3E);
+    }
+
+    private void assertGrenadeUnpairNotifiesServer(boolean secondSlot, int command) {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = true;
+            Globals.getInstance().mPairedGrenadeID = 3;
+            byte[] packet = grenadePacket(secondSlot, command);
+            receiveTelemetry(activity, packet);
+            assertEquals(0, Globals.getInstance().mPairedGrenadeID);
+            assertEquals(1, tcp.messages.size());
+            assertTrue(tcp.messages.get(0).contains("\"" + TcpServer.JSON_PAIRED_GRENADE_ID + "\":0"));
+            receiveTelemetry(activity, packet);
+            assertEquals("Repeated disarm telemetry should not resend the update", 1, tcp.messages.size());
+            assertEquals(20, get(activity, "mHealth"));
+        });
+    }
+
+    @Test
+    public void grenadePairingWithReservedZeroIdIsIgnored() {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = true;
+            receiveTelemetry(activity, grenadePacket(false, 0x0F));
+            receiveTelemetry(activity, grenadePacket(true, 0x0F));
+            assertEquals(0, Globals.getInstance().mPairedGrenadeID);
+            assertTrue(tcp.messages.isEmpty());
+        });
+    }
+
+    @Test
+    public void validGrenadePairingStillNotifiesDedicatedServer() {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = true;
+            receiveTelemetry(activity, grenadePacket(true, 0x3F));
+            assertEquals(3, Globals.getInstance().mPairedGrenadeID);
+            assertEquals(1, tcp.messages.size());
+            assertTrue(tcp.messages.get(0).contains("\"" + TcpServer.JSON_PAIRED_GRENADE_ID + "\":3"));
+        });
+    }
+
+    private static byte[] grenadePacket(boolean secondSlot, int command) {
+        byte[] packet = telemetryPacket(0, 0, 0, 0);
+        packet[secondSlot ? FullscreenActivity.RECOIL_OFFSET_HIT_BY2 : FullscreenActivity.RECOIL_OFFSET_HIT_BY1]
+                = (byte) Globals.GRENADE_PLAYER_ID;
+        packet[secondSlot ? FullscreenActivity.RECOIL_OFFSET_HIT_BY2_SHOTID : FullscreenActivity.RECOIL_OFFSET_HIT_BY1_SHOTID]
+                = (byte) command;
+        return packet;
     }
 
     @Test

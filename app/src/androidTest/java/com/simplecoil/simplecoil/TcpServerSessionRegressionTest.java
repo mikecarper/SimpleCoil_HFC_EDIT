@@ -6,6 +6,7 @@ import android.os.SystemClock;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -188,6 +189,75 @@ public class TcpServerSessionRegressionTest {
     }
 
     @Test
+    public void stoppingClientWorkerWaitingForLockDoesNotRequireServiceDestruction() throws Exception {
+        connect();
+        Semaphore clientsLock = (Semaphore) get(server, "mClientDataSemaphore");
+        clientsLock.acquire();
+        try {
+            assertTrue(awaitQueued(clientsLock, 2000));
+            server.stopTcpServer();
+            assertTrue("Stopped client worker kept waiting", awaitStopped(server, 1000));
+            assertEquals(0, clientsLock.availablePermits());
+            assertEquals(-1, peer.getInputStream().read());
+        } finally {
+            clientsLock.release();
+        }
+        assertEquals(1, clientsLock.availablePermits());
+        assertTrue(awaitStopped(server, 2000));
+        peer.close();
+        connect();
+        server.sendTCPMessageAll("after-cancelled-lock-wait");
+        assertEquals("after-cancelled-lock-wait", new DataInputStream(peer.getInputStream()).readUTF());
+    }
+
+    @Test
+    public void stoppingDuringRegistrationCancelsTheClientWorker() throws Exception {
+        connect();
+        Semaphore endpointLock = Globals.getInstance().mIPTeamMapSemaphore;
+        CopyOnWriteArrayList<Throwable> failures = new CopyOnWriteArrayList<>();
+        Thread worker = (Thread) get(server, "mClientThread");
+        worker.setUncaughtExceptionHandler((thread, error) -> failures.add(error));
+        endpointLock.acquire();
+        try {
+            new DataOutputStream(peer.getOutputStream()).writeUTF(TcpServer.TCPMESSAGE_PREFIX
+                    + TcpServer.TCPPREFIX_JSON + "{\"playerID\":1,\"playername\":\"Player 1\"}");
+            assertTrue("Registration did not reach the held endpoint lock", awaitQueued(endpointLock, 2000));
+            server.stopTcpServer();
+            assertTrue("Stopped registration retained a worker", awaitStopped(server, 1000));
+            assertTrue("Cancelled registration crashed: " + failures, failures.isEmpty());
+            assertEquals(0, endpointLock.availablePermits());
+            assertEquals(1, ((Semaphore) get(server, "mClientDataSemaphore")).availablePermits());
+            assertEquals(-1, peer.getInputStream().read());
+        } finally {
+            endpointLock.release();
+        }
+    }
+
+    @Test
+    public void stoppingDuringIncomingGpsUpdateDoesNotPublishTheCancelledLocation() throws Exception {
+        connect();
+        Object client = ((Map<?, ?>) get(server, "mClientData")).values().iterator().next();
+        Field playerID = client.getClass().getDeclaredField("mPlayerID");
+        playerID.setAccessible(true);
+        playerID.set(client, (byte) 1);
+        Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
+        locations.acquire();
+        try {
+            new DataOutputStream(peer.getOutputStream()).writeUTF(TcpServer.TCPMESSAGE_PREFIX
+                    + TcpServer.TCPPREFIX_JSON + "{\"gpslongitude\":10,\"gpslatitude\":20}");
+            assertTrue("Incoming location did not reach the held GPS lock", awaitQueued(locations, 2000));
+            server.stopTcpServer();
+            assertTrue("Stopped GPS update retained a worker", awaitStopped(server, 1000));
+            assertTrue(Globals.getInstance().mGPSData.isEmpty());
+            assertEquals(0, locations.availablePermits());
+            assertEquals(1, ((Semaphore) get(server, "mClientDataSemaphore")).availablePermits());
+            assertEquals(-1, peer.getInputStream().read());
+        } finally {
+            locations.release();
+        }
+    }
+
+    @Test
     public void destroyingDuringRegistrationDoesNotCrashOrLeakClientLock() throws Exception {
         connect();
         Semaphore endpointLock = Globals.getInstance().mIPTeamMapSemaphore;
@@ -264,6 +334,180 @@ public class TcpServerSessionRegressionTest {
         InstrumentationRegistry.getInstrumentation().runOnMainSync(old);
         assertSame(current, get(server, "mGPSRunnable"));
         assertTrue((boolean) get(server, "mGPSRunning"));
+    }
+
+    @Test
+    public void stationaryPlayersGpsUsesTheCurrentTeamLayout() throws Exception {
+        int originalMode = Globals.getInstance().mGameMode;
+        try {
+            Globals.getInstance().mUseGPS = true;
+            Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
+            Globals.GPSData location = new Globals.GPSData();
+            location.team = 1; // Player 5's old team in a two-team lobby.
+            location.hasUpdate = true;
+            Globals.getInstance().mGPSData.put((byte) 5, location);
+            set(server, "keepListening", true);
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(server::sendGPSData);
+            Runnable update = (Runnable) get(server, "mGPSRunnable");
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
+            assertEquals(1, server.messages.size());
+            String message = server.messages.get(0);
+            JSONObject gps = new JSONObject(message.substring((TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON).length()));
+            assertEquals(2, gps.getJSONArray(TcpServer.JSON_GPSUPDATE).getJSONObject(0).getInt(TcpServer.JSON_TEAM));
+        } finally {
+            Globals.getInstance().mGameMode = originalMode;
+        }
+    }
+
+    @Test
+    public void forcedFullGpsUpdatePublishesAnEmptyLocationTable() throws Exception {
+        Runnable update = scheduleGpsUpdate();
+        set(server, "mGPSIntervalCount", 20);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
+        assertEquals(1, server.messages.size());
+        JSONObject snapshot = gpsMessage(0);
+        assertTrue(snapshot.getBoolean(TcpServer.JSON_GPSFULLUPDATE));
+        assertEquals(0, snapshot.getJSONArray(TcpServer.JSON_GPSUPDATE).length());
+        assertEquals(0, get(server, "mGPSIntervalCount"));
+    }
+
+    @Test
+    public void emptyGpsTableStillAdvancesPeriodicFullUpdates() throws Exception {
+        Runnable update = scheduleGpsUpdate();
+        set(server, "mGPSIntervalCount", 19);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
+        assertTrue(server.messages.isEmpty());
+        assertEquals(20, get(server, "mGPSIntervalCount"));
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
+        assertEquals(1, server.messages.size());
+        assertTrue(gpsMessage(0).getBoolean(TcpServer.JSON_GPSFULLUPDATE));
+    }
+
+    @Test
+    public void forcedFullGpsUpdateIncludesStationaryPlayers() throws Exception {
+        Runnable update = scheduleGpsUpdate();
+        Globals.GPSData location = new Globals.GPSData();
+        location.longitude = 10;
+        location.latitude = 20;
+        location.hasUpdate = false;
+        Globals.getInstance().mGPSData.put((byte) 2, location);
+        set(server, "mGPSIntervalCount", 20);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
+        assertEquals(1, server.messages.size());
+        assertTrue(gpsMessage(0).getBoolean(TcpServer.JSON_GPSFULLUPDATE));
+        assertEquals(1, gpsMessage(0).getJSONArray(TcpServer.JSON_GPSUPDATE).length());
+        assertEquals(1, Globals.getInstance().mGPSDataSemaphore.availablePermits());
+    }
+
+    @Test
+    public void refreshRequestedWhileGpsCallbackWaitsForLocationsIsNotLost() throws Exception {
+        Runnable update = scheduleGpsUpdate();
+        ((android.os.Handler) get(server, "mGPSHandler")).removeCallbacks(update);
+        Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
+        Thread worker = new Thread(update);
+        locations.acquire();
+        try {
+            worker.start();
+            assertTrue("GPS callback did not reach the held location lock", awaitQueued(locations, 2000));
+            // A player leaving or joining requests a full refresh while the
+            // current incremental update is still being prepared.
+            set(server, "mGPSIntervalCount", 20);
+        } finally {
+            locations.release();
+            worker.join(2000);
+        }
+        assertFalse(worker.isAlive());
+        assertEquals("A newer refresh request was consumed by an incremental update", 20,
+                get(server, "mGPSIntervalCount"));
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
+        assertEquals(1, server.messages.size());
+        assertTrue(gpsMessage(0).getBoolean(TcpServer.JSON_GPSFULLUPDATE));
+    }
+
+    @Test
+    public void stoppingWhileGpsCallbackWaitsDoesNotConsumeLocationUpdates() throws Exception {
+        assertWaitingGpsUpdateIsCancelled(server::stopTcpServer);
+        assertNull(get(server, "mGPSRunnable"));
+        assertFalse((boolean) get(server, "mGPSRunning"));
+    }
+
+    @Test
+    public void destroyingWhileGpsCallbackWaitsDoesNotConsumeLocationUpdates() throws Exception {
+        assertWaitingGpsUpdateIsCancelled(() -> destroy(server));
+        assertNull(get(server, "mGPSRunnable"));
+        assertFalse((boolean) get(server, "mGPSRunning"));
+    }
+
+    @Test
+    public void disablingGpsWhileCallbackWaitsDoesNotSendOrConsumeLocations() throws Exception {
+        assertWaitingGpsUpdateIsCancelled(() -> Globals.getInstance().mUseGPS = false);
+        assertNull(get(server, "mGPSRunnable"));
+        assertFalse((boolean) get(server, "mGPSRunning"));
+    }
+
+    @Test
+    public void replacedGpsCallbackCannotConsumeTheNewSessionsLocationUpdates() throws Exception {
+        Runnable[] replacement = new Runnable[1];
+        assertWaitingGpsUpdateIsCancelled(() -> {
+            server.stopTcpServer();
+            set(server, "keepListening", true);
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(server::sendGPSData);
+            replacement[0] = (Runnable) get(server, "mGPSRunnable");
+            ((android.os.Handler) get(server, "mGPSHandler")).removeCallbacks(replacement[0]);
+        });
+        assertNotNull(replacement[0]);
+        assertSame(replacement[0], get(server, "mGPSRunnable"));
+        assertTrue((boolean) get(server, "mGPSRunning"));
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(replacement[0]);
+        assertEquals(1, server.messages.size());
+        assertFalse(Globals.getInstance().mGPSData.get((byte) 2).hasUpdate);
+    }
+
+    private void assertWaitingGpsUpdateIsCancelled(CheckedAction cancel) throws Exception {
+        Runnable update = scheduleGpsUpdate();
+        ((android.os.Handler) get(server, "mGPSHandler")).removeCallbacks(update);
+        Globals.GPSData location = new Globals.GPSData();
+        location.longitude = 10;
+        location.latitude = 20;
+        location.hasUpdate = true;
+        Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
+        CopyOnWriteArrayList<Throwable> failures = new CopyOnWriteArrayList<>();
+        Thread worker = new Thread(update);
+        worker.setUncaughtExceptionHandler((thread, error) -> failures.add(error));
+        locations.acquire();
+        try {
+            Globals.getInstance().mGPSData.put((byte) 2, location);
+            worker.start();
+            assertTrue("GPS callback did not reach the held location lock", awaitQueued(locations, 2000));
+            cancel.run();
+        } finally {
+            locations.release();
+            worker.join(2000);
+        }
+        assertFalse("GPS callback did not finish", worker.isAlive());
+        assertTrue("GPS callback crashed: " + failures, failures.isEmpty());
+        assertTrue("Cancelled callback consumed a pending location", location.hasUpdate);
+        assertTrue("Cancelled callback published locations", server.messages.isEmpty());
+        assertEquals(1, locations.availablePermits());
+    }
+
+    private interface CheckedAction {
+        void run() throws Exception;
+    }
+
+    private Runnable scheduleGpsUpdate() throws Exception {
+        Globals.getInstance().mUseGPS = true;
+        Globals.getmGPSDataSemaphore();
+        try { Globals.getInstance().mGPSData.clear(); }
+        finally { Globals.getInstance().mGPSDataSemaphore.release(); }
+        set(server, "keepListening", true);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(server::sendGPSData);
+        return (Runnable) get(server, "mGPSRunnable");
+    }
+
+    private JSONObject gpsMessage(int index) throws Exception {
+        String message = server.messages.get(index);
+        return new JSONObject(message.substring((TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON).length()));
     }
 
     private void connect() throws Exception {
@@ -344,6 +588,11 @@ public class TcpServerSessionRegressionTest {
     }
 
     private static final class RecordingServer extends TcpServer {
+        final CopyOnWriteArrayList<String> messages = new CopyOnWriteArrayList<>();
         @Override public void sendBroadcast(Intent intent) { }
+        @Override public void sendTCPMessageAll(String message, boolean queueMessage) {
+            messages.add(message);
+            super.sendTCPMessageAll(message, queueMessage);
+        }
     }
 }

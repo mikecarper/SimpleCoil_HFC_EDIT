@@ -56,13 +56,19 @@ public class UDPListenerService extends Service {
 
     private static final long LISTENER_START_TIMEOUT_MS = 5000;
     private final Object mSendLock = new Object();
-    private static volatile boolean keepListening = true;
-    private static volatile boolean doneListening = true;
-    private static volatile boolean mIsListService = false;
-    private static volatile int mReadyToScan = 0;
+    private volatile boolean keepListening = false;
+    private volatile boolean doneListening = true;
+    private volatile boolean mIsListService = false;
+    private volatile int mReadyToScan = 0;
 
     private volatile boolean mScanRunning = false;
     private final Object mListenerStateLock = new Object();
+    private boolean mDestroyed;
+    private volatile long mJoinGeneration;
+    private InetAddress mJoinAddress;
+    private boolean mBroadcastScan;
+    private CountDownTimer mJoinTimer;
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
 
     public static final String INTENT_PLAYERID = "playerid";
     public static final String INTENT_MESSAGE = "message";
@@ -76,13 +82,17 @@ public class UDPListenerService extends Service {
                 socket.setReuseAddress(true);
                 socket.setBroadcast(true);
                 socket.bind(new InetSocketAddress(port));
-                mSocket = socket;
             }
             socket.setSoTimeout(timeout);
             DatagramPacket packet = new DatagramPacket(recvBuf, recvBuf.length);
             Log.d(TAG, "Waiting for UDP messages on " + ip.toString() + ":" + port);
-            mReadyToScan++;
-            doneListening = false;
+            synchronized (mListenerStateLock) {
+                if (!keepListening || mDestroyed)
+                    return;
+                mSocket = socket;
+                mReadyToScan++;
+                doneListening = false;
+            }
             while (keepListening) {
                 try {
                     packet.setLength(recvBuf.length);
@@ -104,6 +114,8 @@ public class UDPListenerService extends Service {
     }
 
     private void processMessage(InetAddress ip, String message) {
+        if (ip == null || message == null)
+            return;
         Intent intent = null;
         if (mMyIP == null) {
             mMyIP = Globals.getIPAddress();
@@ -112,39 +124,40 @@ public class UDPListenerService extends Service {
             //Log.d(TAG, "IP matched so ignored");
             return;
         }
+        // Older servers send version rejection without the normal UDP prefix.
+        if (message.equals(NetMsg.NETMSG_VERSIONERROR)) {
+            completeJoin(ip, NetMsg.NETMSG_VERSIONERROR);
+            return;
+        }
         if (message.startsWith(NetMsg.MESSAGE_PREFIX)) {
             message = message.substring(NetMsg.MESSAGE_PREFIX.length());
-            if (message.startsWith(NetMsg.NETMSG_SHOTFIRED)) {
+            if (message.equals(NetMsg.NETMSG_SHOTFIRED)) {
+                if (getPlayerID(ip) == null)
+                    return;
                 // someone else fired a shot
                 intent = new Intent(NetMsg.NETMSG_SHOTFIRED);
-            } else if (message.startsWith(NetMsg.NETMSG_HIT)) {
+            } else if (message.equals(NetMsg.NETMSG_HIT)) {
                 // you hit someone!
                 intent = new Intent(NetMsg.NETMSG_HIT);
-                Globals.getmIPTeamMapSemaphore();
-                Byte id = Globals.getInstance().mIPTeamMap.get(ip);
-                Globals.getInstance().mIPTeamMapSemaphore.release();
+                Byte id = getPlayerID(ip);
                 if (id == null) {
                     Log.e(TAG, "Unknown IP " + ip.toString());
                     return;
                 }
                 intent.putExtra(INTENT_PLAYERID, id);
-            } else if (message.startsWith(NetMsg.NETMSG_OUT)) {
+            } else if (message.equals(NetMsg.NETMSG_OUT)) {
                 // hitting a player that's already out
                 intent = new Intent(NetMsg.NETMSG_OUT);
-                Globals.getmIPTeamMapSemaphore();
-                Byte id = Globals.getInstance().mIPTeamMap.get(ip);
-                Globals.getInstance().mIPTeamMapSemaphore.release();
+                Byte id = getPlayerID(ip);
                 if (id == null) {
                     Log.e(TAG, "Unknown IP " + ip.toString());
                     return;
                 }
                 intent.putExtra(INTENT_PLAYERID, id);
-            } else if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
+            } else if (message.equals(NetMsg.NETMSG_ELIMINATED)) {
                 // you eliminated someone!
                 intent = new Intent(NetMsg.NETMSG_ELIMINATED);
-                Globals.getmIPTeamMapSemaphore();
-                Byte id = Globals.getInstance().mIPTeamMap.get(ip);
-                Globals.getInstance().mIPTeamMapSemaphore.release();
+                Byte id = getPlayerID(ip);
                 if (id == null) {
                     Log.e(TAG, "Unknown IP " + ip.toString());
                     return;
@@ -206,13 +219,10 @@ public class UDPListenerService extends Service {
                 }
                 Log.d(TAG, "player " + team + " found at " + ip.toString());
                 sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY, ip, LISTEN_PORT);
-            } else if (message.startsWith(NetMsg.NETMSG_SERVERREPLY)) {
-                if (!mScanRunning)
-                    return;
-                mScanRunning = false;
-                Globals.getInstance().mServerIP = ip;
-                intent = new Intent(NetMsg.NETMSG_SERVERREPLY);
-            } else if (message.startsWith(NetMsg.NETMSG_LEAVE)) {
+            } else if (message.equals(NetMsg.NETMSG_SERVERREPLY)) {
+                completeJoin(ip, NetMsg.NETMSG_SERVERREPLY);
+                return;
+            } else if (message.equals(NetMsg.NETMSG_LEAVE)) {
                 // This is a player left message
                 Globals.getmIPTeamMapSemaphore();
                 Byte team;
@@ -234,18 +244,24 @@ public class UDPListenerService extends Service {
                 }
                 Log.d(TAG, "player " + team + " left at " + ip.toString());
                 intent = new Intent(NetMsg.NETMSG_LEAVE);
-            } else if (message.startsWith(NetMsg.NETMSG_ENDGAME)) {
-                if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
+            } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
+                if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                        || (getPlayerID(ip) == null && !ip.equals(Globals.getInstance().mServerIP)))
                     return;
                 // game ends!
                 intent = new Intent(NetMsg.NETMSG_ENDGAME);
-            } else if (message.startsWith(NetMsg.NETMSG_ERROR)) {
+            } else if (message.equals(NetMsg.NETMSG_ERROR)) {
                 // some kind of error
                 intent = new Intent(NetMsg.NETMSG_ERROR);
-            } else if (message.startsWith(NetMsg.NETMSG_SAMETEAM)) {
-                // Two players using the same ID error!
-                intent = new Intent(NetMsg.NETMSG_SAMETEAM);
-            } else if (message.startsWith(NetMsg.NETMSG_TEAMELIMINATED)) {
+            } else if (message.equals(NetMsg.NETMSG_SAMETEAM) || message.equals(NetMsg.NETMSG_VERSIONERROR)) {
+                completeJoin(ip, message);
+                return;
+            } else if (message.equals(NetMsg.NETMSG_TEAMELIMINATED)) {
+                Byte playerID = getPlayerID(ip);
+                Globals globals = Globals.getInstance();
+                if (playerID == null || globals.mGameMode == Globals.GAME_MODE_FFA
+                        || globals.calcNetworkTeam(playerID) != globals.calcNetworkTeam(globals.mPlayerID))
+                    return;
                 // Someone else on your team scored a point
                 intent = new Intent(NetMsg.NETMSG_TEAMELIMINATED);
             }
@@ -254,10 +270,35 @@ public class UDPListenerService extends Service {
             sendBroadcast(intent);
     }
 
+    private Byte getPlayerID(InetAddress ip) {
+        Globals.getmIPTeamMapSemaphore();
+        try {
+            Byte playerID = Globals.getInstance().mIPTeamMap.get(ip);
+            return playerID != null && playerID > 0 && Globals.isValidPlayerID(playerID) ? playerID : null;
+        } finally {
+            Globals.getInstance().mIPTeamMapSemaphore.release();
+        }
+    }
+
+    private void completeJoin(InetAddress ip, String action) {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !mScanRunning || (!mBroadcastScan && !ip.equals(mJoinAddress)))
+                return;
+            endScanningLocked();
+            if (NetMsg.NETMSG_SERVERREPLY.equals(action))
+                Globals.getInstance().mServerIP = ip;
+            else
+                stopListen();
+            sendBroadcast(new Intent(action));
+        }
+    }
+
     private volatile Thread mUDPMessageThread;
 
     public void startListenForUDPMessage() {
         synchronized (mListenerStateLock) {
+            if (mDestroyed)
+                return;
             if (mUDPMessageThread != null && mUDPMessageThread.isAlive()) {
                 Log.w(TAG, "UDP listener is already running");
                 return;
@@ -297,8 +338,8 @@ public class UDPListenerService extends Service {
                     }
                 } finally {
                     Log.i(TAG, "Stopped listening for UDP messages");
-                    if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
                     synchronized (mListenerStateLock) {
+                        releaseMulticastLockLocked();
                         if (Thread.currentThread() == mUDPMessageThread) {
                             mUDPMessageThread = null;
                             doneListening = true;
@@ -336,82 +377,105 @@ public class UDPListenerService extends Service {
     }
 
     public void createServer() {
-        if (!doneListening) {
-            Log.e(TAG, "Listening is still in progress");
-            sendFailedJoin();
-            return;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed)
+                return;
+            if (!doneListening) {
+                Log.e(TAG, "Listening is still in progress");
+                sendFailedJoin();
+                return;
+            }
+            mBroadcastAddress = getBroadcastAddress();
+            if (mBroadcastAddress == null) {
+                Log.e(TAG, "Failed to get broadcast IP address");
+                sendFailedJoin();
+                return;
+            }
+            endScanningLocked();
+            Globals.getmIPTeamMapSemaphore();
+            Globals.getInstance().mIPTeamMap.clear();
+            Globals.getInstance().mIPTeamMapSemaphore.release();
+            Globals.getmTeamIPMapSemaphore();
+            Globals.getInstance().mTeamIPMap.clear();
+            Globals.getInstance().mTeamIPMapSemaphore.release();
+            keepListening = true;
+            mIsListService = true;
+            mScanRunning = false;
+            mMyIP = null;
+            mReadyToScan = 0;
+            startListenForUDPMessage();
+            final long generation = mJoinGeneration;
+            new Thread(() -> finishServerCreation(generation), "SimpleCoil UDP server startup").start();
         }
-        mBroadcastAddress = getBroadcastAddress();
-        if (mBroadcastAddress == null) {
-            Log.e(TAG, "Failed to get broadcast IP address");
-            sendFailedJoin();
-            return;
-        }
-        Globals.getmIPTeamMapSemaphore();
-        Globals.getInstance().mIPTeamMap.clear();
-        Globals.getInstance().mIPTeamMapSemaphore.release();
-        Globals.getmTeamIPMapSemaphore();
-        Globals.getInstance().mTeamIPMap.clear();
-        Globals.getInstance().mTeamIPMapSemaphore.release();
-        keepListening = true;
-        mIsListService = true;
-        mScanRunning = false;
-        mMyIP = null;
-        mReadyToScan = 0;
-        startListenForUDPMessage();
-        new Thread(this::finishServerCreation).start();
     }
 
-    private void finishServerCreation() {
+    private void finishServerCreation(long generation) {
         long deadline = System.currentTimeMillis() + LISTENER_START_TIMEOUT_MS;
-        while (keepListening && mReadyToScan == 0 && System.currentTimeMillis() < deadline)
+        while (keepListening && generation == mJoinGeneration && mReadyToScan == 0
+                && System.currentTimeMillis() < deadline)
             sleep(50);
-        if (!keepListening)
-            return;
-        if (mReadyToScan == 0) {
-            Log.e(TAG, "Timed out starting UDP listener");
-            stopListen();
-            sendFailedJoin();
-            return;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !keepListening || generation != mJoinGeneration)
+                return;
+            if (mReadyToScan == 0) {
+                Log.e(TAG, "Timed out starting UDP listener");
+                stopListen();
+                sendFailedJoin();
+                return;
+            }
+            mMyIP = Globals.getIPAddress();
+            if (mMyIP == null) {
+                Log.e(TAG, "No local IPv4 address available for server");
+                stopListen();
+                sendFailedJoin();
+                return;
+            }
+            Globals.getInstance().mServerIP = mMyIP;
+            sendBroadcast(new Intent(NetMsg.NETMSG_SERVERCREATED));
         }
-        mMyIP = Globals.getIPAddress();
-        if (mMyIP == null) {
-            Log.e(TAG, "No local IPv4 address available for server");
-            stopListen();
-            sendFailedJoin();
-            return;
-        }
-        Globals.getInstance().mServerIP = mMyIP;
-        sendBroadcast(new Intent(NetMsg.NETMSG_SERVERCREATED));
     }
 
     public void cancelServer() {
-        if (!mIsListService)
-            return;
-        mIsListService = false;
-        keepListening = false;
-        closeListeningSocket();
+        synchronized (mListenerStateLock) {
+            if (mIsListService)
+                stopListen();
+        }
     }
 
     public void joinServer() {
-        mBroadcastAddress = getBroadcastAddress();
-        if (mBroadcastAddress == null) {
-            sendFailedJoin();
-            return;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed)
+                return;
+            mBroadcastAddress = getBroadcastAddress();
+            if (mBroadcastAddress == null) {
+                sendFailedJoin();
+                return;
+            }
+            joinServer(mBroadcastAddress, LISTEN_PORT);
         }
-        joinServer(mBroadcastAddress, LISTEN_PORT);
     }
 
     public void joinServer(String serverIP) {
-        if (serverIP == null || serverIP.trim().isEmpty()) {
-            Log.w(TAG, "Cannot join an empty server address");
-            sendFailedJoin();
-            return;
-        }
-        serverIP = serverIP.trim();
+        serverIP = serverIP == null ? "" : serverIP.trim();
         if (serverIP.startsWith("/"))
-            serverIP = serverIP.substring(1);
+            serverIP = serverIP.substring(1).trim();
         final String ip = serverIP;
+        final long generation;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed)
+                return;
+            if (ip.isEmpty()) {
+                Log.w(TAG, "Cannot join an empty server address");
+                sendFailedJoin();
+                return;
+            }
+            if (!doneListening) {
+                sendFailedJoin();
+                return;
+            }
+            endScanningLocked();
+            generation = mJoinGeneration;
+        }
         Log.e(TAG, "attempt to join " + ip);
         Thread joinThread = new Thread(() -> {
             InetAddress ipAddr;
@@ -419,16 +483,19 @@ public class UDPListenerService extends Service {
                 ipAddr = InetAddress.getByName(ip);
             } catch (UnknownHostException e) {
                 Log.e(TAG, "unknown host!");
-                sendFailedJoin();
+                synchronized (mListenerStateLock) {
+                    if (!mDestroyed && generation == mJoinGeneration)
+                        sendFailedJoin();
+                }
                 return;
             }
-            if (ipAddr == null) {
-                Log.e(TAG, "ip is still null!");
-                sendFailedJoin();
-                return;
+            synchronized (mListenerStateLock) {
+                // A cancelled DNS lookup must not resurrect discovery or replace
+                // the target of a newer Join request after it finally resolves.
+                if (!mDestroyed && generation == mJoinGeneration)
+                    joinServer(ipAddr);
             }
-            joinServer(ipAddr);
-        });
+        }, "SimpleCoil UDP lookup");
         joinThread.start();
     }
 
@@ -437,49 +504,65 @@ public class UDPListenerService extends Service {
     }
 
     public void joinServer(InetAddress serverIP, Integer port) {
-        if (!doneListening) {
-            Log.e(TAG, "Listening is still in progress");
-            sendFailedJoin();
-            return;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed)
+                return;
+            if (serverIP == null || port == null || port < 1 || port > 65535) {
+                Log.w(TAG, "Cannot join an invalid UDP endpoint");
+                sendFailedJoin();
+                return;
+            }
+            if (!doneListening) {
+                Log.e(TAG, "Listening is still in progress");
+                sendFailedJoin();
+                return;
+            }
+            endScanningLocked();
+            Globals.getmIPTeamMapSemaphore();
+            Globals.getInstance().mIPTeamMap.clear();
+            Globals.getInstance().mIPTeamMapSemaphore.release();
+            Globals.getmTeamIPMapSemaphore();
+            Globals.getInstance().mTeamIPMap.clear();
+            Globals.getInstance().mTeamIPMapSemaphore.release();
+            keepListening = true;
+            mIsListService = false;
+            mScanRunning = true;
+            mJoinAddress = serverIP;
+            mBroadcastScan = serverIP.equals(mBroadcastAddress);
+            mMyIP = null;
+            mReadyToScan = 0;
+            startListenForUDPMessage();
+            joinFailCheck(serverIP, port);
         }
-        Globals.getmIPTeamMapSemaphore();
-        Globals.getInstance().mIPTeamMap.clear();
-        Globals.getInstance().mIPTeamMapSemaphore.release();
-        Globals.getmTeamIPMapSemaphore();
-        Globals.getInstance().mTeamIPMap.clear();
-        Globals.getInstance().mTeamIPMapSemaphore.release();
-        keepListening = true;
-        mIsListService = false;
-        mScanRunning = true;
-        mMyIP = null;
-        mReadyToScan = 0;
-        startListenForUDPMessage();
-        joinFailCheck(serverIP, port);
     }
 
     private void joinFailCheck(final InetAddress serverIP, final Integer port) {
-        new Handler(Looper.getMainLooper()).post(new Runnable() {
-            @Override
-            public void run() {
-                new CountDownTimer(2000, 500) { // We send 3 join requests over 2 seconds and quit if we don't get connected
-
-                    public void onTick(long millisUntilFinished) {
-                        if (mScanRunning) {
-                            Log.d(TAG, "Sending join request");
-                            sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + Globals.getInstance().mPlayerID, serverIP, port);
-                        } else {
-                            this.cancel();
+        final long generation = mJoinGeneration;
+        mMainHandler.post(() -> {
+            synchronized (mListenerStateLock) {
+                if (mDestroyed || !mScanRunning || generation != mJoinGeneration)
+                    return;
+                mJoinTimer = new CountDownTimer(2000, 500) {
+                    @Override public void onTick(long millisUntilFinished) {
+                        synchronized (mListenerStateLock) {
+                            if (mJoinTimer != this || !mScanRunning || generation != mJoinGeneration)
+                                return;
+                            sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_JOIN
+                                    + NetMsg.NETWORK_VERSION + Globals.getInstance().mPlayerID, serverIP, port);
                         }
                     }
 
-                    public void onFinish() {
-                        if (mScanRunning) {
+                    @Override public void onFinish() {
+                        synchronized (mListenerStateLock) {
+                            if (mJoinTimer != this || !mScanRunning || generation != mJoinGeneration)
+                                return;
                             Log.d(TAG, "join failed, could not find a server");
                             stopListen();
                             sendFailedJoin();
                         }
                     }
-                }.start();
+                };
+                mJoinTimer.start();
             }
         });
     }
@@ -571,10 +654,12 @@ public class UDPListenerService extends Service {
     }
 
     void stopListen() {
-        mScanRunning = false;
-        mIsListService = false;
-        keepListening = false;
-        closeListeningSocket();
+        synchronized (mListenerStateLock) {
+            endScanningLocked();
+            mIsListService = false;
+            keepListening = false;
+            closeListeningSocket();
+        }
     }
 
     private void closeListeningSocket() {
@@ -585,20 +670,26 @@ public class UDPListenerService extends Service {
 
     @Override
     public void onCreate() {
-
+        super.onCreate();
     }
 
     @Override
     public void onDestroy() {
-        stopListen();
-        if(multicastLock != null && multicastLock.isHeld()) multicastLock.release();
-        if (mSocket != null)
-            mSocket.close();
+        synchronized (mListenerStateLock) {
+            mDestroyed = true;
+            stopListen();
+            releaseMulticastLockLocked();
+        }
+        super.onDestroy();
+    }
+
+    private void releaseMulticastLockLocked() {
+        if (multicastLock != null && multicastLock.isHeld())
+            multicastLock.release();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        keepListening = true;
         Log.i(TAG, "UDP Service started");
         return START_STICKY;
     }
@@ -639,5 +730,24 @@ public class UDPListenerService extends Service {
         }
     }
 
-    public void endScanning() { mScanRunning = false; }
+    public void endScanning() {
+        synchronized (mListenerStateLock) {
+            endScanningLocked();
+        }
+    }
+
+    private void endScanningLocked() {
+        mJoinGeneration++;
+        mScanRunning = false;
+        mJoinAddress = null;
+        mBroadcastScan = false;
+        if (mJoinTimer != null) {
+            CountDownTimer timer = mJoinTimer;
+            mJoinTimer = null;
+            // CountDownTimer invokes callbacks while holding its own monitor.
+            // Cancel on the same looper, avoiding an inverted lock order with
+            // callbacks that acquire mListenerStateLock.
+            mMainHandler.post(timer::cancel);
+        }
+    }
 }
