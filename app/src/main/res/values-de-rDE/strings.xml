@@ -2,6 +2,8 @@
 <resources>
     <string name="reconnect_weapon_button">Mit der gleichen Waffe neu Verbinden</string>
     <string name="connect_weapon_button">Verbinde Waffe</string>
+    <string name="error_qr_scanner_unavailable">Kein QR-Scanner oder App-Store vorhanden. Bitte die normale Verbindungssuche verwenden.</string>
+    <string name="error_invalid_qr_address">Der QR-Code enthaelt keine gueltige Bluetooth-Adresse.</string>
     <string name="connect_qr_weapon_button">Verbinde Waffe über QR</string>
     <string name="disconnect_weapon_button">Trenne die Verbindung zur Waffe</string>
     <string name="pistol_detected_toast">Pistole erkannt (%1$s)</string>

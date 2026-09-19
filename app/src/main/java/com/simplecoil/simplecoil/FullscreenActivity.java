@@ -27,6 +27,7 @@ import android.bluetooth.BluetoothManager;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
+import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
@@ -553,10 +554,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     Intent intent = new Intent("com.google.zxing.client.android.SCAN");
                     intent.putExtra("SCAN_MODE", "QR_CODE_MODE"); // "PRODUCT_MODE for bar codes
                     startActivityForResult(intent, REQUEST_QR_SCAN);
-                } catch (Exception e) {
+                } catch (ActivityNotFoundException | SecurityException e) {
+                    Log.w(TAG, "QR scanner is unavailable", e);
                     Uri marketUri = Uri.parse("market://details?id=com.google.zxing.client.android");
                     Intent marketIntent = new Intent(Intent.ACTION_VIEW,marketUri);
-                    startActivity(marketIntent);
+                    try {
+                        startActivity(marketIntent);
+                    } catch (ActivityNotFoundException | SecurityException storeError) {
+                        Log.w(TAG, "No accessible app store for the QR scanner", storeError);
+                        Toast.makeText(getApplicationContext(), R.string.error_qr_scanner_unavailable,
+                                Toast.LENGTH_LONG).show();
+                    }
                 }
             }));
         }
@@ -1921,19 +1929,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     Log.w(TAG, "QR scanner returned RESULT_OK without result data");
                     return;
                 }
-                mDeviceAddress = data.getStringExtra("SCAN_RESULT");
-                if (mDeviceAddress != null && !mDeviceAddress.isEmpty()) {
-                    Log.e(TAG, "Got QR: " + mDeviceAddress);
-                    connectWeapon();
-                } else {
-                    Log.e(TAG, "Did not get any good QR result");
+                String scannedAddress = data.getStringExtra("SCAN_RESULT");
+                if (scannedAddress != null)
+                    scannedAddress = scannedAddress.trim().toUpperCase(Locale.US);
+                if (scannedAddress == null || !BluetoothAdapter.checkBluetoothAddress(scannedAddress)) {
+                    Log.w(TAG, "QR scanner did not return a valid Bluetooth address");
+                    Toast.makeText(getApplicationContext(), R.string.error_invalid_qr_address,
+                            Toast.LENGTH_LONG).show();
+                    return;
                 }
+                // Keep the previous selection until a usable address has been validated.
+                mDeviceAddress = scannedAddress;
+                connectWeapon();
             }
             if(resultCode == RESULT_CANCELED){
                 //handle cancel
                 Log.e(TAG, "QR cancel");
             }
-        } else if (requestCode == REQUEST_ENABLE_BT) {
+        } else if (requestCode == REQUEST_ENABLE_BT && resultCode == RESULT_OK) {
             connectWeapon();
         }
     }

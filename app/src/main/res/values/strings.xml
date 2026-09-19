@@ -7,6 +7,8 @@
     <string name="reconnect_weapon_button">Reconnect Same Weapon Only</string>
     <string name="connect_weapon_button">Connect Weapon</string>
     <string name="connect_qr_weapon_button">Connect Weapon Using QR</string>
+    <string name="error_qr_scanner_unavailable">No QR scanner or app store is available. Use Connect Weapon to find your blaster.</string>
+    <string name="error_invalid_qr_address">The QR code does not contain a valid Bluetooth address.</string>
     <string name="disconnect_weapon_button">Disconnect Weapon</string>
     <string name="pistol_detected_toast">Pistol Detected! (%1$s)</string>
     <string name="rifle_detected_toast">Rifle Detected! (%1$s)</string>
