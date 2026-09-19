@@ -75,6 +75,7 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
 
     public void getServerSettings() {
         Globals.getmPlayerSettingsSemaphore();
+        try {
         Globals.PlayerSettings playerSettings = Globals.getInstance().mPlayerSettings.get(mPlayerID);
         if (playerSettings == null)
             playerSettings = new Globals.PlayerSettings();
@@ -101,7 +102,7 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                 break;
         }
         mHealthET.setText("" + playerSettings.health);
-        mReloadShotsET.setText("" + playerSettings.shots);
+        mReloadShotsET.setText("" + (playerSettings.shots & 0xff));
         mReloadTimeET.setText("" + playerSettings.reloadTime);
         mReloadOnEmptySwitch.setChecked(playerSettings.reloadOnEmpty);
         mSpawnTimeET.setText("" + playerSettings.spawnTime);
@@ -165,7 +166,9 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                 break;
         }
 */
-        Globals.getInstance().mPlayerSettingsSemaphore.release();
+        } finally {
+            Globals.getInstance().mPlayerSettingsSemaphore.release();
+        }
         mApplyAllSwitch.setChecked(false);
         mAllowPlayerSettingsSwitch.setChecked(Globals.getInstance().mAllowPlayerSettings);
     }
@@ -177,7 +180,7 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
 //TODO presets ??
     private void getLocalSettings() {
         mHealthET.setText("" + Globals.getInstance().mFullHealth);
-        mReloadShotsET.setText("" + Globals.getInstance().mFullReload);
+        mReloadShotsET.setText("" + (Globals.getInstance().mFullReload & 0xff));
         mReloadTimeET.setText("" + Globals.getInstance().mReloadTime);
         mReloadOnEmptySwitch.setChecked(Globals.getInstance().mReloadOnEmpty);
         mSpawnTimeET.setText("" + Globals.getInstance().mRespawnTime);
@@ -235,6 +238,15 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                 break;
         }
 */    }
+
+    private int readBoundedInt(EditText field, int fallback, int min, int max) {
+        try {
+            int value = Integer.parseInt(field.getText().toString().trim());
+            return value >= min && value <= max ? value : fallback;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -316,31 +328,21 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                         Toast.makeText(getContext(), getContext().getString(R.string.player_settings_shot_mode_error), Toast.LENGTH_SHORT).show();
                         return;
                     }
+                    int health = readBoundedInt(mHealthET, Globals.MAX_HEALTH, 1, 1000);
+                    int reloadShots = readBoundedInt(mReloadShotsET, Globals.RELOAD_COUNT, 1, 255);
+                    int reloadTime = readBoundedInt(mReloadTimeET, (int) Globals.RELOAD_TIME_MILLISECONDS, 0, 10000);
+                    int spawnTime = readBoundedInt(mSpawnTimeET, (int) Globals.RESPAWN_TIME_SECONDS, 1, 1000);
+                    int damage = -readBoundedInt(mDamageET, -Globals.DAMAGE_PER_HIT, 1, 1000);
+                    int lives = readBoundedInt(mLivesET, 0, 0, 1000);
                     if (!isServer) {
-                        Integer value = Integer.parseInt(mHealthET.getText().toString());
-                        if (value > 1000 || value <= 0) value = Globals.MAX_HEALTH;
-                        Globals.getInstance().mFullHealth = value;
-                        value = Integer.parseInt(mReloadShotsET.getText().toString());
-                        if (value > 255 || value <= 0) value = (int) Globals.RELOAD_COUNT;
-                        Globals.getInstance().mFullReload = (byte) (int) value;
-                        value = Integer.parseInt(mReloadTimeET.getText().toString());
-                        if (value > 10000 || value < 0)
-                            value = (int) Globals.RELOAD_TIME_MILLISECONDS;
-                        Globals.getInstance().mReloadTime = value;
+                        Globals.getInstance().mFullHealth = health;
+                        Globals.getInstance().mFullReload = (byte) reloadShots;
+                        Globals.getInstance().mReloadTime = reloadTime;
                         Globals.getInstance().mReloadOnEmpty = mReloadOnEmptySwitch.isChecked();
-                        value = Integer.parseInt(mSpawnTimeET.getText().toString());
-                        if (value > 1000 || value <= 0)
-                            value = (int) Globals.RESPAWN_TIME_SECONDS;
-                        Globals.getInstance().mRespawnTime = value;
-                        value = Integer.parseInt(mDamageET.getText().toString());
-                        if (value > 1000 || value <= 0) value = Globals.DAMAGE_PER_HIT * -1;
-                        value = value * -1;
-                        Globals.getInstance().mDamage = value;
+                        Globals.getInstance().mRespawnTime = spawnTime;
+                        Globals.getInstance().mDamage = damage;
                         Globals.getInstance().mOverrideLives = mOverrideLivesSwitch.isChecked();
-                        value = Integer.parseInt(mLivesET.getText().toString());
-                        if (value > 1000 || value <= 0)
-                            value = 0;
-                        Globals.getInstance().mOverrideLivesVal = value;
+                        Globals.getInstance().mOverrideLivesVal = lives;
                         Globals.getInstance().mAllowSingleShotMode = mShotModeSingle.isChecked();
                         Globals.getInstance().mAllowBurst3ShotMode = mShotModeBurst3.isChecked();
                         Globals.getInstance().mAllowAutoShotMode = mShotModeAuto.isChecked();
@@ -355,35 +357,20 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                         mContext.sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
                     } else {
                         Globals.getmPlayerSettingsSemaphore();
+                        try {
                         Globals.PlayerSettings playerSettings = Globals.getInstance().mPlayerSettings.get(mPlayerID);
                         if (playerSettings == null) {
                             playerSettings = new Globals.PlayerSettings();
                             Globals.getInstance().mPlayerSettings.put(mPlayerID, playerSettings);
                         }
-                        Integer value = Integer.parseInt(mHealthET.getText().toString());
-                        if (value > 1000 || value <= 0) value = Globals.MAX_HEALTH;
-                        playerSettings.health = value;
-                        value = Integer.parseInt(mReloadShotsET.getText().toString());
-                        if (value > 255 || value <= 0) value = (int) Globals.RELOAD_COUNT;
-                        playerSettings.shots = (byte) (int) value;
-                        value = Integer.parseInt(mReloadTimeET.getText().toString());
-                        if (value > 10000 || value < 0)
-                            value = (int) Globals.RELOAD_TIME_MILLISECONDS;
-                        playerSettings.reloadTime = value;
+                        playerSettings.health = health;
+                        playerSettings.shots = (byte) reloadShots;
+                        playerSettings.reloadTime = reloadTime;
                         playerSettings.reloadOnEmpty = mReloadOnEmptySwitch.isChecked();
-                        value = Integer.parseInt(mSpawnTimeET.getText().toString());
-                        if (value > 1000 || value <= 0)
-                            value = (int) Globals.RESPAWN_TIME_SECONDS;
-                        playerSettings.spawnTime = value;
-                        value = Integer.parseInt(mDamageET.getText().toString());
-                        if (value > 1000 || value <= 0) value = Globals.DAMAGE_PER_HIT * -1;
-                        value = value * -1;
-                        playerSettings.damage = value;
+                        playerSettings.spawnTime = spawnTime;
+                        playerSettings.damage = damage;
                         playerSettings.overrideLives = mOverrideLivesSwitch.isChecked();
-                        value = Integer.parseInt(mLivesET.getText().toString());
-                        if (value > 1000 || value <= 0)
-                            value = 0;
-                        playerSettings.lives = value;
+                        playerSettings.lives = lives;
                         playerSettings.allowShotModeSingle = mShotModeSingle.isChecked();
                         playerSettings.allowShotModeBurst3 = mShotModeBurst3.isChecked();
                         playerSettings.allowShotModeAuto = mShotModeAuto.isChecked();
@@ -497,7 +484,9 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                             playerSettings.weaponPreset = Globals.WEAPON_PRESET_DEFAULT;
                         }
 */
-                        Globals.getInstance().mPlayerSettingsSemaphore.release();
+                        } finally {
+                            Globals.getInstance().mPlayerSettingsSemaphore.release();
+                        }
                         if (mTcpServer != null) {
                             mTcpServer.sendPlayerSettings(mPlayerID, mApplyAllSwitch.isChecked(), mAllowPlayerSettingsSwitch.isChecked());
                         }

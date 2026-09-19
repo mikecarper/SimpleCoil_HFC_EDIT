@@ -49,9 +49,9 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
         LayoutInflater inflater = context.getLayoutInflater();
         View rowView;
         if (isClient)
-            rowView = inflater.inflate(R.layout.player_display_data_client, null, true);
+            rowView = inflater.inflate(R.layout.player_display_data_client, parent, false);
         else
-            rowView = inflater.inflate(R.layout.player_display_data, null, true);
+            rowView = inflater.inflate(R.layout.player_display_data, parent, false);
         TextView playerIDTV = rowView.findViewById(R.id.player_id_tv);
         TextView playerNameTV = rowView.findViewById(R.id.player_name_tv);
         TextView playerPointsTV = rowView.findViewById(R.id.player_points_tv);

@@ -47,9 +47,10 @@ import com.mousebird.maply.RemoteTileSource;
 import com.mousebird.maply.ScreenMarker;
 import com.mousebird.maply.SphericalMercatorCoordSystem;
 
+import androidx.core.content.ContextCompat;
+
 import java.io.File;
 import java.util.Map;
-import java.util.Objects;
 
 public class MapFragment extends GlobeMapFragment {
     private static final String TAG = "map";
@@ -60,11 +61,12 @@ public class MapFragment extends GlobeMapFragment {
     private static final double PI180 = Math.PI / 180;
 
     private static final int TWO_MINUTES = 1000 * 60 * 2;
+    private static final int REQUEST_LOCATION_PERMISSION = 1;
 
     private LocationListener mLocationListener = null;
 
-    private static double mLongitude = 0;
-    private static double mLatitude = 0;
+    private double mLongitude = 0;
+    private double mLatitude = 0;
 
     private void sendLocation(Location location) {
         if (location == null) return;
@@ -83,16 +85,23 @@ public class MapFragment extends GlobeMapFragment {
      * @return the last know best location
      */
     private Location getLastBestLocation() {
+        if (mLocationManager == null || !isAdded())
+            return null;
         // We already have this permission because of Bluetooth, but Android Studio insists on having this code or it throws an error
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             int hasLocationPermission = requireActivity().checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION);
-            if (hasLocationPermission != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 1);
+            if (hasLocationPermission != PackageManager.PERMISSION_GRANTED)
                 return null;
-            }
         }
-        Location locationGPS = mLocationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-        Location locationNet = mLocationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+        Location locationGPS;
+        Location locationNet;
+        try {
+            locationGPS = mLocationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+            locationNet = mLocationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+        } catch (SecurityException | IllegalArgumentException e) {
+            Log.w(TAG, "Location provider is unavailable", e);
+            return null;
+        }
 
         long GPSLocationTime = 0;
         if (null != locationGPS) { GPSLocationTime = locationGPS.getTime(); }
@@ -116,6 +125,8 @@ public class MapFragment extends GlobeMapFragment {
 
         @Override
         public void onLocationChanged(Location loc) {
+            if (mLocationListener != this || !isAdded())
+                return;
             String longitude = "Longitude: " + loc.getLongitude();
             Log.v(TAG, longitude);
             String latitude = "Latitude: " + loc.getLatitude();
@@ -224,13 +235,16 @@ public class MapFragment extends GlobeMapFragment {
         IntentFilter filter = new IntentFilter(NetMsg.NETMSG_GPSDATAUPDATE);
         filter.addAction(NetMsg.NETMSG_LISTPLAYERS);
         filter.addAction(NetMsg.NETMSG_GPSSETTING);
-        requireActivity().registerReceiver(mGPSDataReceiver, filter);
+        ContextCompat.registerReceiver(requireActivity(), mGPSDataReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
+        enableGPS(Globals.getInstance().mUseGPS);
     }
 
     @Override
     public void onPause() {
+        enableGPS(false);
+        if (isAdded())
+            requireActivity().unregisterReceiver(mGPSDataReceiver);
         super.onPause();
-        requireActivity().unregisterReceiver(mGPSDataReceiver);
     }
 
     @Override
@@ -262,18 +276,26 @@ public class MapFragment extends GlobeMapFragment {
     public void enableGPS(boolean enabled) {
         if (enabled) {
             if (mLocationListener == null) {
-                mLongitude = 0;
-                mLatitude = 0;
-                mLocationListener = new MyLocationListener();
+                if (!isAdded() || mLocationManager == null)
+                    return;
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     int hasLocationPermission = requireActivity().checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION);
                     if (hasLocationPermission != PackageManager.PERMISSION_GRANTED) {
                         requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
-                                1);
+                                REQUEST_LOCATION_PERMISSION);
                         return;
                     }
                 }
-                mLocationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 500, 1, mLocationListener);
+                mLongitude = 0;
+                mLatitude = 0;
+                mLocationListener = new MyLocationListener();
+                try {
+                    mLocationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 500, 1, mLocationListener);
+                } catch (SecurityException | IllegalArgumentException e) {
+                    Log.w(TAG, "Unable to register for location updates", e);
+                    mLocationListener = null;
+                    return;
+                }
                 currentBestLocation = getLastBestLocation();
                 sendLocation(currentBestLocation);
                 insertYourMarker();
@@ -282,9 +304,25 @@ public class MapFragment extends GlobeMapFragment {
             if (mLocationListener != null) {
                 removeAllPlayerMarkers();
                 removeYourMarker();
-                mLocationManager.removeUpdates(mLocationListener);
+                if (mLocationManager != null) {
+                    try {
+                        mLocationManager.removeUpdates(mLocationListener);
+                    } catch (SecurityException | IllegalArgumentException e) {
+                        Log.w(TAG, "Unable to unregister location updates", e);
+                    }
+                }
                 mLocationListener = null;
             }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_LOCATION_PERMISSION
+                && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            enableGPS(true);
         }
     }
 
@@ -294,7 +332,7 @@ public class MapFragment extends GlobeMapFragment {
         String cacheDirName = "empty";
         File cacheDir = new File(requireActivity().getCacheDir(), cacheDirName);
         cacheDir.mkdir();
-        RemoteTileSource remoteTileSource = new RemoteTileSource(new RemoteTileInfo("http://localhost/", "png", 0, 18));
+        RemoteTileSource remoteTileSource = new RemoteTileSource(mapControl, new RemoteTileInfo("http://localhost/", "png", 0, 18));
         remoteTileSource.setCacheDir(cacheDir);
         SphericalMercatorCoordSystem coordSystem = new SphericalMercatorCoordSystem();
 
@@ -316,6 +354,7 @@ public class MapFragment extends GlobeMapFragment {
         mPlayerMarkers = new ComponentObject[Globals.MAX_PLAYER_ID + 1];
         for (int x = 0; x <= Globals.MAX_PLAYER_ID; x++)
             mPlayerMarkers[x] = null;
+        enableGPS(Globals.getInstance().mUseGPS);
     }
 
     @Override
@@ -329,7 +368,12 @@ public class MapFragment extends GlobeMapFragment {
     private ComponentObject[] mPlayerMarkers = null;
 
     private void insertYourMarker() {
-        if (mapControl == null) return;
+        if (mapControl == null || mPlayerMarkers == null || !isAdded()) return;
+        int playerID = Globals.getInstance().mPlayerID;
+        if (!Globals.isValidPlayerID(playerID) || playerID >= mPlayerMarkers.length) {
+            Log.w(TAG, "Ignoring marker for invalid local player ID " + playerID);
+            return;
+        }
         removeYourMarker();
 
         if (currentBestLocation == null) return;
@@ -342,7 +386,7 @@ public class MapFragment extends GlobeMapFragment {
         you.image = icon;
         you.size = markerSize;
 
-        mPlayerMarkers[Globals.getInstance().mPlayerID] = mapControl.addScreenMarker(you, markerInfo, MaplyBaseController.ThreadMode.ThreadCurrent);
+        mPlayerMarkers[playerID] = mapControl.addScreenMarker(you, markerInfo, MaplyBaseController.ThreadMode.ThreadCurrent);
         mapControl.setPositionGeo(currentBestLocation.getLongitude() * PI180, currentBestLocation.getLatitude() * PI180, ZOOM_LEVEL);
 
         mapControl.currentMapZoom(Point2d.FromDegrees(currentBestLocation.getLongitude(), currentBestLocation.getLatitude()));
@@ -350,14 +394,17 @@ public class MapFragment extends GlobeMapFragment {
     }
 
     private void removeYourMarker() {
-        if (mapControl == null) return;
-        if (mPlayerMarkers[Globals.getInstance().mPlayerID] != null) {
-            mapControl.removeObject(mPlayerMarkers[Globals.getInstance().mPlayerID], MaplyBaseController.ThreadMode.ThreadCurrent);
-            mPlayerMarkers[Globals.getInstance().mPlayerID] = null;
+        if (mapControl == null || mPlayerMarkers == null) return;
+        int playerID = Globals.getInstance().mPlayerID;
+        if (!Globals.isValidPlayerID(playerID) || playerID >= mPlayerMarkers.length) return;
+        if (mPlayerMarkers[playerID] != null) {
+            mapControl.removeObject(mPlayerMarkers[playerID], MaplyBaseController.ThreadMode.ThreadCurrent);
+            mPlayerMarkers[playerID] = null;
         }
     }
 
     private void insertPlayerMarkers() {
+        if (mapControl == null || mPlayerMarkers == null || !isAdded()) return;
         MarkerInfo markerInfo = new MarkerInfo();
         Point2d markerSize = new Point2d(72, 72);
         // Add other players to the map
@@ -365,35 +412,44 @@ public class MapFragment extends GlobeMapFragment {
         if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA)
             currentTeam = Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
         Bitmap teammate = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_teammate);
-        Bitmap enemy = BitmapFactory.decodeResource(getActivity().getResources(), R.drawable.ic_gps_enemy);
+        Bitmap enemy = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_enemy);
         Globals.getmGPSDataSemaphore();
-        for (Map.Entry<Byte, Globals.GPSData> entry : Globals.getInstance().mGPSData.entrySet()) {
-            if (entry.getKey() != Globals.getInstance().mPlayerID && entry.getValue().hasUpdate) {
-                entry.getValue().hasUpdate = false;
-                removePlayerMarker(entry.getKey());
-                ScreenMarker player = new ScreenMarker();
-                player.loc = Point2d.FromDegrees(entry.getValue().longitude, entry.getValue().latitude);
-                player.size = markerSize;
-                if (entry.getValue().team == currentTeam) {
-                    player.image = teammate;
-                    mPlayerMarkers[entry.getKey()] = mapControl.addScreenMarker(player, markerInfo, MaplyBaseController.ThreadMode.ThreadCurrent);
-                } else if (Globals.getInstance().mGPSMode == Globals.GPS_ALL) {
-                    player.image = enemy;
-                    mPlayerMarkers[entry.getKey()] = mapControl.addScreenMarker(player, markerInfo, MaplyBaseController.ThreadMode.ThreadCurrent);
+        try {
+            for (Map.Entry<Byte, Globals.GPSData> entry : Globals.getInstance().mGPSData.entrySet()) {
+                int playerID = entry.getKey();
+                if (!Globals.isValidPlayerID(playerID) || playerID >= mPlayerMarkers.length) {
+                    Log.w(TAG, "Ignoring GPS marker for invalid player ID " + playerID);
+                    continue;
+                }
+                if (entry.getKey() != Globals.getInstance().mPlayerID && entry.getValue().hasUpdate) {
+                    entry.getValue().hasUpdate = false;
+                    removePlayerMarker(entry.getKey());
+                    ScreenMarker player = new ScreenMarker();
+                    player.loc = Point2d.FromDegrees(entry.getValue().longitude, entry.getValue().latitude);
+                    player.size = markerSize;
+                    if (entry.getValue().team == currentTeam) {
+                        player.image = teammate;
+                        mPlayerMarkers[playerID] = mapControl.addScreenMarker(player, markerInfo, MaplyBaseController.ThreadMode.ThreadCurrent);
+                    } else if (Globals.getInstance().mGPSMode == Globals.GPS_ALL) {
+                        player.image = enemy;
+                        mPlayerMarkers[playerID] = mapControl.addScreenMarker(player, markerInfo, MaplyBaseController.ThreadMode.ThreadCurrent);
+                    }
                 }
             }
+        } finally {
+            Globals.getInstance().mGPSDataSemaphore.release();
         }
-        Globals.getInstance().mGPSDataSemaphore.release();
     }
 
     private void removePlayerMarker(int playerID) {
-        if (mapControl == null) return;
+        if (mapControl == null || mPlayerMarkers == null || playerID < 0 || playerID >= mPlayerMarkers.length) return;
         if (mPlayerMarkers[playerID] != null)
             mapControl.removeObject(mPlayerMarkers[playerID], MaplyBaseController.ThreadMode.ThreadCurrent);
         mPlayerMarkers[playerID] = null;
     }
 
     private void removeAllPlayerMarkers() {
+        if (mPlayerMarkers == null) return;
         for (int x = 0; x <= Globals.MAX_PLAYER_ID; x++)
             removePlayerMarker(x);
     }

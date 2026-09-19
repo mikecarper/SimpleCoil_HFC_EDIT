@@ -30,6 +30,7 @@ import android.util.Log;
 import android.widget.Toast;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -37,7 +38,6 @@ import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
-import java.util.Objects;
 
 public class UDPListenerService extends Service {
     private static final String TAG = "UDPSvc";
@@ -46,7 +46,7 @@ public class UDPListenerService extends Service {
     private static final Integer LISTEN_TIMEOUT_MS = 1000;
     private static final int RECEIVE_BUFFER_SIZE = 500; // May need to increase if player count is above 16
 
-    DatagramSocket mSocket;
+    private volatile DatagramSocket mSocket;
 
     WifiManager wm = null;
     WifiManager.MulticastLock multicastLock = null;
@@ -54,43 +54,53 @@ public class UDPListenerService extends Service {
     private InetAddress mMyIP = null;
     private InetAddress mBroadcastAddress = null;
 
-    private static volatile boolean mSendingMessage = false;
+    private static final long LISTENER_START_TIMEOUT_MS = 5000;
+    private final Object mSendLock = new Object();
     private static volatile boolean keepListening = true;
     private static volatile boolean doneListening = true;
     private static volatile boolean mIsListService = false;
     private static volatile int mReadyToScan = 0;
 
     private volatile boolean mScanRunning = false;
+    private final Object mListenerStateLock = new Object();
 
     public static final String INTENT_PLAYERID = "playerid";
     public static final String INTENT_MESSAGE = "message";
 
     private void listenForMessage(InetAddress ip, Integer port, Integer timeout) throws Exception {
         byte[] recvBuf = new byte[RECEIVE_BUFFER_SIZE];
-        if (mSocket == null || mSocket.isClosed()) {
-            mSocket = new DatagramSocket(null);
-            mSocket.setReuseAddress(true);
-            mSocket.setBroadcast(true);
-            mSocket.bind(new InetSocketAddress(port));
-        }
-        mSocket.setSoTimeout(timeout);
-        DatagramPacket packet = new DatagramPacket(recvBuf, recvBuf.length);
-        Log.d(TAG, "Waiting for UDP messages on " + ip.toString() + ":" + port);
-        mReadyToScan++;
-        doneListening = false;
-        while (keepListening) {
-            try {
-                mSocket.receive(packet);
-                String senderIP = packet.getAddress().getHostAddress();
-                String message = new String(packet.getData()).trim();
-                message = message.substring(0, packet.getLength()); // If we don't do this, we get leftover garbage data
-                //Log.e(TAG, "Got UDB message len " + packet.getLength() + " from " + senderIP + ", message: " + message);
-                processMessage(packet.getAddress(), message);
-            } catch (SocketTimeoutException e) {
-                // do nothing
+        DatagramSocket socket = mSocket;
+        try {
+            if (socket == null || socket.isClosed()) {
+                socket = new DatagramSocket(null);
+                socket.setReuseAddress(true);
+                socket.setBroadcast(true);
+                socket.bind(new InetSocketAddress(port));
+                mSocket = socket;
             }
+            socket.setSoTimeout(timeout);
+            DatagramPacket packet = new DatagramPacket(recvBuf, recvBuf.length);
+            Log.d(TAG, "Waiting for UDP messages on " + ip.toString() + ":" + port);
+            mReadyToScan++;
+            doneListening = false;
+            while (keepListening) {
+                try {
+                    packet.setLength(recvBuf.length);
+                    socket.receive(packet);
+                    String message = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
+                    processMessage(packet.getAddress(), message);
+                } catch (SocketTimeoutException e) {
+                    // do nothing
+                } catch (RuntimeException e) {
+                    Log.w(TAG, "Ignoring malformed UDP message", e);
+                }
+            }
+        } finally {
+            if (socket != null)
+                socket.close();
+            if (mSocket == socket)
+                mSocket = null;
         }
-        mSocket.close();
     }
 
     private void processMessage(InetAddress ip, String message) {
@@ -144,39 +154,84 @@ public class UDPListenerService extends Service {
                 if (!mIsListService) return;
                 // This is a player join message
                 message = message.substring(NetMsg.NETMSG_JOIN.length());
+                if (message.length() < 3) {
+                    Log.w(TAG, "Ignoring malformed join request");
+                    return;
+                }
                 String version = message.substring(0, 2);
                 if (!version.equals(NetMsg.NETWORK_VERSION)) {
                     sendUDPMessage(NetMsg.NETMSG_VERSIONERROR, ip, LISTEN_PORT);
                     return;
                 }
                 message = message.substring(2);
-                Byte team = (byte) Integer.parseInt(message);
-                Globals.getmTeamIPMapSemaphore();
-                if (team == Globals.getInstance().mPlayerID || (Globals.getInstance().mTeamIPMap.get(team) != null && !Objects.requireNonNull(Globals.getInstance().mTeamIPMap.get(team)).equals(ip))) {
-                    Globals.getInstance().mTeamIPMapSemaphore.release();
-                    Log.e(TAG, "2 Players using same ID!");
-                    sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SAMETEAM, ip, LISTEN_PORT);
-                } else {
-                    Globals.getInstance().mTeamIPMap.put(team, ip);
-                    Globals.getInstance().mTeamIPMapSemaphore.release();
-                    Globals.getmIPTeamMapSemaphore();
-                    Globals.getInstance().mIPTeamMap.put(ip, team);
-                    Globals.getInstance().mIPTeamMapSemaphore.release();
-                    Log.d(TAG, "player " + team + " found at " + ip.toString());
-                    sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY, ip, LISTEN_PORT);
+                final int playerID;
+                try {
+                    playerID = Integer.parseInt(message);
+                } catch (NumberFormatException e) {
+                    Log.w(TAG, "Ignoring join request with an invalid player ID", e);
+                    return;
                 }
+                if (playerID <= 0 || !Globals.isValidPlayerID(playerID)) {
+                    Log.w(TAG, "Ignoring join request with unsupported player ID " + playerID);
+                    return;
+                }
+                Byte team = (byte) playerID;
+                Globals.getmTeamIPMapSemaphore();
+                try {
+                    InetAddress existingPlayerIP = Globals.getInstance().mTeamIPMap.get(team);
+                    if (team == Globals.getInstance().mPlayerID || (existingPlayerIP != null && !existingPlayerIP.equals(ip))) {
+                        Log.e(TAG, "2 Players using same ID!");
+                        sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SAMETEAM, ip, LISTEN_PORT);
+                        return;
+                    }
+                    Globals.getInstance().mTeamIPMap.put(team, ip);
+                } finally {
+                    Globals.getInstance().mTeamIPMapSemaphore.release();
+                }
+                Globals.getmIPTeamMapSemaphore();
+                Byte previousTeam;
+                try {
+                    previousTeam = Globals.getInstance().mIPTeamMap.put(ip, team);
+                } finally {
+                    Globals.getInstance().mIPTeamMapSemaphore.release();
+                }
+                if (previousTeam != null && previousTeam.byteValue() != team.byteValue()) {
+                    Globals.getmTeamIPMapSemaphore();
+                    try {
+                        if (ip.equals(Globals.getInstance().mTeamIPMap.get(previousTeam)))
+                            Globals.getInstance().mTeamIPMap.remove(previousTeam);
+                    } finally {
+                        Globals.getInstance().mTeamIPMapSemaphore.release();
+                    }
+                }
+                Log.d(TAG, "player " + team + " found at " + ip.toString());
+                sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY, ip, LISTEN_PORT);
             } else if (message.startsWith(NetMsg.NETMSG_SERVERREPLY)) {
+                if (!mScanRunning)
+                    return;
+                mScanRunning = false;
                 Globals.getInstance().mServerIP = ip;
                 intent = new Intent(NetMsg.NETMSG_SERVERREPLY);
             } else if (message.startsWith(NetMsg.NETMSG_LEAVE)) {
                 // This is a player left message
                 Globals.getmIPTeamMapSemaphore();
-                Byte team = Globals.getInstance().mIPTeamMap.get(ip);
-                Globals.getInstance().mIPTeamMap.remove(ip);
-                Globals.getInstance().mIPTeamMapSemaphore.release();
+                Byte team;
+                try {
+                    team = Globals.getInstance().mIPTeamMap.remove(ip);
+                } finally {
+                    Globals.getInstance().mIPTeamMapSemaphore.release();
+                }
+                if (team == null) {
+                    Log.w(TAG, "Ignoring leave request from unknown IP " + ip);
+                    return;
+                }
                 Globals.getmTeamIPMapSemaphore();
-                Globals.getInstance().mTeamIPMap.remove(team);
-                Globals.getInstance().mTeamIPMapSemaphore.release();
+                try {
+                    if (ip.equals(Globals.getInstance().mTeamIPMap.get(team)))
+                        Globals.getInstance().mTeamIPMap.remove(team);
+                } finally {
+                    Globals.getInstance().mTeamIPMapSemaphore.release();
+                }
                 Log.d(TAG, "player " + team + " left at " + ip.toString());
                 intent = new Intent(NetMsg.NETMSG_LEAVE);
             } else if (message.startsWith(NetMsg.NETMSG_ENDGAME)) {
@@ -199,41 +254,60 @@ public class UDPListenerService extends Service {
             sendBroadcast(intent);
     }
 
-    Thread UDPMessageThread;
+    private volatile Thread mUDPMessageThread;
 
     public void startListenForUDPMessage() {
-        keepListening = true;
-        if (mIsListService) {
-            if (wm == null)
-                wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-            if (wm == null) {
-                Log.e(TAG, "Failed to get wifi manager");
-            } else {
-                if (multicastLock == null) {
-                    multicastLock = wm.createMulticastLock("SimpleCoil");
-
-                    multicastLock.setReferenceCounted(true);
-                }
+        synchronized (mListenerStateLock) {
+            if (mUDPMessageThread != null && mUDPMessageThread.isAlive()) {
+                Log.w(TAG, "UDP listener is already running");
+                return;
             }
-            if (multicastLock != null && !multicastLock.isHeld()) multicastLock.acquire();
-        }
+            keepListening = true;
+            // Set this before starting the thread so a fast second Join/Create request cannot
+            // start another listener while the first one is still binding its socket.
+            doneListening = false;
+            if (mIsListService) {
+                if (wm == null)
+                    wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wm == null) {
+                    Log.e(TAG, "Failed to get wifi manager");
+                } else {
+                    if (multicastLock == null) {
+                        multicastLock = wm.createMulticastLock("SimpleCoil");
 
-        UDPMessageThread = new Thread(() -> {
-            while (keepListening) {
+                        multicastLock.setReferenceCounted(true);
+                    }
+                }
+                if (multicastLock != null && !multicastLock.isHeld()) multicastLock.acquire();
+            }
+
+            mUDPMessageThread = new Thread(() -> {
                 try {
-                    InetAddress address = Globals.getIPAddress();
-                    if (mIsListService || address == null)
-                        address = InetAddress.getByName("0.0.0.0");
-                    listenForMessage(address, LISTEN_PORT, LISTEN_TIMEOUT_MS);
-                } catch (Exception e) {
-                    Log.i(TAG, "no longer listening for UDP messages: " + e.getMessage());
+                    while (keepListening) {
+                        try {
+                            InetAddress address = Globals.getIPAddress();
+                            if (mIsListService || address == null)
+                                address = InetAddress.getByName("0.0.0.0");
+                            listenForMessage(address, LISTEN_PORT, LISTEN_TIMEOUT_MS);
+                        } catch (Exception e) {
+                            Log.i(TAG, "no longer listening for UDP messages: " + e.getMessage());
+                            if (keepListening)
+                                sleep(100);
+                        }
+                    }
+                } finally {
+                    Log.i(TAG, "Stopped listening for UDP messages");
+                    if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
+                    synchronized (mListenerStateLock) {
+                        if (Thread.currentThread() == mUDPMessageThread) {
+                            mUDPMessageThread = null;
+                            doneListening = true;
+                        }
+                    }
                 }
-            }
-            Log.i(TAG, "Stopped listening for UDP messages");
-            if(multicastLock != null && multicastLock.isHeld()) multicastLock.release();
-            doneListening = true;
-        });
-        UDPMessageThread.start();
+            }, "SimpleCoil UDP listener");
+            mUDPMessageThread.start();
+        }
     }
 
     private InetAddress getBroadcastAddress() {
@@ -267,8 +341,7 @@ public class UDPListenerService extends Service {
             sendFailedJoin();
             return;
         }
-        if (mBroadcastAddress == null)
-            mBroadcastAddress = getBroadcastAddress();
+        mBroadcastAddress = getBroadcastAddress();
         if (mBroadcastAddress == null) {
             Log.e(TAG, "Failed to get broadcast IP address");
             sendFailedJoin();
@@ -283,28 +356,45 @@ public class UDPListenerService extends Service {
         keepListening = true;
         mIsListService = true;
         mScanRunning = false;
+        mMyIP = null;
         mReadyToScan = 0;
         startListenForUDPMessage();
-        while (mReadyToScan == 0) {
-            sleep(100);
+        new Thread(this::finishServerCreation).start();
+    }
+
+    private void finishServerCreation() {
+        long deadline = System.currentTimeMillis() + LISTENER_START_TIMEOUT_MS;
+        while (keepListening && mReadyToScan == 0 && System.currentTimeMillis() < deadline)
+            sleep(50);
+        if (!keepListening)
+            return;
+        if (mReadyToScan == 0) {
+            Log.e(TAG, "Timed out starting UDP listener");
+            stopListen();
+            sendFailedJoin();
+            return;
         }
+        mMyIP = Globals.getIPAddress();
         if (mMyIP == null) {
-            mMyIP = Globals.getIPAddress();
+            Log.e(TAG, "No local IPv4 address available for server");
+            stopListen();
+            sendFailedJoin();
+            return;
         }
         Globals.getInstance().mServerIP = mMyIP;
-        Intent intent = new Intent(NetMsg.NETMSG_SERVERCREATED);
-        sendBroadcast(intent);
+        sendBroadcast(new Intent(NetMsg.NETMSG_SERVERCREATED));
     }
 
     public void cancelServer() {
         if (!mIsListService)
             return;
+        mIsListService = false;
         keepListening = false;
+        closeListeningSocket();
     }
 
     public void joinServer() {
-        if (mBroadcastAddress == null)
-            mBroadcastAddress = getBroadcastAddress();
+        mBroadcastAddress = getBroadcastAddress();
         if (mBroadcastAddress == null) {
             sendFailedJoin();
             return;
@@ -313,6 +403,12 @@ public class UDPListenerService extends Service {
     }
 
     public void joinServer(String serverIP) {
+        if (serverIP == null || serverIP.trim().isEmpty()) {
+            Log.w(TAG, "Cannot join an empty server address");
+            sendFailedJoin();
+            return;
+        }
+        serverIP = serverIP.trim();
         if (serverIP.startsWith("/"))
             serverIP = serverIP.substring(1);
         final String ip = serverIP;
@@ -355,6 +451,7 @@ public class UDPListenerService extends Service {
         keepListening = true;
         mIsListService = false;
         mScanRunning = true;
+        mMyIP = null;
         mReadyToScan = 0;
         startListenForUDPMessage();
         joinFailCheck(serverIP, port);
@@ -378,8 +475,7 @@ public class UDPListenerService extends Service {
                     public void onFinish() {
                         if (mScanRunning) {
                             Log.d(TAG, "join failed, could not find a server");
-                            mScanRunning = false;
-                            keepListening = false;
+                            stopListen();
                             sendFailedJoin();
                         }
                     }
@@ -408,32 +504,17 @@ public class UDPListenerService extends Service {
     public void sendUDPMessageAll(String message) {
         final String prefixedMessage = NetMsg.MESSAGE_PREFIX + message;
         Thread sendThread = new Thread(() -> {
-            while (mSendingMessage) {
-                sleep(10);
-            }
-            mSendingMessage = true;
-            Globals.getmIPTeamMapSemaphore();
-            for (InetAddress ip : Globals.getInstance().mIPTeamMap.keySet()) {
+            synchronized (mSendLock) {
+                Globals.getmIPTeamMapSemaphore();
                 try {
-                    Log.d(TAG, "sending '" + prefixedMessage + "' to " + ip.toString() + ":" + LISTEN_PORT);
-                    DatagramSocket udpSocket = new DatagramSocket(0); // system will assign any unused port for sending
-                    byte[] buf = prefixedMessage.getBytes();
-                    DatagramPacket packet = new DatagramPacket(buf, buf.length, ip, LISTEN_PORT);
-                    udpSocket.send(packet);
-                    udpSocket.close();
-                } catch (SocketException e) {
-                    Log.e(TAG, "Socket Error:", e);
-                } catch (IOException e) {
-                    //Log.e(TAG, "IO Error:", e);
-                    e.printStackTrace();
-                    Intent intent = new Intent(NetMsg.NETMSG_ERROR);
-                    intent.putExtra(INTENT_MESSAGE, e.getLocalizedMessage());
-                    sendBroadcast(intent);
+                    for (InetAddress ip : Globals.getInstance().mIPTeamMap.keySet()) {
+                        sendDatagram(prefixedMessage, ip, LISTEN_PORT);
+                    }
+                } finally {
+                    Globals.getInstance().mIPTeamMapSemaphore.release();
                 }
+                Log.d(TAG, "send all finished");
             }
-            Globals.getInstance().mIPTeamMapSemaphore.release();
-            mSendingMessage = false;
-            Log.d(TAG, "send all finished");
         });
         sendThread.start();
     }
@@ -441,70 +522,65 @@ public class UDPListenerService extends Service {
     public void sendUDPMessageAllRepeat(String message, final int repeatCount) {
         final String prefixedMessage = NetMsg.MESSAGE_PREFIX + message;
         Thread sendThread = new Thread(() -> {
-            while (mSendingMessage) {
-                sleep(10);
-            }
-            mSendingMessage = true;
-            int repeat = repeatCount;
-            while (repeat-- > 0) {
-                Globals.getmIPTeamMapSemaphore();
-                for (InetAddress ip : Globals.getInstance().mIPTeamMap.keySet()) {
+            synchronized (mSendLock) {
+                int repeat = repeatCount;
+                while (repeat-- > 0) {
+                    Globals.getmIPTeamMapSemaphore();
                     try {
-                        Log.d(TAG, "sending '" + prefixedMessage + "' to " + ip.toString() + ":" + LISTEN_PORT);
-                        DatagramSocket udpSocket = new DatagramSocket(0); // system will assign any unused port for sending
-                        byte[] buf = prefixedMessage.getBytes();
-                        DatagramPacket packet = new DatagramPacket(buf, buf.length, ip, LISTEN_PORT);
-                        udpSocket.send(packet);
-                        udpSocket.close();
-                    } catch (SocketException e) {
-                        Log.e(TAG, "Socket Error:", e);
-                    } catch (IOException e) {
-                        //Log.e(TAG, "IO Error:", e);
-                        e.printStackTrace();
-                        Intent intent = new Intent(NetMsg.NETMSG_ERROR);
-                        intent.putExtra(INTENT_MESSAGE, e.getLocalizedMessage());
-                        sendBroadcast(intent);
+                        for (InetAddress ip : Globals.getInstance().mIPTeamMap.keySet()) {
+                            sendDatagram(prefixedMessage, ip, LISTEN_PORT);
+                        }
+                    } finally {
+                        Globals.getInstance().mIPTeamMapSemaphore.release();
                     }
+                    sleep(50);
                 }
-                Globals.getInstance().mIPTeamMapSemaphore.release();
-                sleep(50);
+                Log.d(TAG, "send all repeat finished");
             }
-            mSendingMessage = false;
-            Log.d(TAG, "send all repeat finished");
         });
         sendThread.start();
     }
 
     private void sendUDPMessage(final String message, final InetAddress ip, final Integer port) {
         Thread sendThread = new Thread(() -> {
-            try {
-                while (mSendingMessage) {
-                    sleep(10);
-                }
-                mSendingMessage = true;
-                Log.d(TAG, "sending '" + message + "' to " + ip.toString() + ":" + port);
-                DatagramSocket udpSocket = new DatagramSocket(0); // system will assign any unused port for sending
-                byte[] buf = message.getBytes();
-                DatagramPacket packet = new DatagramPacket(buf, buf.length, ip, port);
-                udpSocket.send(packet);
-                udpSocket.close();
-            } catch (SocketException e) {
-                Log.e(TAG, "Socket Error:", e);
-            } catch (IOException e) {
-                //Log.e(TAG, "IO Error:", e);
-                e.printStackTrace();
-                Intent intent = new Intent(NetMsg.NETMSG_ERROR);
-                intent.putExtra(INTENT_MESSAGE, e.getLocalizedMessage());
-                sendBroadcast(intent);
+            synchronized (mSendLock) {
+                sendDatagram(message, ip, port);
             }
-            mSendingMessage = false;
         });
         sendThread.start();
     }
 
+    private void sendDatagram(String message, InetAddress ip, int port) {
+        DatagramSocket udpSocket = null;
+        try {
+            Log.d(TAG, "sending '" + message + "' to " + ip.toString() + ":" + port);
+            udpSocket = new DatagramSocket(0); // system will assign any unused port for sending
+            byte[] buf = message.getBytes(StandardCharsets.UTF_8);
+            DatagramPacket packet = new DatagramPacket(buf, buf.length, ip, port);
+            udpSocket.send(packet);
+        } catch (SocketException e) {
+            Log.e(TAG, "Socket Error:", e);
+        } catch (IOException e) {
+            Intent intent = new Intent(NetMsg.NETMSG_ERROR);
+            intent.putExtra(INTENT_MESSAGE, e.getLocalizedMessage());
+            sendBroadcast(intent);
+        } finally {
+            if (udpSocket != null)
+                udpSocket.close();
+        }
+    }
+
     void stopListen() {
         mScanRunning = false;
+        mIsListService = false;
         keepListening = false;
+        closeListeningSocket();
+    }
+
+    private void closeListeningSocket() {
+        DatagramSocket socket = mSocket;
+        if (socket != null && !socket.isClosed())
+            socket.close();
     }
 
     @Override

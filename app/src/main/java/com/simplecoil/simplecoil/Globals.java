@@ -33,15 +33,36 @@ public class Globals {
     be used but would require code changes to the hit detection if you really need 64 players. */
     public static final byte MAX_PLAYER_ID = (byte) 0x10;
 
+    /**
+     * Network messages may carry arbitrary integers, while UI and map storage are sized for
+     * the supported player-ID range.  Keep validation in one place before an ID reaches an
+     * array-backed consumer.
+     */
+    public static boolean isValidPlayerID(int playerID) {
+        return playerID >= 0 && playerID <= MAX_PLAYER_ID;
+    }
+
     public static final byte RELOAD_COUNT = (byte) 30; // Number of shots you get after a reload, max 255
+    public static final int MIN_RELOAD_COUNT = 1;
+    public static final int MAX_RELOAD_COUNT = 255;
     public volatile byte mFullReload = RELOAD_COUNT;
     public static final long RESPAWN_TIME_SECONDS = 10; // Time to wait for respawn after elimination and to start the game
+    public static final long MIN_RESPAWN_TIME_SECONDS = 1;
+    public static final long MAX_RESPAWN_TIME_SECONDS = 1000;
     public volatile long mRespawnTime = RESPAWN_TIME_SECONDS;
     public static final long RELOAD_TIME_MILLISECONDS = 1500; // Reload downtime in ms. 1.5 seconds
+    public static final long MIN_RELOAD_TIME_MILLISECONDS = 0;
+    public static final long MAX_RELOAD_TIME_MILLISECONDS = 10000;
     public volatile long mReloadTime = RELOAD_TIME_MILLISECONDS;
     public static final int MAX_HEALTH = 20; // Number of hits you can take before you are eliminated
+    public static final int MIN_HEALTH = 1;
+    public static final int MAX_CONFIGURED_HEALTH = 1000;
     public volatile int mFullHealth = MAX_HEALTH;
+    public static final int MAX_SHIELDS = 5;
+    public volatile int mFullShields = MAX_SHIELDS;
     public static final int DAMAGE_PER_HIT = -1;
+    public static final int MIN_DAMAGE_PER_HIT = -1000;
+    public static final int MAX_DAMAGE_PER_HIT = -1;
     public volatile int mDamage = DAMAGE_PER_HIT;
     public volatile boolean mOverrideLives = false;
     public volatile int mOverrideLivesVal = 0;
@@ -75,6 +96,10 @@ public class Globals {
     public static final int GAME_MODE_4TEAMS = 4;
     public volatile int mGameMode = GAME_MODE_2TEAMS;
 
+    public static boolean isValidGameMode(int gameMode) {
+        return gameMode == GAME_MODE_FFA || gameMode == GAME_MODE_2TEAMS || gameMode == GAME_MODE_4TEAMS;
+    }
+
     public static final int GAME_LIMIT_NONE = 0;
     public static final int GAME_LIMIT_TIME = 1;
     public static final int GAME_LIMIT_LIVES = 2;
@@ -85,11 +110,27 @@ public class Globals {
     public volatile int mTimeLimit = 0;
     public volatile int mScoreLimit = 0;
     public volatile int mLivesLimit = 0;
+    public static final int MAX_GAME_LIMIT = 100;
+
+    public static boolean isValidGameLimit(int limit) {
+        return limit >= 0 && limit <= MAX_GAME_LIMIT;
+    }
 
     public static final int GPS_DISABLED = 0;
     public static final int GPS_TEAMMATE = 1;
     public static final int GPS_ALL = 2;
     public volatile int mGPSMode = GPS_ALL;
+
+    public static boolean isValidGPSMode(int gpsMode) {
+        return gpsMode == GPS_DISABLED || gpsMode == GPS_TEAMMATE || gpsMode == GPS_ALL;
+    }
+
+    public static boolean isValidCoordinates(double longitude, double latitude) {
+        return !Double.isNaN(longitude) && !Double.isInfinite(longitude)
+                && !Double.isNaN(latitude) && !Double.isInfinite(latitude)
+                && longitude >= -180.0 && longitude <= 180.0
+                && latitude >= -90.0 && latitude <= 90.0;
+    }
 
     public static final int GAME_STATE_NONE = 0; // Game not started
     public static final int GAME_STATE_RUNNING = 1; // Game running and player is in the game
@@ -108,6 +149,26 @@ public class Globals {
     public static final int FIRING_MODE_INDOOR_NO_CONE = 2;
     public volatile int mCurrentFiringMode = FIRING_MODE_OUTDOOR_NO_CONE;
 
+    public static boolean isValidFiringMode(int firingMode) {
+        return firingMode == FIRING_MODE_OUTDOOR_NO_CONE
+                || firingMode == FIRING_MODE_OUTDOOR_WITH_CONE
+                || firingMode == FIRING_MODE_INDOOR_NO_CONE;
+    }
+
+    public static boolean isValidPlayerSettings(int health, int reloadShots, long reloadTime,
+                                                long spawnTime, int damage, int lives,
+                                                boolean allowSingle, boolean allowBurst,
+                                                boolean allowAuto, int firingMode) {
+        return health >= MIN_HEALTH && health <= MAX_CONFIGURED_HEALTH
+                && reloadShots >= MIN_RELOAD_COUNT && reloadShots <= MAX_RELOAD_COUNT
+                && reloadTime >= MIN_RELOAD_TIME_MILLISECONDS && reloadTime <= MAX_RELOAD_TIME_MILLISECONDS
+                && spawnTime >= MIN_RESPAWN_TIME_SECONDS && spawnTime <= MAX_RESPAWN_TIME_SECONDS
+                && damage >= MIN_DAMAGE_PER_HIT && damage <= MAX_DAMAGE_PER_HIT
+                && lives >= 0 && lives <= MAX_CONFIGURED_HEALTH
+                && (allowSingle || allowBurst || allowAuto)
+                && isValidFiringMode(firingMode);
+    }
+
     public volatile byte mPlayerID = 0;
     public volatile String mPlayerName = "";
     public volatile Map<InetAddress, Byte> mIPTeamMap;
@@ -119,6 +180,10 @@ public class Globals {
     public static final int MAX_GRENADE_IDS = 16;
     public volatile byte mPairedGrenadeID = 0;
     public volatile int[] mGrenadePairings;
+
+    public static boolean isValidGrenadeID(int grenadeID) {
+        return grenadeID >= 0 && grenadeID < MAX_GRENADE_IDS;
+    }
 
     public Semaphore mIPTeamMapSemaphore;
     public Semaphore mTeamIPMapSemaphore;
@@ -141,6 +206,7 @@ public class Globals {
             mInstance.mIPTeamMap = new HashMap<>();
             mInstance.mTeamIPMap = new HashMap<>();
             mInstance.mTeamPlayerNameMap = new HashMap<>();
+            mInstance.mGPSData = new HashMap<>();
             mInstance.mPlayerSettings = new HashMap<>();
 
             mInstance.mIPTeamMapSemaphore = new Semaphore(1);
@@ -150,13 +216,14 @@ public class Globals {
             mInstance.mPlayerSettingsSemaphore = new Semaphore(1);
             mInstance.mGrenadePairingsSemaphore = new Semaphore(1);
             mInstance.mGrenadePairings = new int[MAX_GRENADE_IDS];
+            ClearGrenadePairings(false);
         }
         return mInstance;
     }
 
     public int calcNetworkTeam(byte player_id) {
         int team = 1;
-        if (player_id > MAX_PLAYER_ID)
+        if (!isValidPlayerID(player_id))
             return INVALID_PLAYER_ID;
         if (mGameMode == GAME_MODE_2TEAMS) {
             final int x = ((MAX_PLAYER_ID + 1) / 2);
@@ -240,7 +307,7 @@ public class Globals {
     }
 
     public static int getPlayerCount() {
-        int ret = 1;
+        int ret = 0;
         getmTeamIPMapSemaphore();
         if (getInstance().mTeamIPMap != null)
             ret = getInstance().mTeamIPMap.size();
@@ -259,7 +326,8 @@ public class Globals {
         try {
             getInstance().mIPTeamMapSemaphore.acquire();
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring IP/team map lock", e);
         }
     }
 
@@ -267,7 +335,8 @@ public class Globals {
         try {
             getInstance().mTeamIPMapSemaphore.acquire();
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring team/IP map lock", e);
         }
     }
 
@@ -275,7 +344,8 @@ public class Globals {
         try {
             getInstance().mTeamPlayerNameSemaphore.acquire();
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring player-name map lock", e);
         }
     }
 
@@ -283,7 +353,8 @@ public class Globals {
         try {
             getInstance().mGPSDataSemaphore.acquire();
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring GPS data lock", e);
         }
     }
 
@@ -291,7 +362,8 @@ public class Globals {
         try {
             getInstance().mPlayerSettingsSemaphore.acquire();
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring player-settings lock", e);
         }
     }
 
@@ -299,7 +371,8 @@ public class Globals {
         try {
             getInstance().mGrenadePairingsSemaphore.acquire();
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring grenade-pairings lock", e);
         }
     }
 

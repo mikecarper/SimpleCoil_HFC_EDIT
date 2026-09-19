@@ -48,9 +48,11 @@ import android.widget.Toast;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
 
+import java.util.HashMap;
 import java.util.Locale;
-import java.util.Objects;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 @SuppressWarnings("NonAtomicOperationOnVolatileField")
@@ -87,8 +89,10 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     // Code to manage Service lifecycle.
     private ServiceConnection mUDPServiceConnection = null;
     private UDPListenerService mUDPListenerService = null;
+    private boolean mUDPServiceBound = false;
 
     private void setupUDPServiceConnection() {
+        if (mUDPServiceBound) return;
         mUDPServiceConnection = new ServiceConnection() {
 
             @Override
@@ -104,19 +108,23 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         };
         Intent udpServiceIntent = new Intent(getBaseContext(), UDPListenerService.class);
         startService(udpServiceIntent);
-        bindService(udpServiceIntent, mUDPServiceConnection, BIND_AUTO_CREATE);
+        mUDPServiceBound = bindService(udpServiceIntent, mUDPServiceConnection, BIND_AUTO_CREATE);
+        if (!mUDPServiceBound)
+            mUDPServiceConnection = null;
     }
 
     private TcpServer mTcpServer = null;
     private ServiceConnection mTcpServerServiceConnection = null;
+    private boolean mTcpServerServiceBound = false;
 
     private void setupTcpServerServiceConnection() {
+        if (mTcpServerServiceBound) return;
         mTcpServerServiceConnection = new ServiceConnection() {
 
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
                 mTcpServer = ((TcpServer.LocalBinder) service).getService();
-                mTcpServer.setDedicated();
+                mTcpServer.setDedicated(true);
                 mTcpServer.startTcpServer();
             }
 
@@ -127,7 +135,35 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         };
         Intent serviceIntent = new Intent(getBaseContext(), TcpServer.class);
         startService(serviceIntent);
-        bindService(serviceIntent, mTcpServerServiceConnection, BIND_AUTO_CREATE);
+        mTcpServerServiceBound = bindService(serviceIntent, mTcpServerServiceConnection, BIND_AUTO_CREATE);
+        if (!mTcpServerServiceBound)
+            mTcpServerServiceConnection = null;
+    }
+
+    private void unbindUDPService() {
+        if (!mUDPServiceBound) return;
+        try {
+            unbindService(mUDPServiceConnection);
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "UDP service was already unbound", e);
+        } finally {
+            mUDPServiceBound = false;
+            mUDPServiceConnection = null;
+            mUDPListenerService = null;
+        }
+    }
+
+    private void unbindTcpServerService() {
+        if (!mTcpServerServiceBound) return;
+        try {
+            unbindService(mTcpServerServiceConnection);
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "TCP server service was already unbound", e);
+        } finally {
+            mTcpServerServiceBound = false;
+            mTcpServerServiceConnection = null;
+            mTcpServer = null;
+        }
     }
 
     @SuppressWarnings("NonAtomicOperationOnVolatileField")
@@ -170,7 +206,10 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         }
         mEndGameButton = findViewById(R.id.end_game_button);
         if (mEndGameButton != null) {
-            mEndGameButton.setOnClickListener((v -> mTcpServer.endGame()));
+            mEndGameButton.setOnClickListener((v -> {
+                if (mTcpServer != null)
+                    mTcpServer.endGame();
+            }));
         }
         mStartGameButton = findViewById(R.id.start_game_button);
         if (mStartGameButton != null) {
@@ -184,7 +223,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             }));
         }
         sharedPreferences = getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
-        Globals.getInstance().mGameMode = sharedPreferences.getInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
+        int savedGameMode = sharedPreferences.getInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
+        Globals.getInstance().mGameMode = Globals.isValidGameMode(savedGameMode) ? savedGameMode : Globals.GAME_MODE_2TEAMS;
         if (Globals.getInstance().mGameMode == Globals.GAME_MODE_2TEAMS)
             mGameModeButton.setText(R.string.game_mode_2teams);
         else if (Globals.getInstance().mGameMode == Globals.GAME_MODE_4TEAMS)
@@ -192,27 +232,32 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         else
             mGameModeButton.setText(R.string.game_mode_ffa);
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
-        Globals.getInstance().mTimeLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_TIME, 0);
+        int savedTimeLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_TIME, 0);
+        Globals.getInstance().mTimeLimit = Globals.isValidGameLimit(savedTimeLimit) ? savedTimeLimit : 0;
         if (Globals.getInstance().mTimeLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_TIME;
-        Globals.getInstance().mLivesLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_LIVES, 0);
+        int savedLivesLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_LIVES, 0);
+        Globals.getInstance().mLivesLimit = Globals.isValidGameLimit(savedLivesLimit) ? savedLivesLimit : 0;
         if (Globals.getInstance().mLivesLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_LIVES;
-        Globals.getInstance().mScoreLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_SCORE, 0);
+        int savedScoreLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_SCORE, 0);
+        Globals.getInstance().mScoreLimit = Globals.isValidGameLimit(savedScoreLimit) ? savedScoreLimit : 0;
         if (Globals.getInstance().mScoreLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
         setGameLimit();
-        Globals.getInstance().mGPSMode = sharedPreferences.getInt(PREF_GPS_MODE, Globals.GPS_ALL);
+        int savedGPSMode = sharedPreferences.getInt(PREF_GPS_MODE, Globals.GPS_ALL);
+        Globals.getInstance().mGPSMode = Globals.isValidGPSMode(savedGPSMode) ? savedGPSMode : Globals.GPS_ALL;
         setGPSMode(Globals.getInstance().mGPSMode);
         mAllowJoinSwitch = findViewById(R.id.allow_join_switch);
         mAllowJoinSwitch.setOnClickListener((v -> {
-            if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE && mUDPListenerService != null)
                 mUDPListenerService.allowJoin(mAllowJoinSwitch.isChecked());
         }));
         mOnlyServerSettingsSwitch = findViewById(R.id.only_server_settings_switch);
         mOnlyServerSettingsSwitch.setOnClickListener((v -> {
             Globals.getInstance().mOnlyServerSettings = mOnlyServerSettingsSwitch.isChecked();
-            mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+            if (mTcpServer != null)
+                mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
         }));
         try {
             // Display app version
@@ -240,7 +285,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     @Override
     protected void onResume() {
         super.onResume();
-        registerReceiver(mServerUpdateReceiver, makeServerUpdateIntentFilter());
+        ContextCompat.registerReceiver(this, mServerUpdateReceiver, makeServerUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
         setupUDPServiceConnection();
         setupTcpServerServiceConnection();
     }
@@ -249,19 +294,27 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     protected void onPause() {
         super.onPause();
         unregisterReceiver(mServerUpdateReceiver);
-        Globals.getInstance().mUseGPS = false;
     }
 
     @Override
     protected void onDestroy() {
+        if (mSpawnTimer != null) {
+            mSpawnTimer.cancel();
+            mSpawnTimer = null;
+        }
+        if (mGameCountdownTimer != null) {
+            mGameCountdownTimer.cancel();
+            mGameCountdownTimer = null;
+        }
+        if (mTcpServer != null) {
+            mTcpServer.sendTCPMessageAll(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_SERVERCANCEL);
+            mTcpServer.stopTcpServer();
+        }
+        if (mUDPListenerService != null)
+            mUDPListenerService.stopListen();
+        unbindUDPService();
+        unbindTcpServerService();
         super.onDestroy();
-        mTcpServer.sendTCPMessageAll(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_SERVERCANCEL);
-        mUDPListenerService.stopListen();
-        if (mUDPServiceConnection != null)
-            unbindService(mUDPServiceConnection);
-        mTcpServer.stopTcpServer();
-        if (mTcpServerServiceConnection != null)
-            unbindService(mTcpServerServiceConnection);
     }
 
     private void savePreference(String prefName, int prefValue) {
@@ -309,6 +362,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
 
     }
     private void setGPSMode(int mode) {
+        if (!Globals.isValidGPSMode(mode))
+            mode = Globals.GPS_ALL;
         Globals.getInstance().mGPSMode = mode;
         if (mode == Globals.GPS_DISABLED || (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA && mode == Globals.GPS_TEAMMATE)) {
             Globals.getInstance().mUseGPS = false;
@@ -373,28 +428,28 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                                 dialog.dismiss();
                                 return;
                             }
-                            if (limit > 100) {
+                            if (!Globals.isValidGameLimit(limit)) {
                                 Toast.makeText(getApplicationContext(), getString(R.string.error_limit_too_high), Toast.LENGTH_SHORT).show();
                                 dialog.dismiss();
                                 return;
                             }
                             if (gameLimitTime.isChecked()) {
-                                if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) == 0)
-                                    Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_TIME;
-                                else if (limit <= 0)
-                                    Globals.getInstance().mGameLimit -= Globals.GAME_LIMIT_TIME;
+                                if (limit > 0)
+                                    Globals.getInstance().mGameLimit |= Globals.GAME_LIMIT_TIME;
+                                else
+                                    Globals.getInstance().mGameLimit &= ~Globals.GAME_LIMIT_TIME;
                                 Globals.getInstance().mTimeLimit = limit;
                             } else if (gameLimitLives.isChecked()) {
-                                if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_LIVES) == 0)
-                                    Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_LIVES;
-                                else if (limit <= 0)
-                                    Globals.getInstance().mGameLimit -= Globals.GAME_LIMIT_LIVES;
+                                if (limit > 0)
+                                    Globals.getInstance().mGameLimit |= Globals.GAME_LIMIT_LIVES;
+                                else
+                                    Globals.getInstance().mGameLimit &= ~Globals.GAME_LIMIT_LIVES;
                                 Globals.getInstance().mLivesLimit = limit;
                             } else {
-                                if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_SCORE) == 0)
-                                    Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
-                                else if (limit <= 0)
-                                    Globals.getInstance().mGameLimit -= Globals.GAME_LIMIT_SCORE;
+                                if (limit > 0)
+                                    Globals.getInstance().mGameLimit |= Globals.GAME_LIMIT_SCORE;
+                                else
+                                    Globals.getInstance().mGameLimit &= ~Globals.GAME_LIMIT_SCORE;
                                 Globals.getInstance().mScoreLimit = limit;
                             }
                             setGameLimit();
@@ -441,8 +496,19 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
 
     private void startGame() {
-        if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
-            mTcpServer.startGame();
+        if (mTcpServer == null || mUDPListenerService == null) {
+            Log.w(TAG, "Ignoring game start before dedicated server services are ready");
+            return;
+        }
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+            Log.d(TAG, "Ignoring duplicate dedicated game-start event");
+            return;
+        }
+        if (!mTcpServer.startGame()) {
+            Log.w(TAG, "Ignoring game start before a TCP client is connected");
+            Toast.makeText(getApplicationContext(), getString(R.string.not_enough_players_toast), Toast.LENGTH_SHORT).show();
+            return;
+        }
         Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
         mStartGameButton.setEnabled(false);
         mGameModeButton.setEnabled(false);
@@ -454,6 +520,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
             startGameCountdown();
         } else {
+            if (mSpawnTimer != null)
+                mSpawnTimer.cancel();
             mSpawnTimer = new CountDownTimer(Globals.getInstance().mRespawnTime * 1000, 999) {
 
                 public void onTick(long millisUntilFinished) {
@@ -461,10 +529,14 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 }
 
                 public void onFinish() {
+                    if (mSpawnTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
+                        return;
+                    mSpawnTimer = null;
                     mGameTimer.setBase(SystemClock.elapsedRealtime());
                     mGameTimer.start();
                 }
-            }.start();
+            };
+            mSpawnTimer.start();
         }
     }
 
@@ -476,14 +548,19 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mGPSModeButton.setEnabled(true);
         mGameStatusTV.setText(R.string.dedicated_game_waiting);
         mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, 0));
-        mUDPListenerService.allowJoin(true);
+        if (mUDPListenerService != null)
+            mUDPListenerService.allowJoin(true);
         mEndGameButton.setEnabled(false);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         mGameTimer.stop();
-        if (mSpawnTimer != null)
+        if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
-        if (mGameCountdownTimer != null)
+            mSpawnTimer = null;
+        }
+        if (mGameCountdownTimer != null) {
             mGameCountdownTimer.cancel();
+            mGameCountdownTimer = null;
+        }
     }
 
     private final BroadcastReceiver mServerUpdateReceiver = new BroadcastReceiver() {
@@ -509,10 +586,12 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 }
             } else if (NetMsg.NETMSG_SERVERCREATED.equals(action)) {
                 // UDP service is listening
-                String ip = Globals.getInstance().mServerIP.toString();
-                if (ip.startsWith("/"))
-                    ip = ip.substring(1);
-                mServerIPTV.setText(getString(R.string.server_status_serving_on, ip));
+                if (Globals.getInstance().mServerIP != null) {
+                    String ip = Globals.getInstance().mServerIP.toString();
+                    if (ip.startsWith("/"))
+                        ip = ip.substring(1);
+                    mServerIPTV.setText(getString(R.string.server_status_serving_on, ip));
+                }
             } else if (NetMsg.NETMSG_SERVERCANCEL.equals(action)) {
                 mServerIPTV.setText("");
                 Toast.makeText(getApplicationContext(), getString(R.string.error_server_cancel), Toast.LENGTH_SHORT).show();
@@ -536,9 +615,27 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
     private void getPlayerDisplayData() {
         if (mTcpServer == null) return;
+        Map<Byte, String> playerNames = new HashMap<>();
         Globals.getmTeamPlayerNameSemaphore();
+        try {
+            playerNames.putAll(Globals.getInstance().mTeamPlayerNameMap);
+        } finally {
+            Globals.getInstance().mTeamPlayerNameSemaphore.release();
+        }
+
+        Map<Byte, Globals.PlayerSettings> playerSettings = new HashMap<>();
         Globals.getmPlayerSettingsSemaphore();
-        mTcpServer.lockAccess();
+        try {
+            for (Map.Entry<Byte, Globals.PlayerSettings> entry : Globals.getInstance().mPlayerSettings.entrySet()) {
+                Globals.PlayerSettings settings = new Globals.PlayerSettings();
+                settings.overrideLives = entry.getValue().overrideLives;
+                settings.lives = entry.getValue().lives;
+                playerSettings.put(entry.getKey(), settings);
+            }
+        } finally {
+            Globals.getInstance().mPlayerSettingsSemaphore.release();
+        }
+
         int[] teamPoints = new int[4];
         for (int i = 0; i < 4; i++)
             teamPoints[i] = 0;
@@ -568,24 +665,25 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             } else {
                 mPlayerDisplayData[x] = new PlayerDisplayData();
                 mPlayerDisplayData[x].playerID = x;
-                mPlayerDisplayData[x].playerName = Globals.getInstance().mTeamPlayerNameMap.get(x);
+                mPlayerDisplayData[x].playerName = playerNames.get(x);
                 mPlayerDisplayData[x].points = scoreData.points;
-                if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA)
-                    teamPoints[Globals.getInstance().calcNetworkTeam(x) - 1] += scoreData.points;
+                if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
+                    int team = Globals.getInstance().calcNetworkTeam(x);
+                    if (team >= 1 && team <= teamPoints.length)
+                        teamPoints[team - 1] += scoreData.points;
+                }
                 mPlayerDisplayData[x].eliminated = scoreData.eliminated;
                 mPlayerDisplayData[x].isConnected = scoreData.isConnected;
-                if (Globals.getInstance().mPlayerSettings.get(x) == null) {
+                Globals.PlayerSettings settings = playerSettings.get(x);
+                if (settings == null) {
                     mPlayerDisplayData[x].overrideLives = false;
                     mPlayerDisplayData[x].lives = 0;
                 } else {
-                    mPlayerDisplayData[x].overrideLives = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get(x)).overrideLives;
-                    mPlayerDisplayData[x].lives = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get(x)).lives;
+                    mPlayerDisplayData[x].overrideLives = settings.overrideLives;
+                    mPlayerDisplayData[x].lives = settings.lives;
                 }
             }
         }
-        Globals.getInstance().mTeamPlayerNameSemaphore.release();
-        Globals.getInstance().mPlayerSettingsSemaphore.release();
-        mTcpServer.unlockAccess();
         if (mPlayerDisplayListAdapter != null) {
             mPlayerDisplayListAdapter.setData(mPlayerDisplayData);
             if (mPlayerDisplayList != null)
@@ -594,9 +692,13 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
 
     private void startGameCountdown() {
+        if (mGameCountdownTimer != null)
+            mGameCountdownTimer.cancel();
         mGameCountdownTimer = new CountDownTimer(((long) Globals.getInstance().mTimeLimit * 60 * 1000) + (Globals.getInstance().mRespawnTime * 1000), 1000) {
 
             public void onTick(long millisUntilFinished) {
+                if (mGameCountdownTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
+                    return;
                 String display = ""+String.format(Locale.getDefault(),"%02d:%02d",
                         TimeUnit.MILLISECONDS.toMinutes(millisUntilFinished),
                         TimeUnit.MILLISECONDS.toSeconds(millisUntilFinished) - TimeUnit.MINUTES.toSeconds(
@@ -606,12 +708,17 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             }
 
             public void onFinish() {
+                if (mGameCountdownTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
+                    return;
+                mGameCountdownTimer = null;
                 Log.d(TAG, "Game time ended!");
                 Toast.makeText(getApplicationContext(), getString(R.string.dialog_game_time_expired), Toast.LENGTH_SHORT).show();
-                mTcpServer.endGame();
+                if (mTcpServer != null)
+                    mTcpServer.endGame();
                 Globals.getInstance().mServerGameTimeRemaining = 0;
             }
-        }.start();
+        };
+        mGameCountdownTimer.start();
     }
 
 }

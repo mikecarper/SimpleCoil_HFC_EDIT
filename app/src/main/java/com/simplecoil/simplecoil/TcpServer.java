@@ -37,11 +37,12 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class TcpServer extends Service {
     private static final String TAG = "TCPServer";
@@ -108,9 +109,12 @@ public class TcpServer extends Service {
   //  public static final String JSON_WEAPON_PRESET = "Weaponpreset";
 
     private static volatile boolean keepListening = false;
+    private final Object mServerStateLock = new Object();
+    private volatile Thread mServerThread = null;
+    private volatile Thread mClientThread = null;
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
     private volatile Map<Integer, ClientData> mClientData = null;
-    private static boolean mIsDedicated = false;
+    private volatile boolean mIsDedicated = false;
     private static volatile boolean mGPSRunning = false;
 
     Handler mGPSHandler = new Handler();
@@ -220,9 +224,9 @@ public class TcpServer extends Service {
         sendThread.start();
     }
 
-    public void startGame() {
+    public boolean startGame() {
         if (mClientData == null || mClientData.size() == 0)
-            return;
+            return false;
         Thread sendThread = new Thread(() -> {
             // we want to make sure that we have sent the start game message to all clients before broadcasting that the game has started locally
             String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME;
@@ -240,29 +244,39 @@ public class TcpServer extends Service {
                 keepListening = false;
         });
         sendThread.start();
+        return true;
     }
 
     public void endGame() {
-        if (mClientData == null || mClientData.size() == 0)
-            return;
         Thread sendThread = new Thread(() -> {
-            sendPlayerData(SEND_ALL);
-            // we want to make sure that we have sent the end game message to all clients before removing all clients
-            String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME;
-            try {
-                mClientDataSemaphore.acquire();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
+            if (mClientData != null) {
+                sendPlayerData(SEND_ALL);
+                // We want to send the end-game message before removing clients.
+                String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME;
+                boolean hasClientLock = false;
+                try {
+                    mClientDataSemaphore.acquire();
+                    hasClientLock = true;
+                    for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                        entry.getValue().sendTCPMessage(message);
+                        entry.getValue().close();
+                    }
+                    mClientData.clear();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    Log.w(TAG, "Interrupted while ending game", e);
+                } finally {
+                    if (hasClientLock)
+                        mClientDataSemaphore.release();
+                }
             }
-            for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
-                entry.getValue().sendTCPMessage(message);
-                entry.getValue().close();
-            }
-            mClientData.clear();
-            mClientDataSemaphore.release();
             Globals.getmGPSDataSemaphore();
-            Globals.getInstance().mGPSData.clear();
-            Globals.getInstance().mGPSDataSemaphore.release();
+            try {
+                if (Globals.getInstance().mGPSData != null)
+                    Globals.getInstance().mGPSData.clear();
+            } finally {
+                Globals.getInstance().mGPSDataSemaphore.release();
+            }
             Globals.getmTeamPlayerNameSemaphore();
             Globals.getInstance().mTeamPlayerNameMap.clear();
             Globals.getInstance().mTeamPlayerNameSemaphore.release();
@@ -272,18 +286,71 @@ public class TcpServer extends Service {
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
             Globals.getInstance().mIPTeamMapSemaphore.release();
-            Globals.getInstance().mPairedGrenadeID = Globals.INVALID_PLAYER_ID;
+            // A player's physical grenade pairing remains valid across rounds, but the
+            // server's ownership table must not leak into the next round.
+            Globals.ClearGrenadePairings(true);
             sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
         });
         sendThread.start();
     }
 
+    private Map<Byte, InetAddress> getTeamIPMapSnapshot() {
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            return new HashMap<>(Globals.getInstance().mTeamIPMap);
+        } finally {
+            Globals.getInstance().mTeamIPMapSemaphore.release();
+        }
+    }
+
+    /**
+     * Keep the two player/IP maps consistent when a TCP connection is replaced.
+     * A reconnect can legitimately arrive from a different DHCP address.
+     */
+    private void updatePlayerEndpoint(byte playerID, InetAddress address) {
+        if (address == null)
+            return;
+        Globals.getmIPTeamMapSemaphore();
+        try {
+            Iterator<Map.Entry<InetAddress, Byte>> iterator = Globals.getInstance().mIPTeamMap.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<InetAddress, Byte> entry = iterator.next();
+                Byte mappedPlayerID = entry.getValue();
+                if (mappedPlayerID != null && mappedPlayerID.byteValue() == playerID
+                        && !address.equals(entry.getKey())) {
+                    iterator.remove();
+                }
+            }
+            Globals.getInstance().mIPTeamMap.put(address, playerID);
+        } finally {
+            Globals.getInstance().mIPTeamMapSemaphore.release();
+        }
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            Globals.getInstance().mTeamIPMap.put(playerID, address);
+        } finally {
+            Globals.getInstance().mTeamIPMapSemaphore.release();
+        }
+    }
+
+    private void updatePlayerName(byte playerID, String playerName) {
+        Globals.getmTeamPlayerNameSemaphore();
+        try {
+            Globals.getInstance().mTeamPlayerNameMap.put(playerID, playerName);
+        } finally {
+            Globals.getInstance().mTeamPlayerNameSemaphore.release();
+        }
+    }
+
     public void sendAllGameInfo(final int id) {
-        if (mClientData == null || mClientData.size() == 0 || Globals.getInstance().mTeamIPMap == null || Globals.getInstance().mTeamIPMap.size() == 0)
+        if (mClientData == null || mClientData.size() == 0)
             return;
         try {
             JSONArray players = new JSONArray();
-            for (Map.Entry<Byte, InetAddress> entry : Globals.getInstance().mTeamIPMap.entrySet()) {
+            Map<Byte, InetAddress> teamIPMap = getTeamIPMapSnapshot();
+            if (teamIPMap.isEmpty())
+                return;
+            for (Map.Entry<Byte, InetAddress> entry : teamIPMap.entrySet()) {
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERNAME, Globals.getInstance().getPlayerName(entry.getKey()));
                 player.put(JSON_PLAYERID, entry.getKey());
@@ -430,18 +497,21 @@ public class TcpServer extends Service {
     }
 
     public void sendPlayerData(int playerID) {
-        if (mClientData == null || mClientData.size() == 0 || Globals.getInstance().mTeamIPMap == null || Globals.getInstance().mTeamIPMap.size() == 0)
+        if (mClientData == null || mClientData.size() == 0)
             return;
         try {
             JSONArray players = new JSONArray();
-            for (Map.Entry<Byte, InetAddress> entry : Globals.getInstance().mTeamIPMap.entrySet()) {
+            Map<Byte, InetAddress> teamIPMap = getTeamIPMapSnapshot();
+            if (teamIPMap.isEmpty())
+                return;
+            for (Map.Entry<Byte, InetAddress> entry : teamIPMap.entrySet()) {
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERNAME, Globals.getInstance().getPlayerName(entry.getKey()));
                 player.put(JSON_PLAYERID, entry.getKey());
                 player.put(JSON_PLAYERIP, entry.getValue());
                 ScoreData scoreData = getScore(entry.getKey());
-                player.put(JSON_PLAYERPOINTS, scoreData.points);
-                player.put(JSON_PLAYERELIMINATED, scoreData.eliminated);
+                player.put(JSON_PLAYERPOINTS, scoreData == null ? 0 : scoreData.points);
+                player.put(JSON_PLAYERELIMINATED, scoreData == null ? 0 : scoreData.eliminated);
                 players.put(player);
             }
             JSONObject game = new JSONObject();
@@ -461,12 +531,15 @@ public class TcpServer extends Service {
     }
 //TODO player presets
     public JSONArray getPlayerSettings(int playerID, boolean applyAll) {
-        boolean hasSemaphore = false;
+        Globals.getmPlayerSettingsSemaphore();
         try {
             JSONArray players = new JSONArray();
-            Globals.getmPlayerSettingsSemaphore();
-            hasSemaphore = true;
             if (applyAll && playerID != SEND_ALL) {
+                Globals.PlayerSettings sourceSettings = Globals.getInstance().mPlayerSettings.get((byte) playerID);
+                if (sourceSettings == null) {
+                    Log.w(TAG, "Cannot apply settings from unknown player " + playerID);
+                    return null;
+                }
                 for (Byte x = 1; x <= Globals.MAX_PLAYER_ID; x++) {
                     if (x != playerID) {
                         Globals.PlayerSettings playerSettings = Globals.getInstance().mPlayerSettings.get(x);
@@ -474,29 +547,28 @@ public class TcpServer extends Service {
                             playerSettings = new Globals.PlayerSettings();
                             Globals.getInstance().mPlayerSettings.put(x, playerSettings);
                         }
-                        playerSettings.health = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).health;
-                        playerSettings.shots = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).shots;
-                        playerSettings.reloadTime = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).reloadTime;
-                        playerSettings.spawnTime = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).spawnTime;
-                        playerSettings.damage = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).damage;
-                        playerSettings.overrideLives = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).overrideLives;
-                        playerSettings.lives = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).lives;
-                        playerSettings.allowShotModeSingle = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).allowShotModeSingle;
-                        playerSettings.allowShotModeBurst3 = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).allowShotModeBurst3;
-                        playerSettings.allowShotModeAuto = Objects.requireNonNull(Globals.getInstance().mPlayerSettings.get((byte) playerID)).allowShotModeAuto;
+                        playerSettings.health = sourceSettings.health;
+                        playerSettings.shots = sourceSettings.shots;
+                        playerSettings.reloadTime = sourceSettings.reloadTime;
+                        playerSettings.reloadOnEmpty = sourceSettings.reloadOnEmpty;
+                        playerSettings.spawnTime = sourceSettings.spawnTime;
+                        playerSettings.damage = sourceSettings.damage;
+                        playerSettings.overrideLives = sourceSettings.overrideLives;
+                        playerSettings.lives = sourceSettings.lives;
+                        playerSettings.allowShotModeSingle = sourceSettings.allowShotModeSingle;
+                        playerSettings.allowShotModeBurst3 = sourceSettings.allowShotModeBurst3;
+                        playerSettings.allowShotModeAuto = sourceSettings.allowShotModeAuto;
+                        playerSettings.firingMode = sourceSettings.firingMode;
                     }
                 }
             }
-            if (mClientData == null || mClientData.size() == 0 || Globals.getInstance().mTeamIPMap == null || Globals.getInstance().mTeamIPMap.size() == 0) {
-                Globals.getInstance().mPlayerSettingsSemaphore.release();
-                hasSemaphore = false;
+            if (mClientData == null || mClientData.size() == 0)
                 return null;
-            }
             for (Map.Entry<Byte, Globals.PlayerSettings> entry : Globals.getInstance().mPlayerSettings.entrySet()) {
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERID, entry.getKey());
                 player.put(JSON_HEALTH, entry.getValue().health);
-                player.put(JSON_RELOAD_SHOTS, entry.getValue().shots);
+                player.put(JSON_RELOAD_SHOTS, entry.getValue().shots & 0xff);
                 player.put(JSON_RELOAD_TIME, entry.getValue().reloadTime);
                 player.put(JSON_RELOAD_ON_EMPTY, entry.getValue().reloadOnEmpty);
                 player.put(JSON_SPAWN_TIME, entry.getValue().spawnTime);
@@ -513,13 +585,11 @@ public class TcpServer extends Service {
 
                 players.put(player);
             }
-            Globals.getInstance().mPlayerSettingsSemaphore.release();
-            hasSemaphore = false;
             return players;
         } catch (JSONException e) {
             e.printStackTrace();
-            if (hasSemaphore)
-                Globals.getInstance().mPlayerSettingsSemaphore.release();
+        } finally {
+            Globals.getInstance().mPlayerSettingsSemaphore.release();
         }
         return null;
     }
@@ -541,24 +611,33 @@ public class TcpServer extends Service {
     }
 
     void startTcpServer() {
-        if (keepListening) {
-            Log.d(TAG, "Server already listening");
-            return;
+        synchronized (mServerStateLock) {
+            if ((mServerThread != null && mServerThread.isAlive())
+                    || (mClientThread != null && mClientThread.isAlive())) {
+                Log.d(TAG, "Server is still starting, listening, or shutting down");
+                return;
+            }
+            keepListening = true;
+            mServerThread = new Thread(this::runTcpServer, "SimpleCoil TCP server");
+            mServerThread.start();
         }
-        new Thread(this::runTcpServer).start();
     }
 
     private void runTcpServer() {
         if (mClientData == null)
-            mClientData = new HashMap<>();
+            mClientData = new ConcurrentHashMap<>();
         else
             mClientData.clear();
-        if (Globals.getInstance().mGPSData == null)
-            Globals.getInstance().mGPSData = new HashMap<>();
-        else
-            Globals.getInstance().mGPSData.clear();
+        Globals.getmGPSDataSemaphore();
+        try {
+            if (Globals.getInstance().mGPSData == null)
+                Globals.getInstance().mGPSData = new HashMap<>();
+            else
+                Globals.getInstance().mGPSData.clear();
+        } finally {
+            Globals.getInstance().mGPSDataSemaphore.release();
+        }
         Globals.ClearGrenadePairings(true);
-        keepListening = true;
         ServerSocket ss = null;
         int clientID = 0;
         try {
@@ -581,7 +660,8 @@ public class TcpServer extends Service {
                     mClientData.put(clientID, client);
                     mClientDataSemaphore.release();
                     if (clientID <= 1) {
-                        new Thread(new ClientThread()).start();
+                        mClientThread = new Thread(new ClientThread(), "SimpleCoil TCP clients");
+                        mClientThread.start();
                     }
                 } catch (SocketTimeoutException e) {
                     // do nothing
@@ -602,10 +682,16 @@ public class TcpServer extends Service {
             }
         }
         Log.d(TAG, "TCP Server done");
-        keepListening = false;
+        synchronized (mServerStateLock) {
+            if (Thread.currentThread() == mServerThread) {
+                keepListening = false;
+                mServerThread = null;
+            }
+        }
     }
 
     private int clientIDFromPlayerID(byte playerID) {
+        if (mClientData == null) return -1;
         for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
             if (entry.getValue().mPlayerID == playerID) {
                 return entry.getKey();
@@ -630,10 +716,13 @@ public class TcpServer extends Service {
         int clientID = clientIDFromPlayerID(playerID);
         if (clientID < 0)
             return null;
+        ClientData client = mClientData.get(clientID);
+        if (client == null)
+            return null;
         ScoreData scoreData = new ScoreData();
-        scoreData.points = Objects.requireNonNull(mClientData.get(clientID)).points;
-        scoreData.eliminated = Objects.requireNonNull(mClientData.get(clientID)).eliminated;
-        scoreData.isConnected = Objects.requireNonNull(mClientData.get(clientID)).out != null;
+        scoreData.points = client.points;
+        scoreData.eliminated = client.eliminated;
+        scoreData.isConnected = client.out != null;
         return scoreData;
     }
 
@@ -657,7 +746,7 @@ public class TcpServer extends Service {
         private int points = 0;
         private int eliminated = 0;
 
-        public void initialize(Socket s, int cID) {
+        public synchronized void initialize(Socket s, int cID) {
             clientSocket = s;
             clientID = cID;
             noReadCount = 0;
@@ -673,9 +762,9 @@ public class TcpServer extends Service {
             }
         }
 
-        public void sendTCPMessage(final String message) { sendTCPMessage(message, false); }
+        public synchronized void sendTCPMessage(final String message) { sendTCPMessage(message, false); }
 
-        public void sendTCPMessage(final String message, boolean queueFailed) {
+        public synchronized void sendTCPMessage(final String message, boolean queueFailed) {
             if (out == null) {
                 if (queueFailed) {
                     Log.e(TAG, "queuing: " + message);
@@ -698,13 +787,13 @@ public class TcpServer extends Service {
             }
         }
 
-        public void close() {
+        public synchronized void close() {
             if (clientSocket == null) return;
             try { clientSocket.close(); } catch (IOException e) {/*do nothing*/}
-            try { in.close(); } catch (IOException e) {/*do nothing*/}
-            try { is.close(); } catch (IOException e) {/*do nothing*/}
-            try { out.close(); } catch (IOException e) {/*do nothing*/}
-            try { os.close(); } catch (IOException e) {/*do nothing*/}
+            try { if (in != null) in.close(); } catch (IOException e) {/*do nothing*/}
+            try { if (is != null) is.close(); } catch (IOException e) {/*do nothing*/}
+            try { if (out != null) out.close(); } catch (IOException e) {/*do nothing*/}
+            try { if (os != null) os.close(); } catch (IOException e) {/*do nothing*/}
             clientSocket = null;
             in = null;
             is = null;
@@ -712,7 +801,7 @@ public class TcpServer extends Service {
             os = null;
         }
 
-        public void rejoin(Socket s) {
+        public synchronized void rejoin(Socket s) {
             close();
             initialize(s, clientID);
             while (messageQueue.size() > 0) {
@@ -760,12 +849,22 @@ public class TcpServer extends Service {
                                             break;
                                         } else if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
                                             // A player was eliminated
-                                            entry.getValue().eliminated++;
                                             message = message.substring(NetMsg.NETMSG_ELIMINATED.length());
-                                            Byte id = (byte) Integer.parseInt(message);
-                                            int clientID = clientIDFromPlayerID(id);
-                                            if (clientID >= 0)
-                                                Objects.requireNonNull(mClientData.get(clientID)).points++;
+                                            int rawPlayerID = Integer.parseInt(message);
+                                            if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0) {
+                                                Log.w(TAG, "Ignoring elimination with invalid player ID " + rawPlayerID);
+                                                continue;
+                                            }
+                                            byte id = (byte) rawPlayerID;
+                                            ClientData scoringPlayer = mClientData.get(clientIDFromPlayerID(id));
+                                            if (scoringPlayer == null || id == entry.getValue().mPlayerID
+                                                    || (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
+                                                    && scoringPlayer.mNetworkTeam == entry.getValue().mNetworkTeam)) {
+                                                Log.w(TAG, "Ignoring invalid elimination report from player " + entry.getValue().mPlayerID);
+                                                continue;
+                                            }
+                                            entry.getValue().eliminated++;
+                                            scoringPlayer.points++;
                                             sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, false, true);
                                             if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                                                 // Send a message to all teammates about the score increase
@@ -775,7 +874,11 @@ public class TcpServer extends Service {
                                         } else if (message.equals(NetMsg.NETMSG_PLAYERDATAREQUEST)) {
                                             sendPlayerData(entry.getValue().mPlayerID);
                                         } else if (message.equals(NetMsg.NETMSG_STARTGAME)) {
-                                            startGame();
+                                            if (Globals.getInstance().mOnlyServerSettings) {
+                                                Log.w(TAG, "Ignoring game-start request from a client while server-only settings are enabled");
+                                            } else {
+                                                startGame();
+                                            }
                                         } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
                                             if (Globals.getInstance().mOnlyServerSettings) {
                                                 // If server settings only is enabled, then we treat this as if the client is leaving rather than ending the game
@@ -808,6 +911,10 @@ public class TcpServer extends Service {
                         e.printStackTrace();
                         removeClient(entry.getValue(), entry.getKey(), false);
                         break;
+                    } catch (RuntimeException e) {
+                        Log.e(TAG, "Invalid TCP data from client " + entry.getValue().clientID, e);
+                        removeClient(entry.getValue(), entry.getKey(), false);
+                        break;
                     }
                 }
                 mClientDataSemaphore.release();
@@ -829,14 +936,12 @@ public class TcpServer extends Service {
         }
 
         private void sendGrenadePairings(boolean getSemaphore) {
-            boolean has_data = false;
             if (getSemaphore)
                 Globals.getmGrenadePairingsSemaphore();
             try {
                 JSONArray grenadePairings = new JSONArray();
                 for (int index = 1; index < Globals.MAX_GRENADE_IDS; index++) {
                     if (Globals.getInstance().mGrenadePairings[index] != Globals.INVALID_PLAYER_ID) {
-                        has_data = true;
                         JSONObject grenadePairing = new JSONObject();
                         grenadePairing.put(JSON_PLAYERID, Globals.getInstance().mGrenadePairings[index]);
                         grenadePairing.put(JSON_PAIRED_GRENADE_ID, index);
@@ -846,12 +951,12 @@ public class TcpServer extends Service {
                 if (getSemaphore)
                     Globals.getInstance().mGrenadePairingsSemaphore.release();
                 getSemaphore = false; // don't release the semaphore in the exception clause if we fail after this point
-                if (has_data) {
-                    JSONObject data = new JSONObject();
-                    data.put(JSON_GRENADE_PAIRINGS, grenadePairings);
-                    String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + data.toString();
-                    sendTCPMessageAll(message);
-                }
+                // Send empty updates too.  Otherwise a client can keep a pairing from a
+                // previous round after the server has cleared it.
+                JSONObject data = new JSONObject();
+                data.put(JSON_GRENADE_PAIRINGS, grenadePairings);
+                String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + data.toString();
+                sendTCPMessageAll(message);
             } catch (JSONException e) {
                 if (getSemaphore)
                     Globals.getInstance().mGrenadePairingsSemaphore.release();
@@ -868,17 +973,35 @@ public class TcpServer extends Service {
                 return;
             }
             if (player.has(JSON_PAIRED_GRENADE_ID)) {
-                Globals.getmGrenadePairingsSemaphore();
+                final int grenadeID;
+                final int playerID;
                 try {
-                    Globals.getInstance().mGrenadePairings[player.getInt(JSON_PAIRED_GRENADE_ID)] = player.getInt(JSON_PLAYERID);
+                    grenadeID = player.getInt(JSON_PAIRED_GRENADE_ID);
+                    playerID = player.getInt(JSON_PLAYERID);
                 } catch (JSONException e) {
                     e.printStackTrace();
+                    return;
                 }
-                sendGrenadePairings(false);
-                Globals.getInstance().mGrenadePairingsSemaphore.release();
+                if (!Globals.isValidGrenadeID(grenadeID)
+                        || client.mPlayerID <= 0
+                        || playerID != client.mPlayerID) {
+                    Log.w(TAG, "Ignoring invalid grenade pairing ID " + grenadeID);
+                    return;
+                }
+                Globals.getmGrenadePairingsSemaphore();
+                try {
+                    Globals.getInstance().mGrenadePairings[grenadeID] = playerID;
+                    sendGrenadePairings(false);
+                } finally {
+                    Globals.getInstance().mGrenadePairingsSemaphore.release();
+                }
                 return;
             }
             if (player.has(JSON_GPSLONGITUDE)) {
+                if (client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)) {
+                    Log.w(TAG, "Ignoring GPS data from an unregistered client");
+                    return;
+                }
                 Globals.getmGPSDataSemaphore();
                 Globals.GPSData gps = Globals.getInstance().mGPSData.get(client.mPlayerID);
                 double longitude, latitude;
@@ -887,6 +1010,11 @@ public class TcpServer extends Service {
                     latitude = player.getDouble(JSON_GPSLATITUDE);
                 } catch (JSONException e) {
                     e.printStackTrace();
+                    Globals.getInstance().mGPSDataSemaphore.release();
+                    return;
+                }
+                if (!Globals.isValidCoordinates(longitude, latitude)) {
+                    Log.w(TAG, "Ignoring GPS data with invalid coordinates from " + client.mPlayerID);
                     Globals.getInstance().mGPSDataSemaphore.release();
                     return;
                 }
@@ -902,55 +1030,74 @@ public class TcpServer extends Service {
                 return;
             }
             if (player.has(JSON_PLAYERSETTINGS)) {
-                if (!Globals.getInstance().mAllowPlayerSettings) {
+                if (!Globals.getInstance().mAllowPlayerSettings || Globals.getInstance().mOnlyServerSettings
+                        || client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)) {
                     Log.e(TAG, "Player " + client.mPlayerID + "not allowed to send player settings");
-                    sendPlayerSettings((byte)SEND_ALL, false, true);
+                    sendPlayerSettings(SEND_ALL, false, Globals.getInstance().mAllowPlayerSettings);
                     return;
                 }
-                Globals.getmPlayerSettingsSemaphore();
-                Globals.PlayerSettings settings = Globals.getInstance().mPlayerSettings.get(client.mPlayerID);
-                if (settings == null) {
-                    settings = new Globals.PlayerSettings();
-                    Globals.getInstance().mPlayerSettings.put(client.mPlayerID, settings);
-                }
                 try {
-                    settings.health = player.getInt(JSON_HEALTH);
-                    settings.shots = (byte)player.getInt(JSON_RELOAD_SHOTS);
-                    settings.reloadTime = player.getLong(JSON_RELOAD_TIME);
-                    settings.reloadOnEmpty = player.getBoolean(JSON_RELOAD_ON_EMPTY);
-                    settings.spawnTime = player.getLong(JSON_SPAWN_TIME);
-                    settings.damage = player.getInt(JSON_DAMAGE);
-                    if (player.has(JSON_LIVESLIMIT)) {
-                        settings.overrideLives = true;
-                        settings.lives = player.getInt(JSON_LIVESLIMIT);
-                    } else {
-                        settings.overrideLives = false;
-                        settings.lives = 0;
+                    int playerID = player.getInt(JSON_PLAYERID);
+                    int health = player.getInt(JSON_HEALTH);
+                    int reloadShots = player.getInt(JSON_RELOAD_SHOTS);
+                    long reloadTime = player.getLong(JSON_RELOAD_TIME);
+                    boolean reloadOnEmpty = player.getBoolean(JSON_RELOAD_ON_EMPTY);
+                    long spawnTime = player.getLong(JSON_SPAWN_TIME);
+                    int damage = player.getInt(JSON_DAMAGE);
+                    boolean overrideLives = player.has(JSON_LIVESLIMIT);
+                    int lives = overrideLives ? player.getInt(JSON_LIVESLIMIT) : 0;
+                    boolean allowAuto = player.getBoolean(JSON_SHOT_MODE_AUTO);
+                    boolean allowBurst = player.getBoolean(JSON_SHOT_MODE_BURST3);
+                    boolean allowSingle = player.getBoolean(JSON_SHOT_MODE_SINGLE);
+                    int firingMode = player.getInt(JSON_FIRING_MODE);
+                    if (playerID != client.mPlayerID || !Globals.isValidPlayerSettings(health, reloadShots,
+                            reloadTime, spawnTime, damage, lives, allowSingle, allowBurst, allowAuto, firingMode)) {
+                        Log.w(TAG, "Ignoring invalid player settings from " + client.mPlayerID);
+                        sendPlayerSettings(SEND_ALL, false, Globals.getInstance().mAllowPlayerSettings);
+                        return;
                     }
-                    settings.allowShotModeAuto = player.getBoolean(JSON_SHOT_MODE_AUTO);
-                    settings.allowShotModeBurst3 = player.getBoolean(JSON_SHOT_MODE_BURST3);
-                    settings.allowShotModeSingle = player.getBoolean(JSON_SHOT_MODE_SINGLE);
-                    settings.firingMode = player.getInt(JSON_FIRING_MODE);
-                    //TODO preset checks
-                   // settings.playerPreset = player.getInt(JSON_PLAYER_PRESET);
-                 //   settings.weaponPreset = player.getInt(JSON_WEAPON_PRESET);
-
+                    Globals.getmPlayerSettingsSemaphore();
+                    try {
+                        Globals.PlayerSettings settings = Globals.getInstance().mPlayerSettings.get(client.mPlayerID);
+                        if (settings == null) {
+                            settings = new Globals.PlayerSettings();
+                            Globals.getInstance().mPlayerSettings.put(client.mPlayerID, settings);
+                        }
+                        settings.health = health;
+                        settings.shots = (byte) reloadShots;
+                        settings.reloadTime = reloadTime;
+                        settings.reloadOnEmpty = reloadOnEmpty;
+                        settings.spawnTime = spawnTime;
+                        settings.damage = damage;
+                        settings.overrideLives = overrideLives;
+                        settings.lives = lives;
+                        settings.allowShotModeAuto = allowAuto;
+                        settings.allowShotModeBurst3 = allowBurst;
+                        settings.allowShotModeSingle = allowSingle;
+                        settings.firingMode = firingMode;
+                    } finally {
+                        Globals.getInstance().mPlayerSettingsSemaphore.release();
+                    }
                 } catch (JSONException e) {
-                    e.printStackTrace();
+                    Log.w(TAG, "Ignoring malformed player settings from " + client.mPlayerID, e);
+                    return;
                 }
-                Globals.getInstance().mPlayerSettingsSemaphore.release();
-                sendPlayerSettings((byte)SEND_ALL, false, true);
+                sendPlayerSettings(SEND_ALL, false, Globals.getInstance().mAllowPlayerSettings);
                 sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                 return;
             }
             if (player.has(JSON_PLAYERNAMECHANGE)) {
-                byte id;
+                int id;
                 String playerName;
                 try {
-                    id = (byte) player.getInt(JSON_PLAYERID);
+                    id = player.getInt(JSON_PLAYERID);
                     playerName = player.getString(JSON_PLAYERNAMECHANGE);
                 } catch (JSONException e) {
                     e.printStackTrace();
+                    return;
+                }
+                if (client.mPlayerID <= 0 || id != client.mPlayerID) {
+                    Log.w(TAG, "Ignoring player-name change with an invalid player ID");
                     return;
                 }
                 Globals.getmTeamPlayerNameSemaphore();
@@ -967,7 +1114,12 @@ public class TcpServer extends Service {
             String playerName;
             try {
                 rejoin = player.has(JSON_REJOIN);
-                id = (byte) player.getInt(JSON_PLAYERID);
+                int rawPlayerID = player.getInt(JSON_PLAYERID);
+                if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0) {
+                    Log.w(TAG, "Ignoring client with invalid player ID " + rawPlayerID);
+                    return;
+                }
+                id = (byte) rawPlayerID;
                 playerName = player.getString(JSON_PLAYERNAME);
             } catch (JSONException e) {
                 e.printStackTrace();
@@ -979,6 +1131,10 @@ public class TcpServer extends Service {
                         Log.d(TAG, "rejoining " + client.clientID + " to " + entry.getValue().clientID);
                         entry.getValue().rejoin(client.clientSocket);
                         mClientData.remove(client.clientID);
+                        updatePlayerEndpoint(id, client.clientSocket.getInetAddress());
+                        updatePlayerName(id, playerName);
+                        sendAllGameInfo(id);
+                        sendGrenadePairings(true);
                         sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                         return;
                     } else {
@@ -999,17 +1155,12 @@ public class TcpServer extends Service {
             Log.e(TAG, "network team is " + client.mNetworkTeam);
             InetAddress inetAddress = client.clientSocket.getInetAddress();
             Log.d(TAG, "client " + client.clientID + " player '" + playerName + "' (" + client.mPlayerID + ") found at " + inetAddress.toString());
-            Globals.getmTeamIPMapSemaphore();
-            Globals.getInstance().mTeamIPMap.put(client.mPlayerID, inetAddress);
-            Globals.getInstance().mTeamIPMapSemaphore.release();
-            Globals.getmIPTeamMapSemaphore();
-            Globals.getInstance().mIPTeamMap.put(inetAddress, client.mPlayerID);
-            Globals.getInstance().mIPTeamMapSemaphore.release();
-            Globals.getmTeamPlayerNameSemaphore();
-            Globals.getInstance().mTeamPlayerNameMap.put(client.mPlayerID, playerName);
-            Globals.getInstance().mTeamPlayerNameSemaphore.release();
+            updatePlayerEndpoint(client.mPlayerID, inetAddress);
+            updatePlayerName(client.mPlayerID, playerName);
 
             sendAllGameInfo(id);
+            // Synchronize a joining client even when no grenade is currently paired.
+            sendGrenadePairings(true);
             sendBroadcast(new Intent(NetMsg.NETMSG_JOIN));
         }
 
@@ -1058,5 +1209,5 @@ public class TcpServer extends Service {
         }
     }
 
-    public void setDedicated() { mIsDedicated = true; }
+    public void setDedicated(boolean dedicated) { mIsDedicated = dedicated; }
 }
