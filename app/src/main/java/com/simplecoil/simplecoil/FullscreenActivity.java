@@ -388,6 +388,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private TcpClient mTcpClient = null;
     private ServiceConnection mTcpClientServiceConnection = null;
     private boolean mTcpClientServiceBound = false;
+    private boolean mNetworkReceiverRegistered = false;
 
     private TcpServer mTcpServer = null;
     private ServiceConnection mTcpServerServiceConnection = null;
@@ -400,6 +401,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
                 mTcpClient = ((TcpClient.LocalBinder) service).getService();
+                consumePendingServerEvent();
             }
 
             @Override
@@ -412,6 +414,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mTcpClientServiceBound = bindService(serviceIntent, mTcpClientServiceConnection, BIND_AUTO_CREATE);
         if (!mTcpClientServiceBound)
             mTcpClientServiceConnection = null;
+    }
+
+    private void consumePendingServerEvent() {
+        if (!mNetworkReceiverRegistered || mTcpClient == null)
+            return;
+        Intent event = mTcpClient.consumePendingTerminalEvent();
+        if (event != null)
+            mUDPUpdateReceiver.onReceive(this, event);
     }
 
     private void setupTcpServerServiceConnection() {
@@ -1691,14 +1701,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
         registerReceiver(mBluetoothReceiver, filter);
         ContextCompat.registerReceiver(this, mUDPUpdateReceiver, makeUDPUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
+        mNetworkReceiverRegistered = true;
         setupUDPServiceConnection();
         setupTcpClientServiceConnection();
         setupTcpServerServiceConnection();
+        consumePendingServerEvent();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        mNetworkReceiverRegistered = false;
         unregisterReceiver(mGattUpdateReceiver);
         unregisterReceiver(mBluetoothReceiver);
         unregisterReceiver(mUDPUpdateReceiver);
@@ -2669,7 +2682,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private final BroadcastReceiver mUDPUpdateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (intent.hasExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID)) {
+                long eventId = intent.getLongExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID, 0);
+                if (mTcpClient == null || eventId <= 0)
+                    return;
+                intent = mTcpClient.consumePendingTerminalEvent(eventId);
+                if (intent == null)
+                    return; // Already handled, or belongs to an earlier session/service.
+            }
             final String action = intent.getAction();
+            if (!mUseNetwork && (NetMsg.NETMSG_ENDGAME.equals(action)
+                    || NetMsg.NETMSG_SERVERCANCEL.equals(action) || NetMsg.NETMSG_VERSIONERROR.equals(action)))
+                return;
             boolean gameplayEvent = NetMsg.NETMSG_SHOTFIRED.equals(action)
                     || NetMsg.NETMSG_HIT.equals(action) || NetMsg.NETMSG_OUT.equals(action)
                     || NetMsg.NETMSG_ELIMINATED.equals(action) || NetMsg.NETMSG_TEAMELIMINATED.equals(action);
@@ -2774,19 +2798,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         }
                     }
                 }
-                if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_SCORE) != 0 && mScore >= Globals.getInstance().mScoreLimit) {
-                    if (isDedicatedServerConnection())
-                        mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME);
-                    else {
-                        endUDPGame();
-                        endGame();
-                    }
-                }
+                checkPeerScoreLimit();
             } else if (NetMsg.NETMSG_TEAMELIMINATED.equals(action)) {
+                if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA)
+                    return;
                 // Increase team score in team games
                 mTeamScore++;
                 String score = "" + mTeamScore;
                 mTeamScoreTV.setText(score);
+                checkPeerScoreLimit();
             } else if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)) {
                 mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount()));
                 mNetworkPlayerCountTV.setVisibility(View.VISIBLE);
@@ -2890,6 +2910,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             } else if (NetMsg.NETMSG_ENDGAME.equals(action)) {
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                     endGame();
+                else if (mReady) {
+                    mReady = false;
+                    setReady(false);
+                }
             } else if (NetMsg.NETMSG_ERROR.equals(action)) {
                 String errorMessage = intent.getStringExtra(UDPListenerService.INTENT_MESSAGE);
                 if (errorMessage != null && !errorMessage.isEmpty()) {
@@ -2899,8 +2923,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 }
             } else if (NetMsg.NETMSG_VERSIONERROR.equals(action)) {
                 Toast.makeText(getApplicationContext(), getString(R.string.error_udp_version), Toast.LENGTH_SHORT).show();
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                    endGame();
                 mReady = false;
-                setReady();
+                setReady(false);
             } else if (NetMsg.NETMSG_SAMETEAM.equals(action)) {
                 Toast.makeText(getApplicationContext(), getString(R.string.error_same_id), Toast.LENGTH_SHORT).show();
                 mReady = false;
@@ -2941,6 +2967,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
         }
     };
+
+    private void checkPeerScoreLimit() {
+        Globals globals = Globals.getInstance();
+        // Dedicated games use the server's authoritative totals. Sending ENDGAME
+        // here can be interpreted as LEAVE when server-only settings are enabled.
+        if (isDedicatedServerConnection() || (globals.mGameLimit & Globals.GAME_LIMIT_SCORE) == 0
+                || globals.mScoreLimit <= 0)
+            return;
+        int winningScore = globals.mGameMode == Globals.GAME_MODE_FFA ? mScore : mTeamScore;
+        if (winningScore >= globals.mScoreLimit) {
+            endUDPGame();
+            endGame();
+        }
+    }
 
     private static IntentFilter makeUDPUpdateIntentFilter() {
         final IntentFilter intentFilter = new IntentFilter();

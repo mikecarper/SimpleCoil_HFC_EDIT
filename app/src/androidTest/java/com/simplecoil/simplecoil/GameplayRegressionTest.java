@@ -410,6 +410,183 @@ public class GameplayRegressionTest {
         });
     }
 
+    @Test
+    public void ownKillReachingCombinedTeamLimitEndsPeerGame() {
+        scenario.onActivity(activity -> {
+            prepareScoreLimit(activity, Globals.GAME_MODE_2TEAMS);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertEquals(2, get(activity, "mScore"));
+            assertEquals(5, get(activity, "mTeamScore"));
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertEquals(1, udp.endRequests);
+        });
+    }
+
+    @Test
+    public void teammateKillReachingLimitEndsFourTeamPeerGame() {
+        scenario.onActivity(activity -> {
+            prepareScoreLimit(activity, Globals.GAME_MODE_4TEAMS);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+            assertEquals(1, get(activity, "mScore"));
+            assertEquals(5, get(activity, "mTeamScore"));
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertEquals(1, udp.endRequests);
+        });
+    }
+
+    @Test
+    public void freeForAllIgnoresTeamScoreNotifications() {
+        scenario.onActivity(activity -> {
+            prepareScoreLimit(activity, Globals.GAME_MODE_FFA);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+            assertEquals(4, get(activity, "mTeamScore"));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+    }
+
+    @Test
+    public void dedicatedScoreLimitDoesNotSendAnEndOrLeaveRequest() {
+        scenario.onActivity(activity -> {
+            prepareScoreLimit(activity, Globals.GAME_MODE_FFA);
+            tcp.dedicated = true;
+            Globals.getInstance().mOnlyServerSettings = true;
+            set(activity, "mScore", 4);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertTrue(tcp.messages.isEmpty());
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+    }
+
+    @Test
+    public void disabledOrInvalidScoreLimitDoesNotEndRound() {
+        scenario.onActivity(activity -> {
+            prepareScoreLimit(activity, Globals.GAME_MODE_FFA);
+            Globals.getInstance().mScoreLimit = 0;
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            Globals.getInstance().mScoreLimit = 1;
+            Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(0, udp.endRequests);
+        });
+    }
+
+    @Test
+    public void individualLimitStillEndsFreeForAllPeerGame() {
+        scenario.onActivity(activity -> {
+            prepareScoreLimit(activity, Globals.GAME_MODE_FFA);
+            set(activity, "mScore", 4);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertEquals(1, udp.endRequests);
+        });
+    }
+
+    @Test
+    public void roundEndReceivedWhilePausedIsAppliedOnResume() {
+        receiveWhilePaused(NetMsg.NETMSG_ENDGAME);
+        scenario.onActivity(activity -> assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState));
+    }
+
+    @Test
+    public void serverCancellationReceivedWhilePausedIsAppliedOnResume() {
+        receiveWhilePaused(NetMsg.NETMSG_SERVERCANCEL);
+        scenario.onActivity(activity -> assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState));
+    }
+
+    @Test
+    public void versionRejectionReceivedWhilePausedClearsLobbyReadiness() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mReady", true);
+        });
+        receiveWhilePaused(NetMsg.NETMSG_VERSIONERROR);
+        scenario.onActivity(activity -> assertEquals(false, get(activity, "mReady")));
+    }
+
+    @Test
+    public void duplicateTerminalNotificationCannotEndAnotherRound() {
+        scenario.onActivity(activity -> {
+            finishTcpSession(NetMsg.NETMSG_ENDGAME);
+            Intent notification = tcp.broadcasts.get(tcp.broadcasts.size() - 1);
+            receiveNetwork(activity, notification);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            receiveNetwork(activity, notification);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+    }
+
+    @Test
+    public void lateNetworkEndCannotStopAnOfflineRound() {
+        scenario.onActivity(activity -> {
+            set(activity, "mUseNetwork", false);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_SERVERCANCEL));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_VERSIONERROR));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+    }
+
+    @Test
+    public void roundEndClearsReadinessEvenBeforeThePlayerHasSpawned() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mReady", true);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME));
+            assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
+    public void versionRejectionAlsoStopsAnActiveRound() {
+        scenario.onActivity(activity -> {
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_VERSIONERROR));
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    private void prepareScoreLimit(FullscreenActivity activity, int mode) {
+        Globals globals = Globals.getInstance();
+        globals.mGameMode = mode;
+        globals.mGameLimit = Globals.GAME_LIMIT_SCORE;
+        globals.mScoreLimit = 5;
+        set(activity, "mScore", 1);
+        set(activity, "mTeamScore", 4);
+    }
+
+    private void finishTcpSession(String action) {
+        try {
+            Method finish = TcpClient.class.getDeclaredMethod("finishServerSession", String.class);
+            finish.setAccessible(true);
+            finish.invoke(tcp, action);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private void receiveWhilePaused(String action) {
+        // Exercise the actual registration/lifecycle callbacks on the main thread.
+        // ActivityScenario's helper activity cannot reliably restore this API-22
+        // device's foreground task after moveToState(STARTED).
+        scenario.onActivity(activity -> {
+            boolean wasRegistered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            if (wasRegistered)
+                activity.onPause();
+            try {
+                finishTcpSession(action);
+            } finally {
+                activity.onResume();
+                // The device may already have backgrounded the scenario. Restore
+                // its original receiver state after exercising the resume callback.
+                if (!wasRegistered)
+                    activity.onPause();
+            }
+        });
+    }
+
     private void prepareDedicatedJoin(FullscreenActivity activity) {
         tcp.dedicated = true;
         set(activity, "mReady", true);
@@ -608,6 +785,10 @@ public class GameplayRegressionTest {
     private static final class RecordingTcpClient extends TcpClient {
         boolean dedicated;
         final List<String> messages = new ArrayList<>();
+        final List<Intent> broadcasts = new ArrayList<>();
+
+        @Override
+        public void sendBroadcast(Intent intent) { broadcasts.add(intent); }
 
         @Override
         public boolean isDedicatedServer() {
@@ -627,6 +808,10 @@ public class GameplayRegressionTest {
 
     private static final class RecordingUDPService extends UDPListenerService {
         final List<String> messages = new ArrayList<>();
+        int endRequests;
+
+        @Override
+        public void endGame() { endRequests++; }
 
         @Override
         public void sendUDPMessage(String message, Byte playerID) {

@@ -33,6 +33,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -108,20 +109,24 @@ public class TcpServer extends Service {
    // public static final String JSON_PLAYER_PRESET = "playerpreset";
   //  public static final String JSON_WEAPON_PRESET = "Weaponpreset";
 
-    private static volatile boolean keepListening = false;
+    private volatile boolean keepListening = false;
     private final Object mServerStateLock = new Object();
+    private boolean mDestroyed;
+    private ServerSocket mListenSocket;
     private volatile Thread mServerThread = null;
     private volatile Thread mClientThread = null;
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
     private volatile Map<Integer, ClientData> mClientData = null;
+    // Explicitly leaving must not reset a player's score or spent lives in this round.
+    private final Map<Byte, ScoreData> mDepartedScores = new ConcurrentHashMap<>();
     private volatile boolean mIsDedicated = false;
-    private static volatile boolean mGPSRunning = false;
+    private boolean mGPSRunning = false;
 
     Handler mGPSHandler = new Handler();
     Runnable mGPSRunnable = null;
     private static final long GPS_UPDATE_INTERVAL = 1000;
     private static final int SEND_ALL_GPS_INTERVAL = 20; // We will send all GPS data regardless of whether there was a GPS change every xx intervals
-    private static volatile int mGPSIntervalCount = 0;
+    private volatile int mGPSIntervalCount = 0;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -131,6 +136,24 @@ public class TcpServer extends Service {
     @Override
     public boolean onUnbind(Intent intent) {
         return super.onUnbind(intent);
+    }
+
+    @Override
+    public void onDestroy() {
+        synchronized (mServerStateLock) {
+            mDestroyed = true;
+        }
+        stopTcpServer();
+        Thread clients = mClientThread;
+        if (clients != null)
+            clients.interrupt();
+        // Close sockets without waiting for a writer's ClientData monitor. A
+        // stalled peer must not keep service destruction blocked on the UI thread.
+        if (mClientData != null) {
+            for (ClientData client : mClientData.values())
+                closeSocket(client.clientSocket);
+        }
+        super.onDestroy();
     }
 
     public class LocalBinder extends Binder {
@@ -205,7 +228,7 @@ public class TcpServer extends Service {
             int team = -1;
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
                 if (entry.getValue().mPlayerID == playerID) {
-                    team = entry.getValue().mNetworkTeam;
+                    team = entry.getValue().getNetworkTeam();
                     if (includePlayer)
                         entry.getValue().sendTCPMessage(message, queueMessage);
                     break;
@@ -214,7 +237,7 @@ public class TcpServer extends Service {
             if (team != -1) {
                 Log.e(TAG, "team is " + team);
                 for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
-                    if (entry.getValue().mNetworkTeam == team && entry.getValue().mPlayerID != playerID)
+                    if (entry.getValue().getNetworkTeam() == team && entry.getValue().mPlayerID != playerID)
                         entry.getValue().sendTCPMessage(message, queueMessage);
                 }
             }
@@ -262,6 +285,7 @@ public class TcpServer extends Service {
                         entry.getValue().close();
                     }
                     mClientData.clear();
+                    mDepartedScores.clear();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     Log.w(TAG, "Interrupted while ending game", e);
@@ -407,8 +431,9 @@ public class TcpServer extends Service {
                     int teamPoints = 0;
                     int team = Globals.getInstance().calcNetworkTeam((byte)id);
                     for (byte x = 0; x <= Globals.MAX_PLAYER_ID; x++) {
-                        if (Globals.getInstance().calcNetworkTeam(x) == team && getScore(x) != null)
-                            teamPoints += getScore(x).points;
+                        ScoreData teamMemberScore = getScore(x);
+                        if (Globals.getInstance().calcNetworkTeam(x) == team && teamMemberScore != null)
+                            teamPoints += teamMemberScore.points;
                     }
                     playerGameUpdate.put(JSON_TEAMPOINTS, teamPoints);
                 }
@@ -440,60 +465,82 @@ public class TcpServer extends Service {
     }
 
     public void sendGPSData() {
-        if (mGPSRunning) return;
-        mGPSRunning = true;
-        mGPSIntervalCount = 0;
-        mGPSHandler.postDelayed(new Runnable() {
-            public void run() {
-                mGPSRunnable = this;
-                boolean hasSemaphore = false;
-                try {
-                    Globals.getmGPSDataSemaphore();
-                    hasSemaphore = true;
-                    if (Globals.getInstance().mGPSData != null && Globals.getInstance().mGPSData.size() != 0) {
-                        JSONArray players = new JSONArray();
-                        boolean hasUpdate = false;
-                        for (Map.Entry<Byte, Globals.GPSData> entry : Globals.getInstance().mGPSData.entrySet()) {
-                            if (entry.getValue().hasUpdate || mGPSIntervalCount >= SEND_ALL_GPS_INTERVAL) {
-                                JSONObject player = new JSONObject();
-                                player.put(JSON_PLAYERID, entry.getKey());
-                                player.put(JSON_TEAM, entry.getValue().team);
-                                player.put(JSON_GPSLONGITUDE, entry.getValue().longitude);
-                                player.put(JSON_GPSLATITUDE, entry.getValue().latitude);
-                                players.put(player);
-                                hasUpdate = true;
-                            }
-                            entry.getValue().hasUpdate = false;
+        synchronized (mServerStateLock) {
+            if (mGPSRunning || mDestroyed || !keepListening || !Globals.getInstance().mUseGPS)
+                return;
+            mGPSRunning = true;
+            mGPSIntervalCount = 0;
+            // Save the callback before posting, so even its first run can be cancelled.
+            mGPSRunnable = new Runnable() {
+                public void run() {
+                    synchronized (mServerStateLock) {
+                        if (mGPSRunnable != this)
+                            return;
+                        if (mDestroyed || !keepListening || !Globals.getInstance().mUseGPS) {
+                            stopGPSDataLocked();
+                            return;
                         }
-                        Globals.getInstance().mGPSDataSemaphore.release();
-                        hasSemaphore = false;
-                        if (hasUpdate) {
-                            JSONObject game = new JSONObject();
-                            game.put(JSON_GPSUPDATE, players);
-                            if (mGPSIntervalCount >= SEND_ALL_GPS_INTERVAL) {
-                                game.put(JSON_GPSFULLUPDATE, true);
-                            }
-                            String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
-                            sendTCPMessageAll(message, false);
-                        }
-                        if (mGPSIntervalCount++ >= SEND_ALL_GPS_INTERVAL)
-                            mGPSIntervalCount = 0;
-                    } else {
-                        Globals.getInstance().mGPSDataSemaphore.release();
-                        hasSemaphore = false;
                     }
-                } catch (JSONException e) {
-                    e.printStackTrace();
-                    if (hasSemaphore)
-                        Globals.getInstance().mGPSDataSemaphore.release();
+                    boolean hasSemaphore = false;
+                    try {
+                        Globals.getmGPSDataSemaphore();
+                        hasSemaphore = true;
+                        if (Globals.getInstance().mGPSData != null && Globals.getInstance().mGPSData.size() != 0) {
+                            JSONArray players = new JSONArray();
+                            boolean hasUpdate = false;
+                            for (Map.Entry<Byte, Globals.GPSData> entry : Globals.getInstance().mGPSData.entrySet()) {
+                                if (entry.getValue().hasUpdate || mGPSIntervalCount >= SEND_ALL_GPS_INTERVAL) {
+                                    JSONObject player = new JSONObject();
+                                    player.put(JSON_PLAYERID, entry.getKey());
+                                    player.put(JSON_TEAM, entry.getValue().team);
+                                    player.put(JSON_GPSLONGITUDE, entry.getValue().longitude);
+                                    player.put(JSON_GPSLATITUDE, entry.getValue().latitude);
+                                    players.put(player);
+                                    hasUpdate = true;
+                                }
+                                entry.getValue().hasUpdate = false;
+                            }
+                            Globals.getInstance().mGPSDataSemaphore.release();
+                            hasSemaphore = false;
+                            if (hasUpdate) {
+                                JSONObject game = new JSONObject();
+                                game.put(JSON_GPSUPDATE, players);
+                                if (mGPSIntervalCount >= SEND_ALL_GPS_INTERVAL) {
+                                    game.put(JSON_GPSFULLUPDATE, true);
+                                }
+                                String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
+                                sendTCPMessageAll(message, false);
+                            }
+                            if (mGPSIntervalCount++ >= SEND_ALL_GPS_INTERVAL)
+                                mGPSIntervalCount = 0;
+                        } else {
+                            Globals.getInstance().mGPSDataSemaphore.release();
+                            hasSemaphore = false;
+                        }
+                    } catch (JSONException e) {
+                        e.printStackTrace();
+                        if (hasSemaphore)
+                            Globals.getInstance().mGPSDataSemaphore.release();
+                    }
+                    synchronized (mServerStateLock) {
+                        if (mGPSRunnable != this)
+                            return;
+                        if (!mDestroyed && keepListening && Globals.getInstance().mUseGPS)
+                            mGPSHandler.postDelayed(this, GPS_UPDATE_INTERVAL);
+                        else
+                            stopGPSDataLocked();
+                    }
                 }
-                if (keepListening && Globals.getInstance().mUseGPS) {
-                    mGPSHandler.postDelayed(mGPSRunnable, GPS_UPDATE_INTERVAL);
-                } else {
-                    mGPSRunning = false;
-                }
-            }
-        }, GPS_UPDATE_INTERVAL);
+            };
+            mGPSHandler.postDelayed(mGPSRunnable, GPS_UPDATE_INTERVAL);
+        }
+    }
+
+    private void stopGPSDataLocked() {
+        if (mGPSRunnable != null)
+            mGPSHandler.removeCallbacks(mGPSRunnable);
+        mGPSRunnable = null;
+        mGPSRunning = false;
     }
 
     public void sendPlayerData(int playerID) {
@@ -612,6 +659,8 @@ public class TcpServer extends Service {
 
     void startTcpServer() {
         synchronized (mServerStateLock) {
+            if (mDestroyed)
+                return;
             if ((mServerThread != null && mServerThread.isAlive())
                     || (mClientThread != null && mClientThread.isAlive())) {
                 Log.d(TAG, "Server is still starting, listening, or shutting down");
@@ -624,69 +673,94 @@ public class TcpServer extends Service {
     }
 
     private void runTcpServer() {
-        if (mClientData == null)
-            mClientData = new ConcurrentHashMap<>();
-        else
-            mClientData.clear();
-        Globals.getmGPSDataSemaphore();
-        try {
-            if (Globals.getInstance().mGPSData == null)
-                Globals.getInstance().mGPSData = new HashMap<>();
-            else
-                Globals.getInstance().mGPSData.clear();
-        } finally {
-            Globals.getInstance().mGPSDataSemaphore.release();
-        }
-        Globals.ClearGrenadePairings(true);
         ServerSocket ss = null;
+        Socket pendingSocket = null;
         int clientID = 0;
         try {
-            ss = new ServerSocket(TCP_SERVER_PORT);
+            ss = new ServerSocket();
+            synchronized (mServerStateLock) {
+                if (!keepListening || mDestroyed)
+                    return;
+                mListenSocket = ss;
+            }
+            ss.setReuseAddress(true);
+            ss.bind(new InetSocketAddress(TCP_SERVER_PORT));
             ss.setSoTimeout(1000);
-            Socket s = null;
+            // A failed bind must not erase another server's active round state.
+            mDepartedScores.clear();
+            if (mClientData == null)
+                mClientData = new ConcurrentHashMap<>();
+            else
+                mClientData.clear();
+            Globals.getmGPSDataSemaphore();
+            try {
+                if (Globals.getInstance().mGPSData == null)
+                    Globals.getInstance().mGPSData = new HashMap<>();
+                else
+                    Globals.getInstance().mGPSData.clear();
+            } finally {
+                Globals.getInstance().mGPSDataSemaphore.release();
+            }
+            if (!keepListening)
+                return;
+            Globals.ClearGrenadePairings(true);
             Log.d(TAG, "TCP Server listening");
             while (keepListening) {
                 try {
                     // Wait for new clients
-                    s = ss.accept();
-                    clientID++;
+                    pendingSocket = ss.accept();
+                    if (!keepListening)
+                        break;
                     ClientData client = new ClientData();
-                    client.initialize(s, clientID);
-                    try {
-                        mClientDataSemaphore.acquire();
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
+                    if (!client.initialize(pendingSocket, clientID + 1)) {
+                        pendingSocket = null;
+                        continue;
                     }
-                    mClientData.put(clientID, client);
-                    mClientDataSemaphore.release();
-                    if (clientID <= 1) {
-                        mClientThread = new Thread(new ClientThread(), "SimpleCoil TCP clients");
-                        mClientThread.start();
+                    mClientDataSemaphore.acquire();
+                    try {
+                        synchronized (mServerStateLock) {
+                            if (!keepListening || mDestroyed) {
+                                client.close();
+                                break;
+                            }
+                            clientID++;
+                            mClientData.put(clientID, client);
+                            pendingSocket = null;
+                            if (clientID == 1) {
+                                mClientThread = new Thread(new ClientThread(), "SimpleCoil TCP clients");
+                                mClientThread.start();
+                            }
+                        }
+                    } finally {
+                        mClientDataSemaphore.release();
                     }
                 } catch (SocketTimeoutException e) {
                     // do nothing
                 }
             }
-            if (s != null)
-                s.close();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } catch (IOException e) {
-            //if timeout occurs
-            e.printStackTrace();
+            if (keepListening)
+                Log.e(TAG, "TCP listener failed", e);
+        } catch (RuntimeException e) {
+            // Globals' interruptible lock helpers throw when startup is cancelled.
+            // Never let service shutdown become an uncaught background exception.
+            if (keepListening)
+                Log.e(TAG, "TCP server startup failed", e);
         } finally {
-            if (ss != null) {
-                try {
-                    ss.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
+            closeSocket(pendingSocket);
+            closeListener(ss);
+            synchronized (mServerStateLock) {
+                if (mListenSocket == ss)
+                    mListenSocket = null;
+                if (Thread.currentThread() == mServerThread) {
+                    keepListening = false;
+                    stopGPSDataLocked();
+                    mServerThread = null;
                 }
             }
-        }
-        Log.d(TAG, "TCP Server done");
-        synchronized (mServerStateLock) {
-            if (Thread.currentThread() == mServerThread) {
-                keepListening = false;
-                mServerThread = null;
-            }
+            Log.d(TAG, "TCP Server done");
         }
     }
 
@@ -714,16 +788,41 @@ public class TcpServer extends Service {
 
     public ScoreData getScore(byte playerID) {
         int clientID = clientIDFromPlayerID(playerID);
-        if (clientID < 0)
-            return null;
-        ClientData client = mClientData.get(clientID);
-        if (client == null)
-            return null;
+        ClientData client = clientID < 0 ? null : mClientData.get(clientID);
         ScoreData scoreData = new ScoreData();
-        scoreData.points = client.points;
-        scoreData.eliminated = client.eliminated;
-        scoreData.isConnected = client.out != null;
+        if (client != null) {
+            synchronized (client) {
+                scoreData.points = client.points;
+                scoreData.eliminated = client.eliminated;
+                scoreData.isConnected = client.out != null;
+            }
+        } else {
+            ScoreData departed = mDepartedScores.get(playerID);
+            if (departed == null)
+                return null;
+            scoreData.points = departed.points;
+            scoreData.eliminated = departed.eliminated;
+        }
         return scoreData;
+    }
+
+    private boolean hasReachedScoreLimit(ClientData scoringPlayer) {
+        Globals globals = Globals.getInstance();
+        if (!mIsDedicated || (globals.mGameLimit & Globals.GAME_LIMIT_SCORE) == 0 || globals.mScoreLimit <= 0)
+            return false;
+        long score = scoringPlayer.points;
+        if (globals.mGameMode != Globals.GAME_MODE_FFA) {
+            score = 0;
+            int team = scoringPlayer.getNetworkTeam();
+            for (byte id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+                if (globals.calcNetworkTeam(id) == team) {
+                    ScoreData playerScore = getScore(id);
+                    if (playerScore != null)
+                        score += playerScore.points;
+                }
+            }
+        }
+        return score >= globals.mScoreLimit;
     }
 
     public class ScoreData {
@@ -733,23 +832,30 @@ public class TcpServer extends Service {
     }
 
     private class ClientData {
-        private Socket clientSocket = null;
+        private volatile Socket clientSocket = null;
         private int clientID = -1;
         private byte mPlayerID = 0;
-        private int mNetworkTeam = 0;
         private int noReadCount = 0;
         private InputStream is = null;
         private OutputStream os = null;
         private DataInputStream in = null;
+        private TcpMessageReader messageReader = new TcpMessageReader();
         private DataOutputStream out = null;
+        private volatile boolean connectionFailed;
         private Queue<String> messageQueue;
-        private int points = 0;
-        private int eliminated = 0;
+        private volatile int points = 0;
+        private volatile int eliminated = 0;
 
-        public synchronized void initialize(Socket s, int cID) {
+        private int getNetworkTeam() {
+            // The host can change the game mode after players have joined the lobby.
+            return Globals.getInstance().calcNetworkTeam(mPlayerID);
+        }
+
+        public synchronized boolean initialize(Socket s, int cID) {
             clientSocket = s;
             clientID = cID;
             noReadCount = 0;
+            messageReader = new TcpMessageReader();
             if (messageQueue == null)
                 messageQueue = new LinkedList<>();
             try {
@@ -757,26 +863,31 @@ public class TcpServer extends Service {
                 in = new DataInputStream(is);
                 os = clientSocket.getOutputStream();
                 out = new DataOutputStream(os);
+                return true;
             } catch (IOException e) {
                 e.printStackTrace();
+                close();
+                connectionFailed = true;
+                return false;
             }
         }
 
-        public synchronized void sendTCPMessage(final String message) { sendTCPMessage(message, false); }
+        public synchronized boolean sendTCPMessage(final String message) { return sendTCPMessage(message, false); }
 
-        public synchronized void sendTCPMessage(final String message, boolean queueFailed) {
+        public synchronized boolean sendTCPMessage(final String message, boolean queueFailed) {
             if (out == null) {
                 if (queueFailed) {
                     Log.e(TAG, "queuing: " + message);
                     messageQueue.add(message);
                 }
-                return;
+                return false;
             }
             try {
                 out.writeUTF(message);
                 out.flush();
                 if (!message.equals(TcpServer.TCP_SERVER_PING))
                     Log.i(TAG, "sent(" + clientID + "): " + message);
+                return true;
             } catch (IOException e) {
                 //Log.e(TAG, "IO Error:", e);
                 e.printStackTrace();
@@ -784,10 +895,16 @@ public class TcpServer extends Service {
                     Log.e(TAG, "queuing: " + message);
                     messageQueue.add(message);
                 }
+                // The failed write may have emitted only part of its frame.
+                // Keep pending events, but never append to that damaged stream.
+                close();
+                connectionFailed = true;
+                return false;
             }
         }
 
         public synchronized void close() {
+            connectionFailed = false;
             if (clientSocket == null) return;
             try { clientSocket.close(); } catch (IOException e) {/*do nothing*/}
             try { if (in != null) in.close(); } catch (IOException e) {/*do nothing*/}
@@ -803,10 +920,14 @@ public class TcpServer extends Service {
 
         public synchronized void rejoin(Socket s) {
             close();
-            initialize(s, clientID);
-            while (messageQueue.size() > 0) {
+            if (!initialize(s, clientID))
+                return;
+            while (!messageQueue.isEmpty()) {
                 Log.e(TAG, "sending queued: " + messageQueue.peek());
-                sendTCPMessage(messageQueue.peek());
+                // Only dequeue after a successful write and flush. A replacement
+                // connection can fail too; preserve the remainder for another rejoin.
+                if (!sendTCPMessage(messageQueue.peek()))
+                    break;
                 messageQueue.remove();
             }
         }
@@ -814,6 +935,25 @@ public class TcpServer extends Service {
 
     private class ClientThread implements Runnable {
         public void run() {
+            try {
+                runSession();
+            } catch (RuntimeException e) {
+                if (keepListening)
+                    Log.e(TAG, "TCP client handler failed", e);
+                stopTcpServer();
+            } finally {
+                if (mClientData != null) {
+                    for (ClientData client : mClientData.values())
+                        client.close();
+                }
+                synchronized (mServerStateLock) {
+                    if (mClientThread == Thread.currentThread())
+                        mClientThread = null;
+                }
+            }
+        }
+
+        private void runSession() {
             Log.i(TAG, "Running TCP listening server for clients");
             if (Globals.getInstance().mUseGPS) {
                 sendGPSData();
@@ -823,116 +963,140 @@ public class TcpServer extends Service {
                 try {
                     mClientDataSemaphore.acquire();
                 } catch (InterruptedException e) {
-                    e.printStackTrace();
+                    Thread.currentThread().interrupt();
+                    stopTcpServer();
+                    return;
                 }
                 long startTime = System.currentTimeMillis();
-                for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
-                    try {
-                        if (entry.getValue().in != null && entry.getValue().in.available() > 0) {
-                            entry.getValue().noReadCount = 0;
-                            String message = entry.getValue().in.readUTF();
-                            if (!message.equals(TcpClient.TCP_CLIENT_PONG)) {
-                                Log.i(TAG, "received: '" + message + "' from " + entry.getValue().clientID);
-                                if (message.startsWith(TCPMESSAGE_PREFIX)) {
-                                    if (message.startsWith(TCPPREFIX_JSON, TCPMESSAGE_PREFIX.length())) {
-                                        // Handle JSON Data
-                                        message = message.substring(TCPMESSAGE_PREFIX.length() + TCPPREFIX_JSON.length());
-                                        parsePlayerInfo(message, entry.getValue());
-                                        break;
-                                    } else if (message.startsWith(TCPPREFIX_MESG, TCPMESSAGE_PREFIX.length())) {
-                                        // Handle messages
-                                        message = message.substring(TCPMESSAGE_PREFIX.length() + TCPPREFIX_MESG.length());
-                                        if (message.equals(NetMsg.NETMSG_LEAVE)) {
-                                            removeClient(entry.getValue(), entry.getKey(), true);
-                                            if (mClientData.size() <= 1 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
-                                                endGame();
+                try {
+                    for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                        try {
+                            if (entry.getValue().connectionFailed) {
+                                // Writes happen on sender threads. Let this loop update
+                                // lobby membership (or preserve the player for rejoin)
+                                // under the same lock used for read-side disconnects.
+                                removeClient(entry.getValue(), entry.getKey(), false);
+                                break;
+                            }
+                            String message = entry.getValue().in == null ? null
+                                    : entry.getValue().messageReader.poll(entry.getValue().in);
+                            if (message != null) {
+                                entry.getValue().noReadCount = 0;
+                                if (!message.equals(TcpClient.TCP_CLIENT_PONG)) {
+                                    Log.i(TAG, "received: '" + message + "' from " + entry.getValue().clientID);
+                                    if (message.startsWith(TCPMESSAGE_PREFIX)) {
+                                        if (message.startsWith(TCPPREFIX_JSON, TCPMESSAGE_PREFIX.length())) {
+                                            // Handle JSON Data
+                                            message = message.substring(TCPMESSAGE_PREFIX.length() + TCPPREFIX_JSON.length());
+                                            parsePlayerInfo(message, entry.getValue());
                                             break;
-                                        } else if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
-                                            // A player was eliminated
-                                            message = message.substring(NetMsg.NETMSG_ELIMINATED.length());
-                                            int rawPlayerID = Integer.parseInt(message);
-                                            if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0) {
-                                                Log.w(TAG, "Ignoring elimination with invalid player ID " + rawPlayerID);
+                                        } else if (message.startsWith(TCPPREFIX_MESG, TCPMESSAGE_PREFIX.length())) {
+                                            // Handle messages
+                                            message = message.substring(TCPMESSAGE_PREFIX.length() + TCPPREFIX_MESG.length());
+                                            if (entry.getValue().mPlayerID <= 0
+                                                    || !Globals.isValidPlayerID(entry.getValue().mPlayerID)) {
+                                                // A socket is not a player until registration succeeds.
+                                                // Its departure must not end an existing players' round.
+                                                if (message.equals(NetMsg.NETMSG_LEAVE))
+                                                    removeClient(entry.getValue(), entry.getKey(), true);
+                                                Log.w(TAG, "Ignoring game control from an unregistered connection");
                                                 continue;
                                             }
-                                            byte id = (byte) rawPlayerID;
-                                            ClientData scoringPlayer = mClientData.get(clientIDFromPlayerID(id));
-                                            if (scoringPlayer == null || id == entry.getValue().mPlayerID
-                                                    || (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
-                                                    && scoringPlayer.mNetworkTeam == entry.getValue().mNetworkTeam)) {
-                                                Log.w(TAG, "Ignoring invalid elimination report from player " + entry.getValue().mPlayerID);
-                                                continue;
-                                            }
-                                            entry.getValue().eliminated++;
-                                            scoringPlayer.points++;
-                                            sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, false, true);
-                                            if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
-                                                // Send a message to all teammates about the score increase
-                                                sendTCPMessageTeam(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_TEAMELIMINATED, id, false, false, true);
-                                            }
-                                            sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
-                                        } else if (message.equals(NetMsg.NETMSG_PLAYERDATAREQUEST)) {
-                                            sendPlayerData(entry.getValue().mPlayerID);
-                                        } else if (message.equals(NetMsg.NETMSG_STARTGAME)) {
-                                            if (Globals.getInstance().mOnlyServerSettings) {
-                                                Log.w(TAG, "Ignoring game-start request from a client while server-only settings are enabled");
-                                            } else {
-                                                startGame();
-                                            }
-                                        } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
-                                            if (Globals.getInstance().mOnlyServerSettings) {
-                                                // If server settings only is enabled, then we treat this as if the client is leaving rather than ending the game
+                                            if (message.equals(NetMsg.NETMSG_LEAVE)) {
                                                 removeClient(entry.getValue(), entry.getKey(), true);
                                                 if (mClientData.size() <= 1 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                                                     endGame();
                                                 break;
+                                            } else if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
+                                                if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                                                        || entry.getValue().mPlayerID <= 0
+                                                        || !Globals.isValidPlayerID(entry.getValue().mPlayerID)) {
+                                                    Log.w(TAG, "Ignoring elimination outside an active, registered game");
+                                                    continue;
+                                                }
+                                                // A player was eliminated
+                                                message = message.substring(NetMsg.NETMSG_ELIMINATED.length());
+                                                int rawPlayerID = Integer.parseInt(message);
+                                                if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0) {
+                                                    Log.w(TAG, "Ignoring elimination with invalid player ID " + rawPlayerID);
+                                                    continue;
+                                                }
+                                                byte id = (byte) rawPlayerID;
+                                                ClientData scoringPlayer = mClientData.get(clientIDFromPlayerID(id));
+                                                if (scoringPlayer == null || id == entry.getValue().mPlayerID
+                                                        || (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
+                                                        && scoringPlayer.getNetworkTeam() == entry.getValue().getNetworkTeam())) {
+                                                    Log.w(TAG, "Ignoring invalid elimination report from player " + entry.getValue().mPlayerID);
+                                                    continue;
+                                                }
+                                                entry.getValue().eliminated++;
+                                                scoringPlayer.points++;
+                                                sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, false, true);
+                                                if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
+                                                    // Send a message to all teammates about the score increase
+                                                    sendTCPMessageTeam(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_TEAMELIMINATED, id, false, false, true);
+                                                }
+                                                sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+                                                if (hasReachedScoreLimit(scoringPlayer))
+                                                    endGame();
+                                            } else if (message.equals(NetMsg.NETMSG_PLAYERDATAREQUEST)) {
+                                                sendPlayerData(entry.getValue().mPlayerID);
+                                            } else if (message.equals(NetMsg.NETMSG_STARTGAME)) {
+                                                if (Globals.getInstance().mOnlyServerSettings
+                                                        || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+                                                    Log.w(TAG, "Ignoring disallowed or duplicate game-start request");
+                                                } else {
+                                                    startGame();
+                                                }
+                                            } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
+                                                if (Globals.getInstance().mOnlyServerSettings) {
+                                                    // If server settings only is enabled, then we treat this as if the client is leaving rather than ending the game
+                                                    removeClient(entry.getValue(), entry.getKey(), true);
+                                                    if (mClientData.size() <= 1 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                                                        endGame();
+                                                    break;
+                                                }
+                                                endGame();
                                             }
-                                            endGame();
+                                        } else {
+                                            Log.d(TAG, "unknown tcp message received");
                                         }
-                                    } else {
-                                        Log.d(TAG, "unknown tcp message received");
+                                    } else if (message.startsWith(NetMsg.MESSAGE_PREFIX)) {
+                                        entry.getValue().sendTCPMessage(NetMsg.NETMSG_VERSIONERROR);
+                                        break;
                                     }
-                                } else if (message.startsWith(NetMsg.MESSAGE_PREFIX)) {
-                                    entry.getValue().sendTCPMessage(NetMsg.NETMSG_VERSIONERROR);
+                                }
+                            } else {
+                                entry.getValue().noReadCount++;
+                                if (entry.getValue().out != null && entry.getValue().noReadCount >= 35) {
+                                    Log.d(TAG, "no reply so dropping client " + entry.getValue().clientID);
+                                    removeClient(entry.getValue(), entry.getKey(), false);
                                     break;
+                                } else if (entry.getValue().noReadCount == 10 || entry.getValue().noReadCount == 20) {
+                                    entry.getValue().sendTCPMessage(TCP_SERVER_PING);
                                 }
                             }
-                        } else {
-                            entry.getValue().noReadCount++;
-                            if (entry.getValue().out != null && entry.getValue().noReadCount >= 35) {
-                                Log.d(TAG, "no reply so dropping client " + entry.getValue().clientID);
-                                removeClient(entry.getValue(), entry.getKey(), false);
-                                break;
-                            } else if (entry.getValue().noReadCount == 10 || entry.getValue().noReadCount == 20) {
-                                entry.getValue().sendTCPMessage(TCP_SERVER_PING);
-                            }
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                            removeClient(entry.getValue(), entry.getKey(), false);
+                            break;
+                        } catch (RuntimeException e) {
+                            if (Thread.currentThread().isInterrupted())
+                                throw e;
+                            Log.e(TAG, "Invalid TCP data from client " + entry.getValue().clientID, e);
+                            removeClient(entry.getValue(), entry.getKey(), false);
+                            break;
                         }
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                        removeClient(entry.getValue(), entry.getKey(), false);
-                        break;
-                    } catch (RuntimeException e) {
-                        Log.e(TAG, "Invalid TCP data from client " + entry.getValue().clientID, e);
-                        removeClient(entry.getValue(), entry.getKey(), false);
-                        break;
                     }
+                } finally {
+                    mClientDataSemaphore.release();
                 }
-                mClientDataSemaphore.release();
                 long sleepTime = TCP_READ_WAIT_MS - (System.currentTimeMillis() - startTime);
                 if (mIsDedicated)
                     sleepTime = TCP_DEDICATED_READ_WAIT_MS - (System.currentTimeMillis() - startTime);
                 //Log.d(TAG, "Took " + (System.currentTimeMillis() - startTime) + "ms to service " + mClientData.size() + " clients");
                 sleep(sleepTime);
             }
-            try {
-                mClientDataSemaphore.acquire();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-            for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
-                entry.getValue().close();
-            }
-            mClientDataSemaphore.release();
         }
 
         private void sendGrenadePairings(boolean getSemaphore) {
@@ -1024,7 +1188,7 @@ public class TcpServer extends Service {
                 }
                 gps.longitude = longitude;
                 gps.latitude = latitude;
-                gps.team = client.mNetworkTeam;
+                gps.team = client.getNetworkTeam();
                 gps.hasUpdate = true; // Client takes care of making sure that it is only sending us changes in coordinates
                 Globals.getInstance().mGPSDataSemaphore.release();
                 return;
@@ -1125,34 +1289,33 @@ public class TcpServer extends Service {
                 e.printStackTrace();
                 return;
             }
+            if (client.clientSocket == null)
+                return;
+            if (client.mPlayerID != 0 && client.mPlayerID != id) {
+                Log.w(TAG, "Ignoring an attempt to change a registered connection's player ID");
+                return;
+            }
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
-                if (entry.getValue().mPlayerID == id) {
-                    if (rejoin) {
-                        Log.d(TAG, "rejoining " + client.clientID + " to " + entry.getValue().clientID);
-                        entry.getValue().rejoin(client.clientSocket);
-                        mClientData.remove(client.clientID);
-                        updatePlayerEndpoint(id, client.clientSocket.getInetAddress());
-                        updatePlayerName(id, playerName);
-                        sendAllGameInfo(id);
-                        sendGrenadePairings(true);
-                        sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
-                        return;
-                    } else {
-                        Log.d(TAG, "new client " + client.clientID + " replacing old client " + entry.getValue().clientID);
-                        entry.getValue().rejoin(client.clientSocket);
-                        mClientData.remove(client.clientID);
-                        break;
-                    }
+                if (entry.getValue() != client && entry.getValue().mPlayerID == id) {
+                    Log.d(TAG, "rejoining " + client.clientID + " to " + entry.getValue().clientID);
+                    entry.getValue().rejoin(client.clientSocket);
+                    mClientData.remove(client.clientID);
+                    client = entry.getValue();
+                    break;
                 }
             }
-            if (rejoin)
+            if (client.clientSocket == null)
+                return; // A replacement socket can fail while its streams are opened.
+            boolean newRegistration = client.mPlayerID == 0;
+            if (rejoin && newRegistration)
                 Log.d(TAG, "rejoined client " + client.clientID + " not present so adding as a new player");
             client.mPlayerID = id;
-            client.mNetworkTeam = 1;
-            if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
-                client.mNetworkTeam = Globals.getInstance().calcNetworkTeam(id);
+            ScoreData departed = mDepartedScores.remove(id);
+            if (newRegistration && departed != null) {
+                client.points = departed.points;
+                client.eliminated = departed.eliminated;
             }
-            Log.e(TAG, "network team is " + client.mNetworkTeam);
+            Log.d(TAG, "network team is " + client.getNetworkTeam());
             InetAddress inetAddress = client.clientSocket.getInetAddress();
             Log.d(TAG, "client " + client.clientID + " player '" + playerName + "' (" + client.mPlayerID + ") found at " + inetAddress.toString());
             updatePlayerEndpoint(client.mPlayerID, inetAddress);
@@ -1161,29 +1324,59 @@ public class TcpServer extends Service {
             sendAllGameInfo(id);
             // Synchronize a joining client even when no grenade is currently paired.
             sendGrenadePairings(true);
-            sendBroadcast(new Intent(NetMsg.NETMSG_JOIN));
+            sendBroadcast(new Intent(newRegistration ? NetMsg.NETMSG_JOIN : NetMsg.NETMSG_PLAYERDATAUPDATE));
         }
 
         private void removeClient(ClientData client, Integer clientID, boolean alwaysRemove) {
+            if (mClientData.get(clientID) != client)
+                return;
             if (client.mPlayerID != 0) {
                 if (alwaysRemove || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
+                    if (mIsDedicated && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+                        ScoreData score = getScore(client.mPlayerID);
+                        if (score != null) {
+                            score.isConnected = false;
+                            mDepartedScores.put(client.mPlayerID, score);
+                        }
+                    } else {
+                        mDepartedScores.remove(client.mPlayerID);
+                    }
                     Globals.getmTeamPlayerNameSemaphore();
-                    Globals.getInstance().mTeamPlayerNameMap.remove(client.mPlayerID);
-                    Globals.getInstance().mTeamPlayerNameSemaphore.release();
+                    try {
+                        Globals.getInstance().mTeamPlayerNameMap.remove(client.mPlayerID);
+                    } finally {
+                        Globals.getInstance().mTeamPlayerNameSemaphore.release();
+                    }
                     Globals.getmIPTeamMapSemaphore();
-                    Globals.getInstance().mIPTeamMap.remove(client.clientSocket.getInetAddress());
-                    Globals.getInstance().mIPTeamMapSemaphore.release();
+                    try {
+                        // A disconnected client no longer has a socket. Remove endpoints
+                        // by player ID, without dereferencing that socket or another player's IP.
+                        Iterator<Map.Entry<InetAddress, Byte>> endpoints = Globals.getInstance().mIPTeamMap.entrySet().iterator();
+                        while (endpoints.hasNext()) {
+                            Byte playerID = endpoints.next().getValue();
+                            if (playerID != null && playerID.byteValue() == client.mPlayerID)
+                                endpoints.remove();
+                        }
+                    } finally {
+                        Globals.getInstance().mIPTeamMapSemaphore.release();
+                    }
                     Globals.getmTeamIPMapSemaphore();
-                    Globals.getInstance().mTeamIPMap.remove(client.mPlayerID);
-                    Globals.getInstance().mTeamIPMapSemaphore.release();
+                    try {
+                        Globals.getInstance().mTeamIPMap.remove(client.mPlayerID);
+                    } finally {
+                        Globals.getInstance().mTeamIPMapSemaphore.release();
+                    }
                     Globals.getmGPSDataSemaphore();
-                    Globals.getInstance().mGPSData.remove(client.mPlayerID);
-                    mGPSIntervalCount = SEND_ALL_GPS_INTERVAL; // Force a full GPS update when someone leaves
-                    Globals.getInstance().mGPSDataSemaphore.release();
-                    sendAllGameInfo(SEND_ALL);
-                    sendBroadcast(new Intent(NetMsg.NETMSG_LEAVE));
+                    try {
+                        Globals.getInstance().mGPSData.remove(client.mPlayerID);
+                        mGPSIntervalCount = SEND_ALL_GPS_INTERVAL; // Force a full GPS update when someone leaves
+                    } finally {
+                        Globals.getInstance().mGPSDataSemaphore.release();
+                    }
                     client.close();
                     mClientData.remove(clientID);
+                    sendAllGameInfo(SEND_ALL);
+                    sendBroadcast(new Intent(NetMsg.NETMSG_LEAVE));
                 } else {
                     client.close(); // We'll keep this client around in case they rejoin later since the game was underway
                 }
@@ -1196,7 +1389,31 @@ public class TcpServer extends Service {
     }
 
     public void stopTcpServer() {
-        keepListening = false;
+        final ServerSocket listener;
+        final Thread worker;
+        synchronized (mServerStateLock) {
+            keepListening = false;
+            stopGPSDataLocked();
+            listener = mListenSocket;
+            worker = mServerThread;
+        }
+        closeListener(listener);
+        // Closing wakes accept(); interruption also cancels startup/registration
+        // while it is waiting for a shared-state lock.
+        if (worker != null && worker != Thread.currentThread())
+            worker.interrupt();
+    }
+
+    private static void closeListener(ServerSocket socket) {
+        if (socket != null) {
+            try { socket.close(); } catch (IOException ignored) { }
+        }
+    }
+
+    private static void closeSocket(Socket socket) {
+        if (socket != null) {
+            try { socket.close(); } catch (IOException ignored) { }
+        }
     }
 
     private void sleep(long millis) {
@@ -1204,8 +1421,9 @@ public class TcpServer extends Service {
             return;
         try {
             Thread.sleep(millis);
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            stopTcpServer();
         }
     }
 

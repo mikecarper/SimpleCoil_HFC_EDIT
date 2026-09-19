@@ -48,6 +48,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class TcpClient extends Service {
     private static final String TAG = "TCPClient";
@@ -56,13 +61,21 @@ public class TcpClient extends Service {
     private static final int MAX_REJOIN_TRIES = 3;
     private static final int CONNECTION_TIMEOUT_MS = 1000;
     private static final int RECONNECT_RETRY_DELAY_MS = 1000;
+    private static final int SHUTDOWN_FLUSH_TIMEOUT_MS = 1000;
+    static final String EXTRA_TERMINAL_EVENT_ID = "com.simplecoil.simplecoil.TCP_TERMINAL_EVENT_ID";
+    private static final AtomicLong terminalEventIds = new AtomicLong();
 
-    private static volatile boolean keepListening = false;
-    private static volatile boolean isListening = false;
+    private volatile boolean keepListening = false;
+    private volatile boolean isListening = false;
     private volatile boolean mIsDedicatedServer = false;
+    private boolean mDestroyed;
+    private boolean mReceiverRegistered;
+    private Socket mActiveSocket;
+    private Thread mClientThread;
+    private Intent mPendingTerminalEvent;
 
     private volatile DataOutputStream out = null;
-    private final Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
+    private Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
     private final ExecutorService sendExecutor = Executors.newSingleThreadExecutor();
 
     @Override
@@ -88,12 +101,31 @@ public class TcpClient extends Service {
         super.onCreate();
         ContextCompat.registerReceiver(this, mGPSUpdateReceiver,
                 new IntentFilter(NetMsg.NETMSG_GPSLOCUPDATE), ContextCompat.RECEIVER_NOT_EXPORTED);
+        mReceiverRegistered = true;
     }
 
     @Override
     public void onDestroy() {
-        unregisterReceiver(mGPSUpdateReceiver);
+        final Socket socket;
+        final Thread clientThread;
+        synchronized (this) {
+            mDestroyed = true;
+            keepListening = false;
+            out = null;
+            messageQueue = new ConcurrentLinkedQueue<>();
+            mPendingTerminalEvent = null;
+            socket = mActiveSocket;
+            clientThread = mClientThread;
+        }
+        // Closing the socket also interrupts any sender blocked in a write.
+        try { if (socket != null) socket.close(); } catch (IOException e) { /* ignored */ }
+        if (clientThread != null)
+            clientThread.interrupt();
         sendExecutor.shutdownNow();
+        if (mReceiverRegistered) {
+            unregisterReceiver(mGPSUpdateReceiver);
+            mReceiverRegistered = false;
+        }
         super.onDestroy();
     }
 
@@ -101,45 +133,80 @@ public class TcpClient extends Service {
         sendTCPMessage(message, false);
     }
 
-    public void sendTCPMessage(final String message, final boolean queueMessage) {
+    public synchronized void sendTCPMessage(final String message, final boolean queueMessage) {
+        if (mDestroyed)
+            return;
+        if (queueMessage) {
+            // Record persistent events before scheduling work, so a reconnect
+            // cannot drain the queue before an old writer reports its failure.
+            messageQueue.offer(message);
+            sendQueuedMessages();
+            return;
+        }
         final DataOutputStream writer = out;
         if (writer == null) {
             Log.d(TAG, "Writer is null");
-            if (queueMessage) {
-                Log.e(TAG, "queuing: " + message);
-                messageQueue.offer(message);
-            }
             return;
         }
-        if (sendExecutor.isShutdown()) {
-            if (queueMessage)
-                messageQueue.offer(message);
+        if (sendExecutor.isShutdown())
             return;
-        }
         try {
             sendExecutor.execute(() -> {
-                try {
-                    writer.writeUTF(message);
-                    writer.flush();
-                    if (!message.equals(TCP_CLIENT_PONG))
-                        Log.i(TAG, "sent: " + message);
-                } catch (IOException e) {
-                    if (queueMessage) {
-                        Log.e(TAG, "queuing: " + message);
-                        messageQueue.offer(message);
-                    }
-                }
+                if (writer == out)
+                    writeMessage(writer, message);
             });
         } catch (RejectedExecutionException e) {
             // The service can be torn down after the isShutdown() check above.
-            if (queueMessage)
-                messageQueue.offer(message);
             Log.w(TAG, "TCP sender is shutting down", e);
         }
     }
 
+    private synchronized void sendQueuedMessages() {
+        final DataOutputStream writer = out;
+        final Queue<String> pending = messageQueue;
+        if (writer == null || sendExecutor.isShutdown())
+            return;
+        try {
+            sendExecutor.execute(() -> {
+                while (writer == out) {
+                    String message = pending.peek();
+                    if (message == null || !writeMessage(writer, message))
+                        return;
+                    pending.poll();
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            // Nothing was removed from the queue; a later connection can retry.
+            Log.w(TAG, "TCP sender is shutting down", e);
+        }
+    }
+
+    private boolean writeMessage(DataOutputStream writer, String message) {
+        try {
+            writer.writeUTF(message);
+            writer.flush();
+            if (!message.equals(TCP_CLIENT_PONG))
+                Log.i(TAG, "sent: " + message);
+            return true;
+        } catch (IOException e) {
+            Log.w(TAG, "TCP write failed", e);
+            synchronized (this) {
+                // A failed write may have left a partial frame on the wire. Do
+                // not send later events (or events after a failed registration)
+                // on that stream; the reader loop will reconnect instead.
+                if (out == writer)
+                    out = null;
+            }
+            return false;
+        }
+    }
+
     void startTcpClient() {
-        synchronized (TcpClient.class) {
+        synchronized (this) {
+            if (mDestroyed || sendExecutor.isShutdown()) {
+                Log.d(TAG, "Cannot start a destroyed TCP client");
+                return;
+            }
             if (keepListening) {
                 Log.d(TAG, "Client is already listening");
                 return;
@@ -148,14 +215,43 @@ public class TcpClient extends Service {
                 Log.e(TAG, "Please wait for client to stop listening");
                 return;
             }
+            final InetAddress serverAddress = Globals.getInstance().mServerIP;
+            if (serverAddress == null) {
+                Log.w(TAG, "Cannot start TCP client without a server address");
+                return;
+            }
+            // An explicit start joins a new session. Only automatic reconnects
+            // inside runTcpClientSession may replay events from the previous link.
+            messageQueue = new ConcurrentLinkedQueue<>();
+            mPendingTerminalEvent = null;
             mIsDedicatedServer = false;
             keepListening = true;
             isListening = true;
-            new Thread(this::runTcpClient).start();
+            mClientThread = new Thread(() -> runTcpClient(serverAddress), "SimpleCoil TCP client");
+            mClientThread.start();
         }
     }
 
-    private void runTcpClient() {
+    private void runTcpClient(InetAddress serverAddress) {
+        try {
+            runTcpClientSession(serverAddress);
+        } catch (RuntimeException e) {
+            // Shutdown may interrupt acquisition of a shared state lock before
+            // the socket loop is entered. Never leave the service marked running.
+            if (keepListening) {
+                Log.e(TAG, "TCP client stopped unexpectedly", e);
+                finishServerSession(NetMsg.NETMSG_SERVERCANCEL);
+            }
+        } finally {
+            synchronized (this) {
+                keepListening = false;
+                isListening = false;
+                mClientThread = null;
+            }
+        }
+    }
+
+    private void runTcpClientSession(InetAddress serverAddress) {
         Globals.getmGPSDataSemaphore();
         try {
             if (Globals.getInstance().mGPSData == null)
@@ -183,35 +279,55 @@ public class TcpClient extends Service {
                 if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
                     retryCount--;
                 s = new Socket();
-                s.connect(new InetSocketAddress(Globals.getInstance().mServerIP, TcpServer.TCP_SERVER_PORT), CONNECTION_TIMEOUT_MS);
+                synchronized (this) {
+                    if (!keepListening || mDestroyed)
+                        break;
+                    mActiveSocket = s;
+                }
+                // Discovery may find another host while this session is reconnecting.
+                // Pending events belong only to the server selected at explicit start.
+                s.connect(new InetSocketAddress(serverAddress, TcpServer.TCP_SERVER_PORT), CONNECTION_TIMEOUT_MS);
                 is = s.getInputStream();
                 in = new DataInputStream(is);
+                TcpMessageReader messageReader = new TcpMessageReader();
                 os = s.getOutputStream();
                 connectionOut = new DataOutputStream(new BufferedOutputStream(os));
-                out = connectionOut;
-                sendPlayerInfo(rejoin);
+                synchronized (this) {
+                    if (!keepListening || mDestroyed)
+                        break;
+                    // Publish the writer and enqueue registration as one operation,
+                    // before gameplay threads can enqueue events for this connection.
+                    out = connectionOut;
+                    sendPlayerInfo(rejoin);
+                }
                 wasConnected = true;
                 if (rejoin)
                     sendBroadcast(new Intent(NetMsg.NETMSG_NETWORKCONNECTED));
                 rejoin = true;
                 int noReadCount = 0;
                 retryCount = MAX_REJOIN_TRIES;
-                while (keepListening) {
-                    if (in.available() > 0) {
+                while (keepListening && out == connectionOut) {
+                    String message = messageReader.poll(in);
+                    if (message != null) {
                         noReadCount = 0;
-                        String message = in.readUTF();
                         if (message.equals(TcpServer.TCP_SERVER_PING))
                             sendTCPMessage(TCP_CLIENT_PONG);
                         else {
                             Log.i(TAG, "received: '" + message + "'");
-                            if (message.startsWith(TcpServer.TCPPREFIX_JSON, TcpServer.TCPMESSAGE_PREFIX.length())) {
+                            if (message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON)) {
                                 message = message.substring(TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length());
                                 parseGameInfo(message);
-                            } else if (message.startsWith(TcpServer.TCPPREFIX_MESG, TcpServer.TCPMESSAGE_PREFIX.length())) {
+                            } else if (message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG)) {
                                 message = message.substring(TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_MESG.length());
                                 if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
                                     message = message.substring(NetMsg.NETMSG_ELIMINATED.length());
-                                    int playerID = Integer.parseInt(message);
+                                    final int playerID;
+                                    try {
+                                        playerID = Integer.parseInt(message);
+                                    } catch (NumberFormatException e) {
+                                        Log.w(TAG, "Ignoring malformed elimination player ID");
+                                        continue;
+                                    }
                                     if (!Globals.isValidPlayerID(playerID) || playerID <= 0) {
                                         Log.w(TAG, "Ignoring elimination for invalid player ID " + playerID);
                                         continue;
@@ -223,15 +339,16 @@ public class TcpClient extends Service {
                                 } else if (message.equals(NetMsg.NETMSG_TEAMELIMINATED)) {
                                     sendBroadcast(new Intent(NetMsg.NETMSG_TEAMELIMINATED));
                                 } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
-                                    sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
+                                    finishServerSession(NetMsg.NETMSG_ENDGAME);
+                                    break;
                                 } else if (message.equals(NetMsg.NETMSG_STARTGAME)) {
                                     sendBroadcast(new Intent(NetMsg.NETMSG_STARTGAME));
                                 } else if (message.equals(NetMsg.NETMSG_SERVERCANCEL)) {
-                                    sendBroadcast(new Intent(NetMsg.NETMSG_SERVERCANCEL));
+                                    finishServerSession(NetMsg.NETMSG_SERVERCANCEL);
                                     break;
                                 }
-                            } else if (message.startsWith(NetMsg.NETMSG_VERSIONERROR)) {
-                                sendBroadcast(new Intent(NetMsg.NETMSG_VERSIONERROR));
+                            } else if (message.equals(NetMsg.NETMSG_VERSIONERROR)) {
+                                finishServerSession(NetMsg.NETMSG_VERSIONERROR);
                                 break;
                             } else {
                                 Log.d(TAG, "unknown tcp message received");
@@ -259,21 +376,77 @@ public class TcpClient extends Service {
                 Log.e(TAG, "Invalid TCP data; reconnecting", e);
                 waitBeforeReconnect();
             } finally {
+                if (!keepListening)
+                    flushBeforeDisconnect(connectionOut);
                 try { if (s != null) s.close(); } catch (Exception e) { /* ignored */ }
                 try { if (is != null) is.close(); } catch (Exception e) { /* ignored */ }
                 try { if (in != null) in.close(); } catch (Exception e) { /* ignored */ }
                 try { if (os != null) os.close(); } catch (Exception e) { /* ignored */ }
                 try { if (connectionOut != null) connectionOut.close(); } catch (Exception e) { /* ignored */ }
-                if (out == connectionOut)
-                    out = null;
+                synchronized (this) {
+                    if (out == connectionOut)
+                        out = null;
+                    if (mActiveSocket == s)
+                        mActiveSocket = null;
+                }
             }
         }
         if (retryCount == 0 && keepListening) {
-            sendBroadcast(new Intent(NetMsg.NETMSG_SERVERCANCEL));
+            finishServerSession(NetMsg.NETMSG_SERVERCANCEL);
         }
         Log.d(TAG, "Client stopping");
-        keepListening = false;
-        isListening = false;
+    }
+
+    private void finishServerSession(String action) {
+        final Intent notification;
+        synchronized (this) {
+            if (mDestroyed)
+                return;
+            // Terminal messages must stop reconnecting even while the activity
+            // is paused and its broadcast receiver is not registered.
+            keepListening = false;
+            out = null;
+            messageQueue = new ConcurrentLinkedQueue<>();
+            notification = new Intent(action).putExtra(EXTRA_TERMINAL_EVENT_ID, terminalEventIds.incrementAndGet());
+            mPendingTerminalEvent = notification;
+        }
+        sendBroadcast(new Intent(notification));
+    }
+
+    public Intent consumePendingTerminalEvent() {
+        return consumePendingTerminalEvent(0);
+    }
+
+    public synchronized Intent consumePendingTerminalEvent(long eventId) {
+        if (mPendingTerminalEvent == null || (eventId != 0
+                && mPendingTerminalEvent.getLongExtra(EXTRA_TERMINAL_EVENT_ID, 0) != eventId))
+            return null;
+        Intent event = new Intent(mPendingTerminalEvent);
+        event.removeExtra(EXTRA_TERMINAL_EVENT_ID);
+        mPendingTerminalEvent = null;
+        return event;
+    }
+
+    private void flushBeforeDisconnect(DataOutputStream writer) {
+        synchronized (this) {
+            // A rejected/ended session or destroyed service should close immediately.
+            if (writer == null || writer != out || mDestroyed || sendExecutor.isShutdown())
+                return;
+        }
+        Future<?> barrier = null;
+        try {
+            // This runs only on the reader thread. UI shutdown never waits for
+            // networking, and the socket stays open for already queued messages.
+            barrier = sendExecutor.submit(() -> { });
+            barrier.get(SHUTDOWN_FLUSH_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            if (barrier != null) barrier.cancel(false);
+            Log.w(TAG, "Closing TCP connection after sender shutdown timeout");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException | RejectedExecutionException e) {
+            Log.w(TAG, "TCP sender stopped before pending writes completed", e);
+        }
     }
 
     public void sendPlayerNameChange() {
@@ -283,11 +456,7 @@ public class TcpClient extends Service {
             playerInfo.put(TcpServer.JSON_PLAYERNAMECHANGE, Globals.getInstance().mPlayerName);
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerInfo.toString();
             sendTCPMessage(message);
-            String queuedMessage;
-            while ((queuedMessage = messageQueue.poll()) != null) {
-                Log.e(TAG, "sending queued: " + queuedMessage);
-                sendTCPMessage(queuedMessage);
-            }
+            sendQueuedMessages();
         } catch (JSONException e) {
             e.printStackTrace();
         }
@@ -304,11 +473,7 @@ public class TcpClient extends Service {
             }
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerInfo.toString();
             sendTCPMessage(message);
-            String queuedMessage;
-            while ((queuedMessage = messageQueue.poll()) != null) {
-                Log.e(TAG, "sending queued: " + queuedMessage);
-                sendTCPMessage(queuedMessage);
-            }
+            sendQueuedMessages();
         } catch (JSONException e) {
             e.printStackTrace();
         }
@@ -356,9 +521,18 @@ public class TcpClient extends Service {
     }
 
     public void stopTcpClient() {
-        if (mIsDedicatedServer)
-            sleep(75); // Make sure that the end game message gets sent before we close down the socket
-        keepListening = false;
+        final Socket connectingSocket;
+        final Thread connectingThread;
+        synchronized (this) {
+            keepListening = false;
+            // Established connections are drained by the reader before closing.
+            // Startup/retry waits have no outgoing writer and can be interrupted now.
+            connectingSocket = out == null ? mActiveSocket : null;
+            connectingThread = out == null ? mClientThread : null;
+        }
+        try { if (connectingSocket != null) connectingSocket.close(); } catch (IOException e) { /* ignored */ }
+        if (connectingThread != null)
+            connectingThread.interrupt();
     }
 
     public void leaveServer() {
@@ -372,8 +546,9 @@ public class TcpClient extends Service {
     private void sleep(long millis) {
         try {
             Thread.sleep(millis);
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            keepListening = false;
         }
     }
 
