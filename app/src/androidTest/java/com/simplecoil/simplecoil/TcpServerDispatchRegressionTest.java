@@ -29,11 +29,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -258,6 +260,164 @@ public class TcpServerDispatchRegressionTest {
             blocked.close();
             stopping.join(2000);
             worker.join(2000);
+        }
+    }
+
+    @Test
+    public void scoreSnapshotDoesNotWaitForAStalledNetworkWrite() throws Exception {
+        AtomicReference<TcpServer.ScoreData> captured = new AtomicReference<>();
+        assertDoesNotWaitForWriter(() -> captured.set(server.getScore((byte) 1)));
+        assertEquals(7, captured.get().points);
+        assertEquals(2, captured.get().eliminated);
+        assertTrue(captured.get().isConnected);
+        TcpServer.ScoreData disconnected = server.getScore((byte) 1);
+        assertEquals(7, disconnected.points);
+        assertEquals(2, disconnected.eliminated);
+        assertFalse(disconnected.isConnected);
+    }
+
+    @Test
+    public void preparingAPersonalizedRosterDoesNotWaitForAStalledWrite() throws Exception {
+        assertDoesNotWaitForWriter(() -> server.sendAllGameInfo(1));
+    }
+
+    private void assertDoesNotWaitForWriter(CheckedAction action) throws Exception {
+        BlockingSocket blocked = new BlockingSocket();
+        addClient(1, blocked);
+        set(clients.get(1), "points", 7);
+        set(clients.get(1), "eliminated", 2);
+        server.sendTCPMessageAll("blocked write");
+        assertTrue(blocked.writing.await(2, TimeUnit.SECONDS));
+        workers.add(blocked.writer);
+        CountDownLatch read = new CountDownLatch(1);
+        Thread reader = new Thread(() -> {
+            try { action.run(); }
+            catch (Throwable failure) { failures.add(failure); }
+            finally { read.countDown(); }
+        });
+        workers.add(reader);
+        try {
+            reader.start();
+            assertTrue("A UI-readable score operation waited for socket I/O", read.await(1, TimeUnit.SECONDS));
+        } finally {
+            blocked.close();
+            reader.join(1000);
+            blocked.writer.join(1000);
+            captureClientTasks();
+        }
+        assertFalse(reader.isAlive());
+        assertFalse(blocked.writer.isAlive());
+    }
+
+    @Test
+    public void repeatedEndRequestsOnlyQueueOneCleanup() throws Exception {
+        clientsLock.acquire();
+        List<Thread> tasks;
+        try {
+            server.endGame();
+            queuedWorker();
+            server.endGame();
+            tasks = captureClientTasks();
+            assertEquals("Repeated request scheduled a second destructive cleanup", 1, tasks.size());
+        } finally { clientsLock.release(); }
+        for (Thread task : tasks) task.join(1000);
+        assertEquals(1, java.util.Collections.frequency(server.events, NetMsg.NETMSG_ENDGAME));
+    }
+
+    @Test
+    public void endRequestDuringSharedStateCleanupDoesNotQueueAnotherEnd() throws Exception {
+        Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
+        clientsLock.acquire();
+        locations.acquire();
+        Thread worker = null;
+        boolean clientLockHeld = true;
+        try {
+            server.endGame();
+            worker = queuedWorker();
+            clientsLock.release();
+            clientLockHeld = false;
+            assertQueued(locations);
+            server.endGame();
+            assertEquals(1, captureClientTasks().size());
+        } finally {
+            if (clientLockHeld) clientsLock.release();
+            locations.release();
+            if (worker != null) worker.join(1000);
+        }
+        assertFalse(worker.isAlive());
+        assertEquals(1, clientsLock.availablePermits());
+    }
+
+    @Test
+    public void startIsRejectedWhileRoundCleanupIsQueued() throws Exception {
+        clientsLock.acquire();
+        try {
+            server.endGame();
+            queuedWorker();
+            boolean accepted = server.startGame();
+            captureClientTasks();
+            assertFalse("A new start overtook pending round cleanup", accepted);
+        } finally { clientsLock.release(); }
+    }
+
+    @Test
+    public void queuedStartIsCancelledWhenAnEndIsRequestedBeforeDelivery() throws Exception {
+        clientsLock.acquire();
+        List<Thread> tasks;
+        try {
+            assertTrue(server.startGame());
+            queuedWorker();
+            server.endGame();
+            tasks = captureClientTasks();
+        } finally { clientsLock.release(); }
+        for (Thread task : tasks) task.join(1000);
+        assertFalse("A cancelled round was announced as started", server.events.contains(NetMsg.NETMSG_STARTGAME));
+        assertTrue(server.events.contains(NetMsg.NETMSG_ENDGAME));
+    }
+
+    @Test
+    public void interruptedEndReleasesTheRoundCleanupReservation() throws Exception {
+        clientsLock.acquire();
+        Thread start;
+        try {
+            server.endGame();
+            Thread end = queuedWorker();
+            end.interrupt();
+            end.join(1000);
+            assertFalse(end.isAlive());
+            assertTrue("A cancelled cleanup permanently blocked new starts", server.startGame());
+            start = queuedWorker();
+        } finally { clientsLock.release(); }
+        start.join(1000);
+        assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
+        assertFalse(server.events.contains(NetMsg.NETMSG_ENDGAME));
+    }
+
+    @Test
+    public void aLaterRoundCanStillBeEndedAfterCleanupCompletes() throws Exception {
+        dispatchThenChange(server::endGame, () -> { });
+        MemorySocket nextRound = new MemorySocket();
+        addClient(2, nextRound);
+        dispatchThenChange(server::endGame, () -> { });
+        assertTrue(nextRound.closed);
+        assertTrue(clients.isEmpty());
+        assertEquals(2, java.util.Collections.frequency(server.events, NetMsg.NETMSG_ENDGAME));
+    }
+
+    private List<Thread> captureClientTasks() throws Exception {
+        Field lockField = TcpServer.class.getDeclaredField("mServerStateLock");
+        lockField.setAccessible(true);
+        Field tasksField = TcpServer.class.getDeclaredField("mClientTasks");
+        tasksField.setAccessible(true);
+        synchronized (lockField.get(server)) {
+            List<Thread> tasks = new ArrayList<>();
+            for (Object entry : (Set<?>) tasksField.get(server)) {
+                Thread task = (Thread) entry;
+                tasks.add(task);
+                task.setUncaughtExceptionHandler((thread, error) -> failures.add(error));
+                if (!workers.contains(task)) workers.add(task);
+            }
+            return tasks;
         }
     }
 

@@ -116,6 +116,8 @@ public class TcpServer extends Service {
     private volatile boolean keepListening = false;
     private final Object mServerStateLock = new Object();
     private boolean mDestroyed;
+    // Guarded by mServerStateLock from scheduling through cleanup completion.
+    private boolean mEndingGame;
     private ServerSocket mListenSocket;
     private volatile Thread mServerThread = null;
     private volatile Thread mClientThread = null;
@@ -204,9 +206,15 @@ public class TcpServer extends Service {
     }
 
     private boolean runClientTask(Runnable action) {
+        return runClientTask(action, false);
+    }
+
+    private boolean runClientTask(Runnable action, boolean endsRound) {
         synchronized (mServerStateLock) {
-            if (!keepListening || mDestroyed)
+            if (!keepListening || mDestroyed || (endsRound && mEndingGame))
                 return false;
+            if (endsRound)
+                mEndingGame = true;
             Thread task = new Thread(() -> {
                 boolean acquired = false;
                 try {
@@ -227,6 +235,10 @@ public class TcpServer extends Service {
                     if (acquired)
                         mClientDataSemaphore.release();
                     synchronized (mServerStateLock) {
+                        // Cancellation while waiting for the lock must also
+                        // release this reservation so a later round can start.
+                        if (endsRound)
+                            mEndingGame = false;
                         mClientTasks.remove(Thread.currentThread());
                     }
                 }
@@ -316,26 +328,33 @@ public class TcpServer extends Service {
         }
         if (!hasPlayers)
             return false;
-        return runClientTask(() -> {
-            // we want to make sure that we have sent the start game message to all clients before broadcasting that the game has started locally
-            String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME;
-            boolean delivered = false;
-            for (ClientRecipient recipient : recipients) {
-                if (!isClientTaskActive())
+        synchronized (mServerStateLock) {
+            if (mEndingGame)
+                return false;
+            return runClientTask(() -> {
+                // Send to clients before confirming the start locally. A queued
+                // end takes precedence over a start that has not been delivered.
+                String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME;
+                boolean delivered = false;
+                for (ClientRecipient recipient : recipients) {
+                    synchronized (mServerStateLock) {
+                        if (!isClientTaskActive() || mEndingGame)
+                            return;
+                    }
+                    if (recipient.canStartGame())
+                        delivered = recipient.client.sendTCPMessage(message) || delivered;
+                }
+                if (!delivered)
                     return;
-                if (recipient.canStartGame())
-                    delivered = recipient.client.sendTCPMessage(message) || delivered;
-            }
-            if (!delivered)
-                return;
-            synchronized (mServerStateLock) {
-                if (!isClientTaskActive())
-                    return;
-                sendBroadcast(new Intent(NetMsg.NETMSG_STARTGAME));
-                if (!mIsDedicated)
-                    keepListening = false;
-            }
-        });
+                synchronized (mServerStateLock) {
+                    if (!isClientTaskActive() || mEndingGame)
+                        return;
+                    sendBroadcast(new Intent(NetMsg.NETMSG_STARTGAME));
+                    if (!mIsDedicated)
+                        keepListening = false;
+                }
+            });
+        }
     }
 
     public void endGame() {
@@ -404,7 +423,7 @@ public class TcpServer extends Service {
                 if (isClientTaskActive())
                     sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
             }
-        });
+        }, true);
     }
 
     private Map<Byte, InetAddress> getTeamIPMapSnapshot() {
@@ -899,11 +918,11 @@ public class TcpServer extends Service {
         ClientData client = clientID < 0 ? null : mClientData.get(clientID);
         ScoreData scoreData = new ScoreData();
         if (client != null) {
-            synchronized (client) {
-                scoreData.points = client.points;
-                scoreData.eliminated = client.eliminated;
-                scoreData.isConnected = client.out != null;
-            }
+            // These fields are volatile. The client monitor also guards socket
+            // writes, which must never block the host UI's scoreboard reads.
+            scoreData.points = client.points;
+            scoreData.eliminated = client.eliminated;
+            scoreData.isConnected = client.out != null;
         } else {
             ScoreData departed = mDepartedScores.get(playerID);
             if (departed == null)
