@@ -161,6 +161,42 @@ public class TcpServer extends Service {
 
     private final IBinder mBinder = new LocalBinder();
 
+    private final class ClientRecipient {
+        final int connectionID;
+        final ClientData client;
+        final byte playerID;
+        final int team;
+
+        ClientRecipient(int connectionID, ClientData client) {
+            this.connectionID = connectionID;
+            this.client = client;
+            playerID = client.mPlayerID;
+            team = Globals.getInstance().calcNetworkTeam(playerID);
+        }
+
+        boolean isCurrent() {
+            Map<Integer, ClientData> clients = mClientData;
+            return clients != null && clients.get(connectionID) == client
+                    && client.mPlayerID == playerID;
+        }
+
+        boolean canStartGame() {
+            // TCP registration reserves zero for an unregistered socket.
+            return isCurrent() && playerID > 0 && Globals.isValidPlayerID(playerID)
+                    && client.clientSocket != null && client.out != null;
+        }
+    }
+
+    private List<ClientRecipient> getClientRecipients() {
+        List<ClientRecipient> recipients = new ArrayList<>();
+        Map<Integer, ClientData> clients = mClientData;
+        if (clients != null) {
+            for (Map.Entry<Integer, ClientData> entry : clients.entrySet())
+                recipients.add(new ClientRecipient(entry.getKey(), entry.getValue()));
+        }
+        return recipients;
+    }
+
     private boolean isClientTaskActive() {
         synchronized (mServerStateLock) {
             return keepListening && !mDestroyed && !Thread.currentThread().isInterrupted();
@@ -206,26 +242,35 @@ public class TcpServer extends Service {
     }
 
     public void sendTCPMessageAll(final String message, final boolean queueMessage) {
-        if (mClientData == null || mClientData.size() == 0)
+        sendTCPMessageAll(message, queueMessage, getClientRecipients());
+    }
+
+    private void sendTCPMessageAll(final String message, final boolean queueMessage,
+                                   final List<ClientRecipient> recipients) {
+        if (recipients.isEmpty())
             return;
         runClientTask(() -> {
-            for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+            for (ClientRecipient recipient : recipients) {
                 if (!isClientTaskActive())
                     return;
-                entry.getValue().sendTCPMessage(message, queueMessage);
+                // Delayed snapshots must not reach players who joined later or
+                // reused an ID. A real rejoin retains its original ClientData.
+                if (recipient.isCurrent())
+                    recipient.client.sendTCPMessage(message, queueMessage);
             }
         });
     }
 
     private void sendTCPMessageID(final String message, final byte playerID, final boolean queueMessage) {
-        if (mClientData == null || mClientData.size() == 0)
+        final List<ClientRecipient> recipients = getClientRecipients();
+        if (recipients.isEmpty())
             return;
         runClientTask(() -> {
-            for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+            for (ClientRecipient recipient : recipients) {
                 if (!isClientTaskActive())
                     return;
-                if (entry.getValue().mPlayerID == playerID) {
-                    entry.getValue().sendTCPMessage(message, queueMessage);
+                if (recipient.playerID == playerID && recipient.isCurrent()) {
+                    recipient.client.sendTCPMessage(message, queueMessage);
                     break;
                 }
             }
@@ -233,43 +278,56 @@ public class TcpServer extends Service {
     }
 
     private void sendTCPMessageTeam(final String message, final byte playerID, final boolean includePlayer, final boolean queueMessage) {
-        if (mClientData == null || mClientData.size() == 0)
+        final List<ClientRecipient> recipients = getClientRecipients();
+        if (recipients.isEmpty())
             return;
         runClientTask(() -> {
             int team = -1;
-            for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+            for (ClientRecipient recipient : recipients) {
                 if (!isClientTaskActive())
                     return;
-                if (entry.getValue().mPlayerID == playerID) {
-                    team = entry.getValue().getNetworkTeam();
-                    if (includePlayer)
-                        entry.getValue().sendTCPMessage(message, queueMessage);
+                if (recipient.playerID == playerID) {
+                    team = recipient.team;
+                    if (includePlayer && recipient.isCurrent())
+                        recipient.client.sendTCPMessage(message, queueMessage);
                     break;
                 }
             }
             if (team != -1) {
                 Log.e(TAG, "team is " + team);
-                for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                for (ClientRecipient recipient : recipients) {
                     if (!isClientTaskActive())
                         return;
-                    if (entry.getValue().getNetworkTeam() == team && entry.getValue().mPlayerID != playerID)
-                        entry.getValue().sendTCPMessage(message, queueMessage);
+                    if (recipient.team == team && recipient.playerID != playerID && recipient.isCurrent())
+                        recipient.client.sendTCPMessage(message, queueMessage);
                 }
             }
         });
     }
 
     public boolean startGame() {
-        if (mClientData == null || mClientData.size() == 0)
+        final List<ClientRecipient> recipients = getClientRecipients();
+        boolean hasPlayers = false;
+        for (ClientRecipient recipient : recipients) {
+            if (recipient.canStartGame()) {
+                hasPlayers = true;
+                break;
+            }
+        }
+        if (!hasPlayers)
             return false;
         return runClientTask(() -> {
             // we want to make sure that we have sent the start game message to all clients before broadcasting that the game has started locally
             String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME;
-            for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+            boolean delivered = false;
+            for (ClientRecipient recipient : recipients) {
                 if (!isClientTaskActive())
                     return;
-                entry.getValue().sendTCPMessage(message);
+                if (recipient.canStartGame())
+                    delivered = recipient.client.sendTCPMessage(message) || delivered;
             }
+            if (!delivered)
+                return;
             synchronized (mServerStateLock) {
                 if (!isClientTaskActive())
                     return;
@@ -398,7 +456,8 @@ public class TcpServer extends Service {
     }
 
     public void sendAllGameInfo(final int id) {
-        if (mClientData == null || mClientData.size() == 0)
+        final List<ClientRecipient> recipients = getClientRecipients();
+        if (recipients.isEmpty())
             return;
         try {
             JSONArray players = new JSONArray();
@@ -446,7 +505,7 @@ public class TcpServer extends Service {
             game.put(JSON_ONLY_SERVER_SETTINGS, Globals.getInstance().mOnlyServerSettings);
             final String allMessage = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
             if (id == SEND_ALL)
-                sendTCPMessageAll(allMessage);
+                sendTCPMessageAll(allMessage, false, recipients);
             else {
                 // Get update data for this specific player
                 ScoreData scoreData = getScore((byte)id);
@@ -475,13 +534,15 @@ public class TcpServer extends Service {
                 final String idMessage = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
 
                 runClientTask(() -> {
-                    for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                    for (ClientRecipient recipient : recipients) {
                         if (!isClientTaskActive())
                             return;
-                        if (entry.getValue().mPlayerID != id)
-                            entry.getValue().sendTCPMessage(allMessage, false);
+                        if (!recipient.isCurrent())
+                            continue;
+                        if (recipient.playerID != id)
+                            recipient.client.sendTCPMessage(allMessage, false);
                         else
-                            entry.getValue().sendTCPMessage(idMessage, false);
+                            recipient.client.sendTCPMessage(idMessage, false);
                     }
                 });
             }
@@ -881,13 +942,13 @@ public class TcpServer extends Service {
     private class ClientData {
         private volatile Socket clientSocket = null;
         private int clientID = -1;
-        private byte mPlayerID = 0;
+        private volatile byte mPlayerID = 0;
         private int noReadCount = 0;
         private InputStream is = null;
         private OutputStream os = null;
         private DataInputStream in = null;
         private TcpMessageReader messageReader = new TcpMessageReader();
-        private DataOutputStream out = null;
+        private volatile DataOutputStream out = null;
         private volatile boolean connectionFailed;
         private Queue<String> messageQueue;
         private volatile int points = 0;

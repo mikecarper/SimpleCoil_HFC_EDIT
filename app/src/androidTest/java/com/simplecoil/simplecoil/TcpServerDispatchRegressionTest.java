@@ -14,6 +14,7 @@ import org.junit.runner.RunWith;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -338,6 +339,189 @@ public class TcpServerDispatchRegressionTest {
         assertEquals("team", queuedMessages(2).peek());
     }
 
+    @Test
+    public void queuedBroadcastExcludesPlayersWhoJoinAfterItWasPrepared() throws Exception {
+        assertLaterJoinerDoesNotReceive(() -> server.sendTCPMessageAll("old snapshot"), 2);
+    }
+
+    @Test
+    public void queuedBroadcastDoesNotFollowAReplacedConnection() throws Exception {
+        assertReplacementDoesNotReceive(() -> server.sendTCPMessageAll("old snapshot"));
+    }
+
+    @Test
+    public void queuedPlayerMessageDoesNotFollowAReusedPlayerId() throws Exception {
+        assertReplacementDoesNotReceive(() -> sendPlayer(true));
+    }
+
+    @Test
+    public void queuedTeamMessageExcludesLaterTeammates() throws Exception {
+        assertLaterJoinerDoesNotReceive(() -> sendTeam(true, true), 2);
+    }
+
+    @Test
+    public void queuedTeamMessageDoesNotFollowAReplacedTeammate() throws Exception {
+        MemorySocket original = new MemorySocket();
+        MemorySocket replacement = new MemorySocket();
+        addClient(2, original);
+        dispatchThenChange(() -> sendTeam(true, false), () -> {
+            closeClient(2);
+            clients.remove(2);
+            addClient(3, 2, replacement);
+        });
+        assertEquals(0, original.bytes.size());
+        assertEquals("New player received an earlier teammate's score event", 0, replacement.bytes.size());
+    }
+
+    @Test
+    public void queuedPersonalizedRosterExcludesLaterJoiners() throws Exception {
+        assertLaterJoinerDoesNotReceive(() -> server.sendAllGameInfo(1), 2);
+    }
+
+    @Test
+    public void queuedBroadcastRosterExcludesLaterJoiners() throws Exception {
+        assertLaterJoinerDoesNotReceive(() -> server.sendAllGameInfo(TcpServer.SEND_ALL), 2);
+    }
+
+    @Test
+    public void queuedPersonalizedRosterDoesNotFollowAReusedPlayerId() throws Exception {
+        assertReplacementDoesNotReceive(() -> server.sendAllGameInfo(1));
+    }
+
+    @Test
+    public void queuedPlayerMessageStillReachesTheSamePlayersRejoinedConnection() throws Exception {
+        MemorySocket replacement = new MemorySocket();
+        sockets.add(replacement);
+        dispatchThenChange(() -> sendPlayer(true), () -> {
+            Object client = clients.get(1);
+            Method rejoin = client.getClass().getDeclaredMethod("rejoin", Socket.class);
+            rejoin.setAccessible(true);
+            rejoin.invoke(client, replacement);
+        });
+        assertEquals(0, sockets.get(0).bytes.size());
+        assertEquals("player", new DataInputStream(new ByteArrayInputStream(replacement.bytes.toByteArray())).readUTF());
+    }
+
+    @Test
+    public void nextBroadcastStillIncludesNewlyJoinedPlayers() throws Exception {
+        MemorySocket newcomer = new MemorySocket();
+        dispatchThenChange(() -> server.sendTCPMessageAll("old snapshot"), () -> addClient(2, newcomer));
+        newcomer.bytes.reset();
+        dispatchThenChange(() -> server.sendTCPMessageAll("new snapshot"), () -> { });
+        assertEquals("new snapshot", new DataInputStream(new ByteArrayInputStream(newcomer.bytes.toByteArray())).readUTF());
+    }
+
+    @Test
+    public void unregisteredConnectionsCannotSatisfyGameStart() throws Exception {
+        set(clients.get(1), "mPlayerID", (byte) 0);
+        assertFalse("An unregistered socket was treated as a ready player", server.startGame());
+    }
+
+    @Test
+    public void disconnectedPlayersCannotSatisfyGameStart() throws Exception {
+        closeClient(1);
+        assertFalse("A disconnected player was treated as ready", server.startGame());
+    }
+
+    @Test
+    public void gameStartSkipsUnregisteredConnectionsButStartsRegisteredPlayers() throws Exception {
+        MemorySocket unregistered = new MemorySocket();
+        addClient(2, 0, unregistered);
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertEquals("An unregistered connection received a start command", 0, unregistered.bytes.size());
+        assertEquals(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME,
+                new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
+        assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void queuedBroadcastDoesNotSurviveAConnectionsNewRegistration() throws Exception {
+        MemorySocket joining = new MemorySocket();
+        addClient(2, 0, joining);
+        dispatchThenChange(() -> server.sendTCPMessageAll("before registration"),
+                () -> set(clients.get(2), "mPlayerID", (byte) 2));
+        assertEquals("Newly registered player received a pre-registration snapshot", 0, joining.bytes.size());
+        assertTrue(sockets.get(0).bytes.size() > 0);
+    }
+
+    @Test
+    public void queuedPlayerMessageCannotMoveToANewlyRegisteredOwnerOfTheId() throws Exception {
+        MemorySocket joining = new MemorySocket();
+        addClient(2, 0, joining);
+        dispatchThenChange(() -> sendPlayer(true), () -> {
+            closeClient(1);
+            clients.remove(1);
+            set(clients.get(2), "mPlayerID", (byte) 1);
+        });
+        assertEquals("An old score event moved to a new registration", 0, joining.bytes.size());
+        assertEquals(0, sockets.get(0).bytes.size());
+    }
+
+    @Test
+    public void queuedTeamScoreStillReachesTeammatesAfterTheScorerLeaves() throws Exception {
+        MemorySocket teammate = new MemorySocket();
+        addClient(2, teammate);
+        dispatchThenChange(() -> sendTeam(true, false), () -> {
+            closeClient(1);
+            clients.remove(1);
+        });
+        assertEquals("team", new DataInputStream(new ByteArrayInputStream(teammate.bytes.toByteArray())).readUTF());
+        assertEquals(0, sockets.get(0).bytes.size());
+    }
+
+    @Test
+    public void queuedStartCannotMoveToAReplacementRoster() throws Exception {
+        MemorySocket replacement = new MemorySocket();
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> {
+            closeClient(1);
+            clients.remove(1);
+            addClient(3, 1, replacement);
+        });
+        assertEquals("New round inherited an earlier start request", 0, replacement.bytes.size());
+        assertTrue(server.events.isEmpty());
+    }
+
+    @Test
+    public void failedStartWritesDoNotPublishAStartConfirmation() throws Exception {
+        set(clients.get(1), "out", new DataOutputStream(new OutputStream() {
+            @Override public void write(int value) throws IOException { throw new IOException("Disconnected"); }
+        }));
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertTrue("Server confirmed a start that no client received", server.events.isEmpty());
+        assertTrue(sockets.get(0).closed);
+    }
+
+    private void assertLaterJoinerDoesNotReceive(CheckedAction send, int playerID) throws Exception {
+        MemorySocket newcomer = new MemorySocket();
+        dispatchThenChange(send, () -> addClient(playerID, newcomer));
+        assertEquals("Late joiner received an older update", 0, newcomer.bytes.size());
+        assertTrue("Existing recipient lost its update", sockets.get(0).bytes.size() > 0);
+    }
+
+    private void assertReplacementDoesNotReceive(CheckedAction send) throws Exception {
+        MemorySocket replacement = new MemorySocket();
+        dispatchThenChange(send, () -> {
+            closeClient(1);
+            clients.remove(1);
+            addClient(3, 1, replacement);
+        });
+        assertEquals("New connection inherited an old registration's message", 0, replacement.bytes.size());
+        assertEquals(0, sockets.get(0).bytes.size());
+    }
+
+    private void dispatchThenChange(CheckedAction send, CheckedAction change) throws Exception {
+        clientsLock.acquire();
+        Thread worker;
+        try {
+            send.run();
+            worker = queuedWorker();
+            change.run();
+        } finally { clientsLock.release(); }
+        worker.join(1000);
+        assertFalse("Sender did not finish after the membership change", worker.isAlive());
+        assertEquals(1, clientsLock.availablePermits());
+    }
+
     private void assertInterruptedSend(CheckedAction action) throws Exception {
         clientsLock.acquire();
         try {
@@ -414,6 +598,10 @@ public class TcpServerDispatchRegressionTest {
     }
 
     private void addClient(int playerID, MemorySocket socket) throws Exception {
+        addClient(playerID, playerID, socket);
+    }
+
+    private void addClient(int connectionID, int playerID, MemorySocket socket) throws Exception {
         sockets.add(socket);
         Class<?> type = Class.forName(TcpServer.class.getName() + "$ClientData");
         Constructor<?> constructor = type.getDeclaredConstructor(TcpServer.class);
@@ -421,10 +609,11 @@ public class TcpServerDispatchRegressionTest {
         Object client = constructor.newInstance(server);
         Method initialize = type.getDeclaredMethod("initialize", Socket.class, int.class);
         initialize.setAccessible(true);
-        assertTrue((boolean) initialize.invoke(client, socket, playerID));
+        assertTrue((boolean) initialize.invoke(client, socket, connectionID));
         set(client, "mPlayerID", (byte) playerID);
-        clients.put(playerID, client);
-        InetAddress address = InetAddress.getByAddress(new byte[]{127, 0, 0, (byte) playerID});
+        clients.put(connectionID, client);
+        if (playerID == 0) return;
+        InetAddress address = InetAddress.getByAddress(new byte[]{127, 0, 0, (byte) connectionID});
         Globals.getInstance().mTeamIPMap.put((byte) playerID, address);
         Globals.getInstance().mIPTeamMap.put(address, (byte) playerID);
         Globals.getInstance().mTeamPlayerNameMap.put((byte) playerID, "Player " + playerID);
