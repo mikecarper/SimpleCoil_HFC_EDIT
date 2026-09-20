@@ -764,14 +764,21 @@ public class TcpClient extends Service {
             }
             if (game.has(TcpServer.JSON_GRENADE_PAIRINGS)) {
                 int[] pairings = new int[Globals.MAX_GRENADE_IDS];
+                boolean[] pairedGrenades = new boolean[Globals.MAX_GRENADE_IDS];
+                boolean[] pairedPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
                 Arrays.fill(pairings, Globals.INVALID_PLAYER_ID);
                 JSONArray grenadePairings = game.getJSONArray(TcpServer.JSON_GRENADE_PAIRINGS);
                 for (int x = 0; x < grenadePairings.length(); x++) {
                     JSONObject grenadePairing = grenadePairings.getJSONObject(x);
                     int grenadeID = TcpJson.getInt(grenadePairing, TcpServer.JSON_PAIRED_GRENADE_ID);
                     int playerID = TcpJson.getInt(grenadePairing, TcpServer.JSON_PLAYERID);
-                    if (!Globals.isValidGrenadeID(grenadeID) || !Globals.isValidPlayerID(playerID) || playerID <= 0)
+                    if (!Globals.isValidGrenadeID(grenadeID) || grenadeID <= 0
+                            || !Globals.isValidPlayerID(playerID) || playerID <= 0)
                         throw new JSONException("Invalid grenade pairing snapshot");
+                    if (pairedGrenades[grenadeID] || pairedPlayers[playerID])
+                        throw new JSONException("Conflicting grenade pairing snapshot");
+                    pairedGrenades[grenadeID] = true;
+                    pairedPlayers[playerID] = true;
                     pairings[grenadeID] = playerID;
                 }
                 // Parse the complete snapshot before replacing any live state.
@@ -790,6 +797,7 @@ public class TcpClient extends Service {
             if (game.has(TcpServer.JSON_GPSUPDATE)) {
                 JSONArray updates = game.getJSONArray(TcpServer.JSON_GPSUPDATE);
                 Map<Byte, Globals.GPSData> locations = new HashMap<>();
+                boolean[] seenPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
                 boolean fullUpdate = game.has(TcpServer.JSON_GPSFULLUPDATE)
                         && game.getBoolean(TcpServer.JSON_GPSFULLUPDATE);
                 for (int x = 0; x < updates.length(); x++) {
@@ -797,6 +805,9 @@ public class TcpClient extends Service {
                     int rawPlayerID = TcpJson.getInt(update, TcpServer.JSON_PLAYERID);
                     if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0)
                         throw new JSONException("Invalid GPS player ID " + rawPlayerID);
+                    if (seenPlayers[rawPlayerID])
+                        throw new JSONException("Conflicting GPS player snapshot");
+                    seenPlayers[rawPlayerID] = true;
                     byte playerID = (byte) rawPlayerID;
                     if (playerID != Globals.getInstance().mPlayerID) {
                         double longitude = update.getDouble(TcpServer.JSON_GPSLONGITUDE);

@@ -663,6 +663,30 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void duplicateGrenadeIdsDoNotPartiallyReplaceTheSnapshot() throws Exception {
+        int[] before = globals.mGrenadePairings.clone();
+        parse(new JSONObject().put(TcpServer.JSON_GRENADE_PAIRINGS,
+                new JSONArray().put(pairing(2, 3)).put(pairing(2, 4))));
+        assertArrayEquals(before, globals.mGrenadePairings);
+    }
+
+    @Test
+    public void duplicateGrenadeOwnersDoNotPartiallyReplaceTheSnapshot() throws Exception {
+        int[] before = globals.mGrenadePairings.clone();
+        parse(new JSONObject().put(TcpServer.JSON_GRENADE_PAIRINGS,
+                new JSONArray().put(pairing(2, 3)).put(pairing(4, 3))));
+        assertArrayEquals(before, globals.mGrenadePairings);
+    }
+
+    @Test
+    public void zeroGrenadeIdDoesNotPartiallyReplaceTheSnapshot() throws Exception {
+        int[] before = globals.mGrenadePairings.clone();
+        parse(new JSONObject().put(TcpServer.JSON_GRENADE_PAIRINGS,
+                new JSONArray().put(pairing(2, 3)).put(pairing(0, 4))));
+        assertArrayEquals(before, globals.mGrenadePairings);
+    }
+
+    @Test
     public void incrementalGpsUpdateRefreshesThePlayersTeam() throws Exception {
         putGPS(5, 1);
         parse(gpsUpdate(false, gps(5, 2)));
@@ -706,6 +730,16 @@ public class TcpGameInfoRegressionTest {
         JSONObject invalid = gps(9, 2).put(TcpServer.JSON_GPSLATITUDE, 200.0);
         parse(gpsUpdate(true, invalid));
         assertSame(original, globals.mGPSData.get((byte) 5));
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void duplicateGpsPlayersDoNotPartiallyReplaceTheSnapshot() throws Exception {
+        Globals.GPSData original = putGPS(5, 1);
+        parse(gpsUpdate(true, gps(5, 2), gps(5, 1)));
+        assertEquals(1, globals.mGPSData.size());
+        assertSame(original, globals.mGPSData.get((byte) 5));
+        assertEquals(1, original.team);
         assertTrue(client.events.isEmpty());
     }
 
