@@ -332,6 +332,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private SharedPreferences sharedPreferences = null;
     public static final String PREF_NAME = "SimpleCoil";
     private static final String PREF_PLAYER_NAME = "PlayerName";
+    private static final String DEFAULT_PLAYER_NAME = "Player";
     private static final String PREF_PLAYER_ID = "PlayerID";
     private static final String PREF_FIRING_MODE = "FiringMode";
     private static final String PREF_SHOT_MODE = "ShotMode";
@@ -341,6 +342,32 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     public static final String PREF_LIMIT_LIVES = "LivesLimit";
     public static final String PREF_LIMIT_SCORE = "ScoreLimit";
     public static final String PREF_DEVICE_ADDRESS = "DeviceAddress";
+
+    static String normalizePlayerName(String playerName) {
+        return TcpJson.isValidPlayerName(playerName) ? playerName : DEFAULT_PLAYER_NAME;
+    }
+
+    static String normalizeBluetoothAddress(String address) {
+        if (address == null)
+            return "";
+        String normalized = address.trim().toUpperCase(Locale.US);
+        return BluetoothAdapter.checkBluetoothAddress(normalized) ? normalized : "";
+    }
+
+    private void restoreSavedProfile() {
+        String savedPlayerName = sharedPreferences.getString(PREF_PLAYER_NAME, DEFAULT_PLAYER_NAME);
+        String playerName = normalizePlayerName(savedPlayerName);
+        String savedDeviceAddress = sharedPreferences.getString(PREF_DEVICE_ADDRESS, "");
+        String deviceAddress = normalizeBluetoothAddress(savedDeviceAddress);
+        Globals.getInstance().mPlayerName = playerName;
+        mDeviceAddress = deviceAddress;
+        if (!playerName.equals(savedPlayerName) || !deviceAddress.equals(savedDeviceAddress)) {
+            SharedPreferences.Editor editor = sharedPreferences.edit();
+            editor.putString(PREF_PLAYER_NAME, playerName);
+            editor.putString(PREF_DEVICE_ADDRESS, deviceAddress);
+            editor.apply();
+        }
+    }
 
     private void setupBLEServiceConnection() {
         if (mBLEServiceBound) return;
@@ -616,7 +643,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mReconnectButton.setOnClickListener((v -> {
             if (sharedPreferences == null)
                 sharedPreferences = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
-            mDeviceAddress = sharedPreferences.getString(PREF_DEVICE_ADDRESS, "");
+            String savedAddress = sharedPreferences.getString(PREF_DEVICE_ADDRESS, "");
+            mDeviceAddress = normalizeBluetoothAddress(savedAddress);
+            if (!mDeviceAddress.equals(savedAddress))
+                sharedPreferences.edit().putString(PREF_DEVICE_ADDRESS, mDeviceAddress).apply();
             if (mDeviceAddress != null && !mDeviceAddress.isEmpty())
                 connectWeapon();
             else {
@@ -769,7 +799,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         initBatteryQueue();
         vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
         sharedPreferences = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
-        Globals.getInstance().mPlayerName = sharedPreferences.getString(PREF_PLAYER_NAME, "Player");
+        restoreSavedProfile();
         Globals.getInstance().mCurrentFiringMode = sharedPreferences.getInt(PREF_FIRING_MODE, Globals.FIRING_MODE_OUTDOOR_NO_CONE);
         int savedPlayerID = sharedPreferences.getInt(PREF_PLAYER_ID, 0);
         Globals.getInstance().mPlayerID = Globals.isValidPlayerID(savedPlayerID) ? (byte) savedPlayerID : 0;
@@ -791,7 +821,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Globals.getInstance().mScoreLimit = Globals.isValidGameLimit(savedScoreLimit) ? savedScoreLimit : 0;
         if (Globals.getInstance().mScoreLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
-        mDeviceAddress = sharedPreferences.getString(PREF_DEVICE_ADDRESS, "");
         if (mDeviceAddress != null && !mDeviceAddress.isEmpty()) {
             mReconnectButton.setVisibility(View.VISIBLE);
         } else {
@@ -2129,10 +2158,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     Log.w(TAG, "QR scanner returned RESULT_OK without result data");
                     return;
                 }
-                String scannedAddress = data.getStringExtra("SCAN_RESULT");
-                if (scannedAddress != null)
-                    scannedAddress = scannedAddress.trim().toUpperCase(Locale.US);
-                if (scannedAddress == null || !BluetoothAdapter.checkBluetoothAddress(scannedAddress)) {
+                String scannedAddress = normalizeBluetoothAddress(data.getStringExtra("SCAN_RESULT"));
+                if (scannedAddress.isEmpty()) {
                     Log.w(TAG, "QR scanner did not return a valid Bluetooth address");
                     Toast.makeText(getApplicationContext(), R.string.error_invalid_qr_address,
                             Toast.LENGTH_LONG).show();

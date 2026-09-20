@@ -71,9 +71,13 @@ final class TcpJson {
     static String getPlayerName(JSONObject player, String key) throws JSONException {
         Object value = player.get(key);
         // getString() coerces null, numbers and containers into player names.
-        if (!(value instanceof String) || ((String) value).length() > MAX_PLAYER_NAME_LENGTH)
+        if (!(value instanceof String) || !isValidPlayerName((String) value))
             throw new JSONException("Invalid player name");
         return (String) value;
+    }
+
+    static boolean isValidPlayerName(String playerName) {
+        return playerName != null && playerName.length() <= MAX_PLAYER_NAME_LENGTH;
     }
 
     static int getInt(JSONObject object, String key) throws JSONException {
