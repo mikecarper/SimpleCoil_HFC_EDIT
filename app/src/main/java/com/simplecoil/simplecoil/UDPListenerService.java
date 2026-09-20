@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -72,6 +73,14 @@ public class UDPListenerService extends Service {
             SEND_THREAD_KEEP_ALIVE_MS, TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<>(MAX_PENDING_DATAGRAM_SENDS),
             runnable -> new Thread(runnable, "SimpleCoil UDP send"),
+            new ThreadPoolExecutor.DiscardOldestPolicy());
+    // A manual join can require DNS. Keep an unresolved lookup from creating a
+    // new thread for every tap, while retaining the most recent address request.
+    static final int MAX_PENDING_SERVER_LOOKUPS = 1;
+    private final ThreadPoolExecutor mLookupExecutor = new ThreadPoolExecutor(0, 1,
+            SEND_THREAD_KEEP_ALIVE_MS, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(MAX_PENDING_SERVER_LOOKUPS),
+            runnable -> new Thread(runnable, "SimpleCoil UDP lookup"),
             new ThreadPoolExecutor.DiscardOldestPolicy());
     private volatile boolean keepListening = false;
     private volatile boolean doneListening = true;
@@ -477,26 +486,38 @@ public class UDPListenerService extends Service {
             generation = mJoinGeneration;
         }
         Log.e(TAG, "attempt to join " + ip);
-        Thread joinThread = new Thread(() -> {
-            InetAddress ipAddr;
-            try {
-                ipAddr = InetAddress.getByName(ip);
-            } catch (UnknownHostException e) {
-                Log.e(TAG, "unknown host!");
-                synchronized (mListenerStateLock) {
-                    if (!mDestroyed && generation == mJoinGeneration)
-                        sendFailedJoin();
-                }
-                return;
-            }
+        try {
+            mLookupExecutor.execute(() -> resolveAndJoinServer(ip, generation));
+        } catch (RejectedExecutionException e) {
             synchronized (mListenerStateLock) {
-                // A cancelled DNS lookup must not resurrect discovery or replace
-                // the target of a newer Join request after it finally resolves.
                 if (!mDestroyed && generation == mJoinGeneration)
-                    joinServer(ipAddr);
+                    sendFailedJoin();
             }
-        }, "SimpleCoil UDP lookup");
-        joinThread.start();
+        }
+    }
+
+    InetAddress resolveServerAddress(String address) throws UnknownHostException {
+        return InetAddress.getByName(address);
+    }
+
+    private void resolveAndJoinServer(String address, long generation) {
+        final InetAddress ipAddr;
+        try {
+            ipAddr = resolveServerAddress(address);
+        } catch (UnknownHostException | SecurityException e) {
+            Log.w(TAG, "Unable to resolve server address", e);
+            synchronized (mListenerStateLock) {
+                if (!mDestroyed && generation == mJoinGeneration)
+                    sendFailedJoin();
+            }
+            return;
+        }
+        synchronized (mListenerStateLock) {
+            // A cancelled lookup must not resurrect discovery or replace the
+            // target of a newer Join request after it finally resolves.
+            if (!mDestroyed && generation == mJoinGeneration)
+                joinServer(ipAddr);
+        }
     }
 
     public void joinServer(InetAddress serverIP) {
@@ -712,6 +733,7 @@ public class UDPListenerService extends Service {
             releaseMulticastLockLocked();
         }
         mSendExecutor.shutdownNow();
+        mLookupExecutor.shutdownNow();
         super.onDestroy();
     }
 

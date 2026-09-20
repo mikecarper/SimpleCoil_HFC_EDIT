@@ -20,7 +20,10 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -380,6 +383,24 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void rapidManualJoinsUseOneBoundedLatestLookupQueue() throws Exception {
+        service.blockFirstLookup = true;
+        service.joinServer(teammate.getHostAddress());
+        assertTrue("First lookup did not start", service.lookupStarted.await(2000, TimeUnit.MILLISECONDS));
+
+        for (int count = 0; count < 64; count++)
+            service.joinServer(enemy.getHostAddress());
+
+        ThreadPoolExecutor executor = (ThreadPoolExecutor) get(service, "mLookupExecutor");
+        assertEquals(1, executor.getPoolSize());
+        assertTrue(executor.getQueue().size() <= UDPListenerService.MAX_PENDING_SERVER_LOOKUPS);
+
+        service.releaseLookup.countDown();
+        awaitLookups();
+        assertEquals(1, service.listenerStarts);
+    }
+
+    @Test
     public void serviceRestartCommandCannotUndoAnExplicitStop() throws Exception {
         service.stopListen();
         service.onStartCommand(null, 0, 1);
@@ -507,10 +528,26 @@ public class UDPRegressionTest {
         final List<Intent> events = new CopyOnWriteArrayList<>();
         boolean realListener;
         int listenerStarts;
+        boolean blockFirstLookup;
+        final CountDownLatch lookupStarted = new CountDownLatch(1);
+        final CountDownLatch releaseLookup = new CountDownLatch(1);
         @Override public void sendBroadcast(Intent intent) { events.add(new Intent(intent)); }
         @Override public void startListenForUDPMessage() {
             if (realListener) super.startListenForUDPMessage();
             else listenerStarts++;
+        }
+        @Override InetAddress resolveServerAddress(String address) throws java.net.UnknownHostException {
+            if (blockFirstLookup) {
+                blockFirstLookup = false;
+                lookupStarted.countDown();
+                try {
+                    releaseLookup.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new java.net.UnknownHostException("Lookup interrupted");
+                }
+            }
+            return super.resolveServerAddress(address);
         }
     }
 }
