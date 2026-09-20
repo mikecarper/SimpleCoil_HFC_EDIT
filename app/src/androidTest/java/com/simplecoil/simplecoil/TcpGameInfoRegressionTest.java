@@ -591,6 +591,27 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void duplicateLocalPlayerInRosterDoesNotReplaceLivePlayers() throws Exception {
+        parse(roster(new JSONArray().put(player(1)).put(player(1)).put(player(3))));
+        assertOriginalRoster();
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void oversizedRosterDoesNotReplaceLivePlayersOrSettings() throws Exception {
+        JSONArray players = new JSONArray();
+        for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++)
+            players.put(player(id));
+        // The client itself is not stored in the peer endpoint maps, so a
+        // duplicate self entry previously slipped past the endpoint checks.
+        players.put(player(1));
+        parse(roster(players).put(TcpServer.JSON_PLAYERSETTINGS, new JSONArray().put(settings(1)))
+                .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, false));
+        assertOriginalRoster();
+        assertOriginalSettings();
+    }
+
+    @Test
     public void emptyRemoteAddressCannotBeResolvedAsLocalhost() throws Exception {
         parse(roster(new JSONArray().put(player(3).put(TcpServer.JSON_PLAYERIP, "/"))));
         assertOriginalRoster();

@@ -768,6 +768,8 @@ public class TcpClient extends Service {
                 boolean[] pairedPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
                 Arrays.fill(pairings, Globals.INVALID_PLAYER_ID);
                 JSONArray grenadePairings = game.getJSONArray(TcpServer.JSON_GRENADE_PAIRINGS);
+                if (grenadePairings.length() > Globals.MAX_GRENADE_IDS)
+                    throw new JSONException("Too many grenade pairings in snapshot");
                 for (int x = 0; x < grenadePairings.length(); x++) {
                     JSONObject grenadePairing = grenadePairings.getJSONObject(x);
                     int grenadeID = TcpJson.getInt(grenadePairing, TcpServer.JSON_PAIRED_GRENADE_ID);
@@ -796,6 +798,8 @@ public class TcpClient extends Service {
             }
             if (game.has(TcpServer.JSON_GPSUPDATE)) {
                 JSONArray updates = game.getJSONArray(TcpServer.JSON_GPSUPDATE);
+                if (updates.length() > Globals.MAX_PLAYER_ID)
+                    throw new JSONException("Too many GPS updates in snapshot");
                 Map<Byte, Globals.GPSData> locations = new HashMap<>();
                 boolean[] seenPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
                 boolean fullUpdate = game.has(TcpServer.JSON_GPSFULLUPDATE)
@@ -850,6 +854,8 @@ public class TcpClient extends Service {
             boolean allowPlayerSettings = false;
             if (game.has(TcpServer.JSON_PLAYERSETTINGS)) {
                 JSONArray settings = game.getJSONArray(TcpServer.JSON_PLAYERSETTINGS);
+                if (settings.length() > Globals.MAX_PLAYER_ID)
+                    throw new JSONException("Too many player settings in snapshot");
                 settingsUpdate = new HashMap<>();
                 allowPlayerSettings = game.getBoolean(TcpServer.JSON_ALLOWPLAYERSETTINGS);
                 for (int x = 0; x < settings.length(); x++) {
@@ -897,11 +903,17 @@ public class TcpClient extends Service {
                 Map<InetAddress, Byte> ipTeams = new HashMap<>();
                 Map<Byte, String> playerNames = new HashMap<>();
                 JSONArray players = game.getJSONArray(TcpServer.JSON_PLAYERS);
+                if (players.length() > Globals.MAX_PLAYER_ID)
+                    throw new JSONException("Too many players in roster snapshot");
+                boolean[] seenPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
                 for (int x = 0; x < players.length(); x++) {
                     JSONObject player = players.getJSONObject(x);
                     int rawPlayerID = TcpJson.getInt(player, TcpServer.JSON_PLAYERID);
                     if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0)
                         throw new JSONException("Invalid roster player ID " + rawPlayerID);
+                    if (seenPlayers[rawPlayerID])
+                        throw new JSONException("Conflicting player roster snapshot");
+                    seenPlayers[rawPlayerID] = true;
                     byte playerID = (byte) rawPlayerID;
                     if (playerID != Globals.getInstance().mPlayerID) {
                         InetAddress playerIP;
