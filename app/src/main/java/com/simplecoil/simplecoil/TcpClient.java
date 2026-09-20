@@ -165,6 +165,7 @@ public class TcpClient extends Service {
             messageQueue = new ConcurrentLinkedQueue<>();
             mPersistentDrainRequested = false;
             mPendingTerminalEvent = null;
+            mIsDedicatedServer = false;
             resetClockSyncLocked();
             socket = mActiveSocket;
             clientThread = mClientThread;
@@ -691,6 +692,10 @@ public class TcpClient extends Service {
             out = null;
             messageQueue = new ConcurrentLinkedQueue<>();
             mPersistentDrainRequested = false;
+            // This terminal event ends the server relationship. Retaining the
+            // old dedicated flag makes the next peer-host lobby send its
+            // gameplay traffic down a stopped TCP connection.
+            mIsDedicatedServer = false;
             notification = new Intent(action).putExtra(EXTRA_TERMINAL_EVENT_ID, terminalEventIds.incrementAndGet());
             mPendingTerminalEvent = notification;
             resetClockSyncLocked();
@@ -819,6 +824,9 @@ public class TcpClient extends Service {
         synchronized (this) {
             mSessionGeneration++;
             keepListening = false;
+            // A later lobby can be peer-hosted. Do not let a prior dedicated
+            // roster influence its score, grenade, or leave routing.
+            mIsDedicatedServer = false;
             resetClockSyncLocked();
             // Established connections are drained by the reader before closing.
             // Startup/retry waits have no outgoing writer and can be interrupted now.

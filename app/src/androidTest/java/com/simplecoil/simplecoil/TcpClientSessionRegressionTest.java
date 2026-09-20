@@ -191,6 +191,17 @@ public class TcpClientSessionRegressionTest {
     }
 
     @Test
+    public void stoppingDedicatedClientClearsDedicatedModeForTheNextLobby() throws Exception {
+        Field dedicated = TcpClient.class.getDeclaredField("mIsDedicatedServer");
+        dedicated.setAccessible(true);
+        dedicated.setBoolean(client, true);
+
+        client.stopTcpClient();
+
+        assertFalse("A stopped dedicated session affected the next lobby", client.isDedicatedServer());
+    }
+
+    @Test
     public void registeredProtocolStillDeliversGameEvents() throws Exception {
         connect();
         Field dedicated = TcpClient.class.getDeclaredField("mIsDedicatedServer");
