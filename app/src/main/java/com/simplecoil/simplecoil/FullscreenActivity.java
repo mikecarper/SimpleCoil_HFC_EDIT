@@ -152,6 +152,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private ImageView mShotsFiredIV = null;
     private ImageView mScoreIncreaseIV = null;
     private TextView mScoreIncreasePlayerNameTV = null;
+    private final Handler mCombatFeedbackHandler = new Handler(Looper.getMainLooper());
+    private Runnable mIncomingHitCleanup;
+    private Runnable mScoreFeedbackCleanup;
     private TextView mServerIPTV = null;
     private Chronometer mGameTimer = null;
     private Button mGameLimitButton = null;
@@ -1253,6 +1256,49 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
     }
 
+    private static void hideFeedbackView(View view, int visibility) {
+        if (view != null) {
+            view.clearAnimation();
+            view.setVisibility(visibility);
+        }
+    }
+
+    private void clearIncomingHitFeedback() {
+        if (mIncomingHitCleanup != null) {
+            mCombatFeedbackHandler.removeCallbacks(mIncomingHitCleanup);
+            mIncomingHitCleanup = null;
+        }
+        if (mHitAnimation != null) {
+            mHitAnimation.stop();
+            mHitAnimation = null;
+        }
+        hideFeedbackView(mHitIV, View.GONE);
+        // This label is reused for the killer during respawn. Retire both the
+        // old fade and its cleanup before the respawn screen takes ownership.
+        hideFeedbackView(mEliminatedByTV, View.INVISIBLE);
+    }
+
+    private void clearHitConfirmation() {
+        if (mHitPlayerAnimation != null) {
+            mHitPlayerAnimation.stop();
+            mHitPlayerAnimation = null;
+        }
+        hideFeedbackView(mHitPlayerIV, View.GONE);
+        hideFeedbackView(mHitPlayerNameTV, View.GONE);
+    }
+
+    private void clearCombatFeedback() {
+        // Only transient combat UI work uses this handler. Never let an old
+        // round's delayed cleanup hide feedback in the next round.
+        mCombatFeedbackHandler.removeCallbacksAndMessages(null);
+        mScoreFeedbackCleanup = null;
+        clearIncomingHitFeedback();
+        clearHitConfirmation();
+        hideFeedbackView(mShotsFiredIV, View.GONE);
+        hideFeedbackView(mScoreIncreaseIV, View.GONE);
+        hideFeedbackView(mScoreIncreasePlayerNameTV, View.GONE);
+    }
+
     private void startShieldRegeneration(long delayMilliseconds) {
         cancelShieldRegeneration();
         if (mShield >= Globals.getInstance().mFullShields)
@@ -1308,6 +1354,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             endGame();
             return;
         }
+        clearCombatFeedback();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_HIDE_NAVIGATION // hide nav bar
@@ -1373,6 +1420,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void endGame() {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        clearCombatFeedback();
         if (mIsServer && mTcpServer != null)
             mTcpServer.clearScheduledStart();
         mHasSynchronizedStart = false;
@@ -1566,6 +1614,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void startSpawn(String eliminatedBy) {
+        clearIncomingHitFeedback();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
             mSpawnTimer = null;
@@ -1809,6 +1858,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        clearCombatFeedback();
         stopBLEScan();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
@@ -2696,12 +2746,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                         mEliminatedByTV.setText(Globals.getInstance().getPlayerName(hit_by_id));
                                     }
                                     mEliminatedByTV.startAnimation(animationFadeOut);
-                                    new Handler().postDelayed(() -> {
-                                        mHitIV.setVisibility(View.GONE);
-                                        mHitAnimation.stop();
-                                        mHitAnimation = null;
-                                        mEliminatedByTV.setVisibility(View.INVISIBLE);
-                                    }, HIT_ANIMATION_DURATION_MILLISECONDS);
+                                    mIncomingHitCleanup = new Runnable() {
+                                        @Override public void run() {
+                                            if (mIncomingHitCleanup == this)
+                                                clearIncomingHitFeedback();
+                                        }
+                                    };
+                                    mCombatFeedbackHandler.postDelayed(mIncomingHitCleanup,
+                                            HIT_ANIMATION_DURATION_MILLISECONDS);
                                 }
                             } else {
                                 //TODO vibration toggle
@@ -2833,7 +2885,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     mShotsFiredIV.setVisibility(View.VISIBLE);
                     Animation animationFadeOut = AnimationUtils.loadAnimation(getApplicationContext(), R.anim.fadeout);
                     mShotsFiredIV.startAnimation(animationFadeOut);
-                    new Handler().postDelayed(() -> mShotsFiredIV.setVisibility(View.GONE), HIT_ANIMATION_DURATION_MILLISECONDS);
+                    mCombatFeedbackHandler.postDelayed(() -> hideFeedbackView(mShotsFiredIV, View.GONE),
+                            HIT_ANIMATION_DURATION_MILLISECONDS);
                 }
             } else if (NetMsg.NETMSG_HIT.equals(action)) {
                 // Play a sound?
@@ -2853,12 +2906,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         mHitPlayerNameTV.setText(Globals.getInstance().getPlayerName(hitPlayerID));
                     }
                     mHitPlayerNameTV.startAnimation(animationFadeOut);
-                    new Handler().postDelayed(() -> {
-                        mHitPlayerIV.setVisibility(View.GONE);
-                        mHitPlayerAnimation.stop();
-                        mHitPlayerAnimation = null;
-                        mHitPlayerNameTV.setVisibility(View.GONE);
-                    }, HIT_ANIMATION_DURATION_MILLISECONDS);
+                    mCombatFeedbackHandler.postDelayed(FullscreenActivity.this::clearHitConfirmation,
+                            HIT_ANIMATION_DURATION_MILLISECONDS);
                 }
             } else if (NetMsg.NETMSG_OUT.equals(action)) {
                 // Play a sound?
@@ -2878,12 +2927,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         mHitPlayerNameTV.setText(Globals.getInstance().getPlayerName(hitPlayerID));
                     }
                     mHitPlayerNameTV.startAnimation(animationFadeOut);
-                    new Handler().postDelayed(() -> {
-                        mHitPlayerIV.setVisibility(View.GONE);
-                        mHitPlayerAnimation.stop();
-                        mHitPlayerAnimation = null;
-                        mHitPlayerNameTV.setVisibility(View.GONE);
-                    }, HIT_ANIMATION_DURATION_MILLISECONDS);
+                    mCombatFeedbackHandler.postDelayed(FullscreenActivity.this::clearHitConfirmation,
+                            HIT_ANIMATION_DURATION_MILLISECONDS);
                 }
             } else if (NetMsg.NETMSG_ELIMINATED.equals(action)) {
                 // Increase score
@@ -2901,10 +2946,19 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     mScoreIncreasePlayerNameTV.setText(Globals.getInstance().getPlayerName(hitPlayerID));
                 }
                 mScoreIncreasePlayerNameTV.startAnimation(animationFadeOut);
-                new Handler().postDelayed(() -> {
-                    mScoreIncreaseIV.setVisibility(View.GONE);
-                    mScoreIncreasePlayerNameTV.setVisibility(View.GONE);
-                }, ELIMINATED_ANIMATION_DURATION_MILLISECONDS);
+                if (mScoreFeedbackCleanup != null)
+                    mCombatFeedbackHandler.removeCallbacks(mScoreFeedbackCleanup);
+                mScoreFeedbackCleanup = new Runnable() {
+                    @Override public void run() {
+                        if (mScoreFeedbackCleanup != this)
+                            return;
+                        mScoreFeedbackCleanup = null;
+                        hideFeedbackView(mScoreIncreaseIV, View.GONE);
+                        hideFeedbackView(mScoreIncreasePlayerNameTV, View.GONE);
+                    }
+                };
+                mCombatFeedbackHandler.postDelayed(mScoreFeedbackCleanup,
+                        ELIMINATED_ANIMATION_DURATION_MILLISECONDS);
                 playSound(R.raw.score, getApplicationContext());
                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                     mTeamScore++;

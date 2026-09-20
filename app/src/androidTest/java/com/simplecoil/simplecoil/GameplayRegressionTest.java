@@ -192,6 +192,117 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void fatalHitKeepsKillerVisibleAfterEarlierHitFeedbackExpires() throws InterruptedException {
+        scenario.onActivity(activity -> {
+            set(activity, "mHitAnimation", null);
+            set(activity, "mHealth", 6);
+            telemetry(activity, 11, 1, 0, 0);
+            assertEquals(1, get(activity, "mHealth"));
+            assertEquals(View.VISIBLE, ((View) get(activity, "mHitIV")).getVisibility());
+            telemetry(activity, 12, 1, 0, 0);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(View.VISIBLE, ((View) get(activity, "mEliminatedByTV")).getVisibility());
+        });
+        Thread.sleep(600);
+        scenario.onActivity(activity -> {
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals("The earlier hit hid the respawn screen's killer name", View.VISIBLE,
+                    ((View) get(activity, "mEliminatedByTV")).getVisibility());
+        });
+    }
+
+    @Test
+    public void fatalHitCancelsTheEarlierNamesFadeAnimation() {
+        scenario.onActivity(activity -> {
+            set(activity, "mHitAnimation", null);
+            set(activity, "mHealth", 6);
+            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 12, 1, 0, 0);
+            assertNull("The killer name must not inherit the nonfatal hit's fade",
+                    ((View) get(activity, "mEliminatedByTV")).getAnimation());
+            assertNull(get(activity, "mHitAnimation"));
+        });
+    }
+
+    @Test
+    public void endingRoundStopsIncomingAndOutgoingHitAnimations() {
+        scenario.onActivity(activity -> {
+            set(activity, "mHitAnimation", null);
+            telemetry(activity, 11, 1, 0, 0);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+            AnimationDrawable incoming = (AnimationDrawable) get(activity, "mHitAnimation");
+            AnimationDrawable outgoing = (AnimationDrawable) get(activity, "mHitPlayerAnimation");
+            assertTrue(incoming.isRunning());
+            assertTrue(outgoing.isRunning());
+            invoke(activity, "endGame");
+            assertNull("The finished round retained its incoming animation", get(activity, "mHitAnimation"));
+            assertNull("The finished round retained its hit confirmation", get(activity, "mHitPlayerAnimation"));
+            assertEquals(false, incoming.isRunning());
+            assertEquals(false, outgoing.isRunning());
+        });
+    }
+
+    @Test
+    public void nextRoundCanShowHitConfirmationBeforeThePreviousCleanupDeadline() {
+        scenario.onActivity(activity -> {
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+            invoke(activity, "endGame");
+            set(activity, "mUseNetwork", false);
+            invoke(activity, "startGame");
+            CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
+            spawn.cancel();
+            spawn.onFinish();
+            set(activity, "mUseNetwork", true);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_OUT));
+            assertEquals("The old animation suppressed this round's hit confirmation", View.VISIBLE,
+                    ((View) get(activity, "mHitPlayerIV")).getVisibility());
+        });
+    }
+
+    @Test
+    public void endingRoundImmediatelyClearsScoreFeedback() {
+        scenario.onActivity(activity -> {
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertEquals(View.VISIBLE, ((View) get(activity, "mScoreIncreaseIV")).getVisibility());
+            invoke(activity, "endGame");
+            assertEquals(View.GONE, ((View) get(activity, "mScoreIncreaseIV")).getVisibility());
+            assertEquals(View.GONE, ((View) get(activity, "mScoreIncreasePlayerNameTV")).getVisibility());
+        });
+    }
+
+    @Test
+    public void newestScoreFeedbackGetsItsOwnFullDisplayInterval() throws InterruptedException {
+        scenario.onActivity(activity -> receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED)));
+        Thread.sleep(500);
+        scenario.onActivity(activity -> receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED)));
+        Thread.sleep(400);
+        scenario.onActivity(activity -> {
+            assertEquals(2, get(activity, "mScore"));
+            assertEquals("The first kill's cleanup hid the newer score feedback", View.VISIBLE,
+                    ((View) get(activity, "mScoreIncreaseIV")).getVisibility());
+            assertEquals(View.VISIBLE, ((View) get(activity, "mScoreIncreasePlayerNameTV")).getVisibility());
+        });
+    }
+
+    @Test
+    public void ordinaryHitFeedbackStillExpires() throws InterruptedException {
+        scenario.onActivity(activity -> {
+            set(activity, "mHitAnimation", null);
+            telemetry(activity, 11, 1, 0, 0);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+            assertEquals(View.VISIBLE, ((View) get(activity, "mHitIV")).getVisibility());
+            assertEquals(View.VISIBLE, ((View) get(activity, "mHitPlayerIV")).getVisibility());
+        });
+        Thread.sleep(600);
+        scenario.onActivity(activity -> {
+            assertNull(get(activity, "mHitAnimation"));
+            assertNull(get(activity, "mHitPlayerAnimation"));
+            assertEquals(View.GONE, ((View) get(activity, "mHitIV")).getVisibility());
+            assertEquals(View.GONE, ((View) get(activity, "mHitPlayerIV")).getVisibility());
+        });
+    }
+
+    @Test
     public void zeroDelayReloadRefillsImmediately() {
         scenario.onActivity(activity -> {
             Globals.getInstance().mReloadTime = 0;
