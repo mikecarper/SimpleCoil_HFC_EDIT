@@ -692,6 +692,31 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void invalidDedicatedGameScoresDoNotPublishOrReplaceTheRoster() throws Exception {
+        Object[][] invalidValues = {
+                {TcpServer.JSON_PLAYERPOINTS, -1},
+                {TcpServer.JSON_PLAYERPOINTS, TcpClient.MAX_SCOREBOARD_VALUE + 1},
+                {TcpServer.JSON_PLAYERELIMINATED, -1},
+                {TcpServer.JSON_PLAYERELIMINATED, TcpClient.MAX_SCOREBOARD_VALUE + 1},
+                {TcpServer.JSON_TEAMPOINTS, -1},
+                {TcpServer.JSON_TEAMPOINTS, Globals.MAX_TEAM_SCOREBOARD_VALUE + 1}
+        };
+        for (Object[] invalid : invalidValues) {
+            JSONObject update = new JSONObject().put(TcpServer.JSON_PLAYERPOINTS, 7)
+                    .put(TcpServer.JSON_PLAYERELIMINATED, 2).put(TcpServer.JSON_TEAMPOINTS, 11);
+            update.put((String) invalid[0], invalid[1]);
+            JSONObject game = roster(new JSONArray().put(player(1)).put(player(3)))
+                    .put(TcpServer.JSON_DEDICATED, true)
+                    .put(TcpServer.JSON_GAMESTATE, Globals.GAME_STATE_RUNNING)
+                    .put(TcpServer.JSON_PLAYERGAMEUPDATE, update);
+            parse(game);
+            assertOriginalRoster();
+            assertFalse(client.isDedicatedServer());
+            assertTrue(client.events.isEmpty());
+        }
+    }
+
+    @Test
     public void malformedGrenadeSnapshotPreservesExistingPairings() throws Exception {
         int[] before = globals.mGrenadePairings.clone();
         JSONArray pairs = new JSONArray().put(pairing(2, 3))

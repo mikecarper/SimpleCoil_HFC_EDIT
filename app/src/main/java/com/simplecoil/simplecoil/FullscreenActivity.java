@@ -281,6 +281,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean mUseNetwork = false;
     private int mScore = 0;
     private int mTeamScore = 0;
+
+    private static int boundedCounter(int value, int maximum) {
+        return Math.max(0, Math.min(maximum, value));
+    }
+
+    private static int incrementCounter(int value, int maximum) {
+        value = boundedCounter(value, maximum);
+        return value == maximum ? maximum : value + 1;
+    }
+
     // A dedicated host can send a scoreboard only in response to a request or
     // when a round ends. Do not let repeated network frames create unbounded UI
     // parser threads or stack dialogs on top of the game.
@@ -2742,7 +2752,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         if (hit_by_player1 == Globals.GRENADE_PLAYER_ID && (data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x0F) != GRENADE_DAMAGE) {
                             // Ignore non-damage events from grenades
                         } else {
-                            mHitsTaken++;
+                            mHitsTaken = incrementCounter(mHitsTaken, Globals.MAX_SCOREBOARD_VALUE);
                             String hitsTaken = "" + mHitsTaken;
                             mHitsTakenTV.setText(hitsTaken);
                             healthRemoved = Globals.DAMAGE_PER_HIT;
@@ -2784,7 +2794,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         if (hit_by_player2 == Globals.GRENADE_PLAYER_ID && (data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x0F) != GRENADE_DAMAGE) {
                             // Ignore non-damage events from grenades
                         } else {
-                            mHitsTaken++;
+                            mHitsTaken = incrementCounter(mHitsTaken, Globals.MAX_SCOREBOARD_VALUE);
                             mHitsTakenTV.setText(String.valueOf(mHitsTaken));
                             int secondHitDamage = Globals.DAMAGE_PER_HIT;
                             if (mUseNetwork) {
@@ -2869,9 +2879,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                 }
                                 playSound(R.raw.eliminated, getApplicationContext());
                                 if (mHasLivesLimit)
-                                    mEliminationCount--;
+                                    mEliminationCount = Math.max(0, boundedCounter(mEliminationCount,
+                                            Globals.MAX_SCOREBOARD_VALUE) - 1);
                                 else
-                                    mEliminationCount++;
+                                    mEliminationCount = incrementCounter(mEliminationCount,
+                                            Globals.MAX_SCOREBOARD_VALUE);
                                 String elimStr = "" + mEliminationCount;
                                 mEliminationCountTV.setText(elimStr);
                                 String eliminatedBy = "";
@@ -3041,7 +3053,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 }
             } else if (NetMsg.NETMSG_ELIMINATED.equals(action)) {
                 // Increase score
-                mScore++;
+                mScore = incrementCounter(mScore, Globals.MAX_SCOREBOARD_VALUE);
                 String score = "" + mScore;
                 mScoreTV.setText(score);
                 mScoreIncreaseIV.setVisibility(View.VISIBLE);
@@ -3070,7 +3082,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         ELIMINATED_ANIMATION_DURATION_MILLISECONDS);
                 playSound(R.raw.score, getApplicationContext());
                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
-                    mTeamScore++;
+                    mTeamScore = incrementCounter(mTeamScore, Globals.MAX_TEAM_SCOREBOARD_VALUE);
                     score = "" + mTeamScore;
                     mTeamScoreTV.setText(score);
                     if (!isDedicatedServerConnection()) {
@@ -3092,7 +3104,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA)
                     return;
                 // Increase team score in team games
-                mTeamScore++;
+                mTeamScore = incrementCounter(mTeamScore, Globals.MAX_TEAM_SCOREBOARD_VALUE);
                 String score = "" + mTeamScore;
                 mTeamScoreTV.setText(score);
                 checkPeerScoreLimit();
@@ -3134,7 +3146,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             ? intent.getIntExtra(NetMsg.INTENT_GAMESTATE, Globals.GAME_STATE_ELIMINATED)
                             : Globals.GAME_STATE_ELIMINATED;
                     boolean hasGameUpdate = intent.getBooleanExtra(NetMsg.INTENT_HASGAMEUPDATE, false);
-                    int deaths = Math.max(0, intent.getIntExtra(NetMsg.INTENT_ELIMINATIONS, 0));
+                    int deaths = boundedCounter(intent.getIntExtra(NetMsg.INTENT_ELIMINATIONS, 0),
+                            Globals.MAX_SCOREBOARD_VALUE);
                     long timeRemaining = hasGameUpdate ? intent.getLongExtra(NetMsg.INTENT_TIMEREMAINING, -1) : -1;
                     boolean synchronizedStart = intent.hasExtra(NetMsg.INTENT_START_AT);
                     long synchronizedEnd = intent.getLongExtra(NetMsg.INTENT_END_AT, 0);
@@ -3155,14 +3168,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         }
                     }
                     if (hasGameUpdate) {
-                        mScore = Math.max(0, intent.getIntExtra(NetMsg.INTENT_SCORE, 0));
+                        mScore = boundedCounter(intent.getIntExtra(NetMsg.INTENT_SCORE, 0),
+                                Globals.MAX_SCOREBOARD_VALUE);
                         String score = "" + mScore;
                         mScoreTV.setText(score);
                         // The server counts deaths; the local HUD counts remaining lives when limited.
                         mEliminationCount = mHasLivesLimit ? Math.max(0, mLives - deaths) : deaths;
                         mEliminationCountTV.setText(String.valueOf(mEliminationCount));
                         if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
-                            mTeamScore = Math.max(0, intent.getIntExtra(NetMsg.INTENT_TEAMSCORE, 0));
+                            mTeamScore = boundedCounter(intent.getIntExtra(NetMsg.INTENT_TEAMSCORE, 0),
+                                    Globals.MAX_TEAM_SCOREBOARD_VALUE);
                             score = "" + mTeamScore;
                             mTeamScoreTV.setText(score);
                         }

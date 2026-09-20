@@ -36,6 +36,7 @@ public class Globals {
     // Scoreboards aggregate player scores into team totals. Keep each score below
     // a value whose sum remains representable for every supported player.
     public static final int MAX_SCOREBOARD_VALUE = Integer.MAX_VALUE / MAX_PLAYER_ID;
+    public static final int MAX_TEAM_SCOREBOARD_VALUE = MAX_SCOREBOARD_VALUE * MAX_PLAYER_ID;
 
     /**
      * Network messages may carry arbitrary integers, while UI and map storage are sized for

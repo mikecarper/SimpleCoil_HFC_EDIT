@@ -1116,10 +1116,19 @@ public class TcpClient extends Service {
                 if (game.has(TcpServer.JSON_PLAYERGAMEUPDATE)) {
                     intent.putExtra(NetMsg.INTENT_HASGAMEUPDATE, true);
                     JSONObject playerGameUpdate = game.getJSONObject(TcpServer.JSON_PLAYERGAMEUPDATE);
-                    intent.putExtra(NetMsg.INTENT_SCORE, TcpJson.getInt(playerGameUpdate, TcpServer.JSON_PLAYERPOINTS));
-                    intent.putExtra(NetMsg.INTENT_ELIMINATIONS, TcpJson.getInt(playerGameUpdate, TcpServer.JSON_PLAYERELIMINATED));
-                    if (playerGameUpdate.has(TcpServer.JSON_TEAMPOINTS))
-                        intent.putExtra(NetMsg.INTENT_TEAMSCORE, TcpJson.getInt(playerGameUpdate, TcpServer.JSON_TEAMPOINTS));
+                    int points = TcpJson.getInt(playerGameUpdate, TcpServer.JSON_PLAYERPOINTS);
+                    int eliminations = TcpJson.getInt(playerGameUpdate, TcpServer.JSON_PLAYERELIMINATED);
+                    if (points < 0 || points > MAX_SCOREBOARD_VALUE
+                            || eliminations < 0 || eliminations > MAX_SCOREBOARD_VALUE)
+                        throw new JSONException("Invalid player game scores from server");
+                    intent.putExtra(NetMsg.INTENT_SCORE, points);
+                    intent.putExtra(NetMsg.INTENT_ELIMINATIONS, eliminations);
+                    if (playerGameUpdate.has(TcpServer.JSON_TEAMPOINTS)) {
+                        int teamPoints = TcpJson.getInt(playerGameUpdate, TcpServer.JSON_TEAMPOINTS);
+                        if (teamPoints < 0 || teamPoints > Globals.MAX_TEAM_SCOREBOARD_VALUE)
+                            throw new JSONException("Invalid team game score from server");
+                        intent.putExtra(NetMsg.INTENT_TEAMSCORE, teamPoints);
+                    }
                     if (playerGameUpdate.has(TcpServer.JSON_TIMEREMAINING)) {
                         long timeRemaining = TcpJson.getLong(playerGameUpdate, TcpServer.JSON_TIMEREMAINING);
                         long maxGameTimeSeconds = (long) Globals.MAX_GAME_LIMIT * 60 + Globals.MAX_RESPAWN_TIME_SECONDS;

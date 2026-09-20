@@ -879,6 +879,18 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void peerScoreCountersSaturateRatherThanOverflow() {
+        scenario.onActivity(activity -> {
+            set(activity, "mScore", Globals.MAX_SCOREBOARD_VALUE);
+            set(activity, "mTeamScore", Globals.MAX_TEAM_SCOREBOARD_VALUE);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+            assertEquals(Globals.MAX_SCOREBOARD_VALUE, get(activity, "mScore"));
+            assertEquals(Globals.MAX_TEAM_SCOREBOARD_VALUE, get(activity, "mTeamScore"));
+        });
+    }
+
+    @Test
     public void ownKillReachingCombinedTeamLimitEndsPeerGame() {
         scenario.onActivity(activity -> {
             prepareScoreLimit(activity, Globals.GAME_MODE_2TEAMS);
