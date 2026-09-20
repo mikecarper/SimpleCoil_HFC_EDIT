@@ -892,9 +892,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return true;
             }else if (id == R.id.cancel_server_item) {
                     if (!networkServicesReady()) return true;
-                    mReady = false;
-                    setReady();
-                    mIsServer = false;
+                    // A host does not receive its own SERVERCANCEL message.
+                    // End a live local round before tearing down the listener,
+                    // otherwise its weapon and timers remain active after peers
+                    // have been told that the server disappeared.
+                    if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+                        endGame();
+                    } else {
+                        mReady = false;
+                        setReady();
+                        mIsServer = false;
+                    }
                     mUDPListenerService.cancelServer();
                     mTcpServer.cancelServer();
                     setNetworkMenu(NETWORK_TYPE_ENABLED);

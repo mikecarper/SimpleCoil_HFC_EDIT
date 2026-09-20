@@ -149,6 +149,26 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void cancellingPeerHostEndsAnActiveRoundLocally() {
+        scenario.onActivity(activity -> {
+            int[] calls = new int[1];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override public void cancelServer() { calls[0]++; }
+            });
+            set(activity, "mIsServer", true);
+            set(activity, "mReady", true);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            PopupMenu menu = new PopupMenu(activity, activity.findViewById(android.R.id.content));
+            assertTrue(activity.onMenuItemClick(menu.getMenu().add(0, R.id.cancel_server_item, 0, "Cancel")));
+            assertEquals(1, calls[0]);
+            assertEquals("Cancelling the host left its own round active", Globals.GAME_STATE_NONE,
+                    Globals.getInstance().mGameState);
+            assertEquals(false, get(activity, "mIsServer"));
+            assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
     public void firstGrenadeDisarmNotifiesDedicatedServer() {
         assertGrenadeUnpairNotifiesServer(false, 0x3D);
     }
