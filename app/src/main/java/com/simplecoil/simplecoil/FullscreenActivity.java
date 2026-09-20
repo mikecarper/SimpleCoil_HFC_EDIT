@@ -948,9 +948,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         mReady = false;
                         setReady();
                         mIsServer = false;
+                        mUDPListenerService.cancelServer();
+                        mTcpServer.cancelServer();
                     }
-                    mUDPListenerService.cancelServer();
-                    mTcpServer.cancelServer();
                     setNetworkMenu(NETWORK_TYPE_ENABLED);
                     return true;
             }else if (id == R.id.leave_item) {
@@ -1474,6 +1474,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void endGame() {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         clearCombatFeedback();
+        // A peer host owns a TCP listener only while it is serving this lobby or
+        // round. Ending locally must retire that listener too; otherwise the
+        // invisible listener can block a later attempt to host a new game.
+        boolean ownsPeerHost = mIsServer || mPeerHostCreationPending || mPeerUdpServerStarting;
         if (mIsServer && mTcpServer != null)
             mTcpServer.clearScheduledStart();
         mHasSynchronizedStart = false;
@@ -1484,11 +1488,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUseNetwork) {
             if (mUDPListenerService != null)
                 mUDPListenerService.stopListen();
+            if (ownsPeerHost && mTcpServer != null)
+                mTcpServer.cancelServer();
             if (mTcpClient != null && mTcpClient.isDedicatedServer())
                 mTcpClient.stopTcpClient();
+            mPeerHostCreationPending = false;
+            mPeerUdpServerStarting = false;
             mReady = false;
-            setReady(false);
             mIsServer = false;
+            setReady(false);
         }
         hideWeaponDisconnect();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

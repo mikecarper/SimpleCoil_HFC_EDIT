@@ -169,6 +169,25 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void endingPeerHostedGameCancelsItsTcpHost() {
+        scenario.onActivity(activity -> {
+            int[] calls = new int[1];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override public void cancelServer() { calls[0]++; }
+            });
+            set(activity, "mIsServer", true);
+            set(activity, "mReady", true);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+
+            invoke(activity, "endGame");
+
+            assertEquals("Ending a peer game left its TCP host running", 1, calls[0]);
+            assertEquals(false, get(activity, "mIsServer"));
+            assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
     public void failedPeerHostDiscoveryCancelsItsTcpListener() {
         scenario.onActivity(activity -> {
             int[] calls = new int[1];
