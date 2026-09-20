@@ -808,6 +808,20 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void peerCountdownBroadcastsGameEndBeforeLocalTeardown() {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = false;
+
+            invoke(activity, "startGameCountdown", new Class<?>[]{long.class}, 0L);
+
+            assertEquals("A peer match expired without notifying the other phones", 1,
+                    udp.endRequests);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+        });
+    }
+
+    @Test
     public void playerListUpdateCannotExposeLobbyControlsDuringRound() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);

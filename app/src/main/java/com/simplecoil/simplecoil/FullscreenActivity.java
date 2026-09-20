@@ -1884,6 +1884,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         playSound(R.raw.eliminated, getApplicationContext());
         if (isDedicatedServerConnection())
             mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME);
+        else if (mUseNetwork)
+            // A peer game's timers are local.  Notify the other phones before
+            // stopping this listener, otherwise a peer host looks like it was
+            // cancelled and its teammates can continue the finished round.
+            endUDPGame();
         // The server reply can be delayed or lost. Stop spawning and shooting locally now.
         endGame();
     }
