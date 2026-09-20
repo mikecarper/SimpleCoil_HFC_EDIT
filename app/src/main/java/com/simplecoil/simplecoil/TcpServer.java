@@ -263,8 +263,29 @@ public class TcpServer extends Service {
                     if (!Thread.currentThread().isInterrupted())
                         Log.e(TAG, "TCP client task failed", e);
                 } finally {
-                    if (cancelsServer)
+                    if (cancelsServer) {
+                        // A cancellation may time out while a registration owns
+                        // the client lock. Do not let that interruption leave the
+                        // old roster visible in the next lobby. Holding this lock
+                        // also keeps a replacement session from inheriting cleanup.
+                        if (!acquired) {
+                            boolean interrupted = Thread.interrupted();
+                            mClientDataSemaphore.acquireUninterruptibly();
+                            acquired = true;
+                            if (interrupted)
+                                Thread.currentThread().interrupt();
+                        }
+                        boolean interrupted = Thread.interrupted();
+                        try {
+                            clearCancelledSessionState();
+                        } catch (RuntimeException e) {
+                            Log.e(TAG, "Failed to clear cancelled TCP session", e);
+                        } finally {
+                            if (interrupted)
+                                Thread.currentThread().interrupt();
+                        }
                         stopTcpServer(Thread.currentThread());
+                    }
                     if (acquired)
                         mClientDataSemaphore.release();
                     synchronized (mServerStateLock) {
@@ -513,49 +534,9 @@ public class TcpServer extends Service {
                 mClientData.clear();
                 mDepartedScores.clear();
             }
-            Globals.getmGPSDataSemaphore();
-            try {
-                if (!isClientTaskActive())
-                    return;
-                if (Globals.getInstance().mGPSData != null)
-                    Globals.getInstance().mGPSData.clear();
-            } finally {
-                Globals.getInstance().mGPSDataSemaphore.release();
-            }
-            Globals.getmTeamPlayerNameSemaphore();
-            try {
-                if (!isClientTaskActive())
-                    return;
-                Globals.getInstance().mTeamPlayerNameMap.clear();
-            } finally {
-                Globals.getInstance().mTeamPlayerNameSemaphore.release();
-            }
-            Globals.getmTeamIPMapSemaphore();
-            try {
-                if (!isClientTaskActive())
-                    return;
-                Globals.getInstance().mTeamIPMap.clear();
-            } finally {
-                Globals.getInstance().mTeamIPMapSemaphore.release();
-            }
-            Globals.getmIPTeamMapSemaphore();
-            try {
-                if (!isClientTaskActive())
-                    return;
-                Globals.getInstance().mIPTeamMap.clear();
-            } finally {
-                Globals.getInstance().mIPTeamMapSemaphore.release();
-            }
-            // A player's physical grenade pairing remains valid across rounds, but the
-            // server's ownership table must not leak into the next round.
-            Globals.getmGrenadePairingsSemaphore();
-            try {
-                if (!isClientTaskActive())
-                    return;
-                Globals.ClearGrenadePairings(false);
-            } finally {
-                Globals.getInstance().mGrenadePairingsSemaphore.release();
-            }
+            if (!isClientTaskActive())
+                return;
+            clearSharedRosterState();
             synchronized (mServerStateLock) {
                 if (isClientTaskActive()) {
                     mStartAnnounced = false;
@@ -565,6 +546,53 @@ public class TcpServer extends Service {
                 }
             }
         }, RoundTask.END);
+    }
+
+    private void clearCancelledSessionState() {
+        if (mClientData != null) {
+            for (ClientData client : mClientData.values())
+                client.close();
+            mClientData.clear();
+        }
+        mDepartedScores.clear();
+        clearSharedRosterState();
+    }
+
+    private void clearSharedRosterState() {
+        Globals globals = Globals.getInstance();
+        Globals.getmGPSDataSemaphore();
+        try {
+            if (globals.mGPSData != null)
+                globals.mGPSData.clear();
+        } finally {
+            globals.mGPSDataSemaphore.release();
+        }
+        Globals.getmTeamPlayerNameSemaphore();
+        try {
+            globals.mTeamPlayerNameMap.clear();
+        } finally {
+            globals.mTeamPlayerNameSemaphore.release();
+        }
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            globals.mTeamIPMap.clear();
+        } finally {
+            globals.mTeamIPMapSemaphore.release();
+        }
+        Globals.getmIPTeamMapSemaphore();
+        try {
+            globals.mIPTeamMap.clear();
+        } finally {
+            globals.mIPTeamMapSemaphore.release();
+        }
+        // A player's physical grenade pairing remains valid across rounds, but the
+        // server's ownership table must not leak into the next round.
+        Globals.getmGrenadePairingsSemaphore();
+        try {
+            Globals.ClearGrenadePairings(false);
+        } finally {
+            globals.mGrenadePairingsSemaphore.release();
+        }
     }
 
     private Map<Byte, InetAddress> getTeamIPMapSnapshot() {

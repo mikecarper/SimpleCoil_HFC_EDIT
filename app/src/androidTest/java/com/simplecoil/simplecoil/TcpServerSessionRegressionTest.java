@@ -118,6 +118,43 @@ public class TcpServerSessionRegressionTest {
     }
 
     @Test
+    public void hostCancellationClearsSharedRosterBeforeNextLobby() throws Exception {
+        connect();
+        Globals globals = Globals.getInstance();
+        clearSharedRoster();
+        InetAddress endpoint = InetAddress.getByName("192.0.2.20");
+        try {
+            Globals.getmIPTeamMapSemaphore();
+            try { globals.mIPTeamMap.put(endpoint, (byte) 1); }
+            finally { globals.mIPTeamMapSemaphore.release(); }
+            Globals.getmTeamIPMapSemaphore();
+            try { globals.mTeamIPMap.put((byte) 1, endpoint); }
+            finally { globals.mTeamIPMapSemaphore.release(); }
+            Globals.getmTeamPlayerNameSemaphore();
+            try { globals.mTeamPlayerNameMap.put((byte) 1, "Old player"); }
+            finally { globals.mTeamPlayerNameSemaphore.release(); }
+            Globals.GPSData location = new Globals.GPSData();
+            Globals.getmGPSDataSemaphore();
+            try { globals.mGPSData.put((byte) 1, location); }
+            finally { globals.mGPSDataSemaphore.release(); }
+            Globals.getmGrenadePairingsSemaphore();
+            try { globals.mGrenadePairings[3] = 1; }
+            finally { globals.mGrenadePairingsSemaphore.release(); }
+
+            server.cancelServer();
+            assertTrue("Cancelled host retained its workers", awaitStopped(server, 2000));
+            assertEquals("Cancelled host retained a phantom player", 1, Globals.getPlayerCount());
+            assertTrue(globals.mIPTeamMap.isEmpty());
+            assertTrue(globals.mTeamIPMap.isEmpty());
+            assertTrue(globals.mTeamPlayerNameMap.isEmpty());
+            assertTrue(globals.mGPSData.isEmpty());
+            assertEquals(Globals.INVALID_PLAYER_ID, globals.mGrenadePairings[3]);
+        } finally {
+            clearSharedRoster();
+        }
+    }
+
+    @Test
     public void expiredCancellationCannotCloseAReplacementLobby() throws Exception {
         connect();
         Semaphore clientsLock = (Semaphore) get(server, "mClientDataSemaphore");
@@ -616,6 +653,25 @@ public class TcpServerSessionRegressionTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress(TcpServer.TCP_SERVER_PORT));
         }
+    }
+
+    private static void clearSharedRoster() {
+        Globals globals = Globals.getInstance();
+        Globals.getmIPTeamMapSemaphore();
+        try { globals.mIPTeamMap.clear(); }
+        finally { globals.mIPTeamMapSemaphore.release(); }
+        Globals.getmTeamIPMapSemaphore();
+        try { globals.mTeamIPMap.clear(); }
+        finally { globals.mTeamIPMapSemaphore.release(); }
+        Globals.getmTeamPlayerNameSemaphore();
+        try { globals.mTeamPlayerNameMap.clear(); }
+        finally { globals.mTeamPlayerNameSemaphore.release(); }
+        Globals.getmGPSDataSemaphore();
+        try { globals.mGPSData.clear(); }
+        finally { globals.mGPSDataSemaphore.release(); }
+        Globals.getmGrenadePairingsSemaphore();
+        try { Globals.ClearGrenadePairings(false); }
+        finally { globals.mGrenadePairingsSemaphore.release(); }
     }
 
     private static RecordingServer createServer() {
