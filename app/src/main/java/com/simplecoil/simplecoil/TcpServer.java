@@ -1170,6 +1170,9 @@ public class TcpServer extends Service {
         private volatile DataOutputStream out = null;
         private volatile boolean connectionFailed;
         private volatile boolean clockSynchronized;
+        // A ready acknowledgement is meaningful only after this connection has
+        // received the exchanges used to calculate its clock offset.
+        private int clockSamples;
         private long idleTick;
         private Queue<String> messageQueue;
         private volatile int points = 0;
@@ -1185,6 +1188,7 @@ public class TcpServer extends Service {
             clientID = cID;
             noReadCount = 0;
             clockSynchronized = false;
+            clockSamples = 0;
             idleTick = 0;
             messageReader = new TcpMessageReader();
             if (messageQueue == null)
@@ -1504,9 +1508,14 @@ public class TcpServer extends Service {
                         JSONObject reply = new JSONObject().put(JSON_CLOCK_REQUEST, sentAt)
                                 .put(JSON_CLOCK_RECEIVE, receivedAt)
                                 .put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime());
-                        client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply);
+                        if (client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply))
+                            client.clockSamples = Math.min(GameClock.SAMPLES_PER_SYNC,
+                                    client.clockSamples + 1);
                     } else if (Boolean.TRUE.equals(player.get(JSON_CLOCK_READY))) {
-                        client.clockSynchronized = true;
+                        if (client.clockSamples >= GameClock.SAMPLES_PER_SYNC)
+                            client.clockSynchronized = true;
+                        else
+                            Log.w(TAG, "Ignoring clock-ready acknowledgement before sampling completed");
                     }
                 } catch (JSONException e) {
                     Log.w(TAG, "Ignoring invalid clock synchronization request", e);

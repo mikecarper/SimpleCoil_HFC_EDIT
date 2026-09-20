@@ -1096,10 +1096,28 @@ public class TcpServerDispatchRegressionTest {
         assertFalse(server.startGame());
         parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, "true"));
         assertFalse("String true must not acknowledge clock sync", server.startGame());
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC; i++)
+            parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 1000 + i));
         parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
         assertTrue(server.arePlayerClocksSynchronized());
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void clockReadyRequiresCompletedClockSampling() throws Exception {
+        set(clients.get(1), "clockSynchronized", false);
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+        assertFalse("A client cannot claim synchronization before sampling", server.arePlayerClocksSynchronized());
+
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC - 1; i++)
+            parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 2000 + i));
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+        assertFalse("Partial sampling cannot satisfy the clock barrier", server.arePlayerClocksSynchronized());
+
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 3000));
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+        assertTrue(server.arePlayerClocksSynchronized());
     }
 
     @Test
@@ -1279,7 +1297,11 @@ public class TcpServerDispatchRegressionTest {
             first.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                     + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, i));
         ByteArrayOutputStream ready = new ByteArrayOutputStream();
-        new DataOutputStream(ready).writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+        DataOutputStream twentieth = new DataOutputStream(ready);
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC; i++)
+            twentieth.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 1000 + i));
+        twentieth.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                 + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
         set(clients.get(1), "in", new DataInputStream(new ByteArrayInputStream(flood.toByteArray())));
         set(clients.get(20), "in", new DataInputStream(new ByteArrayInputStream(ready.toByteArray())));
