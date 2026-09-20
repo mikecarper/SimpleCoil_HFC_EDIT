@@ -9,6 +9,7 @@ import android.graphics.drawable.AnimationDrawable;
 import android.os.CountDownTimer;
 import android.os.SystemClock;
 import android.widget.Chronometer;
+import android.widget.PopupMenu;
 import android.view.View;
 import android.widget.TextView;
 
@@ -123,6 +124,28 @@ public class GameplayRegressionTest {
         });
         scenario.close();
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
+    }
+
+    @Test
+    public void cancellingPeerHostAllowsCancellationToFlushBeforeStopping() {
+        scenario.onActivity(activity -> {
+            int[] calls = new int[3];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override public void cancelServer() { calls[0]++; }
+                @Override public void stopTcpServer() { calls[1]++; }
+                @Override public void sendTCPMessageAll(String message) { calls[2]++; }
+            });
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mIsServer", true);
+            set(activity, "mReady", true);
+            PopupMenu menu = new PopupMenu(activity, activity.findViewById(android.R.id.content));
+            assertTrue(activity.onMenuItemClick(menu.getMenu().add(0, R.id.cancel_server_item, 0, "Cancel")));
+            assertEquals(1, calls[0]);
+            assertEquals("The host must let cancellation close the connection", 0, calls[1]);
+            assertEquals("Cancellation must not use a separate racing broadcast", 0, calls[2]);
+            assertEquals(false, get(activity, "mIsServer"));
+            assertEquals(false, get(activity, "mReady"));
+        });
     }
 
     @Test

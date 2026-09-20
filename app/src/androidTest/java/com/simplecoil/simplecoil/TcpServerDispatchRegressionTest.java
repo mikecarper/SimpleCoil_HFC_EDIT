@@ -231,6 +231,91 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void hostCancellationSupersedesQueuedWorkAndCoalescesRepeatedRequests() throws Exception {
+        clientsLock.acquire();
+        List<Thread> tasks;
+        try {
+            assertTrue(server.startGame());
+            server.sendTCPMessageAll("obsolete message");
+            server.cancelServer();
+            tasks = captureClientTasks();
+            assertEquals(3, tasks.size());
+            server.cancelServer();
+            server.sendTCPMessageAll("too late");
+            server.endGame();
+            assertFalse("A closing host accepted a new start", server.startGame());
+            assertEquals("Cancellation queued duplicate or late work", 3, captureClientTasks().size());
+        } finally { clientsLock.release(); }
+        for (Thread task : tasks) {
+            task.join(2000);
+            assertFalse(task.isAlive());
+        }
+        assertCancellationFrame(sockets.get(0));
+        assertTrue(sockets.get(0).closed);
+        assertTrue("A closing host published a round event", server.events.isEmpty());
+        assertEquals(1, clientsLock.availablePermits());
+    }
+
+    @Test
+    public void hostCancellationIncludesRegistrationsCompletedWhileItWaited() throws Exception {
+        addClient(2, 0, new MemorySocket());
+        dispatchThenChange(server::cancelServer, () -> {
+            // Simulate an in-flight registration and another accepted connection.
+            set(clients.get(2), "mPlayerID", (byte) 2);
+            addClient(3, 0, new MemorySocket());
+        });
+        for (MemorySocket socket : sockets) {
+            assertCancellationFrame(socket);
+            assertTrue(socket.closed);
+        }
+    }
+
+    @Test
+    public void hostCancellationTimesOutWithoutReleasingAnUnacquiredClientLock() throws Exception {
+        clientsLock.acquire();
+        try {
+            server.cancelServer();
+            Thread worker = queuedWorker();
+            worker.join(2500);
+            assertFalse("Cancellation waited indefinitely for the client lock", worker.isAlive());
+            assertTrue("Timed-out cancellation left the socket open", sockets.get(0).closed);
+            assertEquals(0, sockets.get(0).bytes.size());
+            assertEquals("Cancellation released another thread's client lock", 0, clientsLock.availablePermits());
+        } finally { clientsLock.release(); }
+    }
+
+    @Test
+    public void hostCancellationClosesAStalledWriterWithinItsDeadline() throws Exception {
+        BlockingSocket blocked = new BlockingSocket();
+        addClient(1, blocked);
+        server.cancelServer();
+        assertTrue(blocked.writing.await(2, TimeUnit.SECONDS));
+        Thread worker = blocked.writer;
+        workers.add(worker);
+        worker.join(2500);
+        assertFalse("Cancellation stayed blocked in a socket write", worker.isAlive());
+        assertTrue(blocked.closed);
+        assertEquals(1, clientsLock.availablePermits());
+    }
+
+    @Test
+    public void hostCancellationAlsoClearsAStoppedPeerHostsCountdown() throws Exception {
+        server.setDedicated(false);
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertTrue(server.getScheduledGameStart() != null);
+        server.cancelServer();
+        assertTrue("A cancelled peer host retained its countdown", server.getScheduledGameStart() == null);
+        assertTrue(sockets.get(0).closed);
+    }
+
+    private void assertCancellationFrame(MemorySocket socket) throws Exception {
+        DataInputStream frames = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray()));
+        assertEquals(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_SERVERCANCEL,
+                frames.readUTF());
+        assertEquals("Cancellation must be the final and only frame", 0, frames.available());
+    }
+
+    @Test
     public void destroyingAnEndTaskWaitingForGpsDoesNotEraseReplacementState() throws Exception {
         Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
         clientsLock.acquire();

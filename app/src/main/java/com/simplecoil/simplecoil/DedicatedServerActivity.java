@@ -326,8 +326,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mGameCountdownTimer = null;
         }
         if (mTcpServer != null) {
-            mTcpServer.sendTCPMessageAll(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_SERVERCANCEL);
-            mTcpServer.stopTcpServer();
+            mTcpServer.cancelServer();
         }
         if (mUDPListenerService != null)
             mUDPListenerService.stopListen();

@@ -742,6 +742,14 @@ public class DedicatedServerRegressionTest {
         scenario = null;
     }
 
+    @Test
+    public void closingHostAllowsCancellationToFlushBeforeStopping() {
+        closeActivity();
+        assertEquals(1, tcp.cancellations);
+        assertEquals("The host closed sockets before cancellation could flush", 0, tcp.listenerStops);
+        assertEquals(1, udp.listenerStops);
+    }
+
     private ServiceConnection beginBinding(boolean isTcp) {
         ServiceConnection callback = (ServiceConnection) invoke(isTcp
                 ? "createTcpServerServiceConnection" : "createUDPServiceConnection");
@@ -818,6 +826,7 @@ public class DedicatedServerRegressionTest {
         int gameInfoUpdates;
         int listenerStarts;
         int listenerStops;
+        int cancellations;
         boolean acceptStart = true;
         boolean dedicated;
         ScoreData firstPlayerScore;
@@ -826,6 +835,7 @@ public class DedicatedServerRegressionTest {
         @Override public void endGame() { gameEnds++; }
         @Override void startTcpServer() { listenerStarts++; }
         @Override public void stopTcpServer() { listenerStops++; }
+        @Override public void cancelServer() { cancellations++; }
         @Override public void setDedicated(boolean value) { dedicated = value; }
         @Override public void sendTCPMessageAll(String message) { }
         @Override public void sendAllGameInfo(int playerID) { gameInfoUpdates++; }

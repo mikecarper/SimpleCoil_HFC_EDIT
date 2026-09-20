@@ -21,6 +21,7 @@ import android.content.Intent;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -140,6 +141,12 @@ public class TcpServer extends Service {
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
     // Guarded by mServerStateLock, including registration before Thread.start().
     private final Set<Thread> mClientTasks = new HashSet<>();
+    // Cancellation gets a bounded opportunity to notify clients before sockets
+    // are closed. Both fields are guarded by mServerStateLock.
+    private Thread mCancellationThread;
+    private Runnable mCancellationTimeout;
+    private final Handler mShutdownHandler = new Handler(Looper.getMainLooper());
+    private static final long CANCEL_FLUSH_TIMEOUT_MS = 1000;
     private volatile Map<Integer, ClientData> mClientData = null;
     // Explicitly leaving must not reset a player's score or spent lives in this round.
     private final Map<Byte, ScoreData> mDepartedScores = new ConcurrentHashMap<>();
@@ -217,11 +224,12 @@ public class TcpServer extends Service {
 
     private boolean isClientTaskActive() {
         synchronized (mServerStateLock) {
-            return keepListening && !mDestroyed && !Thread.currentThread().isInterrupted();
+            return keepListening && !mDestroyed && !Thread.currentThread().isInterrupted()
+                    && (mCancellationThread == null || mCancellationThread == Thread.currentThread());
         }
     }
 
-    private enum RoundTask { NONE, START, END }
+    private enum RoundTask { NONE, START, END, CANCEL }
 
     private boolean runClientTask(Runnable action) {
         return runClientTask(action, RoundTask.NONE);
@@ -230,8 +238,9 @@ public class TcpServer extends Service {
     private boolean runClientTask(Runnable action, RoundTask roundTask) {
         final boolean endsRound = roundTask == RoundTask.END;
         final boolean startsRound = roundTask == RoundTask.START;
+        final boolean cancelsServer = roundTask == RoundTask.CANCEL;
         synchronized (mServerStateLock) {
-            if (!keepListening || mDestroyed || (endsRound && mEndingGame))
+            if (!keepListening || mDestroyed || mCancellationThread != null || (endsRound && mEndingGame))
                 return false;
             if (endsRound)
                 mEndingGame = true;
@@ -254,6 +263,8 @@ public class TcpServer extends Service {
                     if (!Thread.currentThread().isInterrupted())
                         Log.e(TAG, "TCP client task failed", e);
                 } finally {
+                    if (cancelsServer)
+                        stopTcpServer(Thread.currentThread());
                     if (acquired)
                         mClientDataSemaphore.release();
                     synchronized (mServerStateLock) {
@@ -263,11 +274,24 @@ public class TcpServer extends Service {
                             mEndingGame = false;
                         if (startsRound)
                             mStartingGame = false;
+                        if (cancelsServer && mCancellationThread == Thread.currentThread()) {
+                            if (mCancellationTimeout != null)
+                                mShutdownHandler.removeCallbacks(mCancellationTimeout);
+                            mCancellationTimeout = null;
+                            mCancellationThread = null;
+                        }
                         mClientTasks.remove(Thread.currentThread());
                     }
                 }
             }, "SimpleCoil TCP send");
             mClientTasks.add(task);
+            if (cancelsServer) {
+                mCancellationThread = task;
+                // A stalled writer or held client lock must not keep shutdown
+                // alive forever. Identity-check the timeout against this task.
+                mCancellationTimeout = () -> stopTcpServer(task);
+                mShutdownHandler.postDelayed(mCancellationTimeout, CANCEL_FLUSH_TIMEOUT_MS);
+            }
             task.start();
             return true;
         }
@@ -354,7 +378,7 @@ public class TcpServer extends Service {
         if (!hasPlayers)
             return false;
         synchronized (mServerStateLock) {
-            if (!keepListening || mDestroyed || mEndingGame
+            if (!keepListening || mDestroyed || mEndingGame || mCancellationThread != null
                     || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                 return false;
             // Repeated clicks and remote requests share the pending start instead
@@ -1251,7 +1275,7 @@ public class TcpServer extends Service {
                     if (!keepListening)
                         return;
                     for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
-                        if (!keepListening)
+                        if (!isClientTaskActive())
                             break;
                         try {
                             if (entry.getValue().connectionFailed) {
@@ -1731,14 +1755,48 @@ public class TcpServer extends Service {
         }
     }
 
-    public void stopTcpServer() {
+    public void cancelServer() {
+        synchronized (mServerStateLock) {
+            if (mCancellationThread != null)
+                return;
+            // Also retire a peer host's start retained after its listener stopped.
+            mStartAnnounced = false;
+            mScheduledStart = -1;
+            mScheduledDuration = 0;
+            if (!keepListening || mDestroyed) {
+                stopTcpServer();
+                return;
+            }
+            runClientTask(() -> {
+                String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_SERVERCANCEL;
+                // Snapshot only after acquiring the client lock: a registration
+                // or rejoin already in progress also needs the terminal notice.
+                for (ClientRecipient recipient : getClientRecipients()) {
+                    if (!isClientTaskActive())
+                        return;
+                    if (recipient.isCurrent())
+                        recipient.client.sendTCPMessage(message);
+                }
+            }, RoundTask.CANCEL);
+        }
+    }
+
+    public void stopTcpServer() { stopTcpServer(null); }
+
+    private void stopTcpServer(Thread cancellationOwner) {
         final ServerSocket listener;
         final Thread worker;
         final Thread clients;
         final Thread[] tasks;
         final List<Socket> sockets = new ArrayList<>();
         synchronized (mServerStateLock) {
+            if (cancellationOwner != null && mCancellationThread != cancellationOwner)
+                return;
             keepListening = false;
+            if (mCancellationTimeout != null) {
+                mShutdownHandler.removeCallbacks(mCancellationTimeout);
+                mCancellationTimeout = null;
+            }
             stopGPSDataLocked();
             listener = mListenSocket;
             worker = mServerThread;

@@ -896,8 +896,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     setReady();
                     mIsServer = false;
                     mUDPListenerService.cancelServer();
-                    mTcpServer.sendTCPMessageAll(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_SERVERCANCEL);
-                    mTcpServer.stopTcpServer();
+                    mTcpServer.cancelServer();
                     setNetworkMenu(NETWORK_TYPE_ENABLED);
                     return true;
             }else if (id == R.id.leave_item) {

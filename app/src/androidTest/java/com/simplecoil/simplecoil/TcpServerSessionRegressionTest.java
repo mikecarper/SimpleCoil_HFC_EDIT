@@ -20,6 +20,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
 
@@ -85,6 +86,56 @@ public class TcpServerSessionRegressionTest {
         assertTrue("Destroyed service retained its workers", awaitStopped(server, 1500));
         assertEquals(-1, peer.getInputStream().read());
         assertPortCanBeReused();
+    }
+
+    @Test
+    public void hostCancellationReachesPlayersBeforeTheConnectionCloses() throws Exception {
+        connect();
+        Semaphore clientsLock = (Semaphore) get(server, "mClientDataSemaphore");
+        clientsLock.acquire();
+        try {
+            // A pending roster/registration can delay the cancellation sender.
+            server.cancelServer();
+        } finally { clientsLock.release(); }
+        assertEquals(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_SERVERCANCEL,
+                new DataInputStream(peer.getInputStream()).readUTF());
+        assertEquals(-1, peer.getInputStream().read());
+        assertTrue("Cancelled host retained its workers", awaitStopped(server, 2000));
+        assertPortCanBeReused();
+    }
+
+    @Test
+    public void hostCancellationRetiresItsAnnouncedCountdown() throws Exception {
+        connect();
+        set(server, "mStartAnnounced", true);
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() + 10000);
+        set(server, "mRoundSequence", 1L);
+        assertNotNull(server.getScheduledGameStart());
+        server.cancelServer();
+        assertTrue("Cancelled host retained its workers", awaitStopped(server, 2000));
+        assertNull("A cancelled server must not restore its old countdown on the next bind",
+                server.getScheduledGameStart());
+    }
+
+    @Test
+    public void expiredCancellationCannotCloseAReplacementLobby() throws Exception {
+        connect();
+        Semaphore clientsLock = (Semaphore) get(server, "mClientDataSemaphore");
+        Runnable timeout;
+        clientsLock.acquire();
+        try {
+            server.cancelServer();
+            timeout = (Runnable) get(server, "mCancellationTimeout");
+            assertNotNull(timeout);
+        } finally { clientsLock.release(); }
+        assertTrue("Cancelled host retained its workers", awaitStopped(server, 2000));
+        peer.close();
+        connect();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(timeout);
+        assertTrue("An old cancellation timeout stopped the new listener", (boolean) get(server, "keepListening"));
+        String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + "new session";
+        server.sendTCPMessageAll(message);
+        assertEquals(message, new DataInputStream(peer.getInputStream()).readUTF());
     }
 
     @Test
@@ -544,7 +595,10 @@ public class TcpServerSessionRegressionTest {
         do {
             Thread accept = (Thread) get(target, "mServerThread");
             Thread clients = (Thread) get(target, "mClientThread");
-            if ((accept == null || !accept.isAlive()) && (clients == null || !clients.isAlive())) return true;
+            synchronized (get(target, "mServerStateLock")) {
+                if ((accept == null || !accept.isAlive()) && (clients == null || !clients.isAlive())
+                        && ((Set<?>) get(target, "mClientTasks")).isEmpty()) return true;
+            }
             Thread.sleep(10);
         } while (SystemClock.elapsedRealtime() < deadline);
         return false;
