@@ -153,6 +153,7 @@ public class UDPRegressionTest {
         receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + secondRound);
         assertEquals(1, service.events.size());
         assertEquals(NetMsg.NETMSG_ENDGAME, service.events.get(0).getAction());
+        assertEquals(secondRound, service.events.get(0).getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
 
         service.events.clear();
         service.startGame(true, firstRound);
@@ -178,8 +179,10 @@ public class UDPRegressionTest {
 
         receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + currentRound + ":1");
         assertEquals(NetMsg.NETMSG_ELIMINATED, service.events.get(0).getAction());
+        assertEquals(currentRound, service.events.get(0).getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
         receive(enemy, NetMsg.NETMSG_PEER_LEAVE + currentRound);
         assertEquals(NetMsg.NETMSG_LEAVE, service.events.get(1).getAction());
+        assertEquals(currentRound, service.events.get(1).getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
     }
 
     @Test

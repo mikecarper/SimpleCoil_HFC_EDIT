@@ -357,6 +357,41 @@ public class GameplayRegressionTest {
         });
     }
 
+    @Test
+    public void stalePeerRoundEventsCannotAffectANewerRound() {
+        scenario.onActivity(activity -> {
+            final String oldRound = "55555555-5555-5555-5555-555555555555";
+            final String currentRound = "66666666-6666-6666-6666-666666666666";
+            set(activity, "mActivePeerRoundToken", currentRound);
+            set(activity, "mScore", 3);
+            set(activity, "mTeamScore", 4);
+            boolean receiverRegistered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            if (!receiverRegistered)
+                set(activity, "mNetworkReceiverRegistered", true);
+            try {
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, oldRound));
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_TEAMELIMINATED)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, oldRound));
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_LEAVE)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, oldRound));
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, oldRound));
+                assertEquals(3, get(activity, "mScore"));
+                assertEquals(4, get(activity, "mTeamScore"));
+                assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, currentRound));
+                assertEquals(4, get(activity, "mScore"));
+                assertEquals(5, get(activity, "mTeamScore"));
+            } finally {
+                if (!receiverRegistered)
+                    set(activity, "mNetworkReceiverRegistered", false);
+            }
+        });
+    }
+
     private static byte[] grenadePacket(boolean secondSlot, int command) {
         byte[] packet = telemetryPacket(0, 0, 0, 0);
         packet[secondSlot ? FullscreenActivity.RECOIL_OFFSET_HIT_BY2 : FullscreenActivity.RECOIL_OFFSET_HIT_BY1]

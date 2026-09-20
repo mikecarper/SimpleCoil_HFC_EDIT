@@ -201,6 +201,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean mHasSynchronizedStart;
     private long mSynchronizedStartAt;
     private long mSynchronizedEndAt;
+    // Peer UDP is connectionless, so the activity repeats the listener's
+    // nonce check when an asynchronously delivered gameplay event reaches the
+    // UI. This closes the gap between a listener validating a datagram and a
+    // newer round being started on the main thread.
+    private String mActivePeerRoundToken;
     private static boolean mHasLivesLimit = false;
     private static int mLives = 0;
 
@@ -1544,10 +1549,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUseNetwork) {
             displayInGameNetworkingOptions();
             mEndNetworkGameButton.setVisibility(View.VISIBLE);
+            // Install the UI-side token immediately before changing the
+            // listener's round. This keeps the two checks adjacent while
+            // still allowing the first accepted current-round event through.
+            mActivePeerRoundToken = peerGame ? peerRoundToken : null;
             mUDPListenerService.startGame(peerGame, peerRoundToken);
             if (!mTcpClient.isDedicatedServer())
                 mTcpClient.stopTcpClient();
         } else {
+            mActivePeerRoundToken = null;
             displayAllNetworkingOptions(false);
             mEndGameButton.setVisibility(View.VISIBLE);
         }
@@ -1593,6 +1603,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mIsServer && mTcpServer != null)
             mTcpServer.clearScheduledStart();
         mHasSynchronizedStart = false;
+        mActivePeerRoundToken = null;
         Globals.getInstance().mOnlyServerSettings = false;
         mFiringModeButton.setVisibility(View.VISIBLE);
         mStartGameButton.setVisibility(View.VISIBLE);
@@ -3102,6 +3113,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return; // Already handled, or belongs to an earlier session/service.
             }
             final String action = intent.getAction();
+            if (isPeerRoundScopedAction(action) && intent.hasExtra(NetMsg.INTENT_ROUND_TOKEN)
+                    && !isCurrentPeerRoundEvent(intent))
+                return;
             if (!mUseNetwork && (NetMsg.NETMSG_ENDGAME.equals(action)
                     || NetMsg.NETMSG_SERVERCANCEL.equals(action) || NetMsg.NETMSG_VERSIONERROR.equals(action)))
                 return;
@@ -3434,6 +3448,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
         }
     };
+
+    private static boolean isPeerRoundScopedAction(String action) {
+        return NetMsg.NETMSG_ELIMINATED.equals(action)
+                || NetMsg.NETMSG_TEAMELIMINATED.equals(action)
+                || NetMsg.NETMSG_LEAVE.equals(action)
+                || NetMsg.NETMSG_ENDGAME.equals(action);
+    }
+
+    private boolean isCurrentPeerRoundEvent(Intent intent) {
+        String token = intent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+        return token != null && token.equals(mActivePeerRoundToken);
+    }
 
     private void checkPeerScoreLimit() {
         Globals globals = Globals.getInstance();

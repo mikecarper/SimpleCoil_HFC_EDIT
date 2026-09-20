@@ -341,31 +341,42 @@ public class UDPListenerService extends Service {
 
     /** Accept an ENDGAME only from a current peer and only for this exact round. */
     private void processPeerEndGame(InetAddress ip, String roundToken) {
-        if (getPlayerID(ip) == null)
+        if (!TcpServer.isValidRoundToken(roundToken))
             return;
-        if (!isCurrentPeerRound(roundToken))
-            return;
-        sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
+        final Intent intent;
+        synchronized (mListenerStateLock) {
+            if (!isCurrentPeerRoundLocked(roundToken) || getPlayerID(ip) == null)
+                return;
+            // Broadcast delivery is asynchronous with a concurrent round start.
+            // Preserve the nonce so the activity can reject an old event after
+            // the listener has switched to a newer round.
+            intent = new Intent(NetMsg.NETMSG_ENDGAME)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
+        }
+        sendBroadcast(intent);
     }
 
     /** A peer LEAVE is valid only for the round that authenticated its roster. */
     private void processPeerLeave(InetAddress ip, String roundToken) {
-        if (!isCurrentPeerRound(roundToken))
+        if (!TcpServer.isValidRoundToken(roundToken))
             return;
-        Byte playerID = removePeerPlayer(ip);
-        if (playerID == null)
-            return;
-        Intent intent = new Intent(NetMsg.NETMSG_LEAVE);
-        intent.putExtra(INTENT_PLAYERID, playerID);
+        final Intent intent;
+        synchronized (mListenerStateLock) {
+            if (!isCurrentPeerRoundLocked(roundToken))
+                return;
+            Byte playerID = removePeerPlayer(ip);
+            if (playerID == null)
+                return;
+            intent = new Intent(NetMsg.NETMSG_LEAVE)
+                    .putExtra(INTENT_PLAYERID, playerID)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
+        }
         sendBroadcast(intent);
     }
 
-    private boolean isCurrentPeerRound(String roundToken) {
-        if (!TcpServer.isValidRoundToken(roundToken))
-            return false;
-        synchronized (mListenerStateLock) {
-            return !mDestroyed && mPeerGame && roundToken.equals(mPeerRoundToken);
-        }
+    // Caller holds mListenerStateLock and has already validated the token.
+    private boolean isCurrentPeerRoundLocked(String roundToken) {
+        return !mDestroyed && mPeerGame && roundToken.equals(mPeerRoundToken);
     }
 
     /**
@@ -387,7 +398,7 @@ public class UDPListenerService extends Service {
             return;
         }
         String roundToken = payload.substring(0, tokenSeparator);
-        if (!isCurrentPeerRound(roundToken))
+        if (!TcpServer.isValidRoundToken(roundToken))
             return;
         String sequenceText = payload.substring(tokenSeparator + 1, sequenceSeparator);
         String grenadeText = payload.substring(sequenceSeparator + 1);
@@ -404,17 +415,24 @@ public class UDPListenerService extends Service {
             Log.w(TAG, "Ignoring oversized peer grenade pairing", e);
             return;
         }
-        Byte playerID = getPlayerID(ip);
-        if (sequence <= 0 || playerID == null || !Globals.isValidGrenadeID(grenadeID)) {
-            Log.w(TAG, "Ignoring invalid peer grenade pairing");
-            return;
-        }
-        synchronized (mPeerGrenadeLock) {
-            if (sequence <= mLastPeerGrenadeSequences[playerID])
+        synchronized (mListenerStateLock) {
+            // Do the sequence update and the pairing mutation in the same
+            // round-critical section as the token check. Otherwise startGame
+            // can reset the sequence between validation and mutation.
+            if (!isCurrentPeerRoundLocked(roundToken))
                 return;
-            mLastPeerGrenadeSequences[playerID] = sequence;
+            Byte playerID = getPlayerID(ip);
+            if (sequence <= 0 || playerID == null || !Globals.isValidGrenadeID(grenadeID)) {
+                Log.w(TAG, "Ignoring invalid peer grenade pairing");
+                return;
+            }
+            synchronized (mPeerGrenadeLock) {
+                if (sequence <= mLastPeerGrenadeSequences[playerID])
+                    return;
+                mLastPeerGrenadeSequences[playerID] = sequence;
+            }
+            updateGrenadePairing(playerID, grenadeID);
         }
-        updateGrenadePairing(playerID, grenadeID);
     }
 
     private static boolean isDecimal(String value) {
@@ -452,31 +470,38 @@ public class UDPListenerService extends Service {
         if (separator <= 0 || separator == payload.length() - 1
                 || payload.indexOf(':', separator + 1) >= 0)
             return;
-        if (!isCurrentPeerRound(payload.substring(0, separator)))
+        String roundToken = payload.substring(0, separator);
+        if (!TcpServer.isValidRoundToken(roundToken))
             return;
         String sequenceText = payload.substring(separator + 1);
         long sequence = parsePositiveSequence(sequenceText);
-        Byte eliminatedPlayerID = getPeerScoreSourceID(ip);
-        Globals globals = Globals.getInstance();
-        int localPlayerID = globals.mPlayerID;
-        if (sequence == 0 || eliminatedPlayerID == null || localPlayerID <= 0
-                || !Globals.isValidPlayerID(localPlayerID))
-            return;
-        // A teammate cannot award this phone a kill in team play. The direct
-        // recipient is the scorer, so this also rejects a stale/misdirected
-        // team packet without relying on its destination port.
-        if (globals.mGameMode != Globals.GAME_MODE_FFA
-                && globals.calcNetworkTeam(eliminatedPlayerID)
-                == globals.calcNetworkTeam((byte) localPlayerID))
-            return;
-        synchronized (mPeerScoreLock) {
-            if (sequence <= mLastPeerEliminationSequences[eliminatedPlayerID])
+        final Intent intent;
+        synchronized (mListenerStateLock) {
+            if (!isCurrentPeerRoundLocked(roundToken))
                 return;
-            mLastPeerEliminationSequences[eliminatedPlayerID] = sequence;
+            Byte eliminatedPlayerID = getPeerScoreSourceID(ip);
+            Globals globals = Globals.getInstance();
+            int localPlayerID = globals.mPlayerID;
+            if (sequence == 0 || eliminatedPlayerID == null || localPlayerID <= 0
+                    || !Globals.isValidPlayerID(localPlayerID))
+                return;
+            // A teammate cannot award this phone a kill in team play. The direct
+            // recipient is the scorer, so this also rejects a stale/misdirected
+            // team packet without relying on its destination port.
+            if (globals.mGameMode != Globals.GAME_MODE_FFA
+                    && globals.calcNetworkTeam(eliminatedPlayerID)
+                    == globals.calcNetworkTeam((byte) localPlayerID))
+                return;
+            synchronized (mPeerScoreLock) {
+                if (sequence <= mLastPeerEliminationSequences[eliminatedPlayerID])
+                    return;
+                mLastPeerEliminationSequences[eliminatedPlayerID] = sequence;
+            }
+            intent = new Intent(NetMsg.NETMSG_ELIMINATED)
+                    .putExtra(INTENT_PLAYERID, eliminatedPlayerID)
+                    .putExtra(NetMsg.INTENT_EVENT_SEQUENCE, sequence)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
         }
-        Intent intent = new Intent(NetMsg.NETMSG_ELIMINATED);
-        intent.putExtra(INTENT_PLAYERID, eliminatedPlayerID);
-        intent.putExtra(NetMsg.INTENT_EVENT_SEQUENCE, sequence);
         sendBroadcast(intent);
     }
 
@@ -494,7 +519,8 @@ public class UDPListenerService extends Service {
                 || playerSeparator == payload.length() - 1
                 || payload.indexOf(':', playerSeparator + 1) >= 0)
             return;
-        if (!isCurrentPeerRound(payload.substring(0, tokenSeparator)))
+        String roundToken = payload.substring(0, tokenSeparator);
+        if (!TcpServer.isValidRoundToken(roundToken))
             return;
         String eliminatedText = payload.substring(tokenSeparator + 1, playerSeparator);
         long sequence = parsePositiveSequence(payload.substring(playerSeparator + 1));
@@ -506,25 +532,32 @@ public class UDPListenerService extends Service {
         } catch (NumberFormatException e) {
             return;
         }
-        Byte scoringPlayerID = getPeerScoreSourceID(ip);
-        Globals globals = Globals.getInstance();
-        int localPlayerID = globals.mPlayerID;
-        if (scoringPlayerID == null || eliminatedPlayerID <= 0
-                || !Globals.isValidPlayerID(eliminatedPlayerID) || localPlayerID <= 0
-                || !Globals.isValidPlayerID(localPlayerID)
-                || globals.mGameMode == Globals.GAME_MODE_FFA)
-            return;
-        int scoringTeam = globals.calcNetworkTeam(scoringPlayerID);
-        if (scoringPlayerID == eliminatedPlayerID
-                || scoringTeam != globals.calcNetworkTeam((byte) localPlayerID)
-                || scoringTeam == globals.calcNetworkTeam((byte) eliminatedPlayerID))
-            return;
-        synchronized (mPeerScoreLock) {
-            if (sequence <= mLastPeerTeamEliminationSequences[scoringPlayerID][eliminatedPlayerID])
+        final Intent intent;
+        synchronized (mListenerStateLock) {
+            if (!isCurrentPeerRoundLocked(roundToken))
                 return;
-            mLastPeerTeamEliminationSequences[scoringPlayerID][eliminatedPlayerID] = sequence;
+            Byte scoringPlayerID = getPeerScoreSourceID(ip);
+            Globals globals = Globals.getInstance();
+            int localPlayerID = globals.mPlayerID;
+            if (scoringPlayerID == null || eliminatedPlayerID <= 0
+                    || !Globals.isValidPlayerID(eliminatedPlayerID) || localPlayerID <= 0
+                    || !Globals.isValidPlayerID(localPlayerID)
+                    || globals.mGameMode == Globals.GAME_MODE_FFA)
+                return;
+            int scoringTeam = globals.calcNetworkTeam(scoringPlayerID);
+            if (scoringPlayerID == eliminatedPlayerID
+                    || scoringTeam != globals.calcNetworkTeam((byte) localPlayerID)
+                    || scoringTeam == globals.calcNetworkTeam((byte) eliminatedPlayerID))
+                return;
+            synchronized (mPeerScoreLock) {
+                if (sequence <= mLastPeerTeamEliminationSequences[scoringPlayerID][eliminatedPlayerID])
+                    return;
+                mLastPeerTeamEliminationSequences[scoringPlayerID][eliminatedPlayerID] = sequence;
+            }
+            intent = new Intent(NetMsg.NETMSG_TEAMELIMINATED)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
         }
-        sendBroadcast(new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+        sendBroadcast(intent);
     }
 
     private void updateGrenadePairing(byte playerID, int grenadeID) {
@@ -574,8 +607,11 @@ public class UDPListenerService extends Service {
                 }
                 sequence = ++mNextPeerGrenadeSequence;
             }
+            // Keep the local pairing linearized with the round token. The
+            // outbound message can be sent after the lock; recipients will
+            // reject it if they have already entered a different round.
+            updateGrenadePairing((byte) playerID, grenadeID);
         }
-        updateGrenadePairing((byte) playerID, grenadeID);
         sendUDPMessageAllRepeat(NetMsg.NETMSG_GRENADEPAIR + roundToken + ":" + sequence + ":" + grenadeID,
                 PEER_GRENADE_UPDATE_REPETITIONS);
     }
