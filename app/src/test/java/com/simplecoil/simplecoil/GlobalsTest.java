@@ -43,4 +43,15 @@ public class GlobalsTest {
             globals.mScoreLimit = scoreLimit;
         }
     }
+
+    @Test public void respawnQrCodesAcceptStructuredAndHumanReadableTeamCodes() {
+        assertEquals(1, Globals.getRespawnTeamFromQrCode("SIMPLECOIL:RESPAWN:1"));
+        assertEquals(4, Globals.getRespawnTeamFromQrCode("  team  4  respawn "));
+    }
+
+    @Test public void respawnQrCodesRejectInvalidTeamsAndUnrelatedPayloads() {
+        assertEquals(0, Globals.getRespawnTeamFromQrCode("SIMPLECOIL:RESPAWN:5"));
+        assertEquals(0, Globals.getRespawnTeamFromQrCode("TEAM 1 RESPAWN NOW"));
+        assertEquals(0, Globals.getRespawnTeamFromQrCode("not a checkpoint"));
+    }
 }

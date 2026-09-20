@@ -236,6 +236,18 @@ public class TcpServer extends Service {
         }
     }
 
+    /** A player whom the dedicated host can manually return to the round. */
+    public static final class RespawnCandidate {
+        public final byte playerID;
+        // Zero denotes free-for-all, where a team label would be misleading.
+        public final int team;
+
+        private RespawnCandidate(byte playerID, int team) {
+            this.playerID = playerID;
+            this.team = team;
+        }
+    }
+
     private List<ClientRecipient> getClientRecipients() {
         List<ClientRecipient> recipients = new ArrayList<>();
         Map<Integer, ClientData> clients = mClientData;
@@ -368,11 +380,11 @@ public class TcpServer extends Service {
         });
     }
 
-    private void sendTCPMessageID(final String message, final byte playerID, final boolean queueMessage) {
+    private boolean sendTCPMessageID(final String message, final byte playerID, final boolean queueMessage) {
         final List<ClientRecipient> recipients = getClientRecipients();
         if (recipients.isEmpty())
-            return;
-        runClientTask(() -> {
+            return false;
+        return runClientTask(() -> {
             for (ClientRecipient recipient : recipients) {
                 if (!isClientTaskActive())
                     return;
@@ -509,6 +521,77 @@ public class TcpServer extends Service {
                 return false;
         }
         return true;
+    }
+
+    private boolean isDedicatedRespawnRoundRunning() {
+        synchronized (mServerStateLock) {
+            return mIsDedicated && keepListening && !mDestroyed && !mEndingGame
+                    && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                    && (mScheduledStart < 0 || SystemClock.elapsedRealtime() >= mScheduledStart);
+        }
+    }
+
+    private boolean clearAwaitingRespawn(ClientData client) {
+        synchronized (client) {
+            if (!client.awaitingRespawn)
+                return false;
+            client.awaitingRespawn = false;
+            return true;
+        }
+    }
+
+    /**
+     * Returns the current, connected players whose valid elimination has not
+     * yet been resolved. The host UI receives a snapshot so it never holds a
+     * socket or roster lock while displaying its dialog.
+     */
+    public List<RespawnCandidate> getGameMasterRespawnCandidates() {
+        List<RespawnCandidate> candidates = new ArrayList<>();
+        if (!isDedicatedRespawnRoundRunning())
+            return candidates;
+        Globals globals = Globals.getInstance();
+        for (ClientRecipient recipient : getClientRecipients()) {
+            if (!recipient.canStartGame())
+                continue;
+            boolean awaiting;
+            synchronized (recipient.client) {
+                awaiting = recipient.client.awaitingRespawn;
+            }
+            if (awaiting) {
+                int team = globals.mGameMode == Globals.GAME_MODE_FFA ? 0
+                        : globals.calcNetworkTeam(recipient.playerID);
+                candidates.add(new RespawnCandidate(recipient.playerID, team));
+            }
+        }
+        return candidates;
+    }
+
+    /**
+     * Grants one selected player a respawn. The boolean result lets the host
+     * UI handle a player who revived or disconnected while its dialog was open.
+     */
+    public boolean grantGameMasterRespawn(byte playerID) {
+        if (!Globals.isValidPlayerID(playerID) || playerID <= 0 || !isDedicatedRespawnRoundRunning())
+            return false;
+        for (ClientRecipient recipient : getClientRecipients()) {
+            if (recipient.playerID != playerID || !recipient.canStartGame())
+                continue;
+            if (!clearAwaitingRespawn(recipient.client))
+                return false;
+            if (!sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_RESPAWNGRANTED,
+                    playerID, true)) {
+                // Do not mark a player alive if the bounded sender could not
+                // accept their grant. They remain available to try again.
+                synchronized (recipient.client) {
+                    if (recipient.isCurrent())
+                        recipient.client.awaitingRespawn = true;
+                }
+                return false;
+            }
+            sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+            return true;
+        }
+        return false;
     }
 
     Intent getScheduledGameStart() {
@@ -1331,6 +1414,8 @@ public class TcpServer extends Service {
         private Queue<String> messageQueue;
         private volatile int points = 0;
         private volatile int eliminated = 0;
+        // Dedicated-host state: only a server-observed death may be revived.
+        private volatile boolean awaitingRespawn;
 
         private int getNetworkTeam() {
             // The host can change the game mode after players have joined the lobby.
@@ -1537,6 +1622,18 @@ public class TcpServer extends Service {
                                                     Log.w(TAG, "Ignoring invalid elimination report from player " + entry.getValue().mPlayerID);
                                                     continue;
                                                 }
+                                                if (mIsDedicated) {
+                                                    synchronized (entry.getValue()) {
+                                                        // A TCP reconnect or replay must not grant another
+                                                        // kill while this player is still dead.
+                                                        if (entry.getValue().awaitingRespawn) {
+                                                            Log.w(TAG, "Ignoring duplicate elimination report from player "
+                                                                    + entry.getValue().mPlayerID);
+                                                            continue;
+                                                        }
+                                                        entry.getValue().awaitingRespawn = true;
+                                                    }
+                                                }
                                                 // Keep server-created scoreboards within the same
                                                 // range clients accept. A bad or repeated event must
                                                 // not wrap an int negative and disconnect every peer.
@@ -1552,6 +1649,35 @@ public class TcpServer extends Service {
                                                 sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                                                 if (hasReachedScoreLimit(scoringPlayer))
                                                     endGame();
+                                            } else if (message.equals(NetMsg.NETMSG_RESPAWNREQUEST)) {
+                                                // A QR checkpoint is a team-game convenience. The server
+                                                // still verifies that this exact registered player is dead.
+                                                if (!mIsDedicated || Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                                                        || !isDedicatedRespawnRoundRunning()) {
+                                                    Log.w(TAG, "Ignoring respawn request outside a dedicated team round");
+                                                    continue;
+                                                }
+                                                if (clearAwaitingRespawn(entry.getValue())) {
+                                                    if (sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG
+                                                            + NetMsg.NETMSG_RESPAWNGRANTED,
+                                                            entry.getValue().mPlayerID, true)) {
+                                                        sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+                                                    } else {
+                                                        synchronized (entry.getValue()) {
+                                                            entry.getValue().awaitingRespawn = true;
+                                                        }
+                                                        Log.w(TAG, "Unable to queue respawn grant for player "
+                                                                + entry.getValue().mPlayerID);
+                                                    }
+                                                } else {
+                                                    Log.w(TAG, "Ignoring respawn request from a player who is not waiting");
+                                                }
+                                            } else if (message.equals(NetMsg.NETMSG_RESPAWNCOMPLETE)) {
+                                                // The local three-minute fallback has already revived the
+                                                // player; clear only the matching pending death on the host.
+                                                if (mIsDedicated && isDedicatedRespawnRoundRunning()
+                                                        && clearAwaitingRespawn(entry.getValue()))
+                                                    sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                                             } else if (message.equals(NetMsg.NETMSG_PLAYERDATAREQUEST)) {
                                                 sendPlayerData(entry.getValue().mPlayerID);
                                             } else if (message.equals(NetMsg.NETMSG_STARTGAME)) {

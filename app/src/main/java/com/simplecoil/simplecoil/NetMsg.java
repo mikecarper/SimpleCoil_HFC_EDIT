@@ -20,13 +20,19 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "13";
+    public static final String NETWORK_VERSION = "14";
 
     // Most of these messages are straightforward and contain no extra data.
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
     public static final String NETMSG_HIT = "HIT";
     public static final String NETMSG_OUT = "OUT";
     public static final String NETMSG_ELIMINATED = "ELIMINATED";
+    // Dedicated hosts authorize checkpoint and Game Master respawns.  Keeping
+    // the approval on the host prevents a phone from reviving itself without a
+    // real elimination in the current round.
+    public static final String NETMSG_RESPAWNREQUEST = "RESPAWNREQUEST";
+    public static final String NETMSG_RESPAWNGRANTED = "RESPAWNGRANTED";
+    public static final String NETMSG_RESPAWNCOMPLETE = "RESPAWNCOMPLETE";
     public static final String NETMSG_LEAVE = "LEAVE";
     public static final String NETMSG_STARTGAME = "STARTGAME";
     public static final String NETMSG_CLOCKSYNCWAITING = "CLOCKSYNCWAITING";

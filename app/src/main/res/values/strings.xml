@@ -69,6 +69,15 @@
     <string name="starting_game_label">STARTING!</string>
     <string name="eliminated_label">ELIMINATED!</string>
     <string name="spawn_in_label">Spawn in %1$d</string>
+    <string name="respawn_qr_wait_label">RESPAWN IN %1$02d:%2$02d\nScan TEAM %3$d RESPAWN QR to return now</string>
+    <string name="respawn_qr_scan_button">SCAN TEAM %1$d RESPAWN QR</string>
+    <string name="respawn_qr_scanner_prompt">Scan the TEAM %1$d respawn QR code</string>
+    <string name="respawn_qr_wait_button">WAIT FOR RESPAWN</string>
+    <string name="respawn_qr_invalid">This is not a respawn QR code.</string>
+    <string name="respawn_qr_wrong_team">That respawn QR belongs to another team.</string>
+    <string name="respawn_qr_request_sent">Respawn requested.</string>
+    <string name="error_camera_permission_required">Camera permission is required to scan a respawn QR code.</string>
+    <string name="error_camera_unavailable">This device has no available camera for respawn QR scanning.</string>
     //Ble Strings
     <string name="ble_not_supported">BLE is not supported</string>
     <string name="error_bluetooth_not_supported">Bluetooth not supported.</string>
@@ -149,6 +158,13 @@
     <string name="dedicated_game_waiting">Waiting to Start</string>
     <string name="dedicated_allow_join">Allow players to join after game has started?</string>
     <string name="dedicated_server_settings_only">Only allow server settings?</string>
+    <string name="game_master_respawn_button">GAME MASTER RESPAWN</string>
+    <string name="game_master_respawn_title">Game Master Respawn</string>
+    <string name="game_master_no_players_waiting">No players are waiting to respawn.</string>
+    <string name="game_master_respawn_player">Team %1$d &#8212; %2$s</string>
+    <string name="game_master_respawn_player_ffa">Player %1$d &#8212; %2$s</string>
+    <string name="game_master_respawn_unknown_player">Player %1$d</string>
+    <string name="game_master_respawn_unavailable">That player is no longer waiting to respawn.</string>
     <string name="gps_mode_disabled">GPS Off</string>
     <string name="gps_mode_teammate">GPS Teammates Only</string>
     <string name="gps_mode_all">GPS All On</string>

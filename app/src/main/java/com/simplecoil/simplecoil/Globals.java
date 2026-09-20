@@ -57,6 +57,8 @@ public class Globals {
     public static final long RESPAWN_TIME_SECONDS = 10; // Time to wait for respawn after elimination and to start the game
     public static final long MIN_RESPAWN_TIME_SECONDS = 1;
     public static final long MAX_RESPAWN_TIME_SECONDS = 1000;
+    // Team games give a player three minutes to reach and scan their team's respawn checkpoint.
+    public static final long TEAM_QR_RESPAWN_WAIT_SECONDS = 3 * 60L;
     public volatile long mRespawnTime = RESPAWN_TIME_SECONDS;
     public static final long RELOAD_TIME_MILLISECONDS = 1500; // Reload downtime in ms. 1.5 seconds
     public static final long MIN_RELOAD_TIME_MILLISECONDS = 0;
@@ -262,6 +264,37 @@ public class Globals {
         } else if (mGameMode == GAME_MODE_FFA)
             return player_id;
         return team;
+    }
+
+    /**
+     * Decode one of the printed team-respawn QR payloads.  The structured form is
+     * SIMPLECOIL:RESPAWN:&lt;team&gt;; the human-readable TEAM &lt;team&gt; RESPAWN form is
+     * accepted too, so existing printed checkpoint signs can stay simple.
+     *
+     * @return a team from 1 through 4, or 0 when the QR payload is not a respawn code.
+     */
+    public static int getRespawnTeamFromQrCode(String contents) {
+        if (contents == null || contents.length() > 64)
+            return 0;
+        String value = contents.trim();
+        final String prefix = "SIMPLECOIL:RESPAWN:";
+        if (value.regionMatches(true, 0, prefix, 0, prefix.length()))
+            return parseRespawnTeam(value.substring(prefix.length()));
+
+        String[] parts = value.split("\\s+");
+        if (parts.length == 3 && "TEAM".equalsIgnoreCase(parts[0])
+                && "RESPAWN".equalsIgnoreCase(parts[2]))
+            return parseRespawnTeam(parts[1]);
+        return 0;
+    }
+
+    private static int parseRespawnTeam(String teamValue) {
+        try {
+            int team = Integer.parseInt(teamValue);
+            return team >= 1 && team <= GAME_MODE_4TEAMS ? team : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     public String getPlayerName(Byte playerID) {

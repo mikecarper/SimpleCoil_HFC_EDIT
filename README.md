@@ -25,7 +25,7 @@ system clock and does not use a public NTP server.
   it. Timed games also use a shared end deadline.
 - The design target is alignment within one second on a healthy local network;
   Wi-Fi congestion, device suspension, or poor signal can still affect it.
-- All participants must use network protocol 13 (this build). Older protocol
+- All participants must use network protocol 14 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
 Peer-game UDP events are scoped to a per-round nonce, and retransmitted score
@@ -44,12 +44,35 @@ for a maximum of 21 phones total.
 | Free-for-all | 1-20 |
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-13 host automatically
+team before starting. If an ID conflicts, a protocol-14 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and
 clears the roster;
 players must join again before the next round.
+
+## Checkpoint and Game Master respawns
+
+Network two-team and four-team games use team QR checkpoints after a player is
+eliminated. The first game-start countdown remains unchanged. On later deaths,
+the app opens its built-in phone-camera scanner automatically and gives the
+player a choice:
+
+- Scan their own team's respawn checkpoint to return immediately.
+- Close the scanner and wait the visible three-minute respawn countdown.
+
+Print one distinct QR code for each team. The preferred payloads are
+`SIMPLECOIL:RESPAWN:1` through `SIMPLECOIL:RESPAWN:4`; the simple forms
+`TEAM 1 RESPAWN` through `TEAM 4 RESPAWN` are accepted too. A checkpoint for a
+different team or an unrelated QR code is rejected. The app needs Camera
+permission and a camera-equipped phone; without either, the player can still
+wait for the timer.
+
+For dedicated-host games, the host verifies the player's recorded elimination
+before honoring a checkpoint request. The dedicated-host screen also has a
+**Game Master Respawn** control. It lists only connected players currently
+waiting to respawn and can return one of them immediately. This manual option
+also works for free-for-all games, where QR checkpoints are not used.
 
 ## Build
 
@@ -81,7 +104,8 @@ adb shell am instrument -w com.simplecoil.simplecoil.test/androidx.test.runner.A
 ## Field checklist
 
 1. Install the same build on every participating phone.
-2. Grant the Bluetooth and location permissions requested by the app.
+2. Grant the Bluetooth, location, and (for checkpoint respawns) Camera
+   permissions requested by the app.
 3. Join every phone to the same Wi-Fi network and verify the host has a usable
    local IPv4 address.
 4. Select unique player IDs, connect the supported BLE hardware, and then join

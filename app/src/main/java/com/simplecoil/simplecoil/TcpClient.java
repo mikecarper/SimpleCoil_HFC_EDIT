@@ -623,6 +623,8 @@ public class TcpClient extends Service {
                                     sendBroadcast(intent);
                                 } else if (message.equals(NetMsg.NETMSG_TEAMELIMINATED)) {
                                     sendBroadcast(new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+                                } else if (message.equals(NetMsg.NETMSG_RESPAWNGRANTED)) {
+                                    sendBroadcast(new Intent(NetMsg.NETMSG_RESPAWNGRANTED));
                                 } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
                                     finishServerSession(NetMsg.NETMSG_ENDGAME);
                                     break;

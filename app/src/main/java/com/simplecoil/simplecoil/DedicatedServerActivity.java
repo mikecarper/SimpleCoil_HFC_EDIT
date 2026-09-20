@@ -52,6 +52,7 @@ import androidx.core.content.ContextCompat;
 
 import java.net.InetAddress;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -72,6 +73,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private Button mGameLimitButton = null;
     private Button mGPSModeButton = null;
     private Button mEndGameButton = null;
+    private Button mGameMasterRespawnButton = null;
     private Button mStartGameButton = null;
     private TextView mGameLimitTV = null;
     private TextView mGameStatusTV = null;
@@ -287,6 +289,9 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         if (mEndGameButton != null) {
             mEndGameButton.setOnClickListener(v -> requestEndGame());
         }
+        mGameMasterRespawnButton = findViewById(R.id.game_master_respawn_button);
+        if (mGameMasterRespawnButton != null)
+            mGameMasterRespawnButton.setOnClickListener(v -> showGameMasterRespawnDialog());
         mStartGameButton = findViewById(R.id.start_game_button);
         if (mStartGameButton != null) {
             mStartGameButton.setOnClickListener((v -> {
@@ -659,6 +664,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         if (mUDPListenerService != null)
             mUDPListenerService.allowJoin(mAllowJoinSwitch.isChecked());
         mEndGameButton.setEnabled(true);
+        updateGameMasterRespawnButton();
         if (mRoundEndAt > 0) {
             startGameCountdown();
         }
@@ -713,6 +719,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mUDPListenerService.allowJoin(true);
         mEndGameButton.setEnabled(false);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        updateGameMasterRespawnButton();
         if (mTcpServer != null)
             mTcpServer.clearScheduledStart();
         Globals.getInstance().mServerGameTimeRemaining = 0;
@@ -811,7 +818,52 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         intentFilter.addAction(NetMsg.NETMSG_PLAYERDATAUPDATE);
         return intentFilter;
     }
+
+    private void updateGameMasterRespawnButton() {
+        if (mGameMasterRespawnButton == null)
+            return;
+        boolean enabled = mTcpServer != null
+                && !mTcpServer.getGameMasterRespawnCandidates().isEmpty();
+        mGameMasterRespawnButton.setEnabled(enabled);
+    }
+
+    private void showGameMasterRespawnDialog() {
+        if (mTcpServer == null)
+            return;
+        final List<TcpServer.RespawnCandidate> candidates =
+                mTcpServer.getGameMasterRespawnCandidates();
+        if (candidates.isEmpty()) {
+            updateGameMasterRespawnButton();
+            Toast.makeText(getApplicationContext(), R.string.game_master_no_players_waiting,
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String[] labels = new String[candidates.size()];
+        for (int index = 0; index < candidates.size(); index++) {
+            TcpServer.RespawnCandidate candidate = candidates.get(index);
+            String playerName = Globals.getInstance().getPlayerName(candidate.playerID);
+            if (playerName == null || playerName.trim().isEmpty())
+                playerName = getString(R.string.game_master_respawn_unknown_player, candidate.playerID);
+            labels[index] = candidate.team > 0
+                    ? getString(R.string.game_master_respawn_player, candidate.team, playerName)
+                    : getString(R.string.game_master_respawn_player_ffa, candidate.playerID, playerName);
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.game_master_respawn_title)
+                .setItems(labels, (dialog, which) -> {
+                    if (which < 0 || which >= candidates.size() || mTcpServer == null
+                            || !mTcpServer.grantGameMasterRespawn(candidates.get(which).playerID)) {
+                        Toast.makeText(getApplicationContext(), R.string.game_master_respawn_unavailable,
+                                Toast.LENGTH_SHORT).show();
+                    }
+                    updateGameMasterRespawnButton();
+                })
+                .setNegativeButton(R.string.cancel, null)
+                .show();
+    }
+
     private void getPlayerDisplayData() {
+        updateGameMasterRespawnButton();
         if (mTcpServer == null) return;
         Map<Byte, String> playerNames = new HashMap<>();
         Globals.getmTeamPlayerNameSemaphore();
@@ -885,6 +937,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         }
         if (mPlayerDisplayListAdapter != null)
             mPlayerDisplayListAdapter.setData(mPlayerDisplayData);
+        updateGameMasterRespawnButton();
     }
 
     private void startGameCountdown() {

@@ -396,6 +396,17 @@
             android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
 
         <Button
+            android:id="@+id/respawn_qr_scan_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/spawn_countdown_tv"
+            android:layout_centerHorizontal="true"
+            android:layout_marginTop="10dp"
+            android:text="@string/respawn_qr_scan_button"
+            android:visibility="gone" />
+
+        <Button
             android:id="@+id/start_game_button"
             style="@style/Widget.AppCompat.Button.Colored"
             android:layout_width="wrap_content"
@@ -618,4 +629,39 @@
 
     </LinearLayout>
     </ScrollView>
+
+    <FrameLayout
+        android:id="@+id/respawn_qr_scanner_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#FF000000"
+        android:clickable="true"
+        android:focusable="true"
+        android:visibility="gone">
+
+        <com.journeyapps.barcodescanner.DecoratedBarcodeView
+            android:id="@+id/respawn_qr_scanner"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <TextView
+            android:id="@+id/respawn_qr_scanner_prompt"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top"
+            android:background="#99000000"
+            android:gravity="center"
+            android:padding="16dp"
+            android:text="@string/respawn_qr_scanner_prompt"
+            android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+
+        <Button
+            android:id="@+id/respawn_qr_wait_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_marginBottom="24dp"
+            android:text="@string/respawn_qr_wait_button" />
+    </FrameLayout>
 </FrameLayout>
