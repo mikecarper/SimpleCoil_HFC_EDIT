@@ -470,6 +470,28 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void newRoundDoesNotReuseHitDeduplicationOrHitCounter() {
+        scenario.onActivity(activity -> {
+            telemetry(activity, 11, 1, 0, 0);
+            assertEquals(15, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mHitsTaken"));
+
+            invoke(activity, "endGame");
+            set(activity, "mUseNetwork", false);
+            invoke(activity, "startGame");
+            CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
+            spawn.cancel();
+            spawn.onFinish();
+
+            telemetry(activity, 11, 1, 0, 0);
+            assertEquals("A reused weapon shot ID was filtered as a prior round's hit", 15,
+                    get(activity, "mHealth"));
+            assertEquals("The hit counter carried over from the prior round", 1,
+                    get(activity, "mHitsTaken"));
+        });
+    }
+
+    @Test
     public void endingRoundImmediatelyClearsScoreFeedback() {
         scenario.onActivity(activity -> {
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));

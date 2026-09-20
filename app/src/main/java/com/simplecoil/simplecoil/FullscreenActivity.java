@@ -1514,6 +1514,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         startShieldRegeneration(SHIELD_REGEN_DELAY_MILLISECONDS);
     }
 
+    /**
+     * Hit packet sequence numbers belong to a physical blaster session, not a
+     * game round. The small shot IDs repeat, so state retained from a completed
+     * round must not suppress a real hit in the next one.
+     */
+    private void resetRoundTelemetryState() {
+        mLastHitData1.playerID = Globals.INVALID_PLAYER_ID;
+        mLastHitData1.shotID = 0;
+        mLastHitData2.playerID = Globals.INVALID_PLAYER_ID;
+        mLastHitData2.shotID = 0;
+        mLastHitMessage = 0;
+        mLastShotFired = 0;
+        mEmptyTriggerCount = 0;
+        mHitsTaken = 0;
+        if (mHitsTakenTV != null)
+            mHitsTakenTV.setText("0");
+    }
+
     private void startGame() { startGame(null); }
 
     private void startGame(Intent start) {
@@ -1539,6 +1557,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             endGame();
             return;
         }
+        resetRoundTelemetryState();
         clearCombatFeedback();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getDecorView().setSystemUiVisibility(
