@@ -18,8 +18,13 @@ package com.simplecoil.simplecoil;
 
 import static java.lang.Boolean.FALSE;
 
+import android.content.Context;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
+
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -287,6 +292,58 @@ public class Globals {
         }
         return "";
     }
+
+    /**
+     * Return the address associated with the Wi-Fi network when one is available.  The game
+     * discovers peers with Wi-Fi broadcast, so a cellular or VPN address is not a usable
+     * substitute when a phone has more than one active network interface.
+     */
+    public static InetAddress getIPAddress(Context context) {
+        if (context != null) {
+            try {
+                Context applicationContext = context.getApplicationContext();
+                if (applicationContext == null)
+                    applicationContext = context;
+                Object service = applicationContext.getSystemService(Context.WIFI_SERVICE);
+                if (service instanceof WifiManager) {
+                    WifiInfo info = ((WifiManager) service).getConnectionInfo();
+                    if (info != null) {
+                        InetAddress wifiAddress = fromWifiIPv4Address(info.getIpAddress());
+                        if (wifiAddress != null)
+                            return wifiAddress;
+                    }
+                }
+            } catch (SecurityException ignored) {
+                // ACCESS_WIFI_STATE can be unavailable on a modified device. Fall back below.
+            }
+        }
+        return getIPAddress();
+    }
+
+    public static String getIPAddressStr(Context context) {
+        InetAddress address = getIPAddress(context);
+        return address == null ? "" : address.getHostAddress();
+    }
+
+    /**
+     * WifiInfo stores IPv4 octets in little-endian order. A zero value means that Wi-Fi has
+     * not received an address yet.
+     */
+    static InetAddress fromWifiIPv4Address(int address) {
+        if (address == 0)
+            return null;
+        byte[] octets = new byte[4];
+        for (int k = 0; k < octets.length; k++)
+            octets[k] = (byte) ((address >> (k * 8)) & 0xFF);
+        try {
+            return InetAddress.getByAddress(octets);
+        } catch (UnknownHostException e) {
+            // A four-octet address is always valid, but do not let an impossible conversion
+            // failure bring down game setup.
+            return null;
+        }
+    }
+
     public static InetAddress getIPAddress() {
         try {
             List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());

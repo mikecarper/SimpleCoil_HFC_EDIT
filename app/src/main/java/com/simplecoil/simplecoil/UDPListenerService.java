@@ -147,7 +147,7 @@ public class UDPListenerService extends Service {
             return;
         Intent intent = null;
         if (mMyIP == null) {
-            mMyIP = Globals.getIPAddress();
+            mMyIP = Globals.getIPAddress(getApplicationContext());
         }
         if (ip.equals(mMyIP)) {
             //Log.d(TAG, "IP matched so ignored");
@@ -326,7 +326,7 @@ public class UDPListenerService extends Service {
                 try {
                     while (keepListening) {
                         try {
-                            InetAddress address = Globals.getIPAddress();
+                            InetAddress address = Globals.getIPAddress(getApplicationContext());
                             if (mIsListService || address == null)
                                 address = InetAddress.getByName("0.0.0.0");
                             listenForMessage(address, LISTEN_PORT, LISTEN_TIMEOUT_MS);
@@ -428,7 +428,7 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
-            mMyIP = Globals.getIPAddress();
+            mMyIP = Globals.getIPAddress(getApplicationContext());
             if (mMyIP == null) {
                 Log.e(TAG, "No local IPv4 address available for server");
                 stopListen();

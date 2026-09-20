@@ -708,7 +708,7 @@ public class TcpServer extends Service {
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERNAME, Globals.getInstance().mPlayerName);
                 player.put(JSON_PLAYERID, Globals.getInstance().mPlayerID);
-                player.put(JSON_PLAYERIP, Globals.getIPAddressStr());
+                player.put(JSON_PLAYERIP, Globals.getIPAddressStr(getApplicationContext()));
                 players.put(player);
             }
             JSONObject game = new JSONObject();

@@ -1099,7 +1099,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (Globals.getInstance().mServerIP != null)
             ip = Globals.getInstance().mServerIP.toString();
         else
-            ip = Globals.getIPAddressStr();
+            ip = Globals.getIPAddressStr(getApplicationContext());
         if (ip.startsWith("/"))
             ip = ip.substring(1);
         serverIPET.setText(ip);
