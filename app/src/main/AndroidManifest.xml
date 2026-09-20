@@ -61,6 +61,7 @@
 
         <activity
             android:name=".DedicatedServerActivity"
+            android:configChanges="orientation|keyboardHidden|screenSize"
             android:label="@string/title_activity_dedicated_server"
             android:theme="@style/AppTheme.NoActionBar" />
     </application>

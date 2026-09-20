@@ -1,15 +1,22 @@
 package com.simplecoil.simplecoil;
 
 import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.database.DataSetObserver;
 import android.os.CountDownTimer;
+import android.os.SystemClock;
+import android.view.KeyEvent;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ListView;
 import android.widget.Switch;
 
+import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -21,6 +28,8 @@ import org.junit.runner.RunWith;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -39,21 +48,34 @@ public class DedicatedServerRegressionTest {
     private byte originalPlayerID;
     private int originalGameState;
     private int originalGameLimit;
+    private int originalTimeLimit;
     private long originalRespawnTime;
+    private long originalTimeRemaining;
     private boolean originalUseGPS;
 
     @Before
     public void setUp() {
+        long wakeTime = SystemClock.uptimeMillis();
+        InstrumentationRegistry.getInstrumentation().getUiAutomation().injectInputEvent(
+                new KeyEvent(wakeTime, wakeTime, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_WAKEUP, 0), true);
+        InstrumentationRegistry.getInstrumentation().getUiAutomation().injectInputEvent(
+                new KeyEvent(wakeTime, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, KeyEvent.KEYCODE_WAKEUP, 0), true);
         Globals globals = Globals.getInstance();
         originalPlayerID = globals.mPlayerID;
         originalGameState = globals.mGameState;
         originalGameLimit = globals.mGameLimit;
+        originalTimeLimit = globals.mTimeLimit;
         originalRespawnTime = globals.mRespawnTime;
+        originalTimeRemaining = globals.mServerGameTimeRemaining;
         originalUseGPS = globals.mUseGPS;
         globals.mGameState = Globals.GAME_STATE_NONE;
         scenario = ActivityScenario.launch(DedicatedServerActivity.class);
         scenario.onActivity(current -> {
             activity = current;
+            // Lifecycle and rotation checks need a visible activity even when
+            // the unattended test device has returned to its lock screen.
+            current.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                    | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
             // Release the activity's real startup bindings before installing fakes.
             invoke("unbindUDPService");
             invoke("unbindTcpServerService");
@@ -63,14 +85,30 @@ public class DedicatedServerRegressionTest {
             udp = new RecordingUDPService();
             set("mTcpServer", tcp);
             set("mUDPListenerService", udp);
+            beginBinding(true);
+            beginBinding(false);
             globals.mUseGPS = false;
             globals.mGameLimit = Globals.GAME_LIMIT_NONE;
             globals.mRespawnTime = 10;
         });
+        scenario.moveToState(Lifecycle.State.RESUMED);
     }
 
     @After
     public void tearDown() {
+        if (scenario != null && scenario.getState() == Lifecycle.State.RESUMED) {
+            scenario.onActivity(current -> {
+                if (activity != current) {
+                    // Also clean up a replacement activity if a rotation regression
+                    // recreates the screen and starts real service bindings.
+                    activity = current;
+                    invoke("unbindUDPService");
+                    invoke("unbindTcpServerService");
+                    current.stopService(new Intent(current, UDPListenerService.class));
+                    current.stopService(new Intent(current, TcpServer.class));
+                }
+            });
+        }
         if (activity != null) {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
                 // Test connections were never bound through Android.
@@ -84,7 +122,9 @@ public class DedicatedServerRegressionTest {
         globals.mPlayerID = originalPlayerID;
         globals.mGameState = originalGameState;
         globals.mGameLimit = originalGameLimit;
+        globals.mTimeLimit = originalTimeLimit;
         globals.mRespawnTime = originalRespawnTime;
+        globals.mServerGameTimeRemaining = originalTimeRemaining;
         globals.mUseGPS = originalUseGPS;
     }
 
@@ -176,6 +216,169 @@ public class DedicatedServerRegressionTest {
             receive(NetMsg.NETMSG_ENDGAME);
             assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
         });
+    }
+
+    @Test
+    public void pausedServerStillAcceptsRemoteStarts() throws InterruptedException {
+        assertBackgroundStart(Lifecycle.State.STARTED);
+    }
+
+    @Test
+    public void stoppedServerStillAcceptsRemoteStarts() throws InterruptedException {
+        assertBackgroundStart(Lifecycle.State.CREATED);
+    }
+
+    private void assertBackgroundStart(Lifecycle.State state) throws InterruptedException {
+        keepRecordingServicesBound();
+        scenario.moveToState(state);
+        broadcastAndWait(NetMsg.NETMSG_STARTGAME);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertNotNull(get("mSpawnTimer"));
+            assertEquals(0, tcp.gameStarts);
+            assertFalse(button(R.id.start_game_button).isEnabled());
+        });
+    }
+
+    @Test
+    public void pausedServerStillEndsAnActiveRound() throws InterruptedException {
+        keepRecordingServicesBound();
+        scenario.onActivity(current -> receive(NetMsg.NETMSG_STARTGAME));
+        scenario.moveToState(Lifecycle.State.STARTED);
+        broadcastAndWait(NetMsg.NETMSG_ENDGAME);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get("mSpawnTimer"));
+            assertTrue(button(R.id.start_game_button).isEnabled());
+            assertFalse(button(R.id.end_game_button).isEnabled());
+        });
+    }
+
+    @Test
+    public void stoppedServerStillEndsATimedRound() throws InterruptedException {
+        keepRecordingServicesBound();
+        scenario.onActivity(current -> {
+            Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
+            Globals.getInstance().mTimeLimit = 5;
+            receive(NetMsg.NETMSG_STARTGAME);
+            assertNotNull(get("mGameCountdownTimer"));
+        });
+        scenario.moveToState(Lifecycle.State.CREATED);
+        broadcastAndWait(NetMsg.NETMSG_ENDGAME);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get("mGameCountdownTimer"));
+            assertEquals(0, Globals.getInstance().mServerGameTimeRemaining);
+        });
+    }
+
+    @Test
+    public void stoppedServerStillRefreshesPlayerScores() throws InterruptedException {
+        keepRecordingServicesBound();
+        scenario.onActivity(current -> {
+            tcp.firstPlayerScore = tcp.new ScoreData();
+            tcp.firstPlayerScore.points = 12;
+        });
+        scenario.moveToState(Lifecycle.State.CREATED);
+        broadcastAndWait(NetMsg.NETMSG_PLAYERDATAUPDATE);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertNotNull(activity.mPlayerDisplayListAdapter.getItem(1));
+            assertEquals(12, activity.mPlayerDisplayListAdapter.getItem(1).points);
+        });
+    }
+
+    @Test
+    public void destroyedServerNoLongerReceivesGameBroadcasts() throws InterruptedException {
+        closeActivity();
+        broadcastAndWait(NetMsg.NETMSG_STARTGAME);
+        assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+        assertNull(get("mSpawnTimer"));
+    }
+
+    @Test
+    public void endingATimedRoundClearsTheAdvertisedTimeRemaining() {
+        scenario.onActivity(current -> {
+            Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
+            Globals.getInstance().mTimeLimit = 5;
+            receive(NetMsg.NETMSG_STARTGAME);
+            CountDownTimer timer = (CountDownTimer) get("mGameCountdownTimer");
+            timer.onTick(42000);
+            assertEquals(42, Globals.getInstance().mServerGameTimeRemaining);
+            receive(NetMsg.NETMSG_ENDGAME);
+            assertEquals(0, Globals.getInstance().mServerGameTimeRemaining);
+            timer.onTick(41000);
+            assertEquals("A retired timer must not restore the old round's time", 0,
+                    Globals.getInstance().mServerGameTimeRemaining);
+        });
+    }
+
+    @Test
+    public void rotationPreservesTheSpawnTimerAndServerConnections() {
+        assertRotationPreservesRound(false);
+    }
+
+    @Test
+    public void rotationPreservesTheGameCountdownAndServerConnections() {
+        assertRotationPreservesRound(true);
+    }
+
+    private void assertRotationPreservesRound(boolean timed) {
+        keepRecordingServicesBound();
+        DedicatedServerActivity original = activity;
+        Object[] timer = new Object[1];
+        int originalOrientation = activity.getResources().getConfiguration().orientation;
+        int targetOrientation = originalOrientation == Configuration.ORIENTATION_LANDSCAPE
+                ? Configuration.ORIENTATION_PORTRAIT : Configuration.ORIENTATION_LANDSCAPE;
+        String timerField = timed ? "mGameCountdownTimer" : "mSpawnTimer";
+        scenario.onActivity(current -> {
+            Globals.getInstance().mRespawnTime = 60;
+            Globals.getInstance().mGameLimit = timed ? Globals.GAME_LIMIT_TIME : Globals.GAME_LIMIT_NONE;
+            Globals.getInstance().mTimeLimit = 5;
+            receive(NetMsg.NETMSG_STARTGAME);
+            timer[0] = get(timerField);
+            assertNotNull(timer[0]);
+            current.setRequestedOrientation(targetOrientation == Configuration.ORIENTATION_LANDSCAPE
+                    ? ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        });
+        long deadline = SystemClock.elapsedRealtime() + 5000;
+        while (!original.isDestroyed()
+                && original.getResources().getConfiguration().orientation != targetOrientation
+                && SystemClock.elapsedRealtime() < deadline) {
+            SystemClock.sleep(10);
+        }
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        assertFalse("Rotating the server screen destroyed the running session", original.isDestroyed());
+        scenario.onActivity(current -> {
+            assertSame(original, current);
+            assertEquals(targetOrientation, current.getResources().getConfiguration().orientation);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertSame(timer[0], get(timerField));
+            assertSame(tcp, get("mTcpServer"));
+            assertSame(udp, get("mUDPListenerService"));
+            assertEquals(0, tcp.listenerStops);
+            assertEquals(0, udp.listenerStops);
+            assertFalse(button(R.id.start_game_button).isEnabled());
+        });
+    }
+
+    private void keepRecordingServicesBound() {
+        scenario.onActivity(current -> {
+            beginBinding(true);
+            beginBinding(false);
+        });
+    }
+
+    private void broadcastAndWait(String action) throws InterruptedException {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        CountDownLatch delivered = new CountDownLatch(1);
+        context.sendOrderedBroadcast(new Intent(action).setPackage(context.getPackageName()), null,
+                new BroadcastReceiver() {
+                    @Override public void onReceive(Context context, Intent intent) {
+                        delivered.countDown();
+                    }
+                }, null, 0, null, null);
+        assertTrue("The test broadcast did not finish", delivered.await(5, TimeUnit.SECONDS));
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
 
     @Test
@@ -376,12 +579,14 @@ public class DedicatedServerRegressionTest {
     private static final class RecordingTcpServer extends TcpServer {
         int gameStarts;
         int listenerStarts;
+        int listenerStops;
         boolean acceptStart = true;
         boolean dedicated;
         ScoreData firstPlayerScore;
 
         @Override public boolean startGame() { gameStarts++; return acceptStart; }
         @Override void startTcpServer() { listenerStarts++; }
+        @Override public void stopTcpServer() { listenerStops++; }
         @Override public void setDedicated(boolean value) { dedicated = value; }
         @Override public void sendTCPMessageAll(String message) { }
         @Override public void sendAllGameInfo(int playerID) { }
@@ -390,10 +595,12 @@ public class DedicatedServerRegressionTest {
 
     private static final class RecordingUDPService extends UDPListenerService {
         int listenerStarts;
+        int listenerStops;
         int joinSettingChanges;
         boolean allowJoin;
 
         @Override public void createServer() { listenerStarts++; }
+        @Override void stopListen() { listenerStops++; }
         @Override public void allowJoin(boolean value) { joinSettingChanges++; allowJoin = value; }
     }
 }

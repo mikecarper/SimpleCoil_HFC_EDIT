@@ -298,24 +298,21 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             dialog.setServer((byte)position, mTcpServer);
             dialog.show();
         });
+        // The server and round timers remain active while this screen is hidden.
+        // Keep consuming their events until the server itself is torn down.
+        ContextCompat.registerReceiver(this, mServerUpdateReceiver, makeServerUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        ContextCompat.registerReceiver(this, mServerUpdateReceiver, makeServerUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
         setupUDPServiceConnection();
         setupTcpServerServiceConnection();
     }
 
     @Override
-    protected void onPause() {
-        super.onPause();
-        unregisterReceiver(mServerUpdateReceiver);
-    }
-
-    @Override
     protected void onDestroy() {
+        unregisterReceiver(mServerUpdateReceiver);
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
             mSpawnTimer = null;
@@ -581,6 +578,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mUDPListenerService.allowJoin(true);
         mEndGameButton.setEnabled(false);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        Globals.getInstance().mServerGameTimeRemaining = 0;
         mGameTimer.stop();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
