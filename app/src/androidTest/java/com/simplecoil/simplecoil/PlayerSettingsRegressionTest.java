@@ -35,6 +35,7 @@ public class PlayerSettingsRegressionTest {
     private Map<Byte, Globals.PlayerSettings> originalSettings;
     private SharedPreferences preferences;
     private Object originalVibrationPreference;
+    private Object originalFiringModePreference;
 
     @Before
     public void setUp() throws Exception {
@@ -58,6 +59,7 @@ public class PlayerSettingsRegressionTest {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         preferences = context.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
         originalVibrationPreference = preferences.getAll().get(FullscreenActivity.PREF_VIBRATE_ON_HIT);
+        originalFiringModePreference = preferences.getAll().get(FullscreenActivity.PREF_FIRING_MODE);
         scenario = ActivityScenario.launch(FullscreenActivity.class);
         scenario.onActivity(activity -> {
             globals.mFullHealth = 20;
@@ -102,6 +104,11 @@ public class PlayerSettingsRegressionTest {
                         (Boolean) originalVibrationPreference);
             else
                 editor.remove(FullscreenActivity.PREF_VIBRATE_ON_HIT);
+            if (originalFiringModePreference instanceof Integer)
+                editor.putInt(FullscreenActivity.PREF_FIRING_MODE,
+                        (Integer) originalFiringModePreference);
+            else
+                editor.remove(FullscreenActivity.PREF_FIRING_MODE);
             editor.commit();
         }
     }
@@ -225,15 +232,39 @@ public class PlayerSettingsRegressionTest {
 
     @Test
     public void localResetRestoresTheDefaultFiringRangeBeforePublishing() {
-        scenario.onActivity(activity -> Globals.getInstance().mCurrentFiringMode =
-                Globals.FIRING_MODE_INDOOR_NO_CONE);
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
+            preferences.edit().putInt(FullscreenActivity.PREF_FIRING_MODE,
+                    Globals.FIRING_MODE_INDOOR_NO_CONE).commit();
+        });
         show(false);
         scenario.onActivity(activity -> dialog.findViewById(R.id.reset_defaults_button).performClick());
         click(DialogInterface.BUTTON_POSITIVE);
         scenario.onActivity(activity -> {
             assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE,
                     Globals.getInstance().mCurrentFiringMode);
+            assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE,
+                    preferences.getInt(FullscreenActivity.PREF_FIRING_MODE, -1));
             assertEquals(1, client.saves);
+        });
+    }
+
+    @Test
+    public void cancellingLocalResetDoesNotChangeTheFiringRange() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
+            preferences.edit().putInt(FullscreenActivity.PREF_FIRING_MODE,
+                    Globals.FIRING_MODE_INDOOR_NO_CONE).commit();
+        });
+        show(false);
+        scenario.onActivity(activity -> dialog.findViewById(R.id.reset_defaults_button).performClick());
+        click(DialogInterface.BUTTON_NEGATIVE);
+        scenario.onActivity(activity -> {
+            assertEquals(Globals.FIRING_MODE_INDOOR_NO_CONE,
+                    Globals.getInstance().mCurrentFiringMode);
+            assertEquals(Globals.FIRING_MODE_INDOOR_NO_CONE,
+                    preferences.getInt(FullscreenActivity.PREF_FIRING_MODE, -1));
+            assertEquals(0, client.saves);
         });
     }
 

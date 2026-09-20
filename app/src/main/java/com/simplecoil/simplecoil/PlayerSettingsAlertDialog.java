@@ -56,6 +56,9 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
 
     private boolean isServer = false;
     private byte mPlayerID = 0;
+    // Keep the range selected in this dialog separate from live game state.
+    // Cancel must discard Reset/default-menu edits just like numeric field edits.
+    private int mSelectedFiringMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;
 
     private TcpServer mTcpServer = null;
     private TcpClient mTcpClient = null;
@@ -113,17 +116,8 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         mShotModeBurst3.setChecked(playerSettings.allowShotModeBurst3);
         mShotModeAuto.setChecked(playerSettings.allowShotModeAuto);
         mFiringModeButton.setVisibility(View.VISIBLE);
-        switch (playerSettings.firingMode) {
-            case Globals.FIRING_MODE_OUTDOOR_NO_CONE:
-                mFiringModeButton.setText(R.string.firing_mode_outdoor_no_cone);
-                break;
-            case Globals.FIRING_MODE_OUTDOOR_WITH_CONE:
-                mFiringModeButton.setText(R.string.firing_mode_outdoor_with_cone);
-                break;
-            case Globals.FIRING_MODE_INDOOR_NO_CONE:
-                mFiringModeButton.setText(R.string.firing_mode_indoor_no_cone);
-                break;
-        }//TODO check presets
+        setFiringModeSelection(playerSettings.firingMode);
+        //TODO check presets
        /* switch (playerSettings.playerPreset){
             case Globals.PLAYER_PRESET_RECON:
                     mPlayerPresetButton.setText(R.string.player_preset_recon);
@@ -193,6 +187,7 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         mShotModeSingle.setChecked(Globals.getInstance().mAllowSingleShotMode);
         mShotModeBurst3.setChecked(Globals.getInstance().mAllowBurst3ShotMode);
         mShotModeAuto.setChecked(Globals.getInstance().mAllowAutoShotMode);
+        setFiringModeSelection(Globals.getInstance().mCurrentFiringMode);
         mVibratePhoneSwitch.setVisibility(View.VISIBLE);
         mVibratePhoneSwitch.setChecked(Globals.getInstance().mVibrateOnHit);
         mAllowPlayerSettingsSwitch.setVisibility(View.GONE);
@@ -250,6 +245,25 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
             return value >= min && value <= max ? value : fallback;
         } catch (NumberFormatException e) {
             return fallback;
+        }
+    }
+
+    private void setFiringModeSelection(int firingMode) {
+        if (!Globals.isValidFiringMode(firingMode))
+            firingMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;
+        mSelectedFiringMode = firingMode;
+        if (mFiringModeButton == null)
+            return;
+        switch (firingMode) {
+            case Globals.FIRING_MODE_OUTDOOR_WITH_CONE:
+                mFiringModeButton.setText(R.string.firing_mode_outdoor_with_cone);
+                break;
+            case Globals.FIRING_MODE_INDOOR_NO_CONE:
+                mFiringModeButton.setText(R.string.firing_mode_indoor_no_cone);
+                break;
+            default:
+                mFiringModeButton.setText(R.string.firing_mode_outdoor_no_cone);
+                break;
         }
     }
 
@@ -314,12 +328,7 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
             mShotModeAuto.setChecked(true);
             mShotModeBurst3.setChecked(true);
             mShotModeSingle.setChecked(true);
-            mFiringModeButton.setText(R.string.firing_mode_outdoor_no_cone);
-            // Local dialogs hide the range selector, so Reset defaults is the
-            // only way to restore its value. Keep the value sent to the server
-            // in sync with the reset label rather than retaining a prior range.
-            if (!isServer)
-                Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;
+            setFiringModeSelection(Globals.FIRING_MODE_OUTDOOR_NO_CONE);
             if (!isServer)
                 mVibratePhoneSwitch.setChecked(false);
             mLivesET.setText("" + 0);
@@ -358,10 +367,14 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                         Globals.getInstance().mAllowSingleShotMode = mShotModeSingle.isChecked();
                         Globals.getInstance().mAllowBurst3ShotMode = mShotModeBurst3.isChecked();
                         Globals.getInstance().mAllowAutoShotMode = mShotModeAuto.isChecked();
+                        Globals.getInstance().mCurrentFiringMode = mSelectedFiringMode;
                         Globals.getInstance().mVibrateOnHit = mVibratePhoneSwitch.isChecked();
                         mContext.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE)
-                                .edit().putBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT,
-                                        Globals.getInstance().mVibrateOnHit).apply();
+                                .edit()
+                                .putInt(FullscreenActivity.PREF_FIRING_MODE, mSelectedFiringMode)
+                                .putBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT,
+                                        Globals.getInstance().mVibrateOnHit)
+                                .apply();
                       //TODO check
                        // Globals.getInstance().mAllowPlayerSettings = mAllowPlayerSettingsSwitch.isChecked();
 
@@ -393,13 +406,8 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                         // Saving local host settings must not depend on a live service binding.
                         Globals.getInstance().mAllowPlayerSettings = mAllowPlayerSettingsSwitch.isChecked();
 
-                        if (mFiringModeButton.getText().equals(getContext().getString(R.string.firing_mode_outdoor_no_cone))) {
-                            playerSettings.firingMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;
-                        }else if (mFiringModeButton.getText().equals(getContext().getString(R.string.firing_mode_outdoor_with_cone)))
-                            playerSettings.firingMode = Globals.FIRING_MODE_OUTDOOR_WITH_CONE;
-                        else {
-                            playerSettings.firingMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
-                        }//TODO add presets
+                        playerSettings.firingMode = mSelectedFiringMode;
+                        //TODO add presets
                        /* if(mPlayerPresetButton.getText().equals(getContext().getString(R.string.player_preset_recon)))
                             playerSettings.playerPreset = Globals.PLAYER_PRESET_RECON;
                         else if(mPlayerPresetButton.getText().equals(getContext().getString(R.string.player_preset_juggernaut)))
@@ -530,19 +538,13 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
     public boolean onMenuItemClick(MenuItem item) {
         switch (item.getItemId()) {
             case R.id.firing_mode_outdoor_no_cone_item:
-                if (!isServer)
-                    Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;
-                mFiringModeButton.setText(R.string.firing_mode_outdoor_no_cone);
+                setFiringModeSelection(Globals.FIRING_MODE_OUTDOOR_NO_CONE);
                 return true;
             case R.id.firing_mode_outdoor_with_cone_item:
-                if (!isServer)
-                    Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_OUTDOOR_WITH_CONE;
-                mFiringModeButton.setText(R.string.firing_mode_outdoor_with_cone);
+                setFiringModeSelection(Globals.FIRING_MODE_OUTDOOR_WITH_CONE);
                 return true;
             case R.id.firing_mode_indoor_no_cone_item:
-                if (!isServer)
-                    Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
-                mFiringModeButton.setText(R.string.firing_mode_indoor_no_cone);
+                setFiringModeSelection(Globals.FIRING_MODE_INDOOR_NO_CONE);
                 return true;
                 //TODO player preset menu handling
             //TODO adding strings for each weapon for reload time ,reload shots,and damage

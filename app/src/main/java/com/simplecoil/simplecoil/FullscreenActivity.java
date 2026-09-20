@@ -339,7 +339,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final String PREF_PLAYER_NAME = "PlayerName";
     private static final String DEFAULT_PLAYER_NAME = "Player";
     private static final String PREF_PLAYER_ID = "PlayerID";
-    private static final String PREF_FIRING_MODE = "FiringMode";
+    static final String PREF_FIRING_MODE = "FiringMode";
     private static final String PREF_SHOT_MODE = "ShotMode";
     private static final String PREF_RECOIL_ENABLED = "RecoilEnabled";
     static final String PREF_VIBRATE_ON_HIT = "VibrateOnHit";
