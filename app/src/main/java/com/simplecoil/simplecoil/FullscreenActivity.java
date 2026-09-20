@@ -376,16 +376,29 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void setupUDPServiceConnection() {
         if (mUDPServiceBound) return;
-        mUDPServiceConnection = new ServiceConnection() {
+        mUDPServiceConnection = createUDPServiceConnection();
+        Intent udpServiceIntent = new Intent(getBaseContext(), UDPListenerService.class);
+        startService(udpServiceIntent);
+        mUDPServiceBound = bindService(udpServiceIntent, mUDPServiceConnection, BIND_AUTO_CREATE);
+        if (!mUDPServiceBound)
+            mUDPServiceConnection = null;
+    }
+
+    private ServiceConnection createUDPServiceConnection() {
+        return new ServiceConnection() {
 
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
+                if (mUDPServiceConnection != this || !mUDPServiceBound || isFinishing() || isDestroyed())
+                    return;
                 mUDPListenerService = ((UDPListenerService.LocalBinder) service).getService();
                 consumePendingServerEvent();
             }
 
             @Override
             public void onServiceDisconnected(ComponentName componentName) {
+                if (mUDPServiceConnection != this || !mUDPServiceBound || isFinishing() || isDestroyed())
+                    return;
                 mReady = false;
                 setReady(false);
                 mIsServer = false;
@@ -394,11 +407,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mUDPListenerService = null;
             }
         };
-        Intent udpServiceIntent = new Intent(getBaseContext(), UDPListenerService.class);
-        startService(udpServiceIntent);
-        mUDPServiceBound = bindService(udpServiceIntent, mUDPServiceConnection, BIND_AUTO_CREATE);
-        if (!mUDPServiceBound)
-            mUDPServiceConnection = null;
     }
 
     private TcpClient mTcpClient = null;
@@ -412,24 +420,34 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void setupTcpClientServiceConnection() {
         if (mTcpClientServiceBound) return;
-        mTcpClientServiceConnection = new ServiceConnection() {
+        mTcpClientServiceConnection = createTcpClientServiceConnection();
+        Intent serviceIntent = new Intent(getBaseContext(), TcpClient.class);
+        startService(serviceIntent);
+        mTcpClientServiceBound = bindService(serviceIntent, mTcpClientServiceConnection, BIND_AUTO_CREATE);
+        if (!mTcpClientServiceBound)
+            mTcpClientServiceConnection = null;
+    }
+
+    private ServiceConnection createTcpClientServiceConnection() {
+        return new ServiceConnection() {
 
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
+                if (mTcpClientServiceConnection != this || !mTcpClientServiceBound
+                        || isFinishing() || isDestroyed())
+                    return;
                 mTcpClient = ((TcpClient.LocalBinder) service).getService();
                 consumePendingServerEvent();
             }
 
             @Override
             public void onServiceDisconnected(ComponentName componentName) {
+                if (mTcpClientServiceConnection != this || !mTcpClientServiceBound
+                        || isFinishing() || isDestroyed())
+                    return;
                 mTcpClient = null;
             }
         };
-        Intent serviceIntent = new Intent(getBaseContext(), TcpClient.class);
-        startService(serviceIntent);
-        mTcpClientServiceBound = bindService(serviceIntent, mTcpClientServiceConnection, BIND_AUTO_CREATE);
-        if (!mTcpClientServiceBound)
-            mTcpClientServiceConnection = null;
     }
 
     private void consumePendingServerEvent() {
@@ -449,10 +467,22 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void setupTcpServerServiceConnection() {
         if (mTcpServerServiceBound) return;
-        mTcpServerServiceConnection = new ServiceConnection() {
+        mTcpServerServiceConnection = createTcpServerServiceConnection();
+        Intent serviceIntent = new Intent(getBaseContext(), TcpServer.class);
+        startService(serviceIntent);
+        mTcpServerServiceBound = bindService(serviceIntent, mTcpServerServiceConnection, BIND_AUTO_CREATE);
+        if (!mTcpServerServiceBound)
+            mTcpServerServiceConnection = null;
+    }
+
+    private ServiceConnection createTcpServerServiceConnection() {
+        return new ServiceConnection() {
 
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
+                if (mTcpServerServiceConnection != this || !mTcpServerServiceBound
+                        || isFinishing() || isDestroyed())
+                    return;
                 mTcpServer = ((TcpServer.LocalBinder) service).getService();
                 mTcpServer.setDedicated(false);
                 consumePendingServerEvent();
@@ -460,14 +490,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
             @Override
             public void onServiceDisconnected(ComponentName componentName) {
+                if (mTcpServerServiceConnection != this || !mTcpServerServiceBound
+                        || isFinishing() || isDestroyed())
+                    return;
                 mTcpServer = null;
             }
         };
-        Intent serviceIntent = new Intent(getBaseContext(), TcpServer.class);
-        startService(serviceIntent);
-        mTcpServerServiceBound = bindService(serviceIntent, mTcpServerServiceConnection, BIND_AUTO_CREATE);
-        if (!mTcpServerServiceBound)
-            mTcpServerServiceConnection = null;
     }
 
     private void unbindUDPService() {
