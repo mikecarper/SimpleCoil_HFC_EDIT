@@ -299,7 +299,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             }));
         }
         sharedPreferences = getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
-        int savedGameMode = sharedPreferences.getInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
+        int savedGameMode = FullscreenActivity.readIntPreference(sharedPreferences,
+                FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
         Globals.getInstance().mGameMode = Globals.isValidGameMode(savedGameMode) ? savedGameMode : Globals.GAME_MODE_2TEAMS;
         if (Globals.getInstance().mGameMode == Globals.GAME_MODE_2TEAMS)
             mGameModeButton.setText(R.string.game_mode_2teams);
@@ -308,20 +309,24 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         else
             mGameModeButton.setText(R.string.game_mode_ffa);
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
-        int savedTimeLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_TIME, 0);
+        int savedTimeLimit = FullscreenActivity.readIntPreference(sharedPreferences,
+                FullscreenActivity.PREF_LIMIT_TIME, 0);
         Globals.getInstance().mTimeLimit = Globals.isValidGameLimit(savedTimeLimit) ? savedTimeLimit : 0;
         if (Globals.getInstance().mTimeLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_TIME;
-        int savedLivesLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_LIVES, 0);
+        int savedLivesLimit = FullscreenActivity.readIntPreference(sharedPreferences,
+                FullscreenActivity.PREF_LIMIT_LIVES, 0);
         Globals.getInstance().mLivesLimit = Globals.isValidGameLimit(savedLivesLimit) ? savedLivesLimit : 0;
         if (Globals.getInstance().mLivesLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_LIVES;
-        int savedScoreLimit = sharedPreferences.getInt(FullscreenActivity.PREF_LIMIT_SCORE, 0);
+        int savedScoreLimit = FullscreenActivity.readIntPreference(sharedPreferences,
+                FullscreenActivity.PREF_LIMIT_SCORE, 0);
         Globals.getInstance().mScoreLimit = Globals.isValidGameLimit(savedScoreLimit) ? savedScoreLimit : 0;
         if (Globals.getInstance().mScoreLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
         setGameLimit();
-        int savedGPSMode = sharedPreferences.getInt(PREF_GPS_MODE, Globals.GPS_ALL);
+        int savedGPSMode = FullscreenActivity.readIntPreference(sharedPreferences, PREF_GPS_MODE,
+                Globals.GPS_ALL);
         Globals.getInstance().mGPSMode = Globals.isValidGPSMode(savedGPSMode) ? savedGPSMode : Globals.GPS_ALL;
         setGPSMode(Globals.getInstance().mGPSMode);
         mAllowJoinSwitch = findViewById(R.id.allow_join_switch);

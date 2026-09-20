@@ -13,6 +13,8 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import java.util.Set;
+
 import static org.junit.Assert.assertEquals;
 
 /** Verifies that old or corrupt saved profile values cannot poison the next connection. */
@@ -21,29 +23,30 @@ public class SavedProfileRegressionTest {
     private static final String PREF_PLAYER_NAME = "PlayerName";
 
     private SharedPreferences preferences;
-    private boolean hadPlayerName;
-    private boolean hadDeviceAddress;
-    private String savedPlayerName;
-    private String savedDeviceAddress;
+    private Object savedPlayerName;
+    private Object savedDeviceAddress;
+    private Object savedGameMode;
     private String originalGlobalPlayerName;
     private boolean originalUseGPS;
     private int originalGameState;
+    private int originalGameMode;
     private ActivityScenario<FullscreenActivity> scenario;
 
     @Before
     public void setUp() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         preferences = context.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
-        hadPlayerName = preferences.contains(PREF_PLAYER_NAME);
-        hadDeviceAddress = preferences.contains(FullscreenActivity.PREF_DEVICE_ADDRESS);
-        savedPlayerName = preferences.getString(PREF_PLAYER_NAME, null);
-        savedDeviceAddress = preferences.getString(FullscreenActivity.PREF_DEVICE_ADDRESS, null);
+        savedPlayerName = preferences.getAll().get(PREF_PLAYER_NAME);
+        savedDeviceAddress = preferences.getAll().get(FullscreenActivity.PREF_DEVICE_ADDRESS);
+        savedGameMode = preferences.getAll().get(FullscreenActivity.PREF_GAME_MODE);
         originalGlobalPlayerName = Globals.getInstance().mPlayerName;
         originalUseGPS = Globals.getInstance().mUseGPS;
         originalGameState = Globals.getInstance().mGameState;
+        originalGameMode = Globals.getInstance().mGameMode;
         preferences.edit()
                 .putString(PREF_PLAYER_NAME, repeat('x', TcpJson.MAX_PLAYER_NAME_LENGTH + 1))
                 .putString(FullscreenActivity.PREF_DEVICE_ADDRESS, "00:11:22:33:44:GG")
+                .putString(FullscreenActivity.PREF_GAME_MODE, "not an integer")
                 .commit();
         Globals.getInstance().mUseGPS = false;
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
@@ -56,15 +59,15 @@ public class SavedProfileRegressionTest {
             scenario.close();
         if (preferences != null) {
             SharedPreferences.Editor editor = preferences.edit();
-            if (hadPlayerName) editor.putString(PREF_PLAYER_NAME, savedPlayerName);
-            else editor.remove(PREF_PLAYER_NAME);
-            if (hadDeviceAddress) editor.putString(FullscreenActivity.PREF_DEVICE_ADDRESS, savedDeviceAddress);
-            else editor.remove(FullscreenActivity.PREF_DEVICE_ADDRESS);
+            restorePreference(editor, PREF_PLAYER_NAME, savedPlayerName);
+            restorePreference(editor, FullscreenActivity.PREF_DEVICE_ADDRESS, savedDeviceAddress);
+            restorePreference(editor, FullscreenActivity.PREF_GAME_MODE, savedGameMode);
             editor.commit();
         }
         Globals.getInstance().mPlayerName = originalGlobalPlayerName;
         Globals.getInstance().mUseGPS = originalUseGPS;
         Globals.getInstance().mGameState = originalGameState;
+        Globals.getInstance().mGameMode = originalGameMode;
     }
 
     @Test
@@ -73,8 +76,28 @@ public class SavedProfileRegressionTest {
             assertEquals("Player", Globals.getInstance().mPlayerName);
             assertEquals("Player", preferences.getString(PREF_PLAYER_NAME, null));
             assertEquals("", preferences.getString(FullscreenActivity.PREF_DEVICE_ADDRESS, null));
+            assertEquals(Globals.GAME_MODE_2TEAMS, Globals.getInstance().mGameMode);
+            assertEquals(false, preferences.contains(FullscreenActivity.PREF_GAME_MODE));
             assertEquals(View.GONE, activity.findViewById(R.id.reconnect_weapon_button).getVisibility());
         });
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void restorePreference(SharedPreferences.Editor editor, String key, Object value) {
+        if (value instanceof String)
+            editor.putString(key, (String) value);
+        else if (value instanceof Integer)
+            editor.putInt(key, (Integer) value);
+        else if (value instanceof Boolean)
+            editor.putBoolean(key, (Boolean) value);
+        else if (value instanceof Long)
+            editor.putLong(key, (Long) value);
+        else if (value instanceof Float)
+            editor.putFloat(key, (Float) value);
+        else if (value instanceof Set)
+            editor.putStringSet(key, (Set<String>) value);
+        else
+            editor.remove(key);
     }
 
     private static String repeat(char value, int count) {

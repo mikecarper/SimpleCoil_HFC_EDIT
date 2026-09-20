@@ -343,6 +343,40 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     public static final String PREF_LIMIT_SCORE = "ScoreLimit";
     public static final String PREF_DEVICE_ADDRESS = "DeviceAddress";
 
+    private static void discardMalformedPreference(SharedPreferences preferences, String key,
+                                                   ClassCastException exception) {
+        Log.w(TAG, "Ignoring malformed saved preference " + key, exception);
+        preferences.edit().remove(key).apply();
+    }
+
+    static String readStringPreference(SharedPreferences preferences, String key, String fallback) {
+        try {
+            String value = preferences.getString(key, fallback);
+            return value == null ? fallback : value;
+        } catch (ClassCastException e) {
+            discardMalformedPreference(preferences, key, e);
+            return fallback;
+        }
+    }
+
+    static int readIntPreference(SharedPreferences preferences, String key, int fallback) {
+        try {
+            return preferences.getInt(key, fallback);
+        } catch (ClassCastException e) {
+            discardMalformedPreference(preferences, key, e);
+            return fallback;
+        }
+    }
+
+    static boolean readBooleanPreference(SharedPreferences preferences, String key, boolean fallback) {
+        try {
+            return preferences.getBoolean(key, fallback);
+        } catch (ClassCastException e) {
+            discardMalformedPreference(preferences, key, e);
+            return fallback;
+        }
+    }
+
     static String normalizePlayerName(String playerName) {
         return TcpJson.isValidPlayerName(playerName) ? playerName : DEFAULT_PLAYER_NAME;
     }
@@ -355,9 +389,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void restoreSavedProfile() {
-        String savedPlayerName = sharedPreferences.getString(PREF_PLAYER_NAME, DEFAULT_PLAYER_NAME);
+        String savedPlayerName = readStringPreference(sharedPreferences, PREF_PLAYER_NAME, DEFAULT_PLAYER_NAME);
         String playerName = normalizePlayerName(savedPlayerName);
-        String savedDeviceAddress = sharedPreferences.getString(PREF_DEVICE_ADDRESS, "");
+        String savedDeviceAddress = readStringPreference(sharedPreferences, PREF_DEVICE_ADDRESS, "");
         String deviceAddress = normalizeBluetoothAddress(savedDeviceAddress);
         Globals.getInstance().mPlayerName = playerName;
         mDeviceAddress = deviceAddress;
@@ -643,7 +677,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mReconnectButton.setOnClickListener((v -> {
             if (sharedPreferences == null)
                 sharedPreferences = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
-            String savedAddress = sharedPreferences.getString(PREF_DEVICE_ADDRESS, "");
+            String savedAddress = readStringPreference(sharedPreferences, PREF_DEVICE_ADDRESS, "");
             mDeviceAddress = normalizeBluetoothAddress(savedAddress);
             if (!mDeviceAddress.equals(savedAddress))
                 sharedPreferences.edit().putString(PREF_DEVICE_ADDRESS, mDeviceAddress).apply();
@@ -800,24 +834,25 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
         sharedPreferences = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
         restoreSavedProfile();
-        Globals.getInstance().mCurrentFiringMode = sharedPreferences.getInt(PREF_FIRING_MODE, Globals.FIRING_MODE_OUTDOOR_NO_CONE);
-        int savedPlayerID = sharedPreferences.getInt(PREF_PLAYER_ID, 0);
+        Globals.getInstance().mCurrentFiringMode = readIntPreference(sharedPreferences, PREF_FIRING_MODE,
+                Globals.FIRING_MODE_OUTDOOR_NO_CONE);
+        int savedPlayerID = readIntPreference(sharedPreferences, PREF_PLAYER_ID, 0);
         Globals.getInstance().mPlayerID = Globals.isValidPlayerID(savedPlayerID) ? (byte) savedPlayerID : 0;
         getFiringMode();
-        mRecoilEnabled = sharedPreferences.getBoolean(PREF_RECOIL_ENABLED, true);
-        mCurrentShotMode = sharedPreferences.getInt(PREF_SHOT_MODE, Globals.SHOT_MODE_SINGLE);
-        int savedGameMode = sharedPreferences.getInt(PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
+        mRecoilEnabled = readBooleanPreference(sharedPreferences, PREF_RECOIL_ENABLED, true);
+        mCurrentShotMode = readIntPreference(sharedPreferences, PREF_SHOT_MODE, Globals.SHOT_MODE_SINGLE);
+        int savedGameMode = readIntPreference(sharedPreferences, PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
         Globals.getInstance().mGameMode = Globals.isValidGameMode(savedGameMode) ? savedGameMode : Globals.GAME_MODE_2TEAMS;
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
-        int savedTimeLimit = sharedPreferences.getInt(PREF_LIMIT_TIME, 0);
+        int savedTimeLimit = readIntPreference(sharedPreferences, PREF_LIMIT_TIME, 0);
         Globals.getInstance().mTimeLimit = Globals.isValidGameLimit(savedTimeLimit) ? savedTimeLimit : 0;
         if (Globals.getInstance().mTimeLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_TIME;
-        int savedLivesLimit = sharedPreferences.getInt(PREF_LIMIT_LIVES, 0);
+        int savedLivesLimit = readIntPreference(sharedPreferences, PREF_LIMIT_LIVES, 0);
         Globals.getInstance().mLivesLimit = Globals.isValidGameLimit(savedLivesLimit) ? savedLivesLimit : 0;
         if (Globals.getInstance().mLivesLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_LIVES;
-        int savedScoreLimit = sharedPreferences.getInt(PREF_LIMIT_SCORE, 0);
+        int savedScoreLimit = readIntPreference(sharedPreferences, PREF_LIMIT_SCORE, 0);
         Globals.getInstance().mScoreLimit = Globals.isValidGameLimit(savedScoreLimit) ? savedScoreLimit : 0;
         if (Globals.getInstance().mScoreLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
