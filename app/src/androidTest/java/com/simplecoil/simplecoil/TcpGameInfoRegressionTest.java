@@ -363,6 +363,25 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void emptySettingsSnapshotClearsSettingsFromPreviousLobby() throws Exception {
+        Globals.PlayerSettings stale = new Globals.PlayerSettings();
+        stale.damage = -77;
+        Globals.getmPlayerSettingsSemaphore();
+        try {
+            globals.mPlayerSettings.put((byte) 7, stale);
+        } finally {
+            globals.mPlayerSettingsSemaphore.release();
+        }
+
+        parse(settingsMessage());
+
+        assertTrue("An empty server snapshot retained old player settings",
+                globals.mPlayerSettings.isEmpty());
+        assertEquals(NetMsg.NETMSG_PLAYERSETTINGSUPDATE, client.events.get(0).getAction());
+        assertEquals(1, globals.mPlayerSettingsSemaphore.availablePermits());
+    }
+
+    @Test
     public void validBundledSettingsAndRosterStillPublishBothUpdates() throws Exception {
         parse(roster(new JSONArray().put(player(3)))
                 .put(TcpServer.JSON_PLAYERSETTINGS, new JSONArray().put(settings(1)))

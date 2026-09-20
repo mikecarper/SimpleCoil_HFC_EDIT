@@ -1231,6 +1231,10 @@ public class TcpClient extends Service {
     // Caller holds both the service monitor and the player-settings semaphore.
     private void applyPlayerSettingsLocked(Map<Byte, Globals.PlayerSettings> settings, boolean allowPlayerSettings) {
         Globals globals = Globals.getInstance();
+        // Server messages contain a complete settings snapshot. Retaining entries
+        // that are absent here carries old lobby damage or lives settings into a
+        // new game when the same player ID is reused.
+        globals.mPlayerSettings.clear();
         globals.mPlayerSettings.putAll(settings);
         Globals.PlayerSettings local = settings.get(globals.mPlayerID);
         if (local != null) {
