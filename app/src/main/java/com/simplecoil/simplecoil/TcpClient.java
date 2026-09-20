@@ -309,8 +309,14 @@ public class TcpClient extends Service {
             if (!isCurrentSession(generation))
                 return;
             long roundID = TcpJson.getLong(startInfo, TcpServer.JSON_ROUND_ID);
+            // Clock sync can delay publication of a start. Keep the newest plan
+            // during that delay; otherwise a late packet for an older round can
+            // replace a newer pending plan and start the wrong game.
+            long pendingRoundID = mPendingStartInfo == null ? 0
+                    : TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_ROUND_ID);
             if (roundID < mLastStartRound || (roundID == mLastStartRound
-                    && NetMsg.NETMSG_STARTGAME.equals(intent.getAction())))
+                    && NetMsg.NETMSG_STARTGAME.equals(intent.getAction()))
+                    || roundID < pendingRoundID)
                 return;
             mPendingStartInfo = startInfo;
             mPendingStartIntent = intent;

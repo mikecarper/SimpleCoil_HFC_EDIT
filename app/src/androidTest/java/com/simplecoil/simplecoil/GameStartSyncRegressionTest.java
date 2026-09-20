@@ -52,6 +52,15 @@ public class GameStartSyncRegressionTest {
         assertEquals(1, client.events.size());
     }
 
+    @Test public void olderRoundCannotReplaceANewerPendingStartBeforeClockSync() throws Exception {
+        long now = SystemClock.elapsedRealtime();
+        parse(plan(2, now + 10000, 0));
+        parse(plan(1, now + 20000, 0));
+        synchronize();
+        assertEquals(1, client.events.size());
+        assertEquals(2, client.events.get(0).getLongExtra(NetMsg.INTENT_ROUND_ID, 0));
+    }
+
     @Test public void startIsRetainedForPausedActivityAndConsumedOnlyOnce() throws Exception {
         synchronize();
         parse(plan(1, SystemClock.elapsedRealtime() + 10000, 0));
