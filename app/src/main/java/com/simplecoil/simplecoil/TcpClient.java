@@ -578,7 +578,10 @@ public class TcpClient extends Service {
     private void finishServerSession(String action) {
         final Intent notification;
         synchronized (this) {
-            if (mDestroyed)
+            // A terminal frame can already be parsed when the user leaves or
+            // stops the client. Do not let that retired session restore an
+            // ENDGAME/CANCEL event after its state was deliberately cleared.
+            if (mDestroyed || !keepListening)
                 return;
             // Terminal messages must stop reconnecting even while the activity
             // is paused and its broadcast receiver is not registered.

@@ -16,6 +16,7 @@ import org.junit.runner.RunWith;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -350,6 +351,18 @@ public class TcpClientSessionRegressionTest {
         assertFalse(pending.hasExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID));
         assertNull(client.consumePendingTerminalEvent());
         assertNull(client.consumePendingTerminalEvent(eventId));
+    }
+
+    @Test
+    public void terminalEventAlreadyReadBeforeManualStopIsIgnored() throws Exception {
+        connect();
+        client.stopTcpClient();
+        Method finish = TcpClient.class.getDeclaredMethod("finishServerSession", String.class);
+        finish.setAccessible(true);
+        finish.invoke(client, NetMsg.NETMSG_ENDGAME);
+        assertFalse("A closed session published a stale terminal event",
+                client.actions.contains(NetMsg.NETMSG_ENDGAME));
+        assertNull(client.consumePendingTerminalEvent());
     }
 
     @Test
