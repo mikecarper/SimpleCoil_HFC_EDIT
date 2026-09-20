@@ -235,6 +235,24 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void peerLeaveCannotOvertakeASequencedFinalScoreEvent() throws Exception {
+        register(teammate, 2);
+        register(enemy, 11);
+        service.startGame(true);
+
+        receive(enemy, NetMsg.NETMSG_LEAVE);
+        receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + "1");
+        assertEquals(2, service.events.size());
+        assertEquals(NetMsg.NETMSG_ELIMINATED, service.events.get(1).getAction());
+        assertEquals(11, service.events.get(1).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+
+        receive(teammate, NetMsg.NETMSG_LEAVE);
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + "11:1");
+        assertEquals(4, service.events.size());
+        assertEquals(NetMsg.NETMSG_TEAMELIMINATED, service.events.get(3).getAction());
+    }
+
+    @Test
     public void peerGrenadePairingTracksKnownPlayerAndRejectsStaleOrUnknownUpdates() throws Exception {
         register(teammate, 2);
         Globals globals = Globals.getInstance();
@@ -320,6 +338,80 @@ public class UDPRegressionTest {
                 globals.mGrenadePairingsSemaphore.release();
             }
         }
+    }
+
+    @Test
+    public void peerEliminationEventsAreSequencedAndCannotAwardDuplicatePoints() throws Exception {
+        register(enemy, 11);
+        register(teammate, 2);
+        service.startGame(true);
+
+        receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + "1");
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_ELIMINATED, service.events.get(0).getAction());
+        assertEquals(11, service.events.get(0).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+        assertEquals(1L, service.events.get(0).getLongExtra(NetMsg.INTENT_EVENT_SEQUENCE, 0));
+
+        receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + "1");
+        receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + "0");
+        receive(teammate, NetMsg.NETMSG_PEER_ELIMINATED + "2");
+        receive(stranger, NetMsg.NETMSG_PEER_ELIMINATED + "2");
+        assertEquals("Duplicate, invalid, teammate, or unknown score events changed the score", 1,
+                service.events.size());
+
+        receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + "2");
+        assertEquals(2, service.events.size());
+        assertEquals(2L, service.events.get(1).getLongExtra(NetMsg.INTENT_EVENT_SEQUENCE, 0));
+    }
+
+    @Test
+    public void peerTeamEliminationEventsAreSequencedAndValidateBothTeams() throws Exception {
+        register(teammate, 2);
+        register(enemy, 11);
+        service.startGame(true);
+
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + "11:1");
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_TEAMELIMINATED, service.events.get(0).getAction());
+
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + "11:1");
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + "2:2");
+        receive(enemy, NetMsg.NETMSG_PEER_TEAMELIMINATED + "2:1");
+        assertEquals("Repeated or invalid team score relays changed the team score", 1,
+                service.events.size());
+
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + "11:2");
+        assertEquals(2, service.events.size());
+    }
+
+    @Test
+    public void peerScorePublisherRetriesSequencedEventsAndLeaves() throws Exception {
+        register(teammate, 2);
+        register(enemy, 11);
+        service.startGame(true);
+
+        service.publishPeerElimination((byte) 11);
+        assertEquals(1, service.directMessages.size());
+        assertEquals(NetMsg.NETMSG_PEER_ELIMINATED + "1", service.directMessages.get(0));
+        assertEquals(Byte.valueOf((byte) 11), service.directRecipients.get(0));
+        assertEquals(3, (int) service.directRepeatCounts.get(0));
+
+        service.publishPeerTeamElimination((byte) 11, 1, (byte) 2);
+        assertEquals(2, service.directMessages.size());
+        assertEquals(NetMsg.NETMSG_PEER_TEAMELIMINATED + "11:1", service.directMessages.get(1));
+        assertEquals(Byte.valueOf((byte) 2), service.directRecipients.get(1));
+        assertEquals(3, (int) service.directRepeatCounts.get(1));
+
+        service.announcePeerLeave();
+        assertEquals(NetMsg.NETMSG_LEAVE, service.sentMessages.get(0));
+        assertEquals(3, (int) service.repeatCounts.get(0));
+
+        service.startGame(false);
+        service.publishPeerElimination((byte) 11);
+        service.publishPeerTeamElimination((byte) 11, 2, (byte) 2);
+        service.announcePeerLeave();
+        assertEquals(2, service.directMessages.size());
+        assertEquals(1, service.sentMessages.size());
     }
 
     @Test
@@ -757,6 +849,9 @@ public class UDPRegressionTest {
         final List<Intent> events = new CopyOnWriteArrayList<>();
         final List<String> sentMessages = new CopyOnWriteArrayList<>();
         final List<Integer> repeatCounts = new CopyOnWriteArrayList<>();
+        final List<String> directMessages = new CopyOnWriteArrayList<>();
+        final List<Byte> directRecipients = new CopyOnWriteArrayList<>();
+        final List<Integer> directRepeatCounts = new CopyOnWriteArrayList<>();
         boolean realListener;
         int listenerStarts;
         boolean blockFirstLookup;
@@ -774,6 +869,11 @@ public class UDPRegressionTest {
         @Override public void sendUDPMessageAllRepeat(String message, int repeatCount) {
             sentMessages.add(message);
             repeatCounts.add(repeatCount);
+        }
+        @Override public void sendUDPMessageRepeat(String message, Byte playerID, int repeatCount) {
+            directMessages.add(message);
+            directRecipients.add(playerID);
+            directRepeatCounts.add(repeatCount);
         }
         @Override public void startListenForUDPMessage() {
             if (realListener) super.startListenForUDPMessage();

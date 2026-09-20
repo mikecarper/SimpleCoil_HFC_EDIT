@@ -17,8 +17,9 @@ Timed games also share an end deadline, so a late packet or reconnect does not g
 a player extra game time. Clock estimates refresh while connected to a dedicated
 server. Actual alignment depends on network delays and device scheduling.
 
-All participating phones must run network protocol 09 (this build). Older protocol
-versions are rejected instead of starting with incompatible countdown behavior.
+All participating phones must run network protocol 10 (this build). Older protocol
+versions are rejected instead of starting with incompatible countdown behavior or
+peer-game score synchronization.
 
 ## Player capacity
 

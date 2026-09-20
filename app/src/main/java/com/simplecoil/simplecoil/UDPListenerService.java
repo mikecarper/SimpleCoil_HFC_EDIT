@@ -41,7 +41,9 @@ import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -90,11 +92,24 @@ public class UDPListenerService extends Service {
     // leaving mid-round must be reflected by a validated UDP LEAVE instead.
     private volatile boolean mPeerGame;
     private static final int PEER_GRENADE_UPDATE_REPETITIONS = 3;
+    private static final int PEER_SCORE_UPDATE_REPETITIONS = 3;
     private final Object mPeerGrenadeLock = new Object();
     // Player IDs are bounded, so a fixed snapshot is cheaper and safer than a
     // map fed by UDP input. Sequence zero means no update from that player yet.
     private final long[] mLastPeerGrenadeSequences = new long[Globals.MAX_PLAYER_ID + 1];
     private long mNextPeerGrenadeSequence;
+    private final Object mPeerScoreLock = new Object();
+    // An elimination sequence belongs to the eliminated player. Team score
+    // relays retain that source sequence, so each scorer/victim pair has a
+    // compact, bounded deduplication slot.
+    private final long[] mLastPeerEliminationSequences = new long[Globals.MAX_PLAYER_ID + 1];
+    private final long[][] mLastPeerTeamEliminationSequences =
+            new long[Globals.MAX_PLAYER_ID + 1][Globals.MAX_PLAYER_ID + 1];
+    // A final kill and its LEAVE can be reordered by UDP. Retain only peers
+    // that were authenticated in this round so that final sequenced score
+    // events remain attributable after roster removal.
+    private final Map<InetAddress, Byte> mDepartedPeerScoreSources = new HashMap<>();
+    private long mNextPeerEliminationSequence;
     private volatile int mReadyToScan = 0;
 
     private volatile boolean mScanRunning = false;
@@ -193,7 +208,14 @@ public class UDPListenerService extends Service {
                     return;
                 }
                 intent.putExtra(INTENT_PLAYERID, id);
+            } else if (message.startsWith(NetMsg.NETMSG_PEER_ELIMINATED)) {
+                processPeerElimination(ip,
+                        message.substring(NetMsg.NETMSG_PEER_ELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_ELIMINATED)) {
+                // Protocol 10 peer games use sequenced elimination events. Keep
+                // the old fixed form only for non-peer compatibility paths.
+                if (mPeerGame)
+                    return;
                 // you eliminated someone!
                 intent = new Intent(NetMsg.NETMSG_ELIMINATED);
                 Byte id = getPlayerID(ip);
@@ -278,7 +300,14 @@ public class UDPListenerService extends Service {
             } else if (message.equals(NetMsg.NETMSG_SAMETEAM) || message.equals(NetMsg.NETMSG_VERSIONERROR)) {
                 completeJoin(ip, message);
                 return;
+            } else if (message.startsWith(NetMsg.NETMSG_PEER_TEAMELIMINATED)) {
+                processPeerTeamElimination(ip,
+                        message.substring(NetMsg.NETMSG_PEER_TEAMELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_TEAMELIMINATED)) {
+                // A bare team score packet cannot distinguish a retransmit from
+                // a new kill, so it is not valid during a protocol 10 peer game.
+                if (mPeerGame)
+                    return;
                 Byte playerID = getPlayerID(ip);
                 Globals globals = Globals.getInstance();
                 if (playerID == null || globals.mGameMode == Globals.GAME_MODE_FFA
@@ -346,6 +375,93 @@ public class UDPListenerService extends Service {
         return true;
     }
 
+    private static long parsePositiveSequence(String value) {
+        if (!isDecimal(value))
+            return 0;
+        try {
+            long sequence = Long.parseLong(value);
+            return sequence > 0 ? sequence : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Accept one peer elimination exactly once. The UDP source owns the
+     * sequence and identifies the eliminated player; it cannot claim another
+     * player in the payload.
+     */
+    private void processPeerElimination(InetAddress ip, String sequenceText) {
+        if (!mPeerGame)
+            return;
+        long sequence = parsePositiveSequence(sequenceText);
+        Byte eliminatedPlayerID = getPeerScoreSourceID(ip);
+        Globals globals = Globals.getInstance();
+        int localPlayerID = globals.mPlayerID;
+        if (sequence == 0 || eliminatedPlayerID == null || localPlayerID <= 0
+                || !Globals.isValidPlayerID(localPlayerID))
+            return;
+        // A teammate cannot award this phone a kill in team play. The direct
+        // recipient is the scorer, so this also rejects a stale/misdirected
+        // team packet without relying on its destination port.
+        if (globals.mGameMode != Globals.GAME_MODE_FFA
+                && globals.calcNetworkTeam(eliminatedPlayerID)
+                == globals.calcNetworkTeam((byte) localPlayerID))
+            return;
+        synchronized (mPeerScoreLock) {
+            if (sequence <= mLastPeerEliminationSequences[eliminatedPlayerID])
+                return;
+            mLastPeerEliminationSequences[eliminatedPlayerID] = sequence;
+        }
+        Intent intent = new Intent(NetMsg.NETMSG_ELIMINATED);
+        intent.putExtra(INTENT_PLAYERID, eliminatedPlayerID);
+        intent.putExtra(NetMsg.INTENT_EVENT_SEQUENCE, sequence);
+        sendBroadcast(intent);
+    }
+
+    /**
+     * Relay an already accepted elimination to a scorer's teammates. The
+     * scorer and victim form the event key, while the victim's sequence makes
+     * retransmits and reordering harmless.
+     */
+    private void processPeerTeamElimination(InetAddress ip, String payload) {
+        if (!mPeerGame || payload == null)
+            return;
+        int separator = payload.indexOf(':');
+        if (separator <= 0 || separator == payload.length() - 1
+                || payload.indexOf(':', separator + 1) >= 0)
+            return;
+        String eliminatedText = payload.substring(0, separator);
+        long sequence = parsePositiveSequence(payload.substring(separator + 1));
+        if (!isDecimal(eliminatedText) || sequence == 0)
+            return;
+        final int eliminatedPlayerID;
+        try {
+            eliminatedPlayerID = Integer.parseInt(eliminatedText);
+        } catch (NumberFormatException e) {
+            return;
+        }
+        Byte scoringPlayerID = getPeerScoreSourceID(ip);
+        Globals globals = Globals.getInstance();
+        int localPlayerID = globals.mPlayerID;
+        if (scoringPlayerID == null || eliminatedPlayerID <= 0
+                || !Globals.isValidPlayerID(eliminatedPlayerID) || localPlayerID <= 0
+                || !Globals.isValidPlayerID(localPlayerID)
+                || globals.mGameMode == Globals.GAME_MODE_FFA)
+            return;
+        int scoringTeam = globals.calcNetworkTeam(scoringPlayerID);
+        if (scoringPlayerID == eliminatedPlayerID
+                || scoringTeam != globals.calcNetworkTeam((byte) localPlayerID)
+                || scoringTeam == globals.calcNetworkTeam((byte) eliminatedPlayerID))
+            return;
+        synchronized (mPeerScoreLock) {
+            if (sequence <= mLastPeerTeamEliminationSequences[scoringPlayerID][eliminatedPlayerID])
+                return;
+            mLastPeerTeamEliminationSequences[scoringPlayerID][eliminatedPlayerID] = sequence;
+        }
+        sendBroadcast(new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+    }
+
     private void updateGrenadePairing(byte playerID, int grenadeID) {
         if (playerID <= 0 || !Globals.isValidPlayerID(playerID)
                 || !Globals.isValidGrenadeID(grenadeID))
@@ -397,12 +513,77 @@ public class UDPListenerService extends Service {
                 PEER_GRENADE_UPDATE_REPETITIONS);
     }
 
+    /** Publish an eliminated player's event to the peer that earned the point. */
+    public void publishPeerElimination(byte scoringPlayerID) {
+        Globals globals = Globals.getInstance();
+        int localPlayerID = globals.mPlayerID;
+        if (scoringPlayerID <= 0 || !Globals.isValidPlayerID(scoringPlayerID)
+                || localPlayerID <= 0 || !Globals.isValidPlayerID(localPlayerID))
+            return;
+        final long sequence;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !mPeerGame)
+                return;
+            synchronized (mPeerScoreLock) {
+                if (mNextPeerEliminationSequence == Long.MAX_VALUE) {
+                    Log.w(TAG, "Peer elimination sequence exhausted");
+                    return;
+                }
+                sequence = ++mNextPeerEliminationSequence;
+            }
+        }
+        sendUDPMessageRepeat(NetMsg.NETMSG_PEER_ELIMINATED + sequence, scoringPlayerID,
+                PEER_SCORE_UPDATE_REPETITIONS);
+    }
+
+    /** Relay a deduplicable peer score event to one teammate. */
+    public void publishPeerTeamElimination(byte eliminatedPlayerID, long sequence,
+                                           byte teammateID) {
+        if (eliminatedPlayerID <= 0 || !Globals.isValidPlayerID(eliminatedPlayerID)
+                || teammateID <= 0 || !Globals.isValidPlayerID(teammateID) || sequence <= 0)
+            return;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !mPeerGame)
+                return;
+        }
+        sendUDPMessageRepeat(NetMsg.NETMSG_PEER_TEAMELIMINATED + eliminatedPlayerID + ":"
+                + sequence, teammateID, PEER_SCORE_UPDATE_REPETITIONS);
+    }
+
+    /** A peer that leaves mid-round announces it repeatedly because UDP can drop packets. */
+    public void announcePeerLeave() {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !mPeerGame)
+                return;
+        }
+        sendUDPMessageAllRepeat(NetMsg.NETMSG_LEAVE, PEER_SCORE_UPDATE_REPETITIONS);
+    }
+
     private void resetPeerGrenadeSequences() {
         synchronized (mPeerGrenadeLock) {
             mNextPeerGrenadeSequence = 0;
             for (int index = 0; index < mLastPeerGrenadeSequences.length; index++)
                 mLastPeerGrenadeSequences[index] = 0;
         }
+    }
+
+    private void resetPeerScoreSequences() {
+        synchronized (mPeerScoreLock) {
+            mNextPeerEliminationSequence = 0;
+            mDepartedPeerScoreSources.clear();
+            for (int playerID = 0; playerID < mLastPeerEliminationSequences.length; playerID++) {
+                mLastPeerEliminationSequences[playerID] = 0;
+                for (int eliminatedPlayerID = 0;
+                     eliminatedPlayerID < mLastPeerTeamEliminationSequences[playerID].length;
+                     eliminatedPlayerID++)
+                    mLastPeerTeamEliminationSequences[playerID][eliminatedPlayerID] = 0;
+            }
+        }
+    }
+
+    private void resetPeerGameSequences() {
+        resetPeerGrenadeSequences();
+        resetPeerScoreSequences();
     }
 
     private Byte getPlayerID(InetAddress ip) {
@@ -412,6 +593,22 @@ public class UDPListenerService extends Service {
             return playerID != null && playerID > 0 && Globals.isValidPlayerID(playerID) ? playerID : null;
         } finally {
             Globals.getInstance().mIPTeamMapSemaphore.release();
+        }
+    }
+
+    /**
+     * Resolve a current peer, or one that was just removed by a validated
+     * LEAVE. This is deliberately limited to sequenced peer score events;
+     * departed peers cannot otherwise participate in the roster or game.
+     */
+    private Byte getPeerScoreSourceID(InetAddress ip) {
+        Byte playerID = getPlayerID(ip);
+        if (playerID != null)
+            return playerID;
+        synchronized (mPeerScoreLock) {
+            playerID = mDepartedPeerScoreSources.get(ip);
+            return playerID != null && playerID > 0 && Globals.isValidPlayerID(playerID)
+                    ? playerID : null;
         }
     }
 
@@ -435,6 +632,10 @@ public class UDPListenerService extends Service {
             globals.mIPTeamMap.remove(ip);
         } finally {
             globals.mIPTeamMapSemaphore.release();
+        }
+
+        synchronized (mPeerScoreLock) {
+            mDepartedPeerScoreSources.put(ip, playerID);
         }
 
         Globals.getmTeamIPMapSemaphore();
@@ -608,7 +809,7 @@ public class UDPListenerService extends Service {
             mSendGeneration++;
             endScanningLocked();
             mPeerGame = false;
-            resetPeerGrenadeSequences();
+            resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
             Globals.getInstance().mIPTeamMapSemaphore.release();
@@ -768,7 +969,7 @@ public class UDPListenerService extends Service {
             mSendGeneration++;
             endScanningLocked();
             mPeerGame = false;
-            resetPeerGrenadeSequences();
+            resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
             Globals.getInstance().mIPTeamMapSemaphore.release();
@@ -824,8 +1025,13 @@ public class UDPListenerService extends Service {
     }
 
     public void sendUDPMessage(String message, Byte playerID) {
+        sendUDPMessageRepeat(message, playerID, 1);
+    }
+
+    /** Send a direct UDP event with bounded, ordered retries. */
+    public void sendUDPMessageRepeat(String message, Byte playerID, int repeatCount) {
         final long generation = getSendGeneration();
-        if (generation < 0)
+        if (generation < 0 || message == null || playerID == null || repeatCount <= 0)
             return;
         message = NetMsg.MESSAGE_PREFIX + message;
         Globals.getmTeamIPMapSemaphore();
@@ -839,7 +1045,7 @@ public class UDPListenerService extends Service {
             Log.e(TAG, "cannot send message to unknown ID " + playerID);
             return;
         }
-        sendDatagrams(message, Collections.singletonList(ip), LISTEN_PORT, 1, generation);
+        sendDatagrams(message, Collections.singletonList(ip), LISTEN_PORT, repeatCount, generation);
     }
 
     public void sendUDPMessageAll(String message) {
@@ -935,7 +1141,7 @@ public class UDPListenerService extends Service {
             endScanningLocked();
             mIsListService = false;
             mPeerGame = false;
-            resetPeerGrenadeSequences();
+            resetPeerGameSequences();
             keepListening = false;
             closeListeningSocket();
         }
@@ -1000,7 +1206,7 @@ public class UDPListenerService extends Service {
         synchronized (mListenerStateLock) {
             mIsListService = false; // There is no list service while the game is running
             if (mPeerGame != peerGame)
-                resetPeerGrenadeSequences();
+                resetPeerGameSequences();
             mPeerGame = peerGame;
         }
     }

@@ -20,7 +20,7 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "09";
+    public static final String NETWORK_VERSION = "10";
 
     // All of these messages are straightforward and contain no extra data
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
@@ -53,6 +53,11 @@ public class NetMsg {
     // updates therefore carry a monotonically increasing sequence and grenade
     // ID over UDP: GRENADEPAIR:<sequence>:<grenade ID>.
     public static final String NETMSG_GRENADEPAIR = "GRENADEPAIR:";
+    // Peer score events carry a source-owned sequence so a retransmitted UDP
+    // datagram cannot award duplicate points: ELIMINATED:<sequence> and
+    // TEAMELIMINATED:<eliminated player ID>:<sequence>.
+    public static final String NETMSG_PEER_ELIMINATED = NETMSG_ELIMINATED + ":";
+    public static final String NETMSG_PEER_TEAMELIMINATED = NETMSG_TEAMELIMINATED + ":";
 
     // When players join a game in progress, the server can send the player updates on appropriate values.
     // These items are intent extras.
@@ -65,6 +70,7 @@ public class NetMsg {
     public static final String INTENT_START_AT = "START_AT_ELAPSED";
     public static final String INTENT_END_AT = "END_AT_ELAPSED";
     public static final String INTENT_ROUND_ID = "ROUND_ID";
+    public static final String INTENT_EVENT_SEQUENCE = "EVENT_SEQUENCE";
 
     public static final String INTENT_LONGITUDE = "longitude";
     public static final String INTENT_LATITUDE = "latitude";

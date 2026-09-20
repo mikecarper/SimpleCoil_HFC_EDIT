@@ -1644,8 +1644,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUseNetwork) {
             if (isDedicatedServerConnection())
                 mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_LEAVE);
-            else
-                sendUDPMessageAll(NetMsg.NETMSG_LEAVE);
+            else if (mUDPListenerService != null)
+                mUDPListenerService.announcePeerLeave();
         }
         Toast.makeText(getApplicationContext(), getString(R.string.dialog_out_of_lives), Toast.LENGTH_LONG).show();
         endGame();
@@ -2994,8 +2994,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                     if (hit_by_id > 0 && hit_by_id != Globals.getInstance().mPlayerID && Globals.getInstance().calcNetworkTeam(hit_by_id) != Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID)) {
                                         if (isDedicatedServerConnection())
                                             mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + hit_by_id, true);
-                                        else
-                                            sendUDPMessage(NetMsg.NETMSG_ELIMINATED, hit_by_id);
+                                        else if (mUDPListenerService != null)
+                                            mUDPListenerService.publishPeerElimination(hit_by_id);
                                     }
                                 }
                                 if (outOfLives)
@@ -3196,9 +3196,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             teamSize = ((Globals.MAX_PLAYER_ID + 1) / 4);
                         }
                         int startPoint = (teamSize * mNetworkTeam) - teamSize + 1;
+                        long eventSequence = intent.getLongExtra(NetMsg.INTENT_EVENT_SEQUENCE, 0);
                         for (int x = startPoint; x < startPoint + teamSize; x++) {
                             if (x != Globals.getInstance().mPlayerID) { // don't send a message to ourselves
-                                sendUDPMessage(NetMsg.NETMSG_TEAMELIMINATED, (byte) x);
+                                if (eventSequence > 0 && mUDPListenerService != null)
+                                    mUDPListenerService.publishPeerTeamElimination(hitPlayerID,
+                                            eventSequence, (byte) x);
                             }
                         }
                     }

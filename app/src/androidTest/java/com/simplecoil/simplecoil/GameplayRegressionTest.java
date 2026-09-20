@@ -332,6 +332,31 @@ public class GameplayRegressionTest {
         });
     }
 
+    @Test
+    public void sequencedPeerEliminationRelaysTheSameEventToTeammates() {
+        scenario.onActivity(activity -> {
+            Intent event = new Intent(NetMsg.NETMSG_ELIMINATED)
+                    .putExtra(UDPListenerService.INTENT_PLAYERID, (byte) 11)
+                    .putExtra(NetMsg.INTENT_EVENT_SEQUENCE, 42L);
+            // Android 5.1 can pause an ActivityScenario between setup and this
+            // callback. Model a real, registered network receiver while the
+            // incoming peer event is delivered.
+            boolean receiverRegistered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            if (!receiverRegistered)
+                set(activity, "mNetworkReceiverRegistered", true);
+            try {
+                receiveNetwork(activity, event);
+                assertEquals(9, udp.peerTeamEliminationPublishes);
+                assertEquals(Byte.valueOf((byte) 11), udp.lastPeerTeamEliminatedPlayer);
+                assertEquals(42L, udp.lastPeerTeamEventSequence);
+                assertEquals(Byte.valueOf((byte) 10), udp.lastPeerTeamRecipient);
+            } finally {
+                if (!receiverRegistered)
+                    set(activity, "mNetworkReceiverRegistered", false);
+            }
+        });
+    }
+
     private static byte[] grenadePacket(boolean secondSlot, int command) {
         byte[] packet = telemetryPacket(0, 0, 0, 0);
         packet[secondSlot ? FullscreenActivity.RECOIL_OFFSET_HIT_BY2 : FullscreenActivity.RECOIL_OFFSET_HIT_BY1]
@@ -1372,8 +1397,9 @@ public class GameplayRegressionTest {
             set(activity, "mEliminationCount", 1);
             set(activity, "mHealth", 5);
             telemetry(activity, 11, 1, 0, 0);
-            assertTrue(udp.messages.contains(NetMsg.NETMSG_ELIMINATED + ":11"));
-            assertTrue(udp.messages.contains(NetMsg.NETMSG_LEAVE + ":all"));
+            assertEquals(1, udp.peerEliminationPublishes);
+            assertEquals(Byte.valueOf((byte) 11), udp.lastPeerEliminationRecipient);
+            assertEquals(1, udp.peerLeaveAnnouncements);
             assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
             assertNull(get(activity, "mSpawnTimer"));
         });
@@ -1733,6 +1759,13 @@ public class GameplayRegressionTest {
         int serverCreates;
         int serverCancellations;
         int peerGrenadePairingPublishes;
+        int peerEliminationPublishes;
+        Byte lastPeerEliminationRecipient;
+        int peerLeaveAnnouncements;
+        int peerTeamEliminationPublishes;
+        Byte lastPeerTeamEliminatedPlayer;
+        long lastPeerTeamEventSequence;
+        Byte lastPeerTeamRecipient;
 
         @Override
         public void endGame() { endRequests++; }
@@ -1756,6 +1789,26 @@ public class GameplayRegressionTest {
         @Override
         public void publishPeerGrenadePairing() {
             peerGrenadePairingPublishes++;
+        }
+
+        @Override
+        public void publishPeerElimination(byte scoringPlayerID) {
+            peerEliminationPublishes++;
+            lastPeerEliminationRecipient = scoringPlayerID;
+        }
+
+        @Override
+        public void publishPeerTeamElimination(byte eliminatedPlayerID, long sequence,
+                                               byte teammateID) {
+            peerTeamEliminationPublishes++;
+            lastPeerTeamEliminatedPlayer = eliminatedPlayerID;
+            lastPeerTeamEventSequence = sequence;
+            lastPeerTeamRecipient = teammateID;
+        }
+
+        @Override
+        public void announcePeerLeave() {
+            peerLeaveAnnouncements++;
         }
 
         @Override
