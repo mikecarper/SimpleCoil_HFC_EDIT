@@ -2652,6 +2652,34 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 || (playerID > 0 && Globals.isValidPlayerID(playerID)) ? source : 0;
     }
 
+    /**
+     * Resolve a telemetry source to the player that should receive credit. Grenades use a
+     * reserved source byte, so their owner has to come from the current pairing table instead
+     * of the source's upper bits. An unpaired grenade remains a valid physical hit, but must not
+     * be attributed to an out-of-range pseudo-player.
+     */
+    private byte resolveHitPlayerID(int hitSource, byte hitData) {
+        if (hitSource != Globals.GRENADE_PLAYER_ID)
+            return (byte) (hitSource >> 2);
+
+        int grenadeID = (hitData & 0xF0) >> 4;
+        if (grenadeID == 0 || !Globals.isValidGrenadeID(grenadeID))
+            return 0;
+
+        Globals.getmGrenadePairingsSemaphore();
+        try {
+            int playerID = Globals.getInstance().mGrenadePairings[grenadeID];
+            return playerID > 0 && Globals.isValidPlayerID(playerID) ? (byte) playerID : 0;
+        } finally {
+            Globals.getInstance().mGrenadePairingsSemaphore.release();
+        }
+    }
+
+    private boolean isFriendlyHit(byte playerID) {
+        return playerID > 0 && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
+                && Globals.getInstance().calcNetworkTeam(playerID) == mNetworkTeam;
+    }
+
     /* Telemetry data is 20 bytes of raw data in the following format:
        00 seems to be part of a continuous counter, first byte always 0 and second byte counts 0 to F, increments with each packet sent
        01 player ID, 01, 02, 03, etc. 00 when not set
@@ -2824,6 +2852,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     processGrenadeCommand(data[RECOIL_OFFSET_HIT_BY1_SHOTID]);
                 if (hit_by_player2 == Globals.GRENADE_PLAYER_ID)
                     processGrenadeCommand(data[RECOIL_OFFSET_HIT_BY2_SHOTID]);
+                byte hitByPlayer1ID = resolveHitPlayerID(hit_by_player1,
+                        data[RECOIL_OFFSET_HIT_BY1_SHOTID]);
+                byte hitByPlayer2ID = resolveHitPlayerID(hit_by_player2,
+                        data[RECOIL_OFFSET_HIT_BY2_SHOTID]);
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
                     if (hit_by_player1 != 0) {
                     if ((mLastHitData1.playerID == hit_by_player1 && mLastHitData1.shotID == shot_id1) || (mLastHitData2.playerID == hit_by_player1 && mLastHitData2.shotID == shot_id1)) {
@@ -2840,28 +2872,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             // every weapon to the one-hit default.
                             healthRemoved = Globals.getInstance().mDamage;
                             if (mUseNetwork) {
-                                hit_by_id = (byte) (hit_by_player1 >> 2);
-                                //Log.d(TAG, "hit by 1 ID is " + hit_by_id);
-                                if ((hit_by_player1 != Globals.GRENADE_PLAYER_ID) && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA && Globals.getInstance().calcNetworkTeam(hit_by_id) == mNetworkTeam) {
+                                if (isFriendlyHit(hitByPlayer1ID)) {
                                     //Log.d(TAG, "friendly fire ignored");
                                     healthRemoved = 0;
                                 } else {
-                                    if (hit_by_player1 == Globals.GRENADE_PLAYER_ID) {
-                                        int grenadeID = (data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0xF0) >> 4;
-                                        if (grenadeID != 0) {
-                                            Globals.getmGrenadePairingsSemaphore();
-                                            if (Globals.getInstance().mGrenadePairings[grenadeID] != Globals.INVALID_PLAYER_ID)
-                                                hit_by_id = (byte)Globals.getInstance().mGrenadePairings[grenadeID];
-                                            Globals.getInstance().mGrenadePairingsSemaphore.release();
-                                        }
-                                    }
-                                    healthRemoved = getPlayerDamage(hit_by_id);
-                                    if (mLastHitMessage < System.currentTimeMillis()) {
+                                    healthRemoved = getPlayerDamage(hitByPlayer1ID);
+                                    hit_by_id = hitByPlayer1ID;
+                                    if (hitByPlayer1ID > 0 && mLastHitMessage < System.currentTimeMillis()) {
                                         mLastHitMessage = System.currentTimeMillis() + HIT_ANIMATION_DURATION_MILLISECONDS;
                                         if (survivesDamage(healthRemoved))
-                                            sendUDPMessage(NetMsg.NETMSG_HIT, hit_by_id);
+                                            sendUDPMessage(NetMsg.NETMSG_HIT, hitByPlayer1ID);
                                         else
-                                            sendUDPMessage(NetMsg.NETMSG_OUT, hit_by_id);
+                                            sendUDPMessage(NetMsg.NETMSG_OUT, hitByPlayer1ID);
                                     }
                                 }
                             }
@@ -2879,28 +2901,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             mHitsTakenTV.setText(String.valueOf(mHitsTaken));
                             int secondHitDamage = Globals.getInstance().mDamage;
                             if (mUseNetwork) {
-                                hit_by_id = (byte) (hit_by_player2 >> 2);
-                                //Log.d(TAG, "hit by 2 ID is " + hit_by_id);
-                                if ((hit_by_player2 != Globals.GRENADE_PLAYER_ID) && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA && Globals.getInstance().calcNetworkTeam(hit_by_id) == mNetworkTeam) {
+                                if (isFriendlyHit(hitByPlayer2ID)) {
                                     //Log.d(TAG, "friendly fire ignored");
                                     secondHitDamage = 0;
                                 } else {
-                                    if (hit_by_player2 == Globals.GRENADE_PLAYER_ID) {
-                                        int grenadeID = (data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0xF0) >> 4;
-                                        if (grenadeID != 0) {
-                                            Globals.getmGrenadePairingsSemaphore();
-                                            if (Globals.getInstance().mGrenadePairings[grenadeID] != Globals.INVALID_PLAYER_ID)
-                                                hit_by_id = (byte)Globals.getInstance().mGrenadePairings[grenadeID];
-                                            Globals.getInstance().mGrenadePairingsSemaphore.release();
-                                        }
-                                    }
-                                    secondHitDamage = getPlayerDamage(hit_by_id);
-                                    if (mLastHitMessage < System.currentTimeMillis()) {
+                                    secondHitDamage = getPlayerDamage(hitByPlayer2ID);
+                                    hit_by_id = hitByPlayer2ID;
+                                    if (hitByPlayer2ID > 0 && mLastHitMessage < System.currentTimeMillis()) {
                                         mLastHitMessage = System.currentTimeMillis() + HIT_ANIMATION_DURATION_MILLISECONDS;
                                         if (survivesDamage(healthRemoved + secondHitDamage))
-                                            sendUDPMessage(NetMsg.NETMSG_HIT, hit_by_id);
+                                            sendUDPMessage(NetMsg.NETMSG_HIT, hitByPlayer2ID);
                                         else
-                                            sendUDPMessage(NetMsg.NETMSG_OUT, hit_by_id);
+                                            sendUDPMessage(NetMsg.NETMSG_OUT, hitByPlayer2ID);
                                     }
                                 }
                             }
@@ -2974,7 +2986,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                 if (!outOfLives)
                                     startSpawn(eliminatedBy);
                                 if (mUseNetwork) {
-                                    if (hit_by_id != Globals.getInstance().mPlayerID && Globals.getInstance().calcNetworkTeam(hit_by_id) != Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID)) {
+                                    if (hit_by_id > 0 && hit_by_id != Globals.getInstance().mPlayerID && Globals.getInstance().calcNetworkTeam(hit_by_id) != Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID)) {
                                         if (isDedicatedServerConnection())
                                             mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + hit_by_id, true);
                                         else

@@ -1486,6 +1486,58 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void teammateGrenadeDoesNotBypassFriendlyFire() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            Globals.getmGrenadePairingsSemaphore();
+            int previousOwner;
+            try {
+                previousOwner = globals.mGrenadePairings[3];
+                globals.mGrenadePairings[3] = 2;
+            } finally { globals.mGrenadePairingsSemaphore.release(); }
+            try {
+                receiveTelemetry(activity, grenadePacket(false, 0x31));
+                assertEquals("A teammate grenade bypassed friendly-fire protection", 20,
+                        get(activity, "mHealth"));
+                assertEquals(1, get(activity, "mHitsTaken"));
+                assertTrue(udp.messages.isEmpty());
+            } finally {
+                Globals.getmGrenadePairingsSemaphore();
+                try { globals.mGrenadePairings[3] = previousOwner; }
+                finally { globals.mGrenadePairingsSemaphore.release(); }
+            }
+        });
+    }
+
+    @Test
+    public void unpairedGrenadeDoesNotNotifyAnInvalidPseudoPlayer() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            Globals.getmGrenadePairingsSemaphore();
+            int previousOwner;
+            try {
+                previousOwner = globals.mGrenadePairings[3];
+                globals.mGrenadePairings[3] = Globals.INVALID_PLAYER_ID;
+            } finally { globals.mGrenadePairingsSemaphore.release(); }
+            try {
+                byte[] packet = telemetryPacket(11, 1, 0, 0);
+                packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY2] = (byte) Globals.GRENADE_PLAYER_ID;
+                packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY2_SHOTID] = 0x31;
+                receiveTelemetry(activity, packet);
+                assertEquals("An unpaired grenade should still use default damage", 14,
+                        get(activity, "mHealth"));
+                assertTrue(udp.messages.contains(NetMsg.NETMSG_HIT + ":11"));
+                assertTrue("An unpaired grenade was credited to pseudo-player 41",
+                        !udp.messages.contains(NetMsg.NETMSG_HIT + ":41"));
+            } finally {
+                Globals.getmGrenadePairingsSemaphore();
+                try { globals.mGrenadePairings[3] = previousOwner; }
+                finally { globals.mGrenadePairingsSemaphore.release(); }
+            }
+        });
+    }
+
+    @Test
     public void repeatedGrenadeDamageTelemetryOnlyDamagesOnce() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
