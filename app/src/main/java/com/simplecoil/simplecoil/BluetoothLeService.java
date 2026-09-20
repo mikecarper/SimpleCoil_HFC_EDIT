@@ -88,6 +88,8 @@ public class BluetoothLeService extends Service {
     private final Queue<DescriptorWrite> mDescriptorWriteQueue = new LinkedList<>();
     private final Queue<BluetoothGattCharacteristic> mCharacteristicReadQueue = new LinkedList<>();
     private CharacteristicWrite mActiveCharacteristicWrite;
+    private DescriptorWrite mActiveDescriptorWrite;
+    private BluetoothGattCharacteristic mActiveCharacteristicRead;
 
     // Android 5.1 uses mutable characteristic objects. Keep each operation's payload
     // separate from that object until it actually reaches the front of the queue.
@@ -129,6 +131,8 @@ public class BluetoothLeService extends Service {
     private synchronized void clearPendingGattOperations() {
         mActionAvailable = true;
         mActiveCharacteristicWrite = null;
+        mActiveDescriptorWrite = null;
+        mActiveCharacteristicRead = null;
         mCharacteristicWriteQueue.clear();
         mDescriptorWriteQueue.clear();
         mCharacteristicReadQueue.clear();
@@ -160,6 +164,23 @@ public class BluetoothLeService extends Service {
         return false;
     }
 
+    private boolean startDescriptorWrite(BluetoothGatt gatt, DescriptorWrite write) {
+        write.prepare();
+        mActiveDescriptorWrite = write;
+        if (gatt.writeDescriptor(write.descriptor))
+            return true;
+        mActiveDescriptorWrite = null;
+        return false;
+    }
+
+    private boolean startCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+        mActiveCharacteristicRead = characteristic;
+        if (gatt.readCharacteristic(characteristic))
+            return true;
+        mActiveCharacteristicRead = null;
+        return false;
+    }
+
     /**
      * A GATT operation completes asynchronously.  If a queued operation cannot be started,
      * keep advancing instead of waiting forever for a callback that will never arrive.
@@ -180,15 +201,14 @@ public class BluetoothLeService extends Service {
                 }
                 if (!mDescriptorWriteQueue.isEmpty()) {
                     DescriptorWrite write = mDescriptorWriteQueue.remove();
-                    write.prepare();
-                    if (gatt.writeDescriptor(write.descriptor))
+                    if (startDescriptorWrite(gatt, write))
                         return;
                     Log.w(TAG, "Failed to write queued descriptor " + write.descriptor.getUuid());
                     continue;
                 }
                 if (!mCharacteristicReadQueue.isEmpty()) {
                     BluetoothGattCharacteristic characteristic = mCharacteristicReadQueue.remove();
-                    if (gatt.readCharacteristic(characteristic))
+                    if (startCharacteristicRead(gatt, characteristic))
                         return;
                     Log.w(TAG, "Failed to read queued characteristic " + characteristic.getUuid());
                     continue;
@@ -248,14 +268,20 @@ public class BluetoothLeService extends Service {
         public void onCharacteristicRead(BluetoothGatt gatt,
                                          BluetoothGattCharacteristic characteristic,
                                          int status) {
-            if (!isCurrentGatt(gatt)) return;
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "read success!");
-                broadcastUpdate(characteristic);
-            } else {
-                Log.d(TAG, "read failed");
+            synchronized (BluetoothLeService.this) {
+                // An unrelated or late completion must not advance another request's queue.
+                if (!isCurrentGatt(gatt) || mActiveCharacteristicRead == null
+                        || mActiveCharacteristicRead != characteristic)
+                    return;
+                mActiveCharacteristicRead = null;
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d(TAG, "read success!");
+                    broadcastUpdate(characteristic);
+                } else {
+                    Log.d(TAG, "read failed");
+                }
+                startNextGattOperation(gatt);
             }
-            startNextGattOperation(gatt);
         }
 
         @Override
@@ -285,14 +311,19 @@ public class BluetoothLeService extends Service {
         public void onDescriptorWrite(BluetoothGatt gatt,
                                           BluetoothGattDescriptor descriptor,
                                           int status) {
-            if (!isCurrentGatt(gatt)) return;
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "descriptor write success!");
-            } else {
-                Log.d(TAG, "descriptor write failed");
+            synchronized (BluetoothLeService.this) {
+                if (!isCurrentGatt(gatt) || mActiveDescriptorWrite == null
+                        || mActiveDescriptorWrite.descriptor != descriptor)
+                    return;
+                mActiveDescriptorWrite = null;
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d(TAG, "descriptor write success!");
+                } else {
+                    Log.d(TAG, "descriptor write failed");
+                }
+                startNextGattOperation(gatt);
+                broadcastUpdate(DESCRIPTOR_WRITE_FINISHED);
             }
-            startNextGattOperation(gatt);
-            broadcastUpdate(DESCRIPTOR_WRITE_FINISHED);
         }
     };
 
@@ -500,7 +531,7 @@ public class BluetoothLeService extends Service {
             return;
         }
         try {
-            if (mBluetoothGatt.readCharacteristic(characteristic)) {
+            if (startCharacteristicRead(mBluetoothGatt, characteristic)) {
                 Log.d(TAG, "read the char");
                 mActionAvailable = false;
             } else {
@@ -555,7 +586,7 @@ public class BluetoothLeService extends Service {
             return;
         }
         try {
-            if (mBluetoothGatt.writeDescriptor(descriptor)) {
+            if (startDescriptorWrite(mBluetoothGatt, new DescriptorWrite(descriptor))) {
                 //Log.d(TAG, "wrote descriptor success");
                 mActionAvailable = false;
             } else {
@@ -586,7 +617,7 @@ public class BluetoothLeService extends Service {
             }
         } catch (SecurityException e) {
             Log.w(TAG, "Bluetooth permission was revoked while changing notifications", e);
-            clearPendingGattOperations();
+            failPendingGattOperations();
             return;
         }
 
