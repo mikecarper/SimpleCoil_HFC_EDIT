@@ -164,6 +164,26 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void peerEndGameIsRetainedUntilTheActivityCanConsumeIt() throws Exception {
+        final String replacementRound = "77777777-7777-7777-7777-777777777777";
+        register(enemy, 11);
+        service.startGame(true, PEER_ROUND_TOKEN);
+
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
+        Intent pendingEvent = service.consumePendingPeerEndGame();
+        assertNotNull("A paused activity lost the authenticated peer ENDGAME", pendingEvent);
+        assertEquals(NetMsg.NETMSG_ENDGAME, pendingEvent.getAction());
+        assertEquals(PEER_ROUND_TOKEN, pendingEvent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
+        assertNull("A retained peer ENDGAME was delivered more than once",
+                service.consumePendingPeerEndGame());
+
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
+        service.startGame(true, replacementRound);
+        assertNull("A previous round's retained ENDGAME crossed into its replacement",
+                service.consumePendingPeerEndGame());
+    }
+
+    @Test
     public void stalePeerScoreAndLeaveCannotCrossIntoANewRound() throws Exception {
         final String oldRound = "33333333-3333-3333-3333-333333333333";
         final String currentRound = "44444444-4444-4444-4444-444444444444";

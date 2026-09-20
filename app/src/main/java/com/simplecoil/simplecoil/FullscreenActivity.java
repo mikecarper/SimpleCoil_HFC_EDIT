@@ -547,9 +547,19 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void consumePendingServerEvent() {
-        if (!mNetworkReceiverRegistered || mTcpClient == null)
+        if (!mNetworkReceiverRegistered)
             return;
-        Intent event = mTcpClient.consumePendingTerminalEvent();
+        Intent event;
+        if (mUDPListenerService != null) {
+            event = mUDPListenerService.consumePendingPeerEndGame();
+            if (event != null) {
+                mUDPUpdateReceiver.onReceive(this, event);
+                return;
+            }
+        }
+        if (mTcpClient == null)
+            return;
+        event = mTcpClient.consumePendingTerminalEvent();
         if (event != null) {
             mUDPUpdateReceiver.onReceive(this, event);
             return;

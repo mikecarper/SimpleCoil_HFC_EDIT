@@ -1056,6 +1056,29 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void peerRoundEndReceivedWhilePausedIsAppliedOnResume() {
+        scenario.onActivity(activity -> {
+            final String roundToken = "88888888-8888-8888-8888-888888888888";
+            udp.startGame(true, roundToken);
+            set(activity, "mActivePeerRoundToken", roundToken);
+            boolean wasRegistered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            if (wasRegistered)
+                activity.onPause();
+            try {
+                retainPeerEndGame(udp, roundToken);
+            } finally {
+                activity.onResume();
+                if (!wasRegistered)
+                    activity.onPause();
+            }
+            assertEquals("A peer ENDGAME received while paused left the round active",
+                    Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull("The resumed activity did not consume the retained peer ENDGAME",
+                    udp.consumePendingPeerEndGame());
+        });
+    }
+
+    @Test
     public void serverCancellationReceivedWhilePausedIsAppliedOnResume() {
         receiveWhilePaused(NetMsg.NETMSG_SERVERCANCEL);
         scenario.onActivity(activity -> assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState));
@@ -1171,6 +1194,17 @@ public class GameplayRegressionTest {
                     activity.onPause();
             }
         });
+    }
+
+    private static void retainPeerEndGame(UDPListenerService service, String roundToken) {
+        try {
+            Field field = UDPListenerService.class.getDeclaredField("mPendingPeerEndGame");
+            field.setAccessible(true);
+            field.set(service, new Intent(NetMsg.NETMSG_ENDGAME)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken));
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     @Test

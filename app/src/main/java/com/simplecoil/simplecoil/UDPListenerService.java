@@ -95,6 +95,10 @@ public class UDPListenerService extends Service {
     // UDP endpoint membership alone cannot distinguish a delayed prior-round
     // packet from a current one.
     private String mPeerRoundToken;
+    // The activity unregisters its UDP receiver while paused. Retain the one
+    // terminal event that must still be applied when it returns, but never let
+    // it survive a replacement peer round or a stopped listener.
+    private Intent mPendingPeerEndGame;
     private static final int PEER_GRENADE_UPDATE_REPETITIONS = 3;
     private static final int PEER_SCORE_UPDATE_REPETITIONS = 3;
     private final Object mPeerGrenadeLock = new Object();
@@ -352,8 +356,20 @@ public class UDPListenerService extends Service {
             // the listener has switched to a newer round.
             intent = new Intent(NetMsg.NETMSG_ENDGAME)
                     .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
+            mPendingPeerEndGame = new Intent(intent);
         }
         sendBroadcast(intent);
+    }
+
+    /** Returns and clears a peer ENDGAME received while no activity receiver was registered. */
+    Intent consumePendingPeerEndGame() {
+        synchronized (mListenerStateLock) {
+            if (mPendingPeerEndGame == null)
+                return null;
+            Intent pendingEvent = new Intent(mPendingPeerEndGame);
+            mPendingPeerEndGame = null;
+            return pendingEvent;
+        }
     }
 
     /** A peer LEAVE is valid only for the round that authenticated its roster. */
@@ -919,6 +935,7 @@ public class UDPListenerService extends Service {
             endScanningLocked();
             mPeerGame = false;
             mPeerRoundToken = null;
+            mPendingPeerEndGame = null;
             resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
@@ -1080,6 +1097,7 @@ public class UDPListenerService extends Service {
             endScanningLocked();
             mPeerGame = false;
             mPeerRoundToken = null;
+            mPendingPeerEndGame = null;
             resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
@@ -1253,6 +1271,7 @@ public class UDPListenerService extends Service {
             mIsListService = false;
             mPeerGame = false;
             mPeerRoundToken = null;
+            mPendingPeerEndGame = null;
             resetPeerGameSequences();
             keepListening = false;
             closeListeningSocket();
@@ -1330,8 +1349,10 @@ public class UDPListenerService extends Service {
         }
         synchronized (mListenerStateLock) {
             mIsListService = false; // There is no list service while the game is running
-            if (mPeerGame != peerGame || (peerGame && !roundToken.equals(mPeerRoundToken)))
+            if (mPeerGame != peerGame || (peerGame && !roundToken.equals(mPeerRoundToken))) {
                 resetPeerGameSequences();
+                mPendingPeerEndGame = null;
+            }
             mPeerGame = peerGame;
             mPeerRoundToken = peerGame ? roundToken : null;
         }
