@@ -9,6 +9,7 @@
     </style>
 
     <style name="FullscreenTheme" parent="AppTheme">
+        <item name="actionBarStyle">@style/FullscreenActionBarStyle</item>
         <item name="android:actionBarStyle">@style/FullscreenActionBarStyle</item>
         <item name="android:windowActionBarOverlay">true</item>
         <item name="android:windowBackground">@null</item>
@@ -17,7 +18,15 @@
     </style>
 
     <style name="FullscreenActionBarStyle" parent="Widget.AppCompat.ActionBar">
+        <item name="background">@color/black_overlay</item>
         <item name="android:background">@color/black_overlay</item>
+        <item name="titleTextStyle">@style/FullscreenActionBarTitleText</item>
+    </style>
+
+    <!-- Android UI text is expressed in scalable pixels.  12sp is the compact
+         12-point-equivalent requested for the in-game SimpleCoil title. -->
+    <style name="FullscreenActionBarTitleText" parent="TextAppearance.AppCompat.Widget.ActionBar.Title">
+        <item name="android:textSize">12sp</item>
     </style>
 
     <style name="AppTheme.NoActionBar">

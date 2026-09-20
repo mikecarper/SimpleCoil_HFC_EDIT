@@ -1707,7 +1707,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mHitPlayerIV.setVisibility(View.GONE);
         mHitPlayerNameTV.setVisibility(View.GONE);
         mShotsFiredIV.setVisibility(View.GONE);
+        // The weapon still receives the disabled-state command after a round,
+        // but that command is not a reload the player is waiting to complete.
+        // Do not leave its indeterminate progress indicator running on the
+        // finished-round screen.
         startReload(RELOADING_STATE_ELIMINATED);
+        hideReloadProgress();
         mGameTimer.stop();
         mUseNetworkingButton.setVisibility(View.VISIBLE);
         mFiringModeButton.setVisibility(View.VISIBLE);
@@ -1732,18 +1737,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
        having previously set a team does not seem to work. We do a reload cycle before starting the
        game each time to ensure that the player starts on the right team and with full ammo. */
     private void setTeam() {
-        if (!TEST_NETWORK) {
-            if (mBluetoothLeService == null)
-                return;
+        if (Globals.getInstance().mPlayerID < 1 || Globals.getInstance().mPlayerID > Globals.MAX_PLAYER_ID) {
+            Log.e(TAG, "Invalid player ID!");
+            return;
+        }
+        if (!TEST_NETWORK && mBluetoothLeService != null && mCommandCharacteristic != null) {
             Log.d(TAG, "setting player ID to " + Globals.getInstance().mPlayerID);
-            if (Globals.getInstance().mPlayerID < 1 || Globals.getInstance().mPlayerID > Globals.MAX_PLAYER_ID) {
-                Log.e(TAG, "Invalid player ID!");
-                return;
-            }
-            if (mCommandCharacteristic == null) {
-                Log.e(TAG, "No command characteristic available");
-                return;
-            }
             byte[] command = new byte[20];
             command[0] = mCommandID;
             mCommandID += COMMAND_ID_INCREMENT;
@@ -1751,12 +1750,30 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             command[4] = Globals.getInstance().mPlayerID;
             mCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             mBluetoothLeService.writeCharacteristic(mCommandCharacteristic, command);
+        } else if (!TEST_NETWORK) {
+            // Keep the selected/network-assigned ID in the UI and preferences
+            // until a disconnected blaster is available to receive it.
+            Log.d(TAG, "Saving player ID until the blaster command is available");
         }
-        SharedPreferences.Editor editor = sharedPreferences.edit();
-        editor.putInt(PREF_PLAYER_ID, Globals.getInstance().mPlayerID);
-        editor.putInt(PREF_GAME_MODE, Globals.getInstance().mGameMode);
-        editor.apply();
+        if (sharedPreferences != null) {
+            SharedPreferences.Editor editor = sharedPreferences.edit();
+            editor.putInt(PREF_PLAYER_ID, Globals.getInstance().mPlayerID);
+            editor.putInt(PREF_GAME_MODE, Globals.getInstance().mGameMode);
+            editor.apply();
+        }
         displayCurrentTeam();
+    }
+
+    private void applyServerAssignedPlayerID(byte assignedPlayerID) {
+        if (assignedPlayerID <= 0 || !Globals.isValidPlayerID(assignedPlayerID)
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            return;
+        if (Globals.getInstance().mPlayerID == assignedPlayerID)
+            return;
+        Globals.getInstance().mPlayerID = assignedPlayerID;
+        setTeam();
+        Toast.makeText(getApplicationContext(), getString(R.string.player_id_reassigned,
+                assignedPlayerID), Toast.LENGTH_SHORT).show();
     }
 
     private void displayCurrentTeam() {
@@ -1792,6 +1809,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void startReload() { startReload(RELOADING_STATE_STARTED); }
+
+    private void hideReloadProgress() {
+        if (mReloadBar != null)
+            mReloadBar.setVisibility(View.GONE);
+        if (mShotsRemainingTV != null)
+            mShotsRemainingTV.setVisibility(View.VISIBLE);
+    }
 
     /* Initial reload command that tells the tagger not to shoot anymore (or maybe it just sets the
        remaining shot counter to 0). It also sets the tagger in what I guess is status 0x03 instead
@@ -2629,10 +2653,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     Log.w(TAG, "Reload command failed; allow another reload attempt");
                     mReloading = Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
                             ? RELOADING_STATE_NONE : RELOADING_STATE_ELIMINATED;
-                    if (mReloading == RELOADING_STATE_NONE) {
-                        mReloadBar.setVisibility(View.INVISIBLE);
-                        mShotsRemainingTV.setVisibility(View.VISIBLE);
-                    }
+                    if (mReloading == RELOADING_STATE_NONE)
+                        hideReloadProgress();
                     return;
                 }
                 if (mReloading == RELOADING_STATE_STARTED) {
@@ -2654,8 +2676,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 } else if (mReloading == RELOADING_STATE_FINISHING) {
                     mReloading = RELOADING_STATE_NONE;
                     setShotsRemaining(completedCommand[6]);
-                    mReloadBar.setVisibility(View.INVISIBLE);
-                    mShotsRemainingTV.setVisibility(View.VISIBLE);
+                    hideReloadProgress();
                     if (!Globals.getInstance().mReloadOnEmpty)
                         playSound(R.raw.reload, getApplicationContext());
                     Log.d(TAG, "Reload finished");
@@ -3501,6 +3522,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 }
                 Toast.makeText(getApplicationContext(), getString(R.string.error_server_cancel), Toast.LENGTH_SHORT).show();
             } else if (NetMsg.NETMSG_SERVERREPLY.equals(action)) {
+                applyServerAssignedPlayerID(intent.getByteExtra(UDPListenerService.INTENT_PLAYERID,
+                        (byte) 0));
                 if (mTcpClient != null)
                     mTcpClient.startTcpClient();
             } else if (NetMsg.NETMSG_NETWORKCONNECTED.equals(action)) {

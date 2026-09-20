@@ -25,7 +25,7 @@ system clock and does not use a public NTP server.
   it. Timed games also use a shared end deadline.
 - The design target is alignment within one second on a healthy local network;
   Wi-Fi congestion, device suspension, or poor signal can still affect it.
-- All participants must use network protocol 12 (this build). Older protocol
+- All participants must use network protocol 13 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
 Peer-game UDP events are scoped to a per-round nonce, and retransmitted score
@@ -43,9 +43,12 @@ for a maximum of 21 phones total.
 | Four teams | Teams 1-4: 1-5, 6-10, 11-15, 16-20 |
 | Free-for-all | 1-20 |
 
-Give every player a unique ID and confirm the displayed team before starting.
-The dedicated host is not a player. At the end of a dedicated round, the host
-keeps listening but closes the current client sessions and clears the roster;
+Choose each player's desired team/ID before joining and confirm the displayed
+team before starting. If an ID conflicts, a protocol-13 host automatically
+moves that player to the first free ID on the same team; a full team still
+rejects the join. The dedicated host is not a player. At the end of a dedicated
+round, the host keeps listening but closes the current client sessions and
+clears the roster;
 players must join again before the next round.
 
 ## Build

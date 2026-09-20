@@ -28,6 +28,7 @@ import android.os.CountDownTimer;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -46,6 +47,7 @@ import java.util.ArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
@@ -127,6 +129,13 @@ public class UDPListenerService extends Service {
     private final Map<InetAddress, Byte> mDepartedPeerScoreSources = new HashMap<>();
     private long mNextPeerEliminationSequence;
     private volatile int mReadyToScan = 0;
+
+    // UDP discovery happens before TCP owns a roster endpoint. Reserve a
+    // proposed ID briefly so several phones with the same saved ID cannot all
+    // receive the same apparent free slot during that gap.
+    private static final long JOIN_ASSIGNMENT_TIMEOUT_MS = 10_000;
+    private final Object mJoinAssignmentLock = new Object();
+    private final Map<InetAddress, PendingJoinAssignment> mPendingJoinAssignments = new HashMap<>();
 
     private volatile boolean mScanRunning = false;
     private final Object mListenerStateLock = new Object();
@@ -258,7 +267,7 @@ public class UDPListenerService extends Service {
                 processPeerElimination(ip,
                         message.substring(NetMsg.NETMSG_PEER_ELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_ELIMINATED)) {
-                // Protocol 12 peer games use round-scoped, sequenced elimination events. Keep
+                // Protocol 13 peer games use round-scoped, sequenced elimination events. Keep
                 // the old fixed form only for non-peer compatibility paths.
                 if (mPeerGame)
                     return;
@@ -295,31 +304,37 @@ public class UDPListenerService extends Service {
                     Log.w(TAG, "Ignoring join request with unsupported player ID " + playerID);
                     return;
                 }
-                Byte team = (byte) playerID;
-                final boolean conflictingPlayerID;
+                final Map<Byte, InetAddress> playerEndpoints;
                 Globals.getmTeamIPMapSemaphore();
                 try {
-                    InetAddress existingPlayerIP = Globals.getInstance().mTeamIPMap.get(team);
-                    conflictingPlayerID = team == Globals.getInstance().mPlayerID
-                            || (existingPlayerIP != null && !existingPlayerIP.equals(ip));
+                    playerEndpoints = new HashMap<>(Globals.getInstance().mTeamIPMap);
                 } finally {
                     Globals.getInstance().mTeamIPMapSemaphore.release();
                 }
+                final int assignedPlayerID = reserveAvailablePlayerID(playerID, ip, playerEndpoints);
                 // Setup holds the listener-state lock while replacing the roster.
                 // Do not acquire that lock to send a rejection while holding the
                 // team map lock, or a simultaneous duplicate join can deadlock.
-                if (conflictingPlayerID) {
-                    Log.e(TAG, "2 Players using same ID!");
+                if (assignedPlayerID <= 0) {
+                    Log.e(TAG, "No free player ID remains on this team");
                     sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SAMETEAM, ip, LISTEN_PORT);
                     return;
                 }
                 // Discovery only proves that a peer can receive UDP. TCP registration
                 // owns roster membership and endpoints. Recording a JOIN here leaves
                 // ghosts when its sender never completes the TCP handshake.
-                Log.d(TAG, "UDP discovery from player " + team + " at " + ip.toString());
-                sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY, ip, LISTEN_PORT);
+                Log.d(TAG, "UDP discovery from player " + assignedPlayerID + " at " + ip.toString());
+                String reply = NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY;
+                if (assignedPlayerID != playerID)
+                    reply += ":" + assignedPlayerID;
+                sendUDPMessage(reply, ip, LISTEN_PORT);
             } else if (message.equals(NetMsg.NETMSG_SERVERREPLY)) {
                 completeJoin(ip, NetMsg.NETMSG_SERVERREPLY);
+                return;
+            } else if (message.startsWith(NetMsg.NETMSG_SERVERREPLY_ASSIGNMENT_PREFIX)) {
+                Byte assignedPlayerID = parseAssignedPlayerID(message);
+                if (assignedPlayerID != null)
+                    completeJoin(ip, NetMsg.NETMSG_SERVERREPLY, assignedPlayerID);
                 return;
             } else if (message.startsWith(NetMsg.NETMSG_PEER_LEAVE)) {
                 processPeerLeave(ip,
@@ -345,7 +360,7 @@ public class UDPListenerService extends Service {
                 processPeerEndGame(ip,
                         message.substring(NetMsg.NETMSG_PEER_ENDGAME.length()));
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
-                // Protocol 12 peer games bind ENDGAME to the current round nonce.
+                // Protocol 13 peer games bind ENDGAME to the current round nonce.
                 // Keep the old fixed form only for TCP-authoritative games.
                 if (mPeerGame)
                     return;
@@ -365,7 +380,7 @@ public class UDPListenerService extends Service {
                         message.substring(NetMsg.NETMSG_PEER_TEAMELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_TEAMELIMINATED)) {
                 // A bare team score packet cannot distinguish a retransmit from
-                // a new kill, so it is not valid during a protocol 12 peer game.
+                // a new kill, so it is not valid during a protocol 13 peer game.
                 if (mPeerGame)
                     return;
                 Byte playerID = getPlayerID(ip);
@@ -379,6 +394,99 @@ public class UDPListenerService extends Service {
         }
         if (intent != null)
             sendBroadcast(intent);
+    }
+
+    /**
+     * Select an available identity for a discovery request. Team modes retain
+     * the joining player's current host-side team; FFA has no shared teams, so
+     * any unused valid identity is suitable. The TCP server remains the
+     * authoritative roster owner after this discovery reply.
+     *
+     * The caller supplies a roster snapshot so this method never holds a
+     * roster lock while acquiring the assignment lock.
+     */
+    private int reserveAvailablePlayerID(int requestedPlayerID, InetAddress joiningIP,
+                                         Map<Byte, InetAddress> playerEndpoints) {
+        Globals globals = Globals.getInstance();
+        int requestedTeam = globals.calcNetworkTeam((byte) requestedPlayerID);
+        if (requestedTeam == Globals.INVALID_PLAYER_ID)
+            return Globals.INVALID_PLAYER_ID;
+        long now = SystemClock.elapsedRealtime();
+        synchronized (mJoinAssignmentLock) {
+            pruneJoinAssignmentsLocked(playerEndpoints, now);
+            PendingJoinAssignment existingAssignment = mPendingJoinAssignments.get(joiningIP);
+            if (existingAssignment != null)
+                return existingAssignment.playerID;
+            for (int candidate = 1; candidate <= Globals.MAX_PLAYER_ID; candidate++) {
+                if (globals.mGameMode != Globals.GAME_MODE_FFA
+                        && globals.calcNetworkTeam((byte) candidate) != requestedTeam)
+                    continue;
+                if (candidate == globals.mPlayerID)
+                    continue; // The host's own player identity is never available.
+                InetAddress existingPlayerIP = playerEndpoints.get((byte) candidate);
+                // A retransmitted discovery request from an already registered
+                // player must receive the original reply, not a new identity.
+                boolean registeredRequester = candidate == requestedPlayerID
+                        && joiningIP.equals(existingPlayerIP);
+                if (existingPlayerIP != null && !registeredRequester)
+                    continue;
+                if (isReservedByAnotherPlayerLocked((byte) candidate, joiningIP))
+                    continue;
+                if (!registeredRequester) {
+                    mPendingJoinAssignments.put(joiningIP, new PendingJoinAssignment((byte) candidate,
+                            now + JOIN_ASSIGNMENT_TIMEOUT_MS));
+                }
+                return candidate;
+            }
+        }
+        return Globals.INVALID_PLAYER_ID;
+    }
+
+    private boolean isReservedByAnotherPlayerLocked(byte playerID, InetAddress joiningIP) {
+        for (Map.Entry<InetAddress, PendingJoinAssignment> entry : mPendingJoinAssignments.entrySet()) {
+            if (!joiningIP.equals(entry.getKey()) && entry.getValue().playerID == playerID)
+                return true;
+        }
+        return false;
+    }
+
+    private void pruneJoinAssignmentsLocked(Map<Byte, InetAddress> playerEndpoints, long now) {
+        Iterator<Map.Entry<InetAddress, PendingJoinAssignment>> assignments =
+                mPendingJoinAssignments.entrySet().iterator();
+        while (assignments.hasNext()) {
+            Map.Entry<InetAddress, PendingJoinAssignment> entry = assignments.next();
+            PendingJoinAssignment assignment = entry.getValue();
+            if (assignment.expiresAt <= now || playerEndpoints.containsKey(assignment.playerID))
+                assignments.remove();
+        }
+    }
+
+    private void clearJoinAssignments() {
+        synchronized (mJoinAssignmentLock) {
+            mPendingJoinAssignments.clear();
+        }
+    }
+
+    private static final class PendingJoinAssignment {
+        final byte playerID;
+        final long expiresAt;
+
+        PendingJoinAssignment(byte playerID, long expiresAt) {
+            this.playerID = playerID;
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    private static Byte parseAssignedPlayerID(String message) {
+        String value = message.substring(NetMsg.NETMSG_SERVERREPLY_ASSIGNMENT_PREFIX.length());
+        if (!isDecimal(value))
+            return null;
+        try {
+            int playerID = Integer.parseInt(value);
+            return playerID > 0 && Globals.isValidPlayerID(playerID) ? (byte) playerID : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /** Accept an ENDGAME only from a current peer and only for this exact round. */
@@ -881,6 +989,10 @@ public class UDPListenerService extends Service {
     }
 
     private void completeJoin(InetAddress ip, String action) {
+        completeJoin(ip, action, null);
+    }
+
+    private void completeJoin(InetAddress ip, String action, Byte assignedPlayerID) {
         synchronized (mListenerStateLock) {
             if (mDestroyed || !mScanRunning || (!mBroadcastScan && !ip.equals(mJoinAddress)))
                 return;
@@ -889,7 +1001,10 @@ public class UDPListenerService extends Service {
                 Globals.getInstance().mServerIP = ip;
             else
                 stopListen();
-            sendBroadcast(new Intent(action));
+            Intent result = new Intent(action);
+            if (assignedPlayerID != null)
+                result.putExtra(INTENT_PLAYERID, assignedPlayerID);
+            sendBroadcast(result);
         }
     }
 
@@ -1023,6 +1138,7 @@ public class UDPListenerService extends Service {
             Globals.getmTeamIPMapSemaphore();
             Globals.getInstance().mTeamIPMap.clear();
             Globals.getInstance().mTeamIPMapSemaphore.release();
+            clearJoinAssignments();
             keepListening = true;
             mIsListService = true;
             mScanRunning = false;
@@ -1186,6 +1302,7 @@ public class UDPListenerService extends Service {
             Globals.getmTeamIPMapSemaphore();
             Globals.getInstance().mTeamIPMap.clear();
             Globals.getInstance().mTeamIPMapSemaphore.release();
+            clearJoinAssignments();
             keepListening = true;
             mIsListService = false;
             mScanRunning = true;
@@ -1278,7 +1395,7 @@ public class UDPListenerService extends Service {
         sendDatagrams(NetMsg.MESSAGE_PREFIX + message, recipients, LISTEN_PORT, repeatCount, generation);
     }
 
-    private void sendUDPMessage(final String message, final InetAddress ip, final Integer port) {
+    void sendUDPMessage(final String message, final InetAddress ip, final Integer port) {
         sendDatagrams(message, Collections.singletonList(ip), port, 1, getSendGeneration());
     }
 
@@ -1355,6 +1472,7 @@ public class UDPListenerService extends Service {
             mPendingPeerRoundToken = null;
             mPendingPeerEndGame = null;
             resetPeerGameSequences();
+            clearJoinAssignments();
             keepListening = false;
             mReadyToScan = 0;
             closeListeningSocket();
@@ -1443,6 +1561,7 @@ public class UDPListenerService extends Service {
         }
         synchronized (mListenerStateLock) {
             mIsListService = false; // There is no list service while the game is running
+            clearJoinAssignments();
             boolean peerRoundChanged = mPeerGame != peerGame
                     || (peerGame && !roundToken.equals(mPeerRoundToken));
             if (!peerGame) {

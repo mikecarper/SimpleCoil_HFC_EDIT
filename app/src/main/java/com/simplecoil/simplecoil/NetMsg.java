@@ -20,9 +20,9 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "12";
+    public static final String NETWORK_VERSION = "13";
 
-    // All of these messages are straightforward and contain no extra data
+    // Most of these messages are straightforward and contain no extra data.
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
     public static final String NETMSG_HIT = "HIT";
     public static final String NETMSG_OUT = "OUT";
@@ -41,6 +41,9 @@ public class NetMsg {
     public static final String NETMSG_TCPSERVERFAILED = "TCPSERVERFAILED";
     public static final String NETMSG_TEAMELIMINATED = "TEAMELIMINATED";
     public static final String NETMSG_SERVERREPLY = "SERVERREPLY";
+    // A host appends ":<player ID>" to SERVERREPLY only when it moved a
+    // conflicting joining player to an available slot on the same team.
+    public static final String NETMSG_SERVERREPLY_ASSIGNMENT_PREFIX = NETMSG_SERVERREPLY + ":";
     public static final String NETMSG_GPSLOCUPDATE = "GPSLOCUPDATE";
     public static final String NETMSG_GPSDATAUPDATE = "GPSDATAUPDATE";
     public static final String NETMSG_GPSSETTING = "GPSSETTING";

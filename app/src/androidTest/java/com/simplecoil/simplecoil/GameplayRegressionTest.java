@@ -569,6 +569,47 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void endingGameHidesReloadProgressWhileStillDisablingTheWeapon() {
+        scenario.onActivity(activity -> {
+            set(activity, "mUseNetwork", false);
+            set(activity, "mReloading", 0);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+
+            invoke(activity, "endGame");
+
+            assertEquals("Round teardown left the reload spinner visible", View.GONE,
+                    ((View) get(activity, "mReloadBar")).getVisibility());
+            assertEquals(View.VISIBLE, ((View) get(activity, "mShotsRemainingTV")).getVisibility());
+            assertEquals(3, get(activity, "mReloading"));
+            assertEquals(2, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+        });
+    }
+
+    @Test
+    public void assignedServerReplyChangesIdBeforeTcpRegistration() {
+        scenario.onActivity(activity -> {
+            boolean receiverRegistered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            if (!receiverRegistered)
+                set(activity, "mNetworkReceiverRegistered", true);
+            try {
+                Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+                Globals.getInstance().mPlayerID = 1;
+
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_SERVERREPLY)
+                        .putExtra(UDPListenerService.INTENT_PLAYERID, (byte) 2));
+
+                assertEquals(2, Globals.getInstance().mPlayerID);
+                assertEquals(1, tcp.startRequests);
+                assertEquals(2, tcp.playerIdWhenStarted);
+                assertEquals(2, bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
+            } finally {
+                if (!receiverRegistered)
+                    set(activity, "mNetworkReceiverRegistered", false);
+            }
+        });
+    }
+
+    @Test
     public void configurationWriteCannotStartReloadTimer() {
         scenario.onActivity(activity -> {
             invoke(activity, "startReload");
@@ -1867,6 +1908,8 @@ public class GameplayRegressionTest {
 
     private static final class RecordingTcpClient extends TcpClient {
         boolean dedicated;
+        int startRequests;
+        byte playerIdWhenStarted;
         final List<String> messages = new ArrayList<>();
         final List<Intent> broadcasts = new ArrayList<>();
 
@@ -1876,6 +1919,12 @@ public class GameplayRegressionTest {
         @Override
         public boolean isDedicatedServer() {
             return dedicated;
+        }
+
+        @Override
+        void startTcpClient() {
+            startRequests++;
+            playerIdWhenStarted = Globals.getInstance().mPlayerID;
         }
 
         @Override

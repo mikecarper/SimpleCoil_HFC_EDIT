@@ -257,6 +257,55 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void conflictingDiscoveryAssignsFirstFreeSlotOnTheSameTeam() throws Exception {
+        set(service, "mIsListService", true);
+        // The host is player 1, and player 2 already occupies the first other
+        // slot on team 1. A joining player that requested 1 must receive 3,
+        // not a slot from the opposing team.
+        register(enemy, 2);
+
+        receive(teammate, NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "1");
+
+        assertEquals(1, service.endpointMessages.size());
+        assertEquals(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY + ":3",
+                service.endpointMessages.get(0));
+        assertEquals(teammate, service.endpointRecipients.get(0));
+        assertEquals(Globals.getInstance().calcNetworkTeam((byte) 1),
+                Globals.getInstance().calcNetworkTeam((byte) 3));
+        assertEquals("UDP discovery must not create an unauthenticated roster entry", 1,
+                Globals.getInstance().mTeamIPMap.size());
+    }
+
+    @Test
+    public void simultaneousConflictingDiscoveriesReceiveDistinctReservedSlots() throws Exception {
+        set(service, "mIsListService", true);
+
+        receive(teammate, NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "1");
+        receive(enemy, NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "1");
+
+        assertEquals(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY + ":2",
+                service.endpointMessages.get(0));
+        assertEquals(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY + ":3",
+                service.endpointMessages.get(1));
+        assertEquals("Discovery reservations must not become roster entries", 0,
+                Globals.getInstance().mTeamIPMap.size());
+    }
+
+    @Test
+    public void assignedServerReplyCarriesReplacementIdIntoTheTcpJoin() throws Exception {
+        beginJoin(teammate);
+
+        receive(teammate, NetMsg.NETMSG_SERVERREPLY_ASSIGNMENT_PREFIX + "3");
+
+        assertEquals(1, service.events.size());
+        Intent reply = service.events.get(0);
+        assertEquals(NetMsg.NETMSG_SERVERREPLY, reply.getAction());
+        assertEquals(3, reply.getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+        assertEquals(teammate, Globals.getInstance().mServerIP);
+        assertFalse(flag("mScanRunning"));
+    }
+
+    @Test
     public void conflictingDiscoveryDoesNotDeadlockWithLobbyReplacement() throws Exception {
         Globals globals = Globals.getInstance();
         Semaphore originalTeams = globals.mTeamIPMapSemaphore;
@@ -991,6 +1040,8 @@ public class UDPRegressionTest {
         final List<String> directMessages = new CopyOnWriteArrayList<>();
         final List<Byte> directRecipients = new CopyOnWriteArrayList<>();
         final List<Integer> directRepeatCounts = new CopyOnWriteArrayList<>();
+        final List<String> endpointMessages = new CopyOnWriteArrayList<>();
+        final List<InetAddress> endpointRecipients = new CopyOnWriteArrayList<>();
         boolean realListener;
         int listenerStarts;
         boolean blockFirstLookup;
@@ -1013,6 +1064,12 @@ public class UDPRegressionTest {
             directMessages.add(message);
             directRecipients.add(playerID);
             directRepeatCounts.add(repeatCount);
+        }
+        @Override void sendUDPMessage(String message, InetAddress address, Integer port) {
+            endpointMessages.add(message);
+            endpointRecipients.add(address);
+            if (realListener)
+                super.sendUDPMessage(message, address, port);
         }
         @Override public void startListenForUDPMessage() {
             if (realListener) super.startListenForUDPMessage();

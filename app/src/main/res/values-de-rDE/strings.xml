@@ -42,6 +42,7 @@
     <string name="error_bluetooth_not_supported">Bluetooth wird nicht unterstützt</string>
     <string name="error_select_team">Wähle zuerst ein Team aus!</string>
     <string name="error_same_id">Zwei Spieler nutzen dieselbe ID!</string>
+    <string name="player_id_reassigned">Spieler-ID wurde zur Vermeidung eines Konflikts auf %1$d geändert.</string>
     <string name="error_udp_version">Netzwerk Client Version unterschied. Update die APP!</string>
     <string name="error_no_wifi">WLAN muss verbunden sein</string>
     <string name="error_join">Server lobby nicht gefunden!</string>
