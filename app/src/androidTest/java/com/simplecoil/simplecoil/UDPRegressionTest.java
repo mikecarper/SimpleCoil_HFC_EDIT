@@ -221,6 +221,20 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void peerLeaveRemovesPeerRosterAndNotifiesRemainingPlayers() throws Exception {
+        register(teammate, 2);
+        service.startGame(true);
+
+        receive(teammate, NetMsg.NETMSG_LEAVE);
+
+        assertTrue(Globals.getInstance().mIPTeamMap.isEmpty());
+        assertTrue(Globals.getInstance().mTeamIPMap.isEmpty());
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_LEAVE, service.events.get(0).getAction());
+        assertEquals(2, service.events.get(0).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+    }
+
+    @Test
     public void validHitOutAndEliminationKeepTheirPlayerIds() throws Exception {
         register(enemy, 11);
         String[] commands = {NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT, NetMsg.NETMSG_ELIMINATED};

@@ -85,6 +85,10 @@ public class UDPListenerService extends Service {
     private volatile boolean keepListening = false;
     private volatile boolean doneListening = true;
     private volatile boolean mIsListService = false;
+    // Dedicated games keep their roster authoritative over TCP.  A peer-hosted
+    // round closes that TCP listener after the start announcement, so a player
+    // leaving mid-round must be reflected by a validated UDP LEAVE instead.
+    private volatile boolean mPeerGame;
     private volatile int mReadyToScan = 0;
 
     private volatile boolean mScanRunning = false;
@@ -244,11 +248,15 @@ public class UDPListenerService extends Service {
                 completeJoin(ip, NetMsg.NETMSG_SERVERREPLY);
                 return;
             } else if (message.equals(NetMsg.NETMSG_LEAVE)) {
-                // A UDP datagram cannot prove that a TCP player disconnected.
-                // The TCP server removes roster entries after its authenticated
-                // connection closes, so a stale or spoofed LEAVE cannot evict a
-                // live player from game traffic.
-                Log.d(TAG, "Ignoring UDP leave; TCP owns roster removal");
+                Byte playerID = removePeerPlayer(ip);
+                if (playerID == null) {
+                    // A UDP datagram cannot prove that a dedicated-server player
+                    // disconnected.  Keep that roster TCP-authoritative.
+                    Log.d(TAG, "Ignoring UDP leave; TCP owns roster removal");
+                    return;
+                }
+                intent = new Intent(NetMsg.NETMSG_LEAVE);
+                intent.putExtra(INTENT_PLAYERID, playerID);
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
                 if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                         || (getPlayerID(ip) == null && !ip.equals(Globals.getInstance().mServerIP)))
@@ -283,6 +291,66 @@ public class UDPListenerService extends Service {
         } finally {
             Globals.getInstance().mIPTeamMapSemaphore.release();
         }
+    }
+
+    /**
+     * Peer games no longer have a TCP listener after the synchronized start is
+     * announced.  Remove a departing, already-known peer from the local
+     * snapshots so remaining players do not keep waiting for it forever.  This
+     * is deliberately disabled for dedicated games, where UDP alone must never
+     * alter the TCP-owned roster.
+     */
+    private Byte removePeerPlayer(InetAddress ip) {
+        if (!mPeerGame)
+            return null;
+        final Byte playerID;
+        Globals globals = Globals.getInstance();
+        Globals.getmIPTeamMapSemaphore();
+        try {
+            playerID = globals.mIPTeamMap.get(ip);
+            if (playerID == null || playerID <= 0 || !Globals.isValidPlayerID(playerID))
+                return null;
+            globals.mIPTeamMap.remove(ip);
+        } finally {
+            globals.mIPTeamMapSemaphore.release();
+        }
+
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            InetAddress endpoint = globals.mTeamIPMap.get(playerID);
+            if (ip.equals(endpoint))
+                globals.mTeamIPMap.remove(playerID);
+        } finally {
+            globals.mTeamIPMapSemaphore.release();
+        }
+        Globals.getmTeamPlayerNameSemaphore();
+        try {
+            globals.mTeamPlayerNameMap.remove(playerID);
+        } finally {
+            globals.mTeamPlayerNameSemaphore.release();
+        }
+        Globals.getmGPSDataSemaphore();
+        try {
+            globals.mGPSData.remove(playerID);
+        } finally {
+            globals.mGPSDataSemaphore.release();
+        }
+        Globals.getmPlayerSettingsSemaphore();
+        try {
+            globals.mPlayerSettings.remove(playerID);
+        } finally {
+            globals.mPlayerSettingsSemaphore.release();
+        }
+        Globals.getmGrenadePairingsSemaphore();
+        try {
+            for (int index = 1; index < globals.mGrenadePairings.length; index++) {
+                if (globals.mGrenadePairings[index] == playerID)
+                    globals.mGrenadePairings[index] = Globals.INVALID_PLAYER_ID;
+            }
+        } finally {
+            globals.mGrenadePairingsSemaphore.release();
+        }
+        return playerID;
     }
 
     private void completeJoin(InetAddress ip, String action) {
@@ -417,6 +485,7 @@ public class UDPListenerService extends Service {
             }
             mSendGeneration++;
             endScanningLocked();
+            mPeerGame = false;
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
             Globals.getInstance().mIPTeamMapSemaphore.release();
@@ -575,6 +644,7 @@ public class UDPListenerService extends Service {
             }
             mSendGeneration++;
             endScanningLocked();
+            mPeerGame = false;
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
             Globals.getInstance().mIPTeamMapSemaphore.release();
@@ -740,6 +810,7 @@ public class UDPListenerService extends Service {
         synchronized (mListenerStateLock) {
             endScanningLocked();
             mIsListService = false;
+            mPeerGame = false;
             keepListening = false;
             closeListeningSocket();
         }
@@ -798,8 +869,11 @@ public class UDPListenerService extends Service {
 
     private final IBinder mBinder = new LocalBinder();
 
-    public void startGame() {
+    public void startGame() { startGame(false); }
+
+    public void startGame(boolean peerGame) {
         mIsListService = false; // There is no list service while the game is running
+        mPeerGame = peerGame;
     }
 
     public void endGame() {

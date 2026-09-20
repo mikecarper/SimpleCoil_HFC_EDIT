@@ -1534,7 +1534,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUseNetwork) {
             displayInGameNetworkingOptions();
             mEndNetworkGameButton.setVisibility(View.VISIBLE);
-            mUDPListenerService.startGame();
+            mUDPListenerService.startGame(!isDedicatedServerConnection());
             if (!mTcpClient.isDedicatedServer())
                 mTcpClient.stopTcpClient();
         } else {
