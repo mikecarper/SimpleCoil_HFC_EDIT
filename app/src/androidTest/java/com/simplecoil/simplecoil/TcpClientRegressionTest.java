@@ -23,6 +23,7 @@ import java.util.Queue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -170,6 +171,49 @@ public class TcpClientRegressionTest {
     }
 
     @Test
+    public void ordinarySendBacklogStaysWithinItsConfiguredLimit() throws Exception {
+        CountDownLatch release = blockSender();
+        ByteArrayOutputStream delivered = new ByteArrayOutputStream();
+        try {
+            field("out").set(client, new DataOutputStream(delivered));
+            for (int index = 0; index < TcpClient.MAX_PENDING_SEND_TASKS * 3; index++)
+                client.sendTCPMessage("burst " + index);
+            assertEquals(TcpClient.MAX_PENDING_SEND_TASKS,
+                    ((ThreadPoolExecutor) sender).getQueue().size());
+        } finally {
+            release.countDown();
+        }
+        awaitSender();
+        DataInputStream messages = messages(delivered);
+        int count = 0;
+        while (messages.available() > 0) {
+            messages.readUTF();
+            count++;
+        }
+        assertEquals(TcpClient.MAX_PENDING_SEND_TASKS, count);
+    }
+
+    @Test
+    public void repeatedPongsShareOneQueuedWrite() throws Exception {
+        CountDownLatch release = blockSender();
+        ByteArrayOutputStream delivered = new ByteArrayOutputStream();
+        try {
+            field("out").set(client, new DataOutputStream(delivered));
+            Method pong = TcpClient.class.getDeclaredMethod("sendPong");
+            pong.setAccessible(true);
+            for (int index = 0; index < TcpClient.MAX_PENDING_SEND_TASKS * 3; index++)
+                pong.invoke(client);
+            assertEquals(1, ((ThreadPoolExecutor) sender).getQueue().size());
+        } finally {
+            release.countDown();
+        }
+        awaitSender();
+        DataInputStream messages = messages(delivered);
+        assertEquals(TcpClient.TCP_CLIENT_PONG, messages.readUTF());
+        assertEquals(0, messages.available());
+    }
+
+    @Test
     public void failedRegistrationPreventsReplayOnAPartiallyWrittenStream() throws Exception {
         client.sendTCPMessage("event", true);
         final int[] flushes = {0};
@@ -245,6 +289,18 @@ public class TcpClientRegressionTest {
         CountDownLatch drained = new CountDownLatch(1);
         sender.execute(drained::countDown);
         assertTrue("TCP sender did not finish", drained.await(3, TimeUnit.SECONDS));
+    }
+
+    private CountDownLatch blockSender() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        sender.execute(() -> {
+            entered.countDown();
+            try { release.await(3, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        });
+        assertTrue("TCP sender did not begin blocking", entered.await(3, TimeUnit.SECONDS));
+        return release;
     }
 
     private static Field field(String name) throws Exception {

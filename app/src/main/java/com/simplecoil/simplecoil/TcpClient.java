@@ -47,14 +47,16 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class TcpClient extends Service {
@@ -68,6 +70,11 @@ public class TcpClient extends Service {
     // A disconnected player can retain elimination reports until it rejoins.
     // Keep that recovery buffer finite on memory-constrained game phones.
     static final int MAX_QUEUED_PERSISTENT_MESSAGES = 64;
+    // A blocked socket must not let pings or gameplay updates accumulate an
+    // unbounded executor queue on a client phone.
+    static final int MAX_PENDING_SEND_TASKS = 64;
+    private static final int MAX_PENDING_PRIORITY_SEND_TASKS = 4;
+    private static final int MAX_PENDING_PERSISTENT_DRAINS = 4;
     // Scoreboards sum values by team, so keep every untrusted row low enough
     // that a supported lobby cannot overflow an integer total.
     static final int MAX_SCOREBOARD_VALUE = Integer.MAX_VALUE / Globals.MAX_PLAYER_ID;
@@ -97,7 +104,21 @@ public class TcpClient extends Service {
 
     private volatile DataOutputStream out = null;
     private Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
-    private final ExecutorService sendExecutor = Executors.newSingleThreadExecutor();
+    private final Semaphore mSendTaskSlots = new Semaphore(MAX_PENDING_SEND_TASKS);
+    // Session control frames retain reserved capacity when ordinary updates
+    // already fill their bounded backlog.
+    private final Semaphore mPrioritySendTaskSlots = new Semaphore(MAX_PENDING_PRIORITY_SEND_TASKS);
+    // Persistent events are retained separately, so reserve only a few drain
+    // tasks. A reconnect must retain its position behind registration but ahead
+    // of follow-up state, even while a stale connection is still unwinding.
+    private final Semaphore mPersistentDrainTaskSlots = new Semaphore(MAX_PENDING_PERSISTENT_DRAINS);
+    private boolean mPersistentDrainRequested;
+    private boolean mPongQueued;
+    private final ExecutorService sendExecutor = new ThreadPoolExecutor(1, 1, 0L,
+            TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(MAX_PENDING_SEND_TASKS
+            + MAX_PENDING_PRIORITY_SEND_TASKS + MAX_PENDING_PERSISTENT_DRAINS),
+            runnable -> new Thread(runnable, "SimpleCoil TCP send"),
+            new ThreadPoolExecutor.AbortPolicy());
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -142,6 +163,7 @@ public class TcpClient extends Service {
             keepListening = false;
             out = null;
             messageQueue = new ConcurrentLinkedQueue<>();
+            mPersistentDrainRequested = false;
             mPendingTerminalEvent = null;
             resetClockSyncLocked();
             socket = mActiveSocket;
@@ -182,33 +204,97 @@ public class TcpClient extends Service {
         }
         if (sendExecutor.isShutdown())
             return;
+        scheduleSendTask(() -> {
+            if (writer == out)
+                writeMessage(writer, message);
+        }, mSendTaskSlots);
+    }
+
+    private synchronized void sendPriorityTCPMessage(final String message) {
+        if (mDestroyed)
+            return;
+        final DataOutputStream writer = out;
+        if (writer == null || sendExecutor.isShutdown())
+            return;
+        scheduleSendTask(() -> {
+            if (writer == out)
+                writeMessage(writer, message);
+        }, mPrioritySendTaskSlots);
+    }
+
+    private boolean scheduleSendTask(Runnable task, Semaphore slots) {
+        if (!slots.tryAcquire())
+            return false;
         try {
             sendExecutor.execute(() -> {
-                if (writer == out)
-                    writeMessage(writer, message);
+                try {
+                    task.run();
+                } finally {
+                    slots.release();
+                }
             });
+            return true;
         } catch (RejectedExecutionException e) {
-            // The service can be torn down after the isShutdown() check above.
+            // The service can be torn down after the caller checked its state.
+            slots.release();
             Log.w(TAG, "TCP sender is shutting down", e);
+            return false;
+        }
+    }
+
+    private void sendPong() {
+        synchronized (this) {
+            if (mDestroyed || mPongQueued || out == null || sendExecutor.isShutdown())
+                return;
+            final DataOutputStream writer = out;
+            mPongQueued = true;
+            if (!scheduleSendTask(() -> {
+                try {
+                    if (writer == out)
+                        writeMessage(writer, TCP_CLIENT_PONG);
+                } finally {
+                    synchronized (TcpClient.this) {
+                        mPongQueued = false;
+                    }
+                }
+            }, mSendTaskSlots)) {
+                mPongQueued = false;
+            }
         }
     }
 
     private synchronized void sendQueuedMessages() {
+        mPersistentDrainRequested = true;
+        scheduleQueuedMessagesLocked();
+    }
+
+    private void scheduleQueuedMessagesLocked() {
         final DataOutputStream writer = out;
         final Queue<String> pending = messageQueue;
-        if (writer == null || sendExecutor.isShutdown())
+        if (!mPersistentDrainRequested || writer == null || sendExecutor.isShutdown())
             return;
+        if (!mPersistentDrainTaskSlots.tryAcquire())
+            return;
+        mPersistentDrainRequested = false;
         try {
             sendExecutor.execute(() -> {
-                while (writer == out) {
-                    String message = pending.peek();
-                    if (message == null || !writeMessage(writer, message))
-                        return;
-                    pending.poll();
+                try {
+                    while (writer == out) {
+                        String message = pending.peek();
+                        if (message == null || !writeMessage(writer, message))
+                            return;
+                        pending.poll();
+                    }
+                } finally {
+                    mPersistentDrainTaskSlots.release();
+                    synchronized (TcpClient.this) {
+                        scheduleQueuedMessagesLocked();
+                    }
                 }
             });
         } catch (RejectedExecutionException e) {
-            // Nothing was removed from the queue; a later connection can retry.
+            mPersistentDrainTaskSlots.release();
+            mPersistentDrainRequested = true;
             Log.w(TAG, "TCP sender is shutting down", e);
         }
     }
@@ -243,6 +329,7 @@ public class TcpClient extends Service {
         mPendingStartInfo = null;
         mPendingStartIntent = null;
         mPendingGameStartEvent = null;
+        mPongQueued = false;
     }
 
     public synchronized boolean isClockSynchronized() { return mClockSynchronized; }
@@ -261,8 +348,7 @@ public class TcpClient extends Service {
         final DataOutputStream writer = out;
         final long generation = mSessionGeneration;
         mClockRequestQueued = true;
-        try {
-            sendExecutor.execute(() -> {
+        if (!scheduleSendTask(() -> {
                 final long sentAt;
                 synchronized (TcpClient.this) {
                     if (!isCurrentSession(generation) || writer != out)
@@ -278,8 +364,7 @@ public class TcpClient extends Service {
                 } catch (JSONException e) {
                     Log.w(TAG, "Unable to request clock synchronization", e);
                 }
-            });
-        } catch (RejectedExecutionException e) {
+            }, mPrioritySendTaskSlots)) {
             mClockRequestQueued = false;
         }
     }
@@ -299,7 +384,7 @@ public class TcpClient extends Service {
             if (ready) {
                 mClockSynchronized = true;
                 mLastClockSync = receivedAt;
-                sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                sendPriorityTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                         + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
             }
         }
@@ -400,6 +485,7 @@ public class TcpClient extends Service {
             // An explicit start joins a new session. Only automatic reconnects
             // inside runTcpClientSession may replay events from the previous link.
             messageQueue = new ConcurrentLinkedQueue<>();
+            mPersistentDrainRequested = false;
             mPendingTerminalEvent = null;
             mIsDedicatedServer = false;
             resetClockSyncLocked();
@@ -498,7 +584,7 @@ public class TcpClient extends Service {
                         noReadCount = 0;
                         idleTick = SystemClock.elapsedRealtime();
                         if (message.equals(TcpServer.TCP_SERVER_PING))
-                            sendTCPMessage(TCP_CLIENT_PONG);
+                            sendPong();
                         else {
                             Log.i(TAG, "received: '" + message + "'");
                             if (message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON)) {
@@ -604,6 +690,7 @@ public class TcpClient extends Service {
             mSessionGeneration++;
             out = null;
             messageQueue = new ConcurrentLinkedQueue<>();
+            mPersistentDrainRequested = false;
             notification = new Intent(action).putExtra(EXTRA_TERMINAL_EVENT_ID, terminalEventIds.incrementAndGet());
             mPendingTerminalEvent = notification;
             resetClockSyncLocked();
@@ -670,14 +757,14 @@ public class TcpClient extends Service {
                 playerInfo.put(TcpServer.JSON_REJOIN, true);
             }
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerInfo.toString();
-            sendTCPMessage(message);
+            sendPriorityTCPMessage(message);
             sendQueuedMessages();
         } catch (JSONException e) {
             e.printStackTrace();
         }
         // A disarm can happen while offline. Re-publish zero as well as paired
         // IDs on registration so reconnecting cannot resurrect stale ownership.
-        sendPlayerGrenade();
+        sendPlayerGrenade(true);
     }
 //TODO player presets
     public void sendPlayerSettings() {
@@ -708,12 +795,19 @@ public class TcpClient extends Service {
     }
 
     public void sendPlayerGrenade() {
+        sendPlayerGrenade(false);
+    }
+
+    private void sendPlayerGrenade(boolean priority) {
         try {
             JSONObject playerGrenade = new JSONObject();
             playerGrenade.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
             playerGrenade.put(TcpServer.JSON_PAIRED_GRENADE_ID, Globals.getInstance().mPairedGrenadeID);
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerGrenade.toString();
-            sendTCPMessage(message);
+            if (priority)
+                sendPriorityTCPMessage(message);
+            else
+                sendTCPMessage(message);
         } catch (JSONException e) {
             e.printStackTrace();
         }
@@ -739,7 +833,7 @@ public class TcpClient extends Service {
     public void leaveServer() {
         if (keepListening) {
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_LEAVE;
-            sendTCPMessage(message);
+            sendPriorityTCPMessage(message);
             stopTcpClient();
         }
     }
