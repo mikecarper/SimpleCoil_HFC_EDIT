@@ -965,6 +965,7 @@ public class TcpServer extends Service {
         Globals.getmPlayerSettingsSemaphore();
         try {
             JSONArray players = new JSONArray();
+            ensureServerControlledSettingsLocked();
             if (applyAll && playerID != SEND_ALL) {
                 Globals.PlayerSettings sourceSettings = Globals.getInstance().mPlayerSettings.get((byte) playerID);
                 if (sourceSettings == null) {
@@ -1023,6 +1024,23 @@ public class TcpServer extends Service {
             Globals.getInstance().mPlayerSettingsSemaphore.release();
         }
         return null;
+    }
+
+    // Caller holds the player-settings semaphore.  A disabled client-settings
+    // policy must be authoritative even when the operator has not opened an
+    // individual player's dialog yet.  Without a record here, an empty
+    // snapshot leaves a newly joined phone using its own old weapon settings.
+    private void ensureServerControlledSettingsLocked() {
+        Globals globals = Globals.getInstance();
+        if ((globals.mAllowPlayerSettings && !globals.mOnlyServerSettings) || mClientData == null)
+            return;
+        for (ClientData client : mClientData.values()) {
+            byte playerID = client.mPlayerID;
+            if (playerID > 0 && Globals.isValidPlayerID(playerID)
+                    && !globals.mPlayerSettings.containsKey(playerID)) {
+                globals.mPlayerSettings.put(playerID, new Globals.PlayerSettings());
+            }
+        }
     }
 
     public void sendPlayerSettings(int playerID, boolean applyAll, boolean allowPlayerSettings) {

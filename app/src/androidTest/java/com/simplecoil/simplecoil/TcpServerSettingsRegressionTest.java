@@ -227,6 +227,27 @@ public class TcpServerSettingsRegressionTest {
     }
 
     @Test
+    public void serverControlledPoliciesPublishDefaultsForUnconfiguredPlayers() throws Exception {
+        Globals globals = Globals.getInstance();
+        globals.mPlayerSettings.clear();
+        for (boolean serverOnly : new boolean[]{false, true}) {
+            globals.mAllowPlayerSettings = serverOnly;
+            globals.mOnlyServerSettings = serverOnly;
+
+            org.json.JSONArray settings = server.getPlayerSettings(TcpServer.SEND_ALL, false);
+
+            assertEquals(1, settings.length());
+            assertEquals(1, settings.getJSONObject(0).getInt(TcpServer.JSON_PLAYERID));
+            assertEquals(Globals.MAX_HEALTH,
+                    settings.getJSONObject(0).getInt(TcpServer.JSON_HEALTH));
+            assertEquals(Globals.RELOAD_COUNT & 0xff,
+                    settings.getJSONObject(0).getInt(TcpServer.JSON_RELOAD_SHOTS));
+            assertTrue(globals.mPlayerSettings.containsKey((byte) 1));
+            globals.mPlayerSettings.clear();
+        }
+    }
+
+    @Test
     public void playerCannotApplySettingsForAnotherPlayer() throws Exception {
         parse(settingsMessage().put(TcpServer.JSON_PLAYERID, 2));
         assertSettingsUnchanged();
