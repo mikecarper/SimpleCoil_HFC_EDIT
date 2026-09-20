@@ -302,15 +302,19 @@ public class Globals {
         if (context != null) {
             try {
                 Context applicationContext = context.getApplicationContext();
-                if (applicationContext == null)
-                    applicationContext = context;
-                Object service = applicationContext.getSystemService(Context.WIFI_SERVICE);
-                if (service instanceof WifiManager) {
-                    WifiInfo info = ((WifiManager) service).getConnectionInfo();
-                    if (info != null) {
-                        InetAddress wifiAddress = fromWifiIPv4Address(info.getIpAddress());
-                        if (wifiAddress != null)
-                            return wifiAddress;
+                // On Android 5.1, WifiManager can retain the context used for its
+                // lookup. Never substitute an Activity when an application context
+                // is unavailable; fall back to the interface scan below instead.
+                if (applicationContext != null) {
+                    Object service = applicationContext.getApplicationContext()
+                            .getSystemService(Context.WIFI_SERVICE);
+                    if (service instanceof WifiManager) {
+                        WifiInfo info = ((WifiManager) service).getConnectionInfo();
+                        if (info != null) {
+                            InetAddress wifiAddress = fromWifiIPv4Address(info.getIpAddress());
+                            if (wifiAddress != null)
+                                return wifiAddress;
+                        }
                     }
                 }
             } catch (SecurityException ignored) {
