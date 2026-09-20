@@ -352,28 +352,43 @@ public class UDPListenerService extends Service {
     }
 
     private InetAddress getBroadcastAddress() {
-        if(wm == null)wm = (WifiManager)getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm == null) {
-            Log.e(TAG, "Failed to get wifi manager");
+        try {
+            if (wm == null)
+                wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm == null) {
+                Log.e(TAG, "Failed to get wifi manager");
+                return null;
+            }
+            DhcpInfo dhcp = wm.getDhcpInfo();
+            if (dhcp == null) {
+                Log.e(TAG, "Failed to get dhcp info");
+                return null;
+            }
+            return broadcastAddressForDhcp(dhcp.ipAddress, dhcp.netmask);
+        } catch (SecurityException e) {
+            Log.w(TAG, "Unable to read Wi-Fi DHCP information", e);
             return null;
         }
-        DhcpInfo dhcp = wm.getDhcpInfo();
-        if (dhcp == null) {
-            Log.e(TAG, "Failed to get dhcp info");
-            return null;
-        }
+    }
 
-        int broadcast = (dhcp.ipAddress & dhcp.netmask) | ~dhcp.netmask;
+    static InetAddress broadcastAddressForDhcp(int ipAddress, int netmask) {
+        // Wi-Fi reports zeroes before it has a DHCP lease. Calculating a
+        // broadcast from those values produces 255.255.255.255, which can make
+        // a host look ready even though peers cannot discover it on the LAN.
+        if (ipAddress == 0 || netmask == 0) {
+            Log.w(TAG, "No usable Wi-Fi DHCP lease for UDP discovery");
+            return null;
+        }
+        int broadcast = (ipAddress & netmask) | ~netmask;
         byte[] quads = new byte[4];
         for (int k = 0; k < 4; k++)
             quads[k] = (byte) ((broadcast >> k * 8) & 0xFF);
-        InetAddress ret = null;
         try {
-            ret = InetAddress.getByAddress(quads);
+            return InetAddress.getByAddress(quads);
         } catch (Exception e) {
             Log.e(TAG, "Failed to get broadcast IP address");
+            return null;
         }
-        return ret;
     }
 
     public void createServer() {

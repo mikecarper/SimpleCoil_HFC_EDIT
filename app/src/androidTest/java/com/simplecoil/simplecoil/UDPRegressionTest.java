@@ -303,6 +303,14 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void missingDhcpLeaseDoesNotCreateAGlobalBroadcastAddress() throws Exception {
+        assertNull(UDPListenerService.broadcastAddressForDhcp(0, 0));
+        assertNull(UDPListenerService.broadcastAddressForDhcp(0, 0x00FFFFFF));
+        assertEquals("192.168.1.255", UDPListenerService.broadcastAddressForDhcp(
+                0x0101A8C0, 0x00FFFFFF).getHostAddress());
+    }
+
+    @Test
     public void failedHostCreationCancelsAnOlderJoinBeforeItCanSucceed() throws Exception {
         // A user can select Create Server while a previous discovery request is
         // still shutting down. Reporting that failure alone leaves the old scan
