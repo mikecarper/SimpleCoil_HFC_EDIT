@@ -171,7 +171,11 @@ public class UDPListenerService extends Service {
                 if (!keepListening || mDestroyed)
                     return;
                 mSocket = socket;
-                mReadyToScan++;
+                // There is only one listener thread.  Readiness describes the
+                // current bound socket, not how many times a failed listener
+                // has retried, so a stale successful bind cannot keep a host
+                // marked ready after its socket has gone away.
+                mReadyToScan = 1;
                 doneListening = false;
             }
             while (keepListening) {
@@ -189,9 +193,24 @@ public class UDPListenerService extends Service {
         } finally {
             if (socket != null)
                 socket.close();
-            if (mSocket == socket)
-                mSocket = null;
+            synchronized (mListenerStateLock) {
+                if (mSocket == socket) {
+                    mSocket = null;
+                    mReadyToScan = 0;
+                }
+            }
         }
+    }
+
+    private boolean isListenerReady() {
+        synchronized (mListenerStateLock) {
+            return isListenerReadyLocked();
+        }
+    }
+
+    private boolean isListenerReadyLocked() {
+        DatagramSocket socket = mSocket;
+        return mReadyToScan != 0 && socket != null && !socket.isClosed();
     }
 
     private void processMessage(InetAddress ip, String message) {
@@ -1017,13 +1036,13 @@ public class UDPListenerService extends Service {
 
     private void finishServerCreation(long generation) {
         long deadline = System.currentTimeMillis() + LISTENER_START_TIMEOUT_MS;
-        while (keepListening && generation == mJoinGeneration && mReadyToScan == 0
+        while (keepListening && generation == mJoinGeneration && !isListenerReady()
                 && System.currentTimeMillis() < deadline)
             sleep(50);
         synchronized (mListenerStateLock) {
             if (mDestroyed || !keepListening || generation != mJoinGeneration)
                 return;
-            if (mReadyToScan == 0) {
+            if (!isListenerReadyLocked()) {
                 Log.e(TAG, "Timed out starting UDP listener");
                 stopListen();
                 sendFailedJoin();
@@ -1337,6 +1356,7 @@ public class UDPListenerService extends Service {
             mPendingPeerEndGame = null;
             resetPeerGameSequences();
             keepListening = false;
+            mReadyToScan = 0;
             closeListeningSocket();
         }
     }

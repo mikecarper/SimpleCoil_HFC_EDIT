@@ -819,6 +819,36 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void closedListenerDoesNotLeaveStaleHostReadiness() throws Exception {
+        set(service, "keepListening", true);
+        Method method = UDPListenerService.class.getDeclaredMethod("listenForMessage",
+                InetAddress.class, Integer.class, Integer.class);
+        method.setAccessible(true);
+        Thread listener = new Thread(() -> {
+            try {
+                method.invoke(service, InetAddress.getLoopbackAddress(), 0, 5000);
+            } catch (Exception ignored) {
+                // Closing the socket below intentionally ends this direct listener.
+            }
+        }, "UDP readiness regression");
+        listener.start();
+
+        long deadline = SystemClock.elapsedRealtime() + 2000;
+        while (get(service, "mSocket") == null && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        DatagramSocket socket = (DatagramSocket) get(service, "mSocket");
+        assertNotNull("Listener did not bind", socket);
+        assertEquals(1, ((Integer) get(service, "mReadyToScan")).intValue());
+
+        socket.close();
+        listener.join(2000);
+        assertFalse("Closed UDP listener did not exit", listener.isAlive());
+        assertNull("Closed listener remained published", get(service, "mSocket"));
+        assertEquals("Closed listener remained ready", 0,
+                ((Integer) get(service, "mReadyToScan")).intValue());
+    }
+
+    @Test
     public void stoppingOldInstanceDoesNotStopCurrentUdpListener() throws Exception {
         service.realListener = true;
         register(teammate, 2);
