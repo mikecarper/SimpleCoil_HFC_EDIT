@@ -482,6 +482,10 @@ public class UDPListenerService extends Service {
                 return;
             }
             if (!doneListening) {
+                // This request replaces the in-flight discovery. Leaving it
+                // active after reporting failure lets a late reply join the
+                // server the player just abandoned.
+                stopListen();
                 sendFailedJoin();
                 return;
             }
@@ -526,6 +530,10 @@ public class UDPListenerService extends Service {
             }
             if (!doneListening) {
                 Log.e(TAG, "Listening is still in progress");
+                // This request replaces the in-flight discovery. Leaving it
+                // active after reporting failure lets a late reply join the
+                // server the player just abandoned.
+                stopListen();
                 sendFailedJoin();
                 return;
             }
