@@ -125,6 +125,7 @@ public class BluetoothLeService extends Service {
     }
 
     private boolean isCurrentGatt(BluetoothGatt gatt) {
+        // Keep the service monitor held from this check through the callback's effects.
         return gatt != null && gatt == mBluetoothGatt;
     }
 
@@ -227,40 +228,46 @@ public class BluetoothLeService extends Service {
     private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-            if (!isCurrentGatt(gatt)) {
-                Log.d(TAG, "Ignoring callback from a closed GATT connection");
-                return;
-            }
-            String intentAction;
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                intentAction = ACTION_GATT_CONNECTED;
-                mConnectionState = STATE_CONNECTED;
-                broadcastUpdate(intentAction);
-                Log.i(TAG, "Connected to GATT server.");
-                // Attempts to discover services after successful connection.
-                try {
-                    Log.i(TAG, "Attempting to start service discovery:" +
-                            gatt.discoverServices());
-                } catch (SecurityException e) {
-                    Log.w(TAG, "Bluetooth permission was revoked before service discovery", e);
+            synchronized (BluetoothLeService.this) {
+                // connect() publishes the new handle under this same monitor. An early
+                // callback must wait for it, and an old one must not affect a replacement.
+                if (!isCurrentGatt(gatt)) {
+                    Log.d(TAG, "Ignoring callback from a closed GATT connection");
+                    return;
                 }
+                String intentAction;
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    intentAction = ACTION_GATT_CONNECTED;
+                    mConnectionState = STATE_CONNECTED;
+                    broadcastUpdate(intentAction);
+                    Log.i(TAG, "Connected to GATT server.");
+                    // Attempts to discover services after successful connection.
+                    try {
+                        Log.i(TAG, "Attempting to start service discovery:" +
+                                gatt.discoverServices());
+                    } catch (SecurityException e) {
+                        Log.w(TAG, "Bluetooth permission was revoked before service discovery", e);
+                    }
 
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                intentAction = ACTION_GATT_DISCONNECTED;
-                mConnectionState = STATE_DISCONNECTED;
-                clearPendingGattOperations();
-                Log.i(TAG, "Disconnected from GATT server: " + status);
-                broadcastUpdate(intentAction);
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    intentAction = ACTION_GATT_DISCONNECTED;
+                    mConnectionState = STATE_DISCONNECTED;
+                    clearPendingGattOperations();
+                    Log.i(TAG, "Disconnected from GATT server: " + status);
+                    broadcastUpdate(intentAction);
+                }
             }
         }
 
         @Override
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-            if (!isCurrentGatt(gatt)) return;
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                broadcastUpdate(ACTION_GATT_SERVICES_DISCOVERED);
-            } else {
-                Log.w(TAG, "onServicesDiscovered received: " + status);
+            synchronized (BluetoothLeService.this) {
+                if (!isCurrentGatt(gatt)) return;
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    broadcastUpdate(ACTION_GATT_SERVICES_DISCOVERED);
+                } else {
+                    Log.w(TAG, "onServicesDiscovered received: " + status);
+                }
             }
         }
 
@@ -303,8 +310,10 @@ public class BluetoothLeService extends Service {
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt,
                                             BluetoothGattCharacteristic characteristic) {
-            if (!isCurrentGatt(gatt)) return;
-            broadcastUpdate(characteristic);
+            synchronized (BluetoothLeService.this) {
+                if (!isCurrentGatt(gatt)) return;
+                broadcastUpdate(characteristic);
+            }
         }
 
         @Override
@@ -483,7 +492,7 @@ public class BluetoothLeService extends Service {
      * {@code BluetoothGattCallback#onConnectionStateChange(android.bluetooth.BluetoothGatt, int, int)}
      * callback.
      */
-    public void disconnect() {
+    public synchronized void disconnect() {
         if (mBluetoothAdapter == null || mBluetoothGatt == null) {
             Log.w(TAG, "BluetoothAdapter not initialized");
             return;
@@ -500,17 +509,19 @@ public class BluetoothLeService extends Service {
      * released properly.
      */
     public synchronized void close() {
-        if (mBluetoothGatt != null) {
-            try {
-                mBluetoothGatt.close();
-            } catch (SecurityException e) {
-                Log.w(TAG, "Bluetooth permission was revoked while closing", e);
-            }
-        }
+        BluetoothGatt gatt = mBluetoothGatt;
+        // Retire the handle and queue before framework cleanup can dispatch callbacks.
         mBluetoothGatt = null;
         mBluetoothDeviceAddress = null;
         mConnectionState = STATE_DISCONNECTED;
         clearPendingGattOperations();
+        if (gatt != null) {
+            try {
+                gatt.close();
+            } catch (SecurityException e) {
+                Log.w(TAG, "Bluetooth permission was revoked while closing", e);
+            }
+        }
     }
 
     /**
@@ -645,7 +656,7 @@ public class BluetoothLeService extends Service {
      *
      * @return A {@code List} of supported services.
      */
-    public List<BluetoothGattService> getSupportedGattServices() {
+    public synchronized List<BluetoothGattService> getSupportedGattServices() {
         if (mBluetoothGatt == null) return null;
 
         try {
