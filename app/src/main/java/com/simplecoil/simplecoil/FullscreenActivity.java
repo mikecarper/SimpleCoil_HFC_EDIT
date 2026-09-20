@@ -193,7 +193,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private byte mLastThumbButtonCount = 0;
     private static int mEliminationCount = 0;
     private static int mEmptyTriggerCount = 0;
-    private static boolean mStartGameTimer = true;
+    private boolean mStartGameTimer = true;
+    private boolean mHasSynchronizedStart;
+    private long mSynchronizedStartAt;
+    private long mSynchronizedEndAt;
     private static boolean mHasLivesLimit = false;
     private static int mLives = 0;
 
@@ -375,6 +378,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             @Override
             public void onServiceConnected(ComponentName componentName, IBinder service) {
                 mUDPListenerService = ((UDPListenerService.LocalBinder) service).getService();
+                consumePendingServerEvent();
             }
 
             @Override
@@ -429,6 +433,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (!mNetworkReceiverRegistered || mTcpClient == null)
             return;
         Intent event = mTcpClient.consumePendingTerminalEvent();
+        if (event != null) {
+            mUDPUpdateReceiver.onReceive(this, event);
+            return;
+        }
+        if (!mUseNetwork || !mReady || !networkServicesReady())
+            return;
+        event = mIsServer ? mTcpServer.getScheduledGameStart() : mTcpClient.consumePendingGameStart(0);
         if (event != null)
             mUDPUpdateReceiver.onReceive(this, event);
     }
@@ -441,6 +452,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             public void onServiceConnected(ComponentName componentName, IBinder service) {
                 mTcpServer = ((TcpServer.LocalBinder) service).getService();
                 mTcpServer.setDedicated(false);
+                consumePendingServerEvent();
             }
 
             @Override
@@ -618,6 +630,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     if (Globals.getPlayerCount() <= 1) {
                         Toast.makeText(getApplicationContext(), getString(R.string.not_enough_players_toast), Toast.LENGTH_SHORT).show();
                         mNetworkPlayerCountTV.setText(R.string.network_player_1count);
+                        return;
+                    }
+                    if (mIsServer ? !mTcpServer.arePlayerClocksSynchronized() : !mTcpClient.isClockSynchronized()) {
+                        Toast.makeText(getApplicationContext(), R.string.clock_sync_waiting, Toast.LENGTH_SHORT).show();
                         return;
                     }
                     if (mIsServer)
@@ -1277,9 +1293,19 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         startShieldRegeneration(SHIELD_REGEN_DELAY_MILLISECONDS);
     }
 
-    private void startGame() {
+    private void startGame() { startGame(null); }
+
+    private void startGame(Intent start) {
         if (mUseNetwork && !networkServicesReady()) {
             Log.w(TAG, "Ignoring game start before network services are ready");
+            return;
+        }
+        mHasSynchronizedStart = start != null && start.hasExtra(NetMsg.INTENT_START_AT);
+        mSynchronizedStartAt = mHasSynchronizedStart ? start.getLongExtra(NetMsg.INTENT_START_AT, 0) : 0;
+        mSynchronizedEndAt = mHasSynchronizedStart ? start.getLongExtra(NetMsg.INTENT_END_AT, 0) : 0;
+        if (mHasSynchronizedStart && mSynchronizedEndAt > 0
+                && mSynchronizedEndAt <= SystemClock.elapsedRealtime()) {
+            endGame();
             return;
         }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -1318,6 +1344,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mStartGameTimer = true;
         setShotMode(mCurrentShotMode); // make sure that the shot mode is correctly set at the start of each game
         startSpawn("");
+        if (mHasSynchronizedStart && mSynchronizedEndAt > 0 && !mGameTimerRunning
+                && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            startGameCountdownMillis(Math.max(0, mSynchronizedEndAt - SystemClock.elapsedRealtime()));
     }
 
     private void confirmEndGame() {
@@ -1344,6 +1373,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void endGame() {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        if (mIsServer && mTcpServer != null)
+            mTcpServer.clearScheduledStart();
+        mHasSynchronizedStart = false;
         Globals.getInstance().mOnlyServerSettings = false;
         mFiringModeButton.setVisibility(View.VISIBLE);
         mStartGameButton.setVisibility(View.VISIBLE);
@@ -1549,14 +1581,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mEliminatedTV.setVisibility(View.VISIBLE);
         mEliminatedByTV.setText(eliminatedBy);
         mEliminatedByTV.setVisibility(View.VISIBLE);
-        mSpawnInTV.setText(getResources().getString(R.string.spawn_in_label, Globals.getInstance().mRespawnTime));
+        final boolean synchronizedCountdown = mStartGameTimer && mHasSynchronizedStart;
+        final long spawnDelay = synchronizedCountdown
+                ? Math.max(0, mSynchronizedStartAt - SystemClock.elapsedRealtime())
+                : Globals.getInstance().mRespawnTime * 1000;
+        mSpawnInTV.setText(getResources().getString(synchronizedCountdown
+                ? R.string.game_start_countdown : R.string.spawn_in_label, (spawnDelay + 999) / 1000));
         mSpawnInTV.setVisibility(View.VISIBLE);
-        mSpawnTimer = new CountDownTimer(Globals.getInstance().mRespawnTime * 1000, 999) {
+        mSpawnTimer = new CountDownTimer(spawnDelay, 999) {
 
             public void onTick(long millisUntilFinished) {
                 if (mSpawnTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_ELIMINATED)
                     return;
-                mSpawnInTV.setText(getResources().getString(R.string.spawn_in_label, (millisUntilFinished / 1000)));
+                mSpawnInTV.setText(getResources().getString(synchronizedCountdown
+                        ? R.string.game_start_countdown : R.string.spawn_in_label, (millisUntilFinished + 999) / 1000));
                 playSound(R.raw.beep, getApplicationContext());
             }
 
@@ -1575,11 +1613,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 finishReload();
                 if (mStartGameTimer) {
                     mStartGameTimer = false;
-                    if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
-                        if (!mGameTimerRunning)
-                            startGameCountdown();
+                    if (mHasSynchronizedStart ? mSynchronizedEndAt > 0
+                            : (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
+                        if (!mGameTimerRunning) {
+                            if (mHasSynchronizedStart)
+                                startGameCountdownMillis(Math.max(0, mSynchronizedEndAt - SystemClock.elapsedRealtime()));
+                            else
+                                startGameCountdown();
+                        }
                     } else {
-                        mGameTimer.setBase(SystemClock.elapsedRealtime());
+                        mGameTimer.setBase(mHasSynchronizedStart ? mSynchronizedStartAt : SystemClock.elapsedRealtime());
                         mGameTimer.start();
                     }
                 }
@@ -1593,10 +1636,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void startGameCountdown(long timeInSeconds) {
+        startGameCountdownMillis(timeInSeconds * 1000);
+    }
+
+    private void startGameCountdownMillis(long timeInMillis) {
         if (mGameCountdownTimer != null)
             mGameCountdownTimer.cancel();
         mGameTimerRunning = true;
-        mGameCountdownTimer = new CountDownTimer(timeInSeconds * 1000, 1000) {
+        mGameCountdownTimer = new CountDownTimer(timeInMillis, 1000) {
 
             public void onTick(long millisUntilFinished) {
                 if (mGameCountdownTimer != this || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
@@ -2743,6 +2790,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private final BroadcastReceiver mUDPUpdateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (intent.hasExtra(TcpClient.EXTRA_START_EVENT_ID)) {
+                if (mTcpClient == null || !mUseNetwork || !mReady || !networkServicesReady())
+                    return;
+                intent = mTcpClient.consumePendingGameStart(intent.getLongExtra(TcpClient.EXTRA_START_EVENT_ID, 0));
+                if (intent == null)
+                    return;
+            }
             if (intent.hasExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID)) {
                 long eventId = intent.getLongExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID, 0);
                 if (mTcpClient == null || eventId <= 0)
@@ -2760,6 +2814,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     || NetMsg.NETMSG_ELIMINATED.equals(action) || NetMsg.NETMSG_TEAMELIMINATED.equals(action);
             if (gameplayEvent && (!mUseNetwork || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE))
                 return; // Messages already in flight must not change a completed round.
+            if (gameplayEvent && mHasSynchronizedStart && mStartGameTimer)
+                return; // Initial countdown is not a scoring or firing phase.
             if (NetMsg.NETMSG_SHOTFIRED.equals(action)) {
                 // Play a sound?
                 mLastShotFired = System.currentTimeMillis() + HIT_ANIMATION_DURATION_MILLISECONDS; // Keeps us from spamming shots fired messages
@@ -2908,6 +2964,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     boolean hasGameUpdate = intent.getBooleanExtra(NetMsg.INTENT_HASGAMEUPDATE, false);
                     int deaths = Math.max(0, intent.getIntExtra(NetMsg.INTENT_ELIMINATIONS, 0));
                     long timeRemaining = hasGameUpdate ? intent.getLongExtra(NetMsg.INTENT_TIMEREMAINING, -1) : -1;
+                    boolean synchronizedStart = intent.hasExtra(NetMsg.INTENT_START_AT);
+                    long synchronizedEnd = intent.getLongExtra(NetMsg.INTENT_END_AT, 0);
+                    boolean roundExpired = synchronizedStart
+                            ? synchronizedEnd > 0 && synchronizedEnd <= SystemClock.elapsedRealtime() : timeRemaining == 0;
                     boolean outOfLives = hasGameUpdate && mHasLivesLimit && deaths >= mLives;
                     boolean roundInProgress = Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
                             || (dedicatedServer && serverGameState == Globals.GAME_STATE_RUNNING);
@@ -2917,9 +2977,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             endGame();
                         } else if (serverGameState == Globals.GAME_STATE_RUNNING
                                 && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
-                                && !outOfLives && timeRemaining != 0) {
+                                && !outOfLives && !roundExpired) {
                             // Initialize the round first; startGame resets the local score counters.
-                            startGame();
+                            startGame(intent);
                         }
                     }
                     if (hasGameUpdate) {
@@ -2936,6 +2996,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         }
                         if (outOfLives && roundInProgress && !serverRoundEnded) {
                             finishOutOfLives();
+                        } else if (synchronizedStart && roundInProgress && !serverRoundEnded) {
+                            if (synchronizedEnd > 0)
+                                startGameCountdownMillis(Math.max(0, synchronizedEnd - SystemClock.elapsedRealtime()));
                         } else if (timeRemaining >= 0 && roundInProgress && !serverRoundEnded) {
                             if (timeRemaining == 0)
                                 finishTimedGame();
@@ -2961,8 +3024,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (playerData != null)
                     displayPlayerData(playerData);
             } else if (NetMsg.NETMSG_STARTGAME.equals(action)) {
+                if (mIsServer && intent.hasExtra(NetMsg.INTENT_ROUND_ID) && mTcpServer != null) {
+                    Intent scheduled = mTcpServer.getScheduledGameStart();
+                    if (scheduled == null || scheduled.getLongExtra(NetMsg.INTENT_ROUND_ID, 0)
+                            != intent.getLongExtra(NetMsg.INTENT_ROUND_ID, -1))
+                        return;
+                }
                 if (mUseNetwork && mReady && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
-                    startGame();
+                    startGame(intent);
+            } else if (NetMsg.NETMSG_CLOCKSYNCWAITING.equals(action)) {
+                Toast.makeText(getApplicationContext(), R.string.clock_sync_waiting, Toast.LENGTH_SHORT).show();
             } else if (NetMsg.NETMSG_ENDGAME.equals(action)) {
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                     endGame();
@@ -3050,6 +3121,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         intentFilter.addAction(NetMsg.NETMSG_LISTPLAYERS);
         intentFilter.addAction(NetMsg.NETMSG_PLAYERDATAUPDATE);
         intentFilter.addAction(NetMsg.NETMSG_STARTGAME);
+        intentFilter.addAction(NetMsg.NETMSG_CLOCKSYNCWAITING);
         intentFilter.addAction(NetMsg.NETMSG_ENDGAME);
         intentFilter.addAction(NetMsg.NETMSG_ERROR);
         intentFilter.addAction(NetMsg.NETMSG_VERSIONERROR);

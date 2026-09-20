@@ -157,4 +157,6 @@
     <string name="firing_mode_outdoor_no_cone">Draußen</string>
     <string name="firing_mode_outdoor_with_cone">Draußen, Kegel</string>
     <string name="firing_mode_indoor_no_cone">Innen</string>
+    <string name="clock_sync_waiting">Spieleruhren werden synchronisiert. Bitte gleich erneut auf Start tippen.</string>
+    <string name="game_start_countdown">Spiel startet in %1$d</string>
 </resources>

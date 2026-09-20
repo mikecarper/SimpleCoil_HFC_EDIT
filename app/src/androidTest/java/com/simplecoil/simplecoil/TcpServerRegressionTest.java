@@ -385,6 +385,16 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void eliminationReportsDuringSharedCountdownDoNotChangeScores() throws Exception {
+        Object victim = client(1, 1);
+        client(2, 9);
+        set(server, "mScheduledStart", android.os.SystemClock.elapsedRealtime() + 10000);
+        eliminate(victim, 9);
+        assertEquals(0, server.getScore((byte) 9).points);
+        assertEquals(0, server.getScore((byte) 1).eliminated);
+    }
+
+    @Test
     public void changingToFourTeamsRecognizesNewEnemies() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
         Object victim = client(1, 1);

@@ -80,6 +80,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
 
     private CountDownTimer mGameCountdownTimer = null;
     private CountDownTimer mSpawnTimer = null;
+    private long mRoundStartAt;
+    private long mRoundEndAt;
 
     private SharedPreferences sharedPreferences = null;
 
@@ -146,6 +148,10 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     return;
                 mTcpServer = ((TcpServer.LocalBinder) service).getService();
                 mTcpServer.setDedicated(true);
+                Intent scheduled = mTcpServer.getScheduledGameStart();
+                if (scheduled != null)
+                    onGameStarted(scheduled);
+                mTcpServer.clearScheduledStart();
                 mTcpServer.startTcpServer();
             }
 
@@ -521,18 +527,27 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         }
         if (!mTcpServer.startGame()) {
             Log.w(TAG, "Ignoring game start before a TCP client is connected");
-            Toast.makeText(getApplicationContext(), getString(R.string.not_enough_players_toast), Toast.LENGTH_SHORT).show();
+            Toast.makeText(getApplicationContext(), mTcpServer.arePlayerClocksSynchronized()
+                    ? R.string.not_enough_players_toast : R.string.clock_sync_waiting, Toast.LENGTH_SHORT).show();
             return;
         }
-        onGameStarted();
+        // Acceptance only queues the send. Start local timers after STARTGAME
+        // confirms that the server actually notified at least one client.
     }
 
-    private void onGameStarted() {
+    private void onGameStarted(Intent start) {
         // A STARTGAME notification confirms a start the server already sent.
         // Applying it locally must not issue another start request to clients.
         if (isFinishing() || isDestroyed() || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             return;
         Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        mRoundStartAt = start.hasExtra(NetMsg.INTENT_START_AT)
+                ? start.getLongExtra(NetMsg.INTENT_START_AT, 0)
+                : SystemClock.elapsedRealtime() + Globals.getInstance().mRespawnTime * 1000;
+        mRoundEndAt = start.hasExtra(NetMsg.INTENT_START_AT)
+                ? start.getLongExtra(NetMsg.INTENT_END_AT, 0)
+                : (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0
+                        ? mRoundStartAt + Globals.getInstance().mTimeLimit * 60000L : 0;
         mStartGameButton.setEnabled(false);
         mGameModeButton.setEnabled(false);
         mGameLimitButton.setEnabled(false);
@@ -541,23 +556,28 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         if (mUDPListenerService != null)
             mUDPListenerService.allowJoin(mAllowJoinSwitch.isChecked());
         mEndGameButton.setEnabled(true);
-        if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
+        if (mRoundEndAt > 0) {
             startGameCountdown();
-        } else {
+        }
+        if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
             if (mSpawnTimer != null)
                 mSpawnTimer.cancel();
-            mSpawnTimer = new CountDownTimer(Globals.getInstance().mRespawnTime * 1000, 999) {
+            mSpawnTimer = new CountDownTimer(Math.max(0, mRoundStartAt - SystemClock.elapsedRealtime()), 999) {
 
                 public void onTick(long millisUntilFinished) {
-                    // Do nothing
+                    if (mSpawnTimer == this && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING)
+                        mGameStatusTV.setText(getString(R.string.game_start_countdown, (millisUntilFinished + 999) / 1000));
                 }
 
                 public void onFinish() {
                     if (mSpawnTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
                         return;
                     mSpawnTimer = null;
-                    mGameTimer.setBase(SystemClock.elapsedRealtime());
-                    mGameTimer.start();
+                    mGameStatusTV.setText(R.string.dedicated_game_running);
+                    if (mRoundEndAt == 0) {
+                        mGameTimer.setBase(mRoundStartAt);
+                        mGameTimer.start();
+                    }
                 }
             };
             mSpawnTimer.start();
@@ -587,6 +607,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mUDPListenerService.allowJoin(true);
         mEndGameButton.setEnabled(false);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        if (mTcpServer != null)
+            mTcpServer.clearScheduledStart();
         Globals.getInstance().mServerGameTimeRemaining = 0;
         mGameTimer.stop();
         if (mSpawnTimer != null) {
@@ -611,7 +633,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     endGame(); // Everyone else is out so game is over - this only works in FFA because we don't keep track of who and how many people are on each team
                 getPlayerDisplayData();
             } else if (NetMsg.NETMSG_STARTGAME.equals(action)) {
-                onGameStarted();
+                onGameStarted(intent);
             } else if (NetMsg.NETMSG_ENDGAME.equals(action)) {
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                     endGame();
@@ -729,7 +751,9 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private void startGameCountdown() {
         if (mGameCountdownTimer != null)
             mGameCountdownTimer.cancel();
-        mGameCountdownTimer = new CountDownTimer(((long) Globals.getInstance().mTimeLimit * 60 * 1000) + (Globals.getInstance().mRespawnTime * 1000), 1000) {
+        long remaining = Math.max(0, mRoundEndAt - SystemClock.elapsedRealtime());
+        Globals.getInstance().mServerGameTimeRemaining = remaining / 1000;
+        mGameCountdownTimer = new CountDownTimer(remaining, 1000) {
 
             public void onTick(long millisUntilFinished) {
                 if (mGameCountdownTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)

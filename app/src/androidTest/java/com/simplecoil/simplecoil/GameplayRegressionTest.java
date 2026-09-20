@@ -7,6 +7,8 @@ import android.content.BroadcastReceiver;
 import android.content.Intent;
 import android.graphics.drawable.AnimationDrawable;
 import android.os.CountDownTimer;
+import android.os.SystemClock;
+import android.widget.Chronometer;
 import android.view.View;
 import android.widget.TextView;
 
@@ -802,6 +804,156 @@ public class GameplayRegressionTest {
                     activity.onPause();
             }
         });
+    }
+
+    @Test
+    public void initialCountdownUsesHostDeadlineInsteadOfPersonalRespawnTime() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            Globals.getInstance().mRespawnTime = 90;
+            long deadline = SystemClock.elapsedRealtime() + 4000;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            String countdown = ((TextView) get(activity, "mSpawnInTV")).getText().toString();
+            assertTrue(countdown, countdown.startsWith("Game starts in "));
+            assertTrue(countdown, !countdown.contains("90"));
+            assertEquals(deadline, get(activity, "mSynchronizedStartAt"));
+            assertEquals(true, get(activity, "mGameTimerRunning"));
+        });
+    }
+
+    @Test
+    public void laterRespawnKeepsPersonalDelayAndCannotResetRoundTimer() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() - 1000;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            Object roundTimer = get(activity, "mGameCountdownTimer");
+            Globals.getInstance().mRespawnTime = 90;
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Hit");
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertTrue(((TextView) get(activity, "mSpawnInTV")).getText().toString().contains("90"));
+            assertSame(roundTimer, get(activity, "mGameCountdownTimer"));
+        });
+    }
+
+    @Test
+    public void lateUnlimitedStartUsesOriginalChronometerBase() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() - 5000;
+            receiveNetwork(activity, synchronizedStart(deadline, 0));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(deadline, ((Chronometer) get(activity, "mGameTimer")).getBase());
+            assertNull(get(activity, "mGameCountdownTimer"));
+        });
+    }
+
+    @Test
+    public void staleZeroSecondsCannotOverrideSynchronizedRejoinDeadline() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() + 10000;
+            receiveNetwork(activity, gameUpdate(7, 2, 12, 0)
+                    .putExtra(NetMsg.INTENT_START_AT, deadline).putExtra(NetMsg.INTENT_END_AT, deadline + 60000));
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(7, get(activity, "mScore"));
+            assertEquals(true, get(activity, "mGameTimerRunning"));
+        });
+    }
+
+    @Test
+    public void expiredSynchronizedStartNeverArmsBlaster() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            receiveNetwork(activity, synchronizedStart(SystemClock.elapsedRealtime() - 5000,
+                    SystemClock.elapsedRealtime() - 1000));
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+            assertNull(get(activity, "mGameCountdownTimer"));
+        });
+    }
+
+    @Test
+    public void initialCountdownCannotReceivePointsAndCancelledTimerCannotStartGame() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            receiveNetwork(activity, synchronizedStart(SystemClock.elapsedRealtime() + 10000, 0));
+            CountDownTimer countdown = (CountDownTimer) get(activity, "mSpawnTimer");
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+            assertEquals(0, get(activity, "mScore"));
+            assertEquals(0, get(activity, "mTeamScore"));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME));
+            countdown.onFinish();
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+        });
+    }
+
+    @Test
+    public void startIsRetainedUntilActivityServicesAreBound() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            Intent start = synchronizedStart(SystemClock.elapsedRealtime() + 10000, 0)
+                    .putExtra(TcpClient.EXTRA_START_EVENT_ID, 42L);
+            try {
+                Field pending = TcpClient.class.getDeclaredField("mPendingGameStartEvent");
+                pending.setAccessible(true);
+                pending.set(tcp, start);
+            } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
+            Object server = get(activity, "mTcpServer");
+            set(activity, "mTcpServer", null);
+            receiveNetwork(activity, start);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            set(activity, "mTcpServer", server);
+            boolean registered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            set(activity, "mNetworkReceiverRegistered", true);
+            try { invoke(activity, "consumePendingServerEvent"); }
+            finally { set(activity, "mNetworkReceiverRegistered", registered); }
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertNull(tcp.consumePendingGameStart(0));
+            Object timer = get(activity, "mSpawnTimer");
+            receiveNetwork(activity, start);
+            assertSame(timer, get(activity, "mSpawnTimer"));
+        });
+    }
+
+    @Test
+    public void pausedPeerHostRecoversItsOriginalDeadlineAndRejectsCancelledStart() {
+        scenario.onActivity(activity -> {
+            set(activity, "mReady", true);
+            set(activity, "mIsServer", true);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            long deadline = SystemClock.elapsedRealtime() + 10000;
+            TcpServer server = (TcpServer) get(activity, "mTcpServer");
+            try {
+                for (String fieldName : new String[]{"mScheduledStart", "mRoundSequence", "mStartAnnounced"}) {
+                    Field field = TcpServer.class.getDeclaredField(fieldName);
+                    field.setAccessible(true);
+                    if (fieldName.equals("mStartAnnounced")) field.setBoolean(server, true);
+                    else field.setLong(server, fieldName.equals("mRoundSequence") ? 1 : deadline);
+                }
+            } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
+            boolean registered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            set(activity, "mNetworkReceiverRegistered", true);
+            try { invoke(activity, "consumePendingServerEvent"); }
+            finally { set(activity, "mNetworkReceiverRegistered", registered); }
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(deadline, get(activity, "mSynchronizedStartAt"));
+            invoke(activity, "endGame");
+            set(activity, "mReady", true);
+            set(activity, "mIsServer", true);
+            receiveNetwork(activity, synchronizedStart(deadline, 0));
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+        });
+    }
+
+    private static Intent synchronizedStart(long startAt, long endAt) {
+        return new Intent(NetMsg.NETMSG_STARTGAME).putExtra(NetMsg.INTENT_START_AT, startAt)
+                .putExtra(NetMsg.INTENT_END_AT, endAt).putExtra(NetMsg.INTENT_ROUND_ID, 1L);
     }
 
     private void prepareDedicatedJoin(FullscreenActivity activity) {

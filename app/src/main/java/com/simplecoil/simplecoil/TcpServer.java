@@ -21,6 +21,7 @@ import android.content.Intent;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 
 import org.json.JSONArray;
@@ -58,6 +59,7 @@ public class TcpServer extends Service {
     // Amount of time to sleep before checking if data is available. Lower is more responsive but may gobble up more CPU time
     public static final int TCP_READ_WAIT_MS = 200;
     public static final int TCP_DEDICATED_READ_WAIT_MS = 100;
+    static final int CLOCK_READ_WAIT_MS = 10;
     public static final String TCP_SERVER_PING = "ping";
 
     public static final String TCPMESSAGE_PREFIX = NetMsg.MESSAGE_PREFIX + NetMsg.NETWORK_VERSION;
@@ -93,6 +95,13 @@ public class TcpServer extends Service {
     public static final String JSON_PLAYERELIMINATED = "eliminated";
     public static final String JSON_TEAMPOINTS = "teampoints";
     public static final String JSON_TIMEREMAINING = "timeremaining";
+    static final String JSON_CLOCK_REQUEST = "clocksync";
+    static final String JSON_CLOCK_RECEIVE = "clockreceive";
+    static final String JSON_CLOCK_SEND = "clocksend";
+    static final String JSON_CLOCK_READY = "clockready";
+    static final String JSON_GAMESTART = "gamestart";
+    static final String JSON_GAMEDURATION = "gameduration";
+    static final String JSON_ROUND_ID = "roundid";
     public static final String JSON_PLAYERGAMEUPDATE = "playergameupdate";
 
     public static final String JSON_PLAYERSETTINGS = "playersettings";
@@ -118,6 +127,13 @@ public class TcpServer extends Service {
     private boolean mDestroyed;
     // Guarded by mServerStateLock from scheduling through cleanup completion.
     private boolean mEndingGame;
+    private boolean mStartingGame;
+    // Retained until round cleanup, including the gap before the UI receives STARTGAME.
+    private boolean mStartAnnounced;
+    private long mScheduledStart = -1;
+    private long mScheduledDuration;
+    private long mRoundSequence;
+    private volatile long mClockSamplingUntil;
     private ServerSocket mListenSocket;
     private volatile Thread mServerThread = null;
     private volatile Thread mClientThread = null;
@@ -205,16 +221,22 @@ public class TcpServer extends Service {
         }
     }
 
+    private enum RoundTask { NONE, START, END }
+
     private boolean runClientTask(Runnable action) {
-        return runClientTask(action, false);
+        return runClientTask(action, RoundTask.NONE);
     }
 
-    private boolean runClientTask(Runnable action, boolean endsRound) {
+    private boolean runClientTask(Runnable action, RoundTask roundTask) {
+        final boolean endsRound = roundTask == RoundTask.END;
+        final boolean startsRound = roundTask == RoundTask.START;
         synchronized (mServerStateLock) {
             if (!keepListening || mDestroyed || (endsRound && mEndingGame))
                 return false;
             if (endsRound)
                 mEndingGame = true;
+            if (startsRound)
+                mStartingGame = true;
             Thread task = new Thread(() -> {
                 boolean acquired = false;
                 try {
@@ -239,6 +261,8 @@ public class TcpServer extends Service {
                         // release this reservation so a later round can start.
                         if (endsRound)
                             mEndingGame = false;
+                        if (startsRound)
+                            mStartingGame = false;
                         mClientTasks.remove(Thread.currentThread());
                     }
                 }
@@ -322,23 +346,48 @@ public class TcpServer extends Service {
         boolean hasPlayers = false;
         for (ClientRecipient recipient : recipients) {
             if (recipient.canStartGame()) {
+                if (!recipient.client.clockSynchronized)
+                    return false;
                 hasPlayers = true;
-                break;
             }
         }
         if (!hasPlayers)
             return false;
         synchronized (mServerStateLock) {
-            if (mEndingGame)
+            if (!keepListening || mDestroyed || mEndingGame
+                    || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                 return false;
+            // Repeated clicks and remote requests share the pending start instead
+            // of scheduling duplicate sends or resetting a confirmed countdown.
+            if (mStartingGame || mStartAnnounced)
+                return true;
             return runClientTask(() -> {
                 // Send to clients before confirming the start locally. A queued
                 // end takes precedence over a start that has not been delivered.
-                String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME;
+                for (ClientRecipient recipient : recipients) {
+                    if (recipient.canStartGame() && !recipient.client.clockSynchronized)
+                        return;
+                }
+                final long startAt;
+                final long duration;
+                final long roundID;
+                synchronized (mServerStateLock) {
+                    if (!isClientTaskActive() || mEndingGame
+                            || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                        return;
+                    long countdown = Math.max(Globals.MIN_RESPAWN_TIME_SECONDS,
+                            Math.min(Globals.MAX_RESPAWN_TIME_SECONDS, Globals.getInstance().mRespawnTime));
+                    startAt = SystemClock.elapsedRealtime() + countdown * 1000;
+                    duration = (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0
+                            ? Math.max(0, Math.min(Globals.MAX_GAME_LIMIT, Globals.getInstance().mTimeLimit)) * 60000L : 0;
+                    roundID = ++mRoundSequence;
+                }
+                String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + createStartInfo(roundID, startAt, duration);
                 boolean delivered = false;
                 for (ClientRecipient recipient : recipients) {
                     synchronized (mServerStateLock) {
-                        if (!isClientTaskActive() || mEndingGame)
+                        if (!isClientTaskActive() || mEndingGame
+                                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                             return;
                     }
                     if (recipient.canStartGame())
@@ -347,13 +396,61 @@ public class TcpServer extends Service {
                 if (!delivered)
                     return;
                 synchronized (mServerStateLock) {
-                    if (!isClientTaskActive() || mEndingGame)
+                    if (!isClientTaskActive() || mEndingGame
+                            || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                         return;
-                    sendBroadcast(new Intent(NetMsg.NETMSG_STARTGAME));
+                    mScheduledStart = startAt;
+                    mScheduledDuration = duration;
+                    mStartAnnounced = true;
+                    sendBroadcast(getScheduledGameStart());
                     if (!mIsDedicated)
                         keepListening = false;
                 }
-            });
+            }, RoundTask.START);
+        }
+    }
+
+    public boolean arePlayerClocksSynchronized() {
+        for (ClientRecipient recipient : getClientRecipients()) {
+            if (recipient.canStartGame() && !recipient.client.clockSynchronized)
+                return false;
+        }
+        return true;
+    }
+
+    Intent getScheduledGameStart() {
+        synchronized (mServerStateLock) {
+            if (mDestroyed || !mStartAnnounced || mScheduledStart < 0)
+                return null;
+            return new Intent(NetMsg.NETMSG_STARTGAME)
+                    .putExtra(NetMsg.INTENT_START_AT, mScheduledStart)
+                    .putExtra(NetMsg.INTENT_END_AT, mScheduledDuration == 0 ? 0 : mScheduledStart + mScheduledDuration)
+                    .putExtra(NetMsg.INTENT_ROUND_ID, mRoundSequence);
+        }
+    }
+
+    void clearScheduledStart() {
+        synchronized (mServerStateLock) {
+            if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
+                mStartAnnounced = false;
+                mScheduledStart = -1;
+                mScheduledDuration = 0;
+            }
+        }
+    }
+
+    private boolean hasRoundStarted() {
+        synchronized (mServerStateLock) {
+            return mScheduledStart < 0 || SystemClock.elapsedRealtime() >= mScheduledStart;
+        }
+    }
+
+    static JSONObject createStartInfo(long roundID, long startAt, long duration) {
+        try {
+            return new JSONObject().put(JSON_ROUND_ID, roundID)
+                    .put(JSON_GAMESTART, startAt).put(JSON_GAMEDURATION, duration);
+        } catch (JSONException e) {
+            throw new IllegalArgumentException("Invalid game start", e);
         }
     }
 
@@ -420,10 +517,14 @@ public class TcpServer extends Service {
                 Globals.getInstance().mGrenadePairingsSemaphore.release();
             }
             synchronized (mServerStateLock) {
-                if (isClientTaskActive())
+                if (isClientTaskActive()) {
+                    mStartAnnounced = false;
+                    mScheduledStart = -1;
+                    mScheduledDuration = 0;
                     sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
+                }
             }
-        }, true);
+        }, RoundTask.END);
     }
 
     private Map<Byte, InetAddress> getTeamIPMapSnapshot() {
@@ -522,6 +623,18 @@ public class TcpServer extends Service {
             game.put(JSON_ALLOWPLAYERSETTINGS, Globals.getInstance().mAllowPlayerSettings);
             game.put(JSON_PLAYERSETTINGS, getPlayerSettings(id, false));
             game.put(JSON_ONLY_SERVER_SETTINGS, Globals.getInstance().mOnlyServerSettings);
+            synchronized (mServerStateLock) {
+                if (mScheduledStart >= 0 && (mStartAnnounced
+                        || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)) {
+                    game.put(JSON_ROUND_ID, mRoundSequence);
+                    game.put(JSON_GAMESTART, mScheduledStart);
+                    game.put(JSON_GAMEDURATION, mScheduledDuration);
+                    // The UI broadcast may not have run yet. A committed start
+                    // must not be overwritten by an apparent lobby snapshot.
+                    if (mIsDedicated)
+                        game.put(JSON_GAMESTATE, Globals.GAME_STATE_RUNNING);
+                }
+            }
             final String allMessage = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
             if (id == SEND_ALL)
                 sendTCPMessageAll(allMessage, false, recipients);
@@ -800,6 +913,9 @@ public class TcpServer extends Service {
                 return;
             }
             keepListening = true;
+            mStartAnnounced = false;
+            mScheduledStart = -1;
+            mScheduledDuration = 0;
             mServerThread = new Thread(this::runTcpServer, "SimpleCoil TCP server");
             mServerThread.start();
         }
@@ -975,6 +1091,8 @@ public class TcpServer extends Service {
         private TcpMessageReader messageReader = new TcpMessageReader();
         private volatile DataOutputStream out = null;
         private volatile boolean connectionFailed;
+        private volatile boolean clockSynchronized;
+        private long idleTick;
         private Queue<String> messageQueue;
         private volatile int points = 0;
         private volatile int eliminated = 0;
@@ -988,6 +1106,8 @@ public class TcpServer extends Service {
             clientSocket = s;
             clientID = cID;
             noReadCount = 0;
+            clockSynchronized = false;
+            idleTick = 0;
             messageReader = new TcpMessageReader();
             if (messageQueue == null)
                 messageQueue = new LinkedList<>();
@@ -1100,7 +1220,7 @@ public class TcpServer extends Service {
                     stopTcpServer();
                     return;
                 }
-                long startTime = System.currentTimeMillis();
+                long startTime = SystemClock.elapsedRealtime();
                 try {
                     if (!keepListening)
                         return;
@@ -1117,6 +1237,7 @@ public class TcpServer extends Service {
                                     : entry.getValue().messageReader.poll(entry.getValue().in);
                             if (message != null) {
                                 entry.getValue().noReadCount = 0;
+                                entry.getValue().idleTick = SystemClock.elapsedRealtime();
                                 if (!message.equals(TcpClient.TCP_CLIENT_PONG)) {
                                     Log.i(TAG, "received: '" + message + "' from " + entry.getValue().clientID);
                                     if (message.startsWith(TCPMESSAGE_PREFIX)) {
@@ -1144,6 +1265,7 @@ public class TcpServer extends Service {
                                                 break;
                                             } else if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
                                                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                                                        || !hasRoundStarted()
                                                         || entry.getValue().mPlayerID <= 0
                                                         || !Globals.isValidPlayerID(entry.getValue().mPlayerID)) {
                                                     Log.w(TAG, "Ignoring elimination outside an active, registered game");
@@ -1187,7 +1309,9 @@ public class TcpServer extends Service {
                                                         || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
                                                     Log.w(TAG, "Ignoring disallowed or duplicate game-start request");
                                                 } else {
-                                                    startGame();
+                                                    if (!startGame() && !arePlayerClocksSynchronized())
+                                                        entry.getValue().sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_MESG
+                                                                + NetMsg.NETMSG_CLOCKSYNCWAITING);
                                                 }
                                             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
                                                 if (Globals.getInstance().mOnlyServerSettings) {
@@ -1208,6 +1332,12 @@ public class TcpServer extends Service {
                                     }
                                 }
                             } else {
+                                // Faster clock sampling must not speed up ping/disconnect timeouts.
+                                long now = SystemClock.elapsedRealtime();
+                                int readWait = mIsDedicated ? TCP_DEDICATED_READ_WAIT_MS : TCP_READ_WAIT_MS;
+                                if (now - entry.getValue().idleTick < readWait)
+                                    continue;
+                                entry.getValue().idleTick = now;
                                 entry.getValue().noReadCount++;
                                 if (entry.getValue().out != null && entry.getValue().noReadCount >= 35) {
                                     Log.d(TAG, "no reply so dropping client " + entry.getValue().clientID);
@@ -1232,10 +1362,10 @@ public class TcpServer extends Service {
                 } finally {
                     mClientDataSemaphore.release();
                 }
-                long sleepTime = TCP_READ_WAIT_MS - (System.currentTimeMillis() - startTime);
-                if (mIsDedicated)
-                    sleepTime = TCP_DEDICATED_READ_WAIT_MS - (System.currentTimeMillis() - startTime);
-                //Log.d(TAG, "Took " + (System.currentTimeMillis() - startTime) + "ms to service " + mClientData.size() + " clients");
+                int readWait = mIsDedicated ? TCP_DEDICATED_READ_WAIT_MS : TCP_READ_WAIT_MS;
+                if (SystemClock.elapsedRealtime() < mClockSamplingUntil)
+                    readWait = CLOCK_READ_WAIT_MS;
+                long sleepTime = readWait - (SystemClock.elapsedRealtime() - startTime);
                 sleep(sleepTime);
             }
         }
@@ -1270,11 +1400,34 @@ public class TcpServer extends Service {
         }
 
         private void parsePlayerInfo(String message, ClientData client) {
+            final long receivedAt = SystemClock.elapsedRealtime();
             JSONObject player;
             try {
                 player = TcpJson.parseObject(message);
             } catch (JSONException e) {
                 e.printStackTrace();
+                return;
+            }
+            if (player.has(JSON_CLOCK_REQUEST) || player.has(JSON_CLOCK_READY)) {
+                if (client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)
+                        || client.clientSocket == null)
+                    return;
+                try {
+                    if (player.has(JSON_CLOCK_REQUEST)) {
+                        long sentAt = TcpJson.getLong(player, JSON_CLOCK_REQUEST);
+                        if (!GameClock.validTimestamp(sentAt))
+                            return;
+                        mClockSamplingUntil = receivedAt + GameClock.MAX_ROUND_TRIP_MS;
+                        JSONObject reply = new JSONObject().put(JSON_CLOCK_REQUEST, sentAt)
+                                .put(JSON_CLOCK_RECEIVE, receivedAt)
+                                .put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime());
+                        client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply);
+                    } else if (Boolean.TRUE.equals(player.get(JSON_CLOCK_READY))) {
+                        client.clockSynchronized = true;
+                    }
+                } catch (JSONException e) {
+                    Log.w(TAG, "Ignoring invalid clock synchronization request", e);
+                }
                 return;
             }
             if (player.has(JSON_PAIRED_GRENADE_ID)) {

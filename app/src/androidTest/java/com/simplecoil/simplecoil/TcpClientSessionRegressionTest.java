@@ -192,7 +192,12 @@ public class TcpClientSessionRegressionTest {
     @Test
     public void registeredProtocolStillDeliversGameEvents() throws Exception {
         connect();
-        send(control(NetMsg.NETMSG_STARTGAME), control(NetMsg.NETMSG_ELIMINATED + "9"),
+        Field dedicated = TcpClient.class.getDeclaredField("mIsDedicatedServer");
+        dedicated.setAccessible(true);
+        dedicated.set(client, true);
+        send(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                        + TcpServer.createStartInfo(1, SystemClock.elapsedRealtime() + 10000, 60000),
+                control(NetMsg.NETMSG_ELIMINATED + "9"),
                 control(NetMsg.NETMSG_TEAMELIMINATED), TcpServer.TCP_SERVER_PING);
         expectPong();
         assertTrue(client.actions.contains(NetMsg.NETMSG_STARTGAME));
@@ -409,6 +414,45 @@ public class TcpClientSessionRegressionTest {
                 + TcpServer.TCPPREFIX_JSON.length()));
         assertEquals(expected, pairing.getInt(TcpServer.JSON_PAIRED_GRENADE_ID));
         assertEquals(Globals.getInstance().mPlayerID, pairing.getInt(TcpServer.JSON_PLAYERID));
+        synchronizeClock();
+    }
+
+    private void synchronizeClock() throws Exception {
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC; i++) {
+            String frame = received.readUTF();
+            long receivedAt = SystemClock.elapsedRealtime();
+            JSONObject request = new JSONObject(frame.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                    + TcpServer.TCPPREFIX_JSON.length()));
+            request.put(TcpServer.JSON_CLOCK_RECEIVE, receivedAt)
+                    .put(TcpServer.JSON_CLOCK_SEND, SystemClock.elapsedRealtime());
+            send(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + request);
+        }
+        assertTrue(received.readUTF().contains(TcpServer.JSON_CLOCK_READY));
+        assertTrue(client.isClockSynchronized());
+    }
+
+    @Test
+    public void startWithoutDeadlineIsIgnoredBySynchronizedProtocol() throws Exception {
+        connect();
+        send(control(NetMsg.NETMSG_STARTGAME), TcpServer.TCP_SERVER_PING);
+        expectPong();
+        assertFalse(client.actions.contains(NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void peerStartStopsReconnectAndSurvivesUntilPausedActivityResumes() throws Exception {
+        connect();
+        long startAt = SystemClock.elapsedRealtime() + 10000;
+        send(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + TcpServer.createStartInfo(1, startAt, 60000));
+        assertTrue("Peer start tried to reconnect without an activity", awaitStopped(1500));
+        assertEquals(-1, peer.getInputStream().read());
+        Intent pending = client.consumePendingGameStart(0);
+        assertNotNull(pending);
+        assertEquals(NetMsg.NETMSG_STARTGAME, pending.getAction());
+        // Real loopback sampling has scheduler jitter, but must preserve the deadline.
+        assertTrue(Math.abs(startAt - pending.getLongExtra(NetMsg.INTENT_START_AT, 0)) < 250);
+        assertFalse(client.actions.contains(NetMsg.NETMSG_SERVERCANCEL));
     }
 
     private void send(String... messages) throws Exception {

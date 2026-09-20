@@ -288,14 +288,55 @@ public class DedicatedServerRegressionTest {
     }
 
     @Test
-    public void localStartRequestsOnceAndItsAcknowledgementDoesNotRestartTheTimer() {
+    public void localStartWaitsForAcknowledgementBeforeStartingTheRound() {
         scenario.onActivity(current -> {
             invoke("startGame");
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull("A queued send is not a confirmed round start", get("mSpawnTimer"));
+            assertTrue(button(R.id.start_game_button).isEnabled());
+            receive(NetMsg.NETMSG_STARTGAME);
             CountDownTimer first = (CountDownTimer) get("mSpawnTimer");
             receive(NetMsg.NETMSG_STARTGAME);
             assertEquals(1, tcp.gameStarts);
             assertNotNull(first);
             assertSame(first, get("mSpawnTimer"));
+        });
+    }
+
+    @Test
+    public void queuedStartDoesNotConsumeTheTimedRoundBeforeClientsAreNotified() {
+        scenario.onActivity(current -> {
+            Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
+            Globals.getInstance().mTimeLimit = 5;
+            Globals.getInstance().mServerGameTimeRemaining = 0;
+            invoke("startGame");
+            assertNull("The timed round started before network delivery", get("mGameCountdownTimer"));
+            assertEquals(0, Globals.getInstance().mServerGameTimeRemaining);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            receive(NetMsg.NETMSG_STARTGAME);
+            assertNotNull(get("mGameCountdownTimer"));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(1, tcp.gameStarts);
+        });
+    }
+
+    @Test
+    public void unconfirmedStartCanBeRetriedInsteadOfLeavingTheHostInAPhantomRound() {
+        scenario.onActivity(current -> {
+            invoke("startGame");
+            // The queued write failed and therefore produced no STARTGAME event.
+            tcp.acceptStart = false;
+            invoke("startGame");
+            assertEquals(2, tcp.gameStarts);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get("mSpawnTimer"));
+            assertTrue(button(R.id.start_game_button).isEnabled());
+            tcp.acceptStart = true;
+            invoke("startGame");
+            receive(NetMsg.NETMSG_STARTGAME);
+            assertEquals(3, tcp.gameStarts);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertNotNull(get("mSpawnTimer"));
         });
     }
 
@@ -662,6 +703,35 @@ public class DedicatedServerRegressionTest {
     private String connectionField(boolean isTcp) { return isTcp ? "mTcpServerServiceConnection" : "mUDPServiceConnection"; }
     private String boundField(boolean isTcp) { return isTcp ? "mTcpServerServiceBound" : "mUDPServiceBound"; }
     private Button button(int id) { return activity.findViewById(id); }
+
+    @Test
+    public void synchronizedHostCountdownUsesBroadcastDeadline() {
+        scenario.onActivity(current -> {
+            long deadline = SystemClock.elapsedRealtime() + 4000;
+            Globals.getInstance().mRespawnTime = 90;
+            ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity,
+                    new Intent(NetMsg.NETMSG_STARTGAME).putExtra(NetMsg.INTENT_START_AT, deadline)
+                            .putExtra(NetMsg.INTENT_END_AT, deadline + 60000));
+            assertEquals(deadline, get("mRoundStartAt"));
+            assertEquals(deadline + 60000, get("mRoundEndAt"));
+            assertNotNull(get("mSpawnTimer"));
+            assertNotNull(get("mGameCountdownTimer"));
+            assertTrue(Globals.getInstance().mServerGameTimeRemaining <= 64);
+            assertTrue(Globals.getInstance().mServerGameTimeRemaining >= 60);
+        });
+    }
+
+    @Test
+    public void delayedUnlimitedHostStartUsesOriginalChronometerBase() {
+        scenario.onActivity(current -> {
+            long deadline = SystemClock.elapsedRealtime() - 5000;
+            ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity,
+                    new Intent(NetMsg.NETMSG_STARTGAME).putExtra(NetMsg.INTENT_START_AT, deadline)
+                            .putExtra(NetMsg.INTENT_END_AT, 0L));
+            assertNull(get("mSpawnTimer"));
+            assertEquals(deadline, ((android.widget.Chronometer) get("mGameTimer")).getBase());
+        });
+    }
 
     private void receive(String action) {
         ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity, new Intent(action));

@@ -20,7 +20,7 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "06";
+    public static final String NETWORK_VERSION = "07";
 
     // All of these messages are straightforward and contain no extra data
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
@@ -29,6 +29,7 @@ public class NetMsg {
     public static final String NETMSG_ELIMINATED = "ELIMINATED";
     public static final String NETMSG_LEAVE = "LEAVE";
     public static final String NETMSG_STARTGAME = "STARTGAME";
+    public static final String NETMSG_CLOCKSYNCWAITING = "CLOCKSYNCWAITING";
     public static final String NETMSG_ENDGAME = "ENDGAME";
     public static final String NETMSG_ERROR = "ERROR";
     public static final String NETMSG_FAILEDTOJOIN = "FAILEDTOJOIN";
@@ -55,6 +56,9 @@ public class NetMsg {
     public static final String INTENT_ELIMINATIONS = "ELIMINATIONS";
     public static final String INTENT_TIMEREMAINING = "TIMEREMAINING";
     public static final String INTENT_GAMESTATE = "GAMESTATE";
+    public static final String INTENT_START_AT = "START_AT_ELAPSED";
+    public static final String INTENT_END_AT = "END_AT_ELAPSED";
+    public static final String INTENT_ROUND_ID = "ROUND_ID";
 
     public static final String INTENT_LONGITUDE = "longitude";
     public static final String INTENT_LATITUDE = "latitude";

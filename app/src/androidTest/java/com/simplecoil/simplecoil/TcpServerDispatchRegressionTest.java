@@ -381,6 +381,103 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void repeatedStartRequestsOnlyQueueOneSend() throws Exception {
+        clientsLock.acquire();
+        List<Thread> tasks;
+        try {
+            assertTrue(server.startGame());
+            queuedWorker();
+            assertTrue(server.startGame());
+            assertTrue(server.startGame());
+            tasks = captureClientTasks();
+            assertEquals("Repeated starts queued duplicate network sends", 1, tasks.size());
+        } finally { clientsLock.release(); }
+        for (Thread task : tasks) {
+            task.join(1000);
+            assertFalse(task.isAlive());
+        }
+        DataInputStream messages = new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray()));
+        assertStartFrame(messages.readUTF());
+        assertEquals("A player received multiple starts for one round", 0, messages.available());
+        assertEquals(1, java.util.Collections.frequency(server.events, NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void interruptedStartReleasesItsReservationForRetry() throws Exception {
+        assertInterruptedSend(() -> assertTrue(server.startGame()));
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertEquals(1, java.util.Collections.frequency(server.events, NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void confirmedStartIsNotSentAgainBeforeTheHostProcessesItsBroadcast() throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        int bytesSent = sockets.get(0).bytes.size();
+        assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+        clientsLock.acquire();
+        try {
+            assertTrue(server.startGame());
+            assertTrue("The pending UI confirmation allowed a duplicate start", captureClientTasks().isEmpty());
+        } finally { clientsLock.release(); }
+        assertEquals(bytesSent, sockets.get(0).bytes.size());
+        assertEquals(1, java.util.Collections.frequency(server.events, NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void completedRoundCleanupAllowsTheNextRoundToStart() throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        dispatchThenChange(server::endGame, () -> { });
+        MemorySocket nextRound = new MemorySocket();
+        addClient(1, nextRound);
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertTrue(nextRound.bytes.size() > 0);
+        assertEquals(2, java.util.Collections.frequency(server.events, NetMsg.NETMSG_STARTGAME));
+        assertEquals(1, java.util.Collections.frequency(server.events, NetMsg.NETMSG_ENDGAME));
+    }
+
+    @Test
+    public void failedStartWriteReleasesItsReservationForRetry() throws Exception {
+        set(clients.get(1), "out", new DataOutputStream(new OutputStream() {
+            @Override public void write(int value) throws IOException { throw new IOException("Disconnected"); }
+        }));
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertTrue(server.events.isEmpty());
+        MemorySocket replacement = new MemorySocket();
+        addClient(1, replacement);
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertEquals(1, java.util.Collections.frequency(server.events, NetMsg.NETMSG_STARTGAME));
+        assertTrue(replacement.bytes.size() > 0);
+    }
+
+    @Test
+    public void activeRoundRejectsAnotherStartRequest() throws Exception {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        clientsLock.acquire();
+        try {
+            boolean accepted = server.startGame();
+            captureClientTasks();
+            assertFalse("A running round accepted another start", accepted);
+        } finally { clientsLock.release(); }
+    }
+
+    @Test
+    public void queuedStartCannotRestartARoundThatBecameActive() throws Exception {
+        assertQueuedStartDoesNotRestart(Globals.GAME_STATE_RUNNING);
+    }
+
+    @Test
+    public void queuedStartCannotRestartARoundWhileTheHostIsSpawning() throws Exception {
+        assertQueuedStartDoesNotRestart(Globals.GAME_STATE_ELIMINATED);
+    }
+
+    private void assertQueuedStartDoesNotRestart(int state) throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> Globals.getInstance().mGameState = state);
+        assertEquals("An obsolete start command was sent to players", 0, sockets.get(0).bytes.size());
+        assertTrue("An obsolete start was confirmed to the host", server.events.isEmpty());
+        assertEquals(state, Globals.getInstance().mGameState);
+    }
+
+    @Test
     public void endRequestDuringSharedStateCleanupDoesNotQueueAnotherEnd() throws Exception {
         Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
         clientsLock.acquire();
@@ -493,8 +590,7 @@ public class TcpServerDispatchRegressionTest {
         } finally { clientsLock.release(); }
         worker.join(1000);
         assertFalse(worker.isAlive());
-        assertEquals(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME,
-                new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
+        assertStartFrame(new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
         assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
         assertEquals(1, clientsLock.availablePermits());
     }
@@ -645,8 +741,7 @@ public class TcpServerDispatchRegressionTest {
         addClient(2, 0, unregistered);
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         assertEquals("An unregistered connection received a start command", 0, unregistered.bytes.size());
-        assertEquals(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME,
-                new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
+        assertStartFrame(new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
         assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
     }
 
@@ -813,6 +908,135 @@ public class TcpServerDispatchRegressionTest {
         method.invoke(server, "team", (byte) 1, includePlayer, queueFailed);
     }
 
+    @Test
+    public void unsynchronizedRegisteredPlayerBlocksStartUntilAcknowledgement() throws Exception {
+        set(clients.get(1), "clockSynchronized", false);
+        assertFalse(server.arePlayerClocksSynchronized());
+        assertFalse(server.startGame());
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, "true"));
+        assertFalse("String true must not acknowledge clock sync", server.startGame());
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+        assertTrue(server.arePlayerClocksSynchronized());
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void everyConnectedPlayerMustHaveASynchronizedClock() throws Exception {
+        addClient(2, new MemorySocket());
+        set(clients.get(2), "clockSynchronized", false);
+        assertFalse(server.startGame());
+        closeClient(2);
+        assertTrue(server.arePlayerClocksSynchronized());
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+    }
+
+    @Test
+    public void clockRequestEchoesTimestampAndIncludesMonotonicHostTimes() throws Exception {
+        long before = SystemClock.elapsedRealtime();
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 123456));
+        JSONObject reply = readJson(sockets.get(0));
+        assertEquals(123456, reply.getLong(TcpServer.JSON_CLOCK_REQUEST));
+        long received = reply.getLong(TcpServer.JSON_CLOCK_RECEIVE);
+        long sent = reply.getLong(TcpServer.JSON_CLOCK_SEND);
+        assertTrue(received >= before);
+        assertTrue(sent >= received);
+        assertTrue(sent <= SystemClock.elapsedRealtime());
+    }
+
+    @Test
+    public void unregisteredOrMalformedClockRequestDoesNotGetAResponse() throws Exception {
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, -1));
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, "123"));
+        assertEquals(0, sockets.get(0).bytes.size());
+        addClient(2, 0, new MemorySocket());
+        parseClock(2, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 123));
+        assertEquals(0, sockets.get(1).bytes.size());
+    }
+
+    @Test
+    public void hostAndAllPlayersReceiveTheSameStartAndEndDeadlines() throws Exception {
+        addClient(2, new MemorySocket());
+        int originalTime = Globals.getInstance().mTimeLimit;
+        try {
+            Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
+            Globals.getInstance().mTimeLimit = 5;
+            dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+            JSONObject first = readJson(sockets.get(0));
+            JSONObject second = readJson(sockets.get(1));
+            Intent host = server.notifications.get(0);
+            assertEquals(first.toString(), second.toString());
+            assertEquals(first.getLong(TcpServer.JSON_GAMESTART), host.getLongExtra(NetMsg.INTENT_START_AT, 0));
+            assertEquals(first.getLong(TcpServer.JSON_GAMESTART) + 300000,
+                    host.getLongExtra(NetMsg.INTENT_END_AT, 0));
+            assertEquals(first.getLong(TcpServer.JSON_ROUND_ID), host.getLongExtra(NetMsg.INTENT_ROUND_ID, 0));
+        } finally { Globals.getInstance().mTimeLimit = originalTime; }
+    }
+
+    @Test
+    public void reconnectRequiresClockResynchronizationBeforeQueuedStart() throws Exception {
+        MemorySocket replacement = new MemorySocket();
+        sockets.add(replacement);
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> {
+            Object client = clients.get(1);
+            Method rejoin = client.getClass().getDeclaredMethod("rejoin", Socket.class);
+            rejoin.setAccessible(true);
+            rejoin.invoke(client, replacement);
+        });
+        assertEquals(0, replacement.bytes.size());
+        assertTrue(server.events.isEmpty());
+        assertFalse(server.arePlayerClocksSynchronized());
+    }
+
+    @Test
+    public void committedStartIsNotAdvertisedAsLobbyBeforeHostUiReceivesIt() throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+        sockets.get(0).bytes.reset();
+        dispatchThenChange(() -> server.sendAllGameInfo(TcpServer.SEND_ALL), () -> { });
+        JSONObject roster = readJson(sockets.get(0));
+        assertEquals(Globals.GAME_STATE_RUNNING, roster.getInt(TcpServer.JSON_GAMESTATE));
+        assertEquals(server.getScheduledGameStart().getLongExtra(NetMsg.INTENT_START_AT, 0),
+                roster.getLong(TcpServer.JSON_GAMESTART));
+    }
+
+    @Test
+    public void pausedPeerHostCanRecoverItsStartAfterLobbyConnectionCloses() throws Exception {
+        server.setDedicated(false);
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        Intent scheduled = server.getScheduledGameStart();
+        assertTrue(scheduled != null);
+        assertEquals(server.notifications.get(0).getLongExtra(NetMsg.INTENT_START_AT, 0),
+                scheduled.getLongExtra(NetMsg.INTENT_START_AT, 0));
+        server.clearScheduledStart();
+        assertTrue(server.getScheduledGameStart() == null);
+    }
+
+    private void parseClock(int connection, JSONObject json) throws Exception {
+        Constructor<?> constructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
+                .getDeclaredConstructor(TcpServer.class);
+        constructor.setAccessible(true);
+        Object handler = constructor.newInstance(server);
+        Object client = clients.get(connection);
+        Method parser = handler.getClass().getDeclaredMethod("parsePlayerInfo", String.class, client.getClass());
+        parser.setAccessible(true);
+        parser.invoke(handler, json.toString(), client);
+    }
+
+    private JSONObject readJson(MemorySocket socket) throws Exception {
+        String message = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray())).readUTF();
+        assertTrue(message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
+        return new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length()));
+    }
+
+    private void assertStartFrame(String frame) throws Exception {
+        assertTrue(frame.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
+        JSONObject start = new JSONObject(frame.substring(TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length()));
+        assertTrue(start.getLong(TcpServer.JSON_ROUND_ID) > 0);
+        assertTrue(start.getLong(TcpServer.JSON_GAMESTART) > 0);
+        assertEquals(0, start.getLong(TcpServer.JSON_GAMEDURATION));
+    }
+
     private void addClient(int playerID, MemorySocket socket) throws Exception {
         addClient(playerID, playerID, socket);
     }
@@ -827,6 +1051,7 @@ public class TcpServerDispatchRegressionTest {
         initialize.setAccessible(true);
         assertTrue((boolean) initialize.invoke(client, socket, connectionID));
         set(client, "mPlayerID", (byte) playerID);
+        set(client, "clockSynchronized", true);
         clients.put(connectionID, client);
         if (playerID == 0) return;
         InetAddress address = InetAddress.getByAddress(new byte[]{127, 0, 0, (byte) connectionID});
@@ -878,7 +1103,11 @@ public class TcpServerDispatchRegressionTest {
 
     private static final class RecordingServer extends TcpServer {
         final CopyOnWriteArrayList<String> events = new CopyOnWriteArrayList<>();
-        @Override public void sendBroadcast(Intent intent) { events.add(intent.getAction()); }
+        final CopyOnWriteArrayList<Intent> notifications = new CopyOnWriteArrayList<>();
+        @Override public void sendBroadcast(Intent intent) {
+            notifications.add(new Intent(intent));
+            events.add(intent.getAction());
+        }
     }
 
     private static class MemorySocket extends Socket {
