@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import static org.junit.Assert.*;
 
@@ -154,6 +155,23 @@ public class UDPDispatchRegressionTest {
         service.sendUDPMessageAll(NetMsg.NETMSG_SHOTFIRED);
         assertMessage(originalPeer, NetMsg.NETMSG_SHOTFIRED);
         assertMessage(laterPeer, NetMsg.NETMSG_SHOTFIRED);
+    }
+
+    @Test
+    public void combatBurstUsesOneBoundedSenderQueue() throws Exception {
+        Thread sender;
+        synchronized (sendLock) {
+            sender = queue(() -> service.sendUDPMessageAll(NetMsg.NETMSG_SHOTFIRED));
+            for (int count = 0; count < UDPListenerService.MAX_PENDING_DATAGRAM_SENDS * 4; count++)
+                service.sendUDPMessageAll(NetMsg.NETMSG_SHOTFIRED);
+
+            Field field = UDPListenerService.class.getDeclaredField("mSendExecutor");
+            field.setAccessible(true);
+            ThreadPoolExecutor executor = (ThreadPoolExecutor) field.get(service);
+            assertEquals(1, executor.getPoolSize());
+            assertTrue(executor.getQueue().size() <= UDPListenerService.MAX_PENDING_DATAGRAM_SENDS);
+        }
+        await(sender);
     }
 
     // The caller holds the send lock, so the new worker cannot finish early.

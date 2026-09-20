@@ -39,8 +39,11 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 public class UDPListenerService extends Service {
     private static final String TAG = "UDPSvc";
@@ -59,7 +62,17 @@ public class UDPListenerService extends Service {
     private InetAddress mBroadcastAddress = null;
 
     private static final long LISTENER_START_TIMEOUT_MS = 5000;
+    // Combat messages can arrive much faster than a congested Wi-Fi link can
+    // transmit them. Keep the sender bounded so a stalled socket cannot create
+    // an unbounded number of Java threads or queued packet snapshots.
+    static final int MAX_PENDING_DATAGRAM_SENDS = 64;
+    private static final long SEND_THREAD_KEEP_ALIVE_MS = 100;
     private final Object mSendLock = new Object();
+    private final ThreadPoolExecutor mSendExecutor = new ThreadPoolExecutor(0, 1,
+            SEND_THREAD_KEEP_ALIVE_MS, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(MAX_PENDING_DATAGRAM_SENDS),
+            runnable -> new Thread(runnable, "SimpleCoil UDP send"),
+            new ThreadPoolExecutor.DiscardOldestPolicy());
     private volatile boolean keepListening = false;
     private volatile boolean doneListening = true;
     private volatile boolean mIsListService = false;
@@ -623,7 +636,7 @@ public class UDPListenerService extends Service {
                                long generation) {
         if (recipients.isEmpty() || !isCurrentSend(generation))
             return;
-        Thread sendThread = new Thread(() -> {
+        Runnable sendTask = () -> {
             synchronized (mSendLock) {
                 for (int repeat = 0; repeat < repeatCount; repeat++) {
                     for (InetAddress ip : recipients) {
@@ -641,8 +654,14 @@ public class UDPListenerService extends Service {
                     }
                 }
             }
-        }, "SimpleCoil UDP send");
-        sendThread.start();
+        };
+        try {
+            // Favor the latest state over stale visual feedback if Wi-Fi is
+            // congested. Game state remains protected by the TCP protocol.
+            mSendExecutor.execute(sendTask);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to queue UDP message", e);
+        }
     }
 
     private void sendDatagram(String message, InetAddress ip, int port) {
@@ -692,6 +711,7 @@ public class UDPListenerService extends Service {
             stopListen();
             releaseMulticastLockLocked();
         }
+        mSendExecutor.shutdownNow();
         super.onDestroy();
     }
 
