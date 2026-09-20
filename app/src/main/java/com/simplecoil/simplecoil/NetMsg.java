@@ -20,7 +20,7 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "11";
+    public static final String NETWORK_VERSION = "12";
 
     // All of these messages are straightforward and contain no extra data
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
@@ -49,17 +49,20 @@ public class NetMsg {
     public static final String NETMSG_NETWORKCONNECTED = "NETWORKCONNECTED";
     public static final String NETMSG_NETWORKDISCONNECTED = "NETWORKDISCONNECTED";
     public static final String NETMSG_PLAYERSETTINGSUPDATE = "PLAYERSETTINGSUPDATE";
-    // Peer-hosted games close their TCP listener after the round starts. Pairing
-    // updates therefore carry a monotonically increasing sequence and grenade
-    // ID over UDP: GRENADEPAIR:<sequence>:<grenade ID>.
+    // Peer-hosted games close their TCP listener after the round starts. Every
+    // state-changing peer UDP payload includes the synchronized round nonce, so
+    // a delayed previous-round datagram cannot affect a later round.
+    // GRENADEPAIR:<round nonce>:<sequence>:<grenade ID>.
     public static final String NETMSG_GRENADEPAIR = "GRENADEPAIR:";
     // Peer score events carry a source-owned sequence so a retransmitted UDP
-    // datagram cannot award duplicate points: ELIMINATED:<sequence> and
-    // TEAMELIMINATED:<eliminated player ID>:<sequence>.
+    // datagram cannot award duplicate points: ELIMINATED:<round nonce>:<sequence>
+    // and TEAMELIMINATED:<round nonce>:<eliminated player ID>:<sequence>.
     public static final String NETMSG_PEER_ELIMINATED = NETMSG_ELIMINATED + ":";
     public static final String NETMSG_PEER_TEAMELIMINATED = NETMSG_TEAMELIMINATED + ":";
-    // A peer ENDGAME is bound to the synchronized round nonce. This prevents a
-    // delayed datagram from a prior lobby from ending a newly started round.
+    public static final String NETMSG_PEER_LEAVE = NETMSG_LEAVE + ":";
+    // ENDGAME and LEAVE use the same round nonce rule as peer score and pairing
+    // events. This prevents a delayed datagram from a prior lobby from ending a
+    // newly started round or removing a current player.
     public static final String NETMSG_PEER_ENDGAME = NETMSG_ENDGAME + ":";
 
     // When players join a game in progress, the server can send the player updates on appropriate values.

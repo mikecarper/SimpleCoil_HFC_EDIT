@@ -216,7 +216,7 @@ public class UDPListenerService extends Service {
                 processPeerElimination(ip,
                         message.substring(NetMsg.NETMSG_PEER_ELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_ELIMINATED)) {
-                // Protocol 10 peer games use sequenced elimination events. Keep
+                // Protocol 12 peer games use round-scoped, sequenced elimination events. Keep
                 // the old fixed form only for non-peer compatibility paths.
                 if (mPeerGame)
                     return;
@@ -279,7 +279,14 @@ public class UDPListenerService extends Service {
             } else if (message.equals(NetMsg.NETMSG_SERVERREPLY)) {
                 completeJoin(ip, NetMsg.NETMSG_SERVERREPLY);
                 return;
+            } else if (message.startsWith(NetMsg.NETMSG_PEER_LEAVE)) {
+                processPeerLeave(ip,
+                        message.substring(NetMsg.NETMSG_PEER_LEAVE.length()));
             } else if (message.equals(NetMsg.NETMSG_LEAVE)) {
+                // A peer LEAVE must be scoped to its current round. Dedicated
+                // games keep roster removal TCP-authoritative either way.
+                if (mPeerGame)
+                    return;
                 Byte playerID = removePeerPlayer(ip);
                 if (playerID == null) {
                     // A UDP datagram cannot prove that a dedicated-server player
@@ -296,7 +303,7 @@ public class UDPListenerService extends Service {
                 processPeerEndGame(ip,
                         message.substring(NetMsg.NETMSG_PEER_ENDGAME.length()));
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
-                // Protocol 11 peer games bind ENDGAME to the current round nonce.
+                // Protocol 12 peer games bind ENDGAME to the current round nonce.
                 // Keep the old fixed form only for TCP-authoritative games.
                 if (mPeerGame)
                     return;
@@ -316,7 +323,7 @@ public class UDPListenerService extends Service {
                         message.substring(NetMsg.NETMSG_PEER_TEAMELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_TEAMELIMINATED)) {
                 // A bare team score packet cannot distinguish a retransmit from
-                // a new kill, so it is not valid during a protocol 10 peer game.
+                // a new kill, so it is not valid during a protocol 12 peer game.
                 if (mPeerGame)
                     return;
                 Byte playerID = getPlayerID(ip);
@@ -336,31 +343,54 @@ public class UDPListenerService extends Service {
     private void processPeerEndGame(InetAddress ip, String roundToken) {
         if (getPlayerID(ip) == null)
             return;
-        synchronized (mListenerStateLock) {
-            if (mDestroyed || !mPeerGame || !TcpServer.isValidRoundToken(roundToken)
-                    || !roundToken.equals(mPeerRoundToken))
-                return;
-        }
+        if (!isCurrentPeerRound(roundToken))
+            return;
         sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
+    }
+
+    /** A peer LEAVE is valid only for the round that authenticated its roster. */
+    private void processPeerLeave(InetAddress ip, String roundToken) {
+        if (!isCurrentPeerRound(roundToken))
+            return;
+        Byte playerID = removePeerPlayer(ip);
+        if (playerID == null)
+            return;
+        Intent intent = new Intent(NetMsg.NETMSG_LEAVE);
+        intent.putExtra(INTENT_PLAYERID, playerID);
+        sendBroadcast(intent);
+    }
+
+    private boolean isCurrentPeerRound(String roundToken) {
+        if (!TcpServer.isValidRoundToken(roundToken))
+            return false;
+        synchronized (mListenerStateLock) {
+            return !mDestroyed && mPeerGame && roundToken.equals(mPeerRoundToken);
+        }
     }
 
     /**
      * Apply a pair/disarm message received from a known peer. The UDP source
      * endpoint determines the player; the payload never gets to choose an
-     * owner. A per-player sequence makes the repeated datagrams idempotent and
-     * prevents an older queued update from reviving a pairing after a disarm.
+     * owner. The synchronized round nonce and a per-player sequence make the
+     * repeated datagrams idempotent and prevent an old queued update from
+     * reviving a pairing after a disarm or a later round has started.
      */
     private void processPeerGrenadePairing(InetAddress ip, String payload) {
-        if (!mPeerGame || payload == null)
+        if (payload == null)
             return;
-        int separator = payload.indexOf(':');
-        if (separator <= 0 || separator == payload.length() - 1
-                || payload.indexOf(':', separator + 1) >= 0) {
+        int tokenSeparator = payload.indexOf(':');
+        int sequenceSeparator = tokenSeparator < 0 ? -1 : payload.indexOf(':', tokenSeparator + 1);
+        if (tokenSeparator <= 0 || sequenceSeparator <= tokenSeparator + 1
+                || sequenceSeparator == payload.length() - 1
+                || payload.indexOf(':', sequenceSeparator + 1) >= 0) {
             Log.w(TAG, "Ignoring malformed peer grenade pairing");
             return;
         }
-        String sequenceText = payload.substring(0, separator);
-        String grenadeText = payload.substring(separator + 1);
+        String roundToken = payload.substring(0, tokenSeparator);
+        if (!isCurrentPeerRound(roundToken))
+            return;
+        String sequenceText = payload.substring(tokenSeparator + 1, sequenceSeparator);
+        String grenadeText = payload.substring(sequenceSeparator + 1);
         if (!isDecimal(sequenceText) || !isDecimal(grenadeText)) {
             Log.w(TAG, "Ignoring non-numeric peer grenade pairing");
             return;
@@ -412,11 +442,19 @@ public class UDPListenerService extends Service {
     /**
      * Accept one peer elimination exactly once. The UDP source owns the
      * sequence and identifies the eliminated player; it cannot claim another
-     * player in the payload.
+     * player in the payload. The round nonce prevents a delayed event from
+     * becoming a new score after sequence state is reset for another round.
      */
-    private void processPeerElimination(InetAddress ip, String sequenceText) {
-        if (!mPeerGame)
+    private void processPeerElimination(InetAddress ip, String payload) {
+        if (payload == null)
             return;
+        int separator = payload.indexOf(':');
+        if (separator <= 0 || separator == payload.length() - 1
+                || payload.indexOf(':', separator + 1) >= 0)
+            return;
+        if (!isCurrentPeerRound(payload.substring(0, separator)))
+            return;
+        String sequenceText = payload.substring(separator + 1);
         long sequence = parsePositiveSequence(sequenceText);
         Byte eliminatedPlayerID = getPeerScoreSourceID(ip);
         Globals globals = Globals.getInstance();
@@ -448,14 +486,18 @@ public class UDPListenerService extends Service {
      * retransmits and reordering harmless.
      */
     private void processPeerTeamElimination(InetAddress ip, String payload) {
-        if (!mPeerGame || payload == null)
+        if (payload == null)
             return;
-        int separator = payload.indexOf(':');
-        if (separator <= 0 || separator == payload.length() - 1
-                || payload.indexOf(':', separator + 1) >= 0)
+        int tokenSeparator = payload.indexOf(':');
+        int playerSeparator = tokenSeparator < 0 ? -1 : payload.indexOf(':', tokenSeparator + 1);
+        if (tokenSeparator <= 0 || playerSeparator <= tokenSeparator + 1
+                || playerSeparator == payload.length() - 1
+                || payload.indexOf(':', playerSeparator + 1) >= 0)
             return;
-        String eliminatedText = payload.substring(0, separator);
-        long sequence = parsePositiveSequence(payload.substring(separator + 1));
+        if (!isCurrentPeerRound(payload.substring(0, tokenSeparator)))
+            return;
+        String eliminatedText = payload.substring(tokenSeparator + 1, playerSeparator);
+        long sequence = parsePositiveSequence(payload.substring(playerSeparator + 1));
         if (!isDecimal(eliminatedText) || sequence == 0)
             return;
         final int eliminatedPlayerID;
@@ -518,9 +560,11 @@ public class UDPListenerService extends Service {
             return;
 
         final long sequence;
+        final String roundToken;
         synchronized (mListenerStateLock) {
-            if (mDestroyed || !mPeerGame)
+            if (mDestroyed || !mPeerGame || !TcpServer.isValidRoundToken(mPeerRoundToken))
                 return;
+            roundToken = mPeerRoundToken;
             synchronized (mPeerGrenadeLock) {
                 // Reaching this in a real round is not practical, but refusing
                 // to wrap is safer than making every old packet look current.
@@ -532,7 +576,7 @@ public class UDPListenerService extends Service {
             }
         }
         updateGrenadePairing((byte) playerID, grenadeID);
-        sendUDPMessageAllRepeat(NetMsg.NETMSG_GRENADEPAIR + sequence + ":" + grenadeID,
+        sendUDPMessageAllRepeat(NetMsg.NETMSG_GRENADEPAIR + roundToken + ":" + sequence + ":" + grenadeID,
                 PEER_GRENADE_UPDATE_REPETITIONS);
     }
 
@@ -544,9 +588,11 @@ public class UDPListenerService extends Service {
                 || localPlayerID <= 0 || !Globals.isValidPlayerID(localPlayerID))
             return;
         final long sequence;
+        final String roundToken;
         synchronized (mListenerStateLock) {
-            if (mDestroyed || !mPeerGame)
+            if (mDestroyed || !mPeerGame || !TcpServer.isValidRoundToken(mPeerRoundToken))
                 return;
+            roundToken = mPeerRoundToken;
             synchronized (mPeerScoreLock) {
                 if (mNextPeerEliminationSequence == Long.MAX_VALUE) {
                     Log.w(TAG, "Peer elimination sequence exhausted");
@@ -555,7 +601,7 @@ public class UDPListenerService extends Service {
                 sequence = ++mNextPeerEliminationSequence;
             }
         }
-        sendUDPMessageRepeat(NetMsg.NETMSG_PEER_ELIMINATED + sequence, scoringPlayerID,
+        sendUDPMessageRepeat(NetMsg.NETMSG_PEER_ELIMINATED + roundToken + ":" + sequence, scoringPlayerID,
                 PEER_SCORE_UPDATE_REPETITIONS);
     }
 
@@ -565,21 +611,25 @@ public class UDPListenerService extends Service {
         if (eliminatedPlayerID <= 0 || !Globals.isValidPlayerID(eliminatedPlayerID)
                 || teammateID <= 0 || !Globals.isValidPlayerID(teammateID) || sequence <= 0)
             return;
+        final String roundToken;
         synchronized (mListenerStateLock) {
-            if (mDestroyed || !mPeerGame)
+            if (mDestroyed || !mPeerGame || !TcpServer.isValidRoundToken(mPeerRoundToken))
                 return;
+            roundToken = mPeerRoundToken;
         }
-        sendUDPMessageRepeat(NetMsg.NETMSG_PEER_TEAMELIMINATED + eliminatedPlayerID + ":"
+        sendUDPMessageRepeat(NetMsg.NETMSG_PEER_TEAMELIMINATED + roundToken + ":" + eliminatedPlayerID + ":"
                 + sequence, teammateID, PEER_SCORE_UPDATE_REPETITIONS);
     }
 
     /** A peer that leaves mid-round announces it repeatedly because UDP can drop packets. */
     public void announcePeerLeave() {
+        final String roundToken;
         synchronized (mListenerStateLock) {
-            if (mDestroyed || !mPeerGame)
+            if (mDestroyed || !mPeerGame || !TcpServer.isValidRoundToken(mPeerRoundToken))
                 return;
+            roundToken = mPeerRoundToken;
         }
-        sendUDPMessageAllRepeat(NetMsg.NETMSG_LEAVE, PEER_SCORE_UPDATE_REPETITIONS);
+        sendUDPMessageAllRepeat(NetMsg.NETMSG_PEER_LEAVE + roundToken, PEER_SCORE_UPDATE_REPETITIONS);
     }
 
     private void resetPeerGrenadeSequences() {
@@ -832,6 +882,7 @@ public class UDPListenerService extends Service {
             mSendGeneration++;
             endScanningLocked();
             mPeerGame = false;
+            mPeerRoundToken = null;
             resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
@@ -992,6 +1043,7 @@ public class UDPListenerService extends Service {
             mSendGeneration++;
             endScanningLocked();
             mPeerGame = false;
+            mPeerRoundToken = null;
             resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
