@@ -27,7 +27,7 @@
     <string name="team_number_label">TEAM %1$d</string>
     <string name="no_team">No Team</string>
     //player data
-    <string name="eliminations_count_label">ELIMINATIONS</string>
+    <string name="eliminations_count_label">YOU DIED</string>
     <string name="lives_count_label">LIVES</string>
     <string name="shots_remaining_label">SHOTS (%1$d, %2$d)</string>
     <string name="shot_mode_label">MODE</string>

@@ -20,7 +20,7 @@
     <string name="team_label">TEAM</string>
     <string name="team_number_label">TEAM %1$d</string>
     <string name="no_team">Kein Team</string>
-    <string name="eliminations_count_label">Eliminierungen</string>
+    <string name="eliminations_count_label">DU BIST GESTORBEN</string>
     <string name="lives_count_label">Leben</string>
     <string name="shots_remaining_label">Schüsse (%1$d, %2$d)</string>
     <string name="shot_mode_label">MODUS</string>
