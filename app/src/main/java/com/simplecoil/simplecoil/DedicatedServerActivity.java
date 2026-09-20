@@ -50,6 +50,7 @@ import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
 
+import java.net.InetAddress;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -82,6 +83,13 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private CountDownTimer mSpawnTimer = null;
     private long mRoundStartAt;
     private long mRoundEndAt;
+    private byte mPreviousPlayerID;
+    private int mPreviousGameState;
+    private long mPreviousGameTimeRemaining;
+    private boolean mPreviousUseGPS;
+    private boolean mPreviousOnlyServerSettings;
+    private InetAddress mPreviousServerIP;
+    private boolean mPreviousAppStateRestored;
 
     private SharedPreferences sharedPreferences = null;
 
@@ -196,7 +204,16 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_dedicated_server);
         this.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-        Globals.getInstance().mPlayerID = 0;
+        Globals globals = Globals.getInstance();
+        mPreviousPlayerID = globals.mPlayerID;
+        mPreviousGameState = globals.mGameState;
+        mPreviousGameTimeRemaining = globals.mServerGameTimeRemaining;
+        mPreviousUseGPS = globals.mUseGPS;
+        mPreviousOnlyServerSettings = globals.mOnlyServerSettings;
+        mPreviousServerIP = globals.mServerIP;
+        globals.mPlayerID = 0;
+        globals.mGameState = Globals.GAME_STATE_NONE;
+        globals.mServerGameTimeRemaining = 0;
         mServerIPTV = findViewById(R.id.server_ip_tv);
         mGameTimer = findViewById(R.id.game_timer_chronometer);
         mGameCountDownTV = findViewById(R.id.game_countdown_tv);
@@ -315,6 +332,15 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
 
     @Override
+    protected void onPause() {
+        // When Back closes this screen, the player activity resumes before this
+        // activity's onDestroy. Restore its identity and state before that resume.
+        if (isFinishing())
+            restorePreviousAppState();
+        super.onPause();
+    }
+
+    @Override
     protected void onDestroy() {
         unregisterReceiver(mServerUpdateReceiver);
         if (mSpawnTimer != null) {
@@ -332,7 +358,21 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mUDPListenerService.stopListen();
         unbindUDPService();
         unbindTcpServerService();
+        restorePreviousAppState();
         super.onDestroy();
+    }
+
+    private void restorePreviousAppState() {
+        if (mPreviousAppStateRestored)
+            return;
+        mPreviousAppStateRestored = true;
+        Globals globals = Globals.getInstance();
+        globals.mPlayerID = mPreviousPlayerID;
+        globals.mGameState = mPreviousGameState;
+        globals.mServerGameTimeRemaining = mPreviousGameTimeRemaining;
+        globals.mUseGPS = mPreviousUseGPS;
+        globals.mOnlyServerSettings = mPreviousOnlyServerSettings;
+        globals.mServerIP = mPreviousServerIP;
     }
 
     private void savePreference(String prefName, int prefValue) {

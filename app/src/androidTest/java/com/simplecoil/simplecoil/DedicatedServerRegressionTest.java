@@ -71,7 +71,12 @@ public class DedicatedServerRegressionTest {
         originalTimeRemaining = globals.mServerGameTimeRemaining;
         originalUseGPS = globals.mUseGPS;
         originalOnlyServerSettings = globals.mOnlyServerSettings;
+        // Dedicated hosting temporarily owns player ID zero. Use a non-zero
+        // selection to verify that closing the host restores the player screen.
+        globals.mPlayerID = 7;
         globals.mGameState = Globals.GAME_STATE_NONE;
+        globals.mServerGameTimeRemaining = 0;
+        globals.mUseGPS = false;
         globals.mOnlyServerSettings = true;
         scenario = ActivityScenario.launch(DedicatedServerActivity.class);
         scenario.onActivity(current -> {
@@ -748,6 +753,26 @@ public class DedicatedServerRegressionTest {
         assertEquals(1, tcp.cancellations);
         assertEquals("The host closed sockets before cancellation could flush", 0, tcp.listenerStops);
         assertEquals(1, udp.listenerStops);
+    }
+
+    @Test
+    public void closingHostRestoresPlayerStateAndEndsItsRound() {
+        scenario.onActivity(current -> {
+            assertEquals(0, Globals.getInstance().mPlayerID);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            Globals.getInstance().mServerGameTimeRemaining = 42;
+            Globals.getInstance().mUseGPS = true;
+            Globals.getInstance().mOnlyServerSettings = false;
+        });
+        closeActivity();
+        assertEquals("Dedicated hosting erased the player's selected ID", 7,
+                Globals.getInstance().mPlayerID);
+        assertEquals("The closed host left the player screen inside its round",
+                Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+        assertEquals(0, Globals.getInstance().mServerGameTimeRemaining);
+        assertFalse("The closed host left its GPS policy active", Globals.getInstance().mUseGPS);
+        assertTrue("The closed host overwrote the player's prior network policy",
+                Globals.getInstance().mOnlyServerSettings);
     }
 
     private ServiceConnection beginBinding(boolean isTcp) {
