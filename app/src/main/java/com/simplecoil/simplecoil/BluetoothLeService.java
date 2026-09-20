@@ -83,6 +83,9 @@ public class BluetoothLeService extends Service {
     public final static UUID UUID_RECOIL_ID =
             UUID.fromString(GattAttributes.RECOIL_ID_UUID);
 
+    // A stalled GATT callback must not let callers retain an unbounded number of payloads.
+    static final int MAX_QUEUED_GATT_OPERATIONS = 64;
+
     private boolean mActionAvailable = true;
     private final Queue<CharacteristicWrite> mCharacteristicWriteQueue = new LinkedList<>();
     private final Queue<DescriptorWrite> mDescriptorWriteQueue = new LinkedList<>();
@@ -127,6 +130,11 @@ public class BluetoothLeService extends Service {
     private boolean isCurrentGatt(BluetoothGatt gatt) {
         // Keep the service monitor held from this check through the callback's effects.
         return gatt != null && gatt == mBluetoothGatt;
+    }
+
+    private boolean hasGattQueueCapacity() {
+        return mCharacteristicWriteQueue.size() + mDescriptorWriteQueue.size()
+                + mCharacteristicReadQueue.size() < MAX_QUEUED_GATT_OPERATIONS;
     }
 
     private synchronized void clearPendingGattOperations() {
@@ -550,6 +558,10 @@ public class BluetoothLeService extends Service {
             return;
         }
         if ((!mActionAvailable)) {
+            if (!hasGattQueueCapacity()) {
+                Log.w(TAG, "Dropping read because the GATT operation queue is full");
+                return;
+            }
             Log.d(TAG, "Reading not available yet, queuing...");
             mCharacteristicReadQueue.add(characteristic);
             return;
@@ -581,6 +593,11 @@ public class BluetoothLeService extends Service {
             return;
         }
         if ((!mActionAvailable)) {
+            if (!hasGattQueueCapacity()) {
+                Log.w(TAG, "Dropping write because the GATT operation queue is full");
+                broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
+                return;
+            }
             Log.d(TAG, "Writing not available yet, queuing...");
             mCharacteristicWriteQueue.add(write);
             return;
@@ -603,6 +620,10 @@ public class BluetoothLeService extends Service {
             return;
         }
         if (!mActionAvailable) {
+            if (!hasGattQueueCapacity()) {
+                Log.w(TAG, "Dropping descriptor write because the GATT operation queue is full");
+                return;
+            }
             Log.d(TAG, "Writing not available yet, queuing...");
             mDescriptorWriteQueue.add(new DescriptorWrite(descriptor));
             return;

@@ -334,6 +334,25 @@ public class BluetoothQueueRegressionTest {
         assertTrue(isAvailable());
     }
 
+    @Test
+    public void stalledGattCapsAllQueuedOperationsAndReportsDroppedCommands() throws Exception {
+        service.writeCharacteristic(command, new byte[]{16, 0, 2});
+        for (int i = 0; i < BluetoothLeService.MAX_QUEUED_GATT_OPERATIONS; i++)
+            service.writeCharacteristic(command, new byte[]{32, 0, (byte) i});
+
+        service.writeCharacteristic(command, new byte[]{48, 0, 6});
+        service.writeDescriptor(descriptor);
+        service.readCharacteristic(telemetry);
+
+        assertEquals(1, operations.size());
+        assertEquals(BluetoothLeService.MAX_QUEUED_GATT_OPERATIONS,
+                ((java.util.Queue<?>) serviceField("mCharacteristicWriteQueue").get(service)).size());
+        assertEquals(0, ((java.util.Queue<?>) serviceField("mDescriptorWriteQueue").get(service)).size());
+        assertEquals(0, ((java.util.Queue<?>) serviceField("mCharacteristicReadQueue").get(service)).size());
+        assertEquals(1, service.broadcasts.size());
+        assertWriteResult(0, new byte[]{48, 0, 6}, BluetoothGatt.GATT_FAILURE);
+    }
+
     private void queueTwoCommands() {
         service.writeCharacteristic(command, new byte[]{16, 0, 2});
         service.writeCharacteristic(command, new byte[]{32, 0, 4});
