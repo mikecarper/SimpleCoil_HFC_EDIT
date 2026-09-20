@@ -36,6 +36,7 @@ public class TcpClientRegressionTest {
     private ExecutorService sender;
     private Queue<?> pending;
     private byte originalPairedGrenade;
+    private Globals.PlayerSettings originalLocalSettings;
 
     @Before
     public void setUp() throws Exception {
@@ -43,6 +44,7 @@ public class TcpClientRegressionTest {
         sender = (ExecutorService) field("sendExecutor").get(client);
         pending = (Queue<?>) field("messageQueue").get(client);
         originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
+        originalLocalSettings = TcpServer.localPlayerSettingsSnapshot(Globals.getInstance());
         Globals.getInstance().mPairedGrenadeID = 0;
     }
 
@@ -51,16 +53,31 @@ public class TcpClientRegressionTest {
         sender.shutdownNow();
         assertTrue(sender.awaitTermination(3, TimeUnit.SECONDS));
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
+        restoreLocalSettings(originalLocalSettings);
     }
 
     @Test
     public void registrationSynchronizesUnpairedGrenadeState() throws Exception {
+        Globals globals = Globals.getInstance();
+        globals.mFullHealth = 77;
+        globals.mFullReload = (byte) 200;
+        globals.mReloadTime = 1200;
+        globals.mReloadOnEmpty = true;
+        globals.mRespawnTime = 6;
+        globals.mDamage = -8;
+        globals.mOverrideLives = true;
+        globals.mOverrideLivesVal = 5;
+        globals.mAllowSingleShotMode = true;
+        globals.mAllowBurst3ShotMode = false;
+        globals.mAllowAutoShotMode = false;
+        globals.mCurrentFiringMode = Globals.FIRING_MODE_OUTDOOR_WITH_CONE;
         ByteArrayOutputStream delivered = new ByteArrayOutputStream();
         field("out").set(client, new DataOutputStream(delivered));
         register();
         awaitSender();
         DataInputStream messages = messages(delivered);
         assertRegistration(messages.readUTF());
+        assertPlayerSettings(messages.readUTF());
         assertGrenadePairing(messages.readUTF(), 0);
     }
 
@@ -73,6 +90,7 @@ public class TcpClientRegressionTest {
         awaitSender();
         DataInputStream initial = messages(firstConnection);
         assertRegistration(initial.readUTF());
+        assertPlayerSettings(initial.readUTF());
         assertGrenadePairing(initial.readUTF(), 3);
 
         field("out").set(client, null);
@@ -85,6 +103,7 @@ public class TcpClientRegressionTest {
         awaitSender();
         DataInputStream rejoined = messages(replacement);
         assertRegistration(rejoined.readUTF());
+        assertPlayerSettings(rejoined.readUTF());
         assertGrenadePairing(rejoined.readUTF(), 0);
         assertEquals(0, rejoined.available());
     }
@@ -104,6 +123,7 @@ public class TcpClientRegressionTest {
         awaitSender();
         DataInputStream messages = messages(delivered);
         assertRegistration(messages.readUTF());
+        assertPlayerSettings(messages.readUTF());
         assertEquals("first event", messages.readUTF());
         assertEquals("second event", messages.readUTF());
         assertGrenadePairing(messages.readUTF(), 0);
@@ -118,7 +138,10 @@ public class TcpClientRegressionTest {
         field("out").set(client, new DataOutputStream(new ByteArrayOutputStream() {
             private int flushes;
             @Override public void flush() throws IOException {
-                if (++flushes >= 3) throw new IOException("Link lost during second event");
+                // Registration and saved settings are both sent before replaying
+                // persistent events. Let the first queued event flush, then fail
+                // while writing the second one.
+                if (++flushes >= 4) throw new IOException("Link lost during second event");
             }
         }));
         register();
@@ -146,6 +169,7 @@ public class TcpClientRegressionTest {
         awaitSender();
         DataInputStream messages = messages(delivered);
         assertRegistration(messages.readUTF());
+        assertPlayerSettings(messages.readUTF());
         assertTrue("Queued event must reach the replacement connection", messages.available() > 0);
         assertEquals("event during disconnect", messages.readUTF());
         assertGrenadePairing(messages.readUTF(), 0);
@@ -330,5 +354,41 @@ public class TcpClientRegressionTest {
                 + TcpServer.TCPPREFIX_JSON.length()));
         assertEquals(expected, pairing.getInt(TcpServer.JSON_PAIRED_GRENADE_ID));
         assertEquals(Globals.getInstance().mPlayerID, pairing.getInt(TcpServer.JSON_PLAYERID));
+    }
+
+    private static void assertPlayerSettings(String message) throws Exception {
+        JSONObject settings = new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                + TcpServer.TCPPREFIX_JSON.length()));
+        Globals globals = Globals.getInstance();
+        assertTrue(settings.getBoolean(TcpServer.JSON_PLAYERSETTINGS));
+        assertEquals(globals.mPlayerID, settings.getInt(TcpServer.JSON_PLAYERID));
+        assertEquals(globals.mFullHealth, settings.getInt(TcpServer.JSON_HEALTH));
+        assertEquals(globals.mFullReload & 0xff, settings.getInt(TcpServer.JSON_RELOAD_SHOTS));
+        assertEquals(globals.mReloadTime, settings.getLong(TcpServer.JSON_RELOAD_TIME));
+        assertEquals(globals.mReloadOnEmpty, settings.getBoolean(TcpServer.JSON_RELOAD_ON_EMPTY));
+        assertEquals(globals.mRespawnTime, settings.getLong(TcpServer.JSON_SPAWN_TIME));
+        assertEquals(globals.mDamage, settings.getInt(TcpServer.JSON_DAMAGE));
+        assertEquals(globals.mAllowSingleShotMode, settings.getBoolean(TcpServer.JSON_SHOT_MODE_SINGLE));
+        assertEquals(globals.mAllowBurst3ShotMode, settings.getBoolean(TcpServer.JSON_SHOT_MODE_BURST3));
+        assertEquals(globals.mAllowAutoShotMode, settings.getBoolean(TcpServer.JSON_SHOT_MODE_AUTO));
+        assertEquals(globals.mCurrentFiringMode, settings.getInt(TcpServer.JSON_FIRING_MODE));
+        if (globals.mOverrideLives)
+            assertEquals(globals.mOverrideLivesVal, settings.getInt(TcpServer.JSON_LIVESLIMIT));
+    }
+
+    private static void restoreLocalSettings(Globals.PlayerSettings settings) {
+        Globals globals = Globals.getInstance();
+        globals.mFullHealth = settings.health;
+        globals.mFullReload = settings.shots;
+        globals.mReloadTime = settings.reloadTime;
+        globals.mReloadOnEmpty = settings.reloadOnEmpty;
+        globals.mRespawnTime = settings.spawnTime;
+        globals.mDamage = settings.damage;
+        globals.mOverrideLives = settings.overrideLives;
+        globals.mOverrideLivesVal = settings.lives;
+        globals.mAllowSingleShotMode = settings.allowShotModeSingle;
+        globals.mAllowBurst3ShotMode = settings.allowShotModeBurst3;
+        globals.mAllowAutoShotMode = settings.allowShotModeAuto;
+        globals.mCurrentFiringMode = settings.firingMode;
     }
 }

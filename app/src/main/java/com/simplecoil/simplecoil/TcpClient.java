@@ -763,6 +763,11 @@ public class TcpClient extends Service {
             }
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerInfo.toString();
             sendPriorityTCPMessage(message);
+            // The registration frame establishes the player ID that authorizes
+            // the settings frame. Send saved settings immediately afterward so
+            // a player does not silently use server defaults until opening the
+            // settings dialog again.
+            sendPlayerSettings(true);
             sendQueuedMessages();
         } catch (JSONException e) {
             e.printStackTrace();
@@ -773,6 +778,10 @@ public class TcpClient extends Service {
     }
 //TODO player presets
     public void sendPlayerSettings() {
+        sendPlayerSettings(false);
+    }
+
+    private void sendPlayerSettings(boolean priority) {
         try {
             JSONObject playerSettings = new JSONObject();
             playerSettings.put(TcpServer.JSON_PLAYERSETTINGS, true);
@@ -793,7 +802,10 @@ public class TcpClient extends Service {
           //  playerSettings.put(TcpServer.JSON_PLAYER_PRESET, Globals.getInstance().mCurrentPlayerPreset);
           //  playerSettings.put(TcpServer.JSON_WEAPON_PRESET, Globals.getInstance().mCurrentWeaponPreset);
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerSettings.toString();
-            sendTCPMessage(message);
+            if (priority)
+                sendPriorityTCPMessage(message);
+            else
+                sendTCPMessage(message);
         } catch (JSONException e) {
             e.printStackTrace();
         }

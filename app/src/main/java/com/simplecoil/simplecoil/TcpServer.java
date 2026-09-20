@@ -626,9 +626,43 @@ public class TcpServer extends Service {
         Globals.getmPlayerSettingsSemaphore();
         try {
             globals.mPlayerSettings.clear();
+            // A peer host is also a player, but it never registers through its
+            // own TCP listener. Seed its current local settings so clients use
+            // its configured damage, reload, and lives rules from the first
+            // lobby snapshot. A dedicated host has no player ID to publish.
+            byte localPlayerID = globals.mPlayerID;
+            if (!mIsDedicated && localPlayerID > 0 && Globals.isValidPlayerID(localPlayerID)) {
+                Globals.PlayerSettings localSettings = localPlayerSettingsSnapshot(globals);
+                int lives = localSettings.overrideLives ? localSettings.lives : 0;
+                if (Globals.isValidPlayerSettings(localSettings.health, localSettings.shots & 0xff,
+                        localSettings.reloadTime, localSettings.spawnTime, localSettings.damage, lives,
+                        localSettings.allowShotModeSingle, localSettings.allowShotModeBurst3,
+                        localSettings.allowShotModeAuto, localSettings.firingMode)) {
+                    globals.mPlayerSettings.put(localPlayerID, localSettings);
+                } else {
+                    Log.w(TAG, "Not publishing invalid local host settings");
+                }
+            }
         } finally {
             globals.mPlayerSettingsSemaphore.release();
         }
+    }
+
+    static Globals.PlayerSettings localPlayerSettingsSnapshot(Globals globals) {
+        Globals.PlayerSettings settings = new Globals.PlayerSettings();
+        settings.health = globals.mFullHealth;
+        settings.shots = globals.mFullReload;
+        settings.reloadTime = globals.mReloadTime;
+        settings.reloadOnEmpty = globals.mReloadOnEmpty;
+        settings.spawnTime = globals.mRespawnTime;
+        settings.damage = globals.mDamage;
+        settings.overrideLives = globals.mOverrideLives;
+        settings.lives = globals.mOverrideLivesVal;
+        settings.allowShotModeSingle = globals.mAllowSingleShotMode;
+        settings.allowShotModeBurst3 = globals.mAllowBurst3ShotMode;
+        settings.allowShotModeAuto = globals.mAllowAutoShotMode;
+        settings.firingMode = globals.mCurrentFiringMode;
+        return settings;
     }
 
     private Map<Byte, InetAddress> getTeamIPMapSnapshot() {
