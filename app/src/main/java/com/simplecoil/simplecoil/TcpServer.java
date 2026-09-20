@@ -619,6 +619,18 @@ public class TcpServer extends Service {
         }
     }
 
+    // Player-specific settings are valid for later rounds on this listener, but
+    // must not be inherited by a new listener whose players happen to reuse IDs.
+    private void clearPlayerSettingsForNewListener() {
+        Globals globals = Globals.getInstance();
+        Globals.getmPlayerSettingsSemaphore();
+        try {
+            globals.mPlayerSettings.clear();
+        } finally {
+            globals.mPlayerSettingsSemaphore.release();
+        }
+    }
+
     private Map<Byte, InetAddress> getTeamIPMapSnapshot() {
         Globals.getmTeamIPMapSemaphore();
         try {
@@ -1046,6 +1058,7 @@ public class TcpServer extends Service {
             else
                 mClientData.clear();
             clearSharedRosterState();
+            clearPlayerSettingsForNewListener();
             if (!keepListening)
                 return;
             synchronized (mServerStateLock) {

@@ -199,6 +199,7 @@ public class TcpServerSessionRegressionTest {
         Globals globals = Globals.getInstance();
         InetAddress endpoint = InetAddress.getByName("192.0.2.20");
         clearSharedRoster();
+        clearPlayerSettings();
         try {
             Globals.getmIPTeamMapSemaphore();
             try { globals.mIPTeamMap.put(endpoint, (byte) 1); }
@@ -215,6 +216,11 @@ public class TcpServerSessionRegressionTest {
             Globals.getmGrenadePairingsSemaphore();
             try { globals.mGrenadePairings[3] = 1; }
             finally { globals.mGrenadePairingsSemaphore.release(); }
+            Globals.PlayerSettings staleSettings = new Globals.PlayerSettings();
+            staleSettings.health = 777;
+            Globals.getmPlayerSettingsSemaphore();
+            try { globals.mPlayerSettings.put((byte) 1, staleSettings); }
+            finally { globals.mPlayerSettingsSemaphore.release(); }
 
             server.startTcpServer();
             long deadline = SystemClock.elapsedRealtime() + 2000;
@@ -227,8 +233,10 @@ public class TcpServerSessionRegressionTest {
             assertTrue(globals.mTeamPlayerNameMap.isEmpty());
             assertTrue(globals.mGPSData.isEmpty());
             assertEquals(Globals.INVALID_PLAYER_ID, globals.mGrenadePairings[3]);
+            assertTrue("New listener retained stale player settings", globals.mPlayerSettings.isEmpty());
         } finally {
             clearSharedRoster();
+            clearPlayerSettings();
         }
     }
 
@@ -724,6 +732,13 @@ public class TcpServerSessionRegressionTest {
         Globals.getmGrenadePairingsSemaphore();
         try { Globals.ClearGrenadePairings(false); }
         finally { globals.mGrenadePairingsSemaphore.release(); }
+    }
+
+    private static void clearPlayerSettings() {
+        Globals globals = Globals.getInstance();
+        Globals.getmPlayerSettingsSemaphore();
+        try { globals.mPlayerSettings.clear(); }
+        finally { globals.mPlayerSettingsSemaphore.release(); }
     }
 
     private static RecordingServer createServer() {
