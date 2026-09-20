@@ -3061,8 +3061,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return;
         }
         // Publish removals too, so the server cannot keep crediting the old owner.
-        if (mUseNetwork && isDedicatedServerConnection())
-            mTcpClient.sendPlayerGrenade();
+        // A peer host closes its TCP listener at the round start, so its updates
+        // must use the roster-validated UDP path instead.
+        if (mUseNetwork) {
+            if (isDedicatedServerConnection())
+                mTcpClient.sendPlayerGrenade();
+            else if (mUDPListenerService != null)
+                mUDPListenerService.publishPeerGrenadePairing();
+        }
     }
 
     private final BroadcastReceiver mUDPUpdateReceiver = new BroadcastReceiver() {

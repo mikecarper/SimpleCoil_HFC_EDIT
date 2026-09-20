@@ -235,6 +235,94 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void peerGrenadePairingTracksKnownPlayerAndRejectsStaleOrUnknownUpdates() throws Exception {
+        register(teammate, 2);
+        Globals globals = Globals.getInstance();
+        int[] originalPairings;
+        Globals.getmGrenadePairingsSemaphore();
+        try {
+            originalPairings = globals.mGrenadePairings.clone();
+            for (int index = 0; index < globals.mGrenadePairings.length; index++)
+                globals.mGrenadePairings[index] = Globals.INVALID_PLAYER_ID;
+            globals.mGrenadePairings[4] = 2;
+        } finally {
+            globals.mGrenadePairingsSemaphore.release();
+        }
+        try {
+            service.startGame(true);
+            receive(teammate, NetMsg.NETMSG_GRENADEPAIR + "1:3");
+            assertEquals(2, globals.mGrenadePairings[3]);
+            assertEquals("A new pairing retained the player's old grenade", Globals.INVALID_PLAYER_ID,
+                    globals.mGrenadePairings[4]);
+
+            receive(teammate, NetMsg.NETMSG_GRENADEPAIR + "2:0");
+            assertEquals("A peer disarm did not clear its prior pairing", Globals.INVALID_PLAYER_ID,
+                    globals.mGrenadePairings[3]);
+            receive(teammate, NetMsg.NETMSG_GRENADEPAIR + "1:4");
+            assertEquals("A delayed pairing revived after a newer disarm", Globals.INVALID_PLAYER_ID,
+                    globals.mGrenadePairings[4]);
+
+            receive(stranger, NetMsg.NETMSG_GRENADEPAIR + "3:5");
+            assertEquals("An unregistered sender claimed a grenade", Globals.INVALID_PLAYER_ID,
+                    globals.mGrenadePairings[5]);
+        } finally {
+            Globals.getmGrenadePairingsSemaphore();
+            try {
+                System.arraycopy(originalPairings, 0, globals.mGrenadePairings, 0,
+                        globals.mGrenadePairings.length);
+            } finally {
+                globals.mGrenadePairingsSemaphore.release();
+            }
+        }
+    }
+
+    @Test
+    public void peerGrenadePublisherUpdatesLocalStateAndRepeatsTheLatestSnapshot() throws Exception {
+        register(teammate, 2);
+        Globals globals = Globals.getInstance();
+        byte originalPairedGrenade = globals.mPairedGrenadeID;
+        int[] originalPairings;
+        Globals.getmGrenadePairingsSemaphore();
+        try {
+            originalPairings = globals.mGrenadePairings.clone();
+            for (int index = 0; index < globals.mGrenadePairings.length; index++)
+                globals.mGrenadePairings[index] = Globals.INVALID_PLAYER_ID;
+        } finally {
+            globals.mGrenadePairingsSemaphore.release();
+        }
+        try {
+            service.startGame(true);
+            globals.mPairedGrenadeID = 3;
+            service.publishPeerGrenadePairing();
+            assertEquals(1, globals.mGrenadePairings[3]);
+            assertEquals(NetMsg.NETMSG_GRENADEPAIR + "1:3", service.sentMessages.get(0));
+            assertEquals(3, (int) service.repeatCounts.get(0));
+
+            globals.mPairedGrenadeID = 0;
+            service.publishPeerGrenadePairing();
+            assertEquals(Globals.INVALID_PLAYER_ID, globals.mGrenadePairings[3]);
+            assertEquals(NetMsg.NETMSG_GRENADEPAIR + "2:0", service.sentMessages.get(1));
+            assertEquals(3, (int) service.repeatCounts.get(1));
+
+            service.startGame(false);
+            globals.mPairedGrenadeID = 4;
+            service.publishPeerGrenadePairing();
+            assertEquals("Dedicated games must retain TCP-authoritative pairings", 2,
+                    service.sentMessages.size());
+            assertEquals(Globals.INVALID_PLAYER_ID, globals.mGrenadePairings[4]);
+        } finally {
+            globals.mPairedGrenadeID = originalPairedGrenade;
+            Globals.getmGrenadePairingsSemaphore();
+            try {
+                System.arraycopy(originalPairings, 0, globals.mGrenadePairings, 0,
+                        globals.mGrenadePairings.length);
+            } finally {
+                globals.mGrenadePairingsSemaphore.release();
+            }
+        }
+    }
+
+    @Test
     public void validHitOutAndEliminationKeepTheirPlayerIds() throws Exception {
         register(enemy, 11);
         String[] commands = {NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT, NetMsg.NETMSG_ELIMINATED};
@@ -667,6 +755,8 @@ public class UDPRegressionTest {
 
     private static final class RecordingService extends UDPListenerService {
         final List<Intent> events = new CopyOnWriteArrayList<>();
+        final List<String> sentMessages = new CopyOnWriteArrayList<>();
+        final List<Integer> repeatCounts = new CopyOnWriteArrayList<>();
         boolean realListener;
         int listenerStarts;
         boolean blockFirstLookup;
@@ -681,6 +771,10 @@ public class UDPRegressionTest {
         }
 
         @Override public void sendBroadcast(Intent intent) { events.add(new Intent(intent)); }
+        @Override public void sendUDPMessageAllRepeat(String message, int repeatCount) {
+            sentMessages.add(message);
+            repeatCounts.add(repeatCount);
+        }
         @Override public void startListenForUDPMessage() {
             if (realListener) super.startListenForUDPMessage();
             else listenerStarts++;

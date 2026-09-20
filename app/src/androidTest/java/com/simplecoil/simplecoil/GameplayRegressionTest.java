@@ -320,6 +320,18 @@ public class GameplayRegressionTest {
         });
     }
 
+    @Test
+    public void validGrenadePairingPublishesToPeerRoster() {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = false;
+            receiveTelemetry(activity, grenadePacket(true, 0x3F));
+            assertEquals(3, Globals.getInstance().mPairedGrenadeID);
+            assertEquals("Peer pairing did not leave the local phone", 1,
+                    udp.peerGrenadePairingPublishes);
+            assertTrue(tcp.messages.isEmpty());
+        });
+    }
+
     private static byte[] grenadePacket(boolean secondSlot, int command) {
         byte[] packet = telemetryPacket(0, 0, 0, 0);
         packet[secondSlot ? FullscreenActivity.RECOIL_OFFSET_HIT_BY2 : FullscreenActivity.RECOIL_OFFSET_HIT_BY1]
@@ -1720,6 +1732,7 @@ public class GameplayRegressionTest {
         int endRequests;
         int serverCreates;
         int serverCancellations;
+        int peerGrenadePairingPublishes;
 
         @Override
         public void endGame() { endRequests++; }
@@ -1738,6 +1751,11 @@ public class GameplayRegressionTest {
         @Override
         public void sendUDPMessageAll(String message) {
             messages.add(message + ":all");
+        }
+
+        @Override
+        public void publishPeerGrenadePairing() {
+            peerGrenadePairingPublishes++;
         }
 
         @Override

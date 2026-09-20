@@ -20,7 +20,7 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "08";
+    public static final String NETWORK_VERSION = "09";
 
     // All of these messages are straightforward and contain no extra data
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
@@ -49,6 +49,10 @@ public class NetMsg {
     public static final String NETMSG_NETWORKCONNECTED = "NETWORKCONNECTED";
     public static final String NETMSG_NETWORKDISCONNECTED = "NETWORKDISCONNECTED";
     public static final String NETMSG_PLAYERSETTINGSUPDATE = "PLAYERSETTINGSUPDATE";
+    // Peer-hosted games close their TCP listener after the round starts. Pairing
+    // updates therefore carry a monotonically increasing sequence and grenade
+    // ID over UDP: GRENADEPAIR:<sequence>:<grenade ID>.
+    public static final String NETMSG_GRENADEPAIR = "GRENADEPAIR:";
 
     // When players join a game in progress, the server can send the player updates on appropriate values.
     // These items are intent extras.

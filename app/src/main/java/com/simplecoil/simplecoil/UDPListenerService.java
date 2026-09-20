@@ -89,6 +89,12 @@ public class UDPListenerService extends Service {
     // round closes that TCP listener after the start announcement, so a player
     // leaving mid-round must be reflected by a validated UDP LEAVE instead.
     private volatile boolean mPeerGame;
+    private static final int PEER_GRENADE_UPDATE_REPETITIONS = 3;
+    private final Object mPeerGrenadeLock = new Object();
+    // Player IDs are bounded, so a fixed snapshot is cheaper and safer than a
+    // map fed by UDP input. Sequence zero means no update from that player yet.
+    private final long[] mLastPeerGrenadeSequences = new long[Globals.MAX_PLAYER_ID + 1];
+    private long mNextPeerGrenadeSequence;
     private volatile int mReadyToScan = 0;
 
     private volatile boolean mScanRunning = false;
@@ -257,6 +263,9 @@ public class UDPListenerService extends Service {
                 }
                 intent = new Intent(NetMsg.NETMSG_LEAVE);
                 intent.putExtra(INTENT_PLAYERID, playerID);
+            } else if (message.startsWith(NetMsg.NETMSG_GRENADEPAIR)) {
+                processPeerGrenadePairing(ip,
+                        message.substring(NetMsg.NETMSG_GRENADEPAIR.length()));
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
                 if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                         || (getPlayerID(ip) == null && !ip.equals(Globals.getInstance().mServerIP)))
@@ -281,6 +290,119 @@ public class UDPListenerService extends Service {
         }
         if (intent != null)
             sendBroadcast(intent);
+    }
+
+    /**
+     * Apply a pair/disarm message received from a known peer. The UDP source
+     * endpoint determines the player; the payload never gets to choose an
+     * owner. A per-player sequence makes the repeated datagrams idempotent and
+     * prevents an older queued update from reviving a pairing after a disarm.
+     */
+    private void processPeerGrenadePairing(InetAddress ip, String payload) {
+        if (!mPeerGame || payload == null)
+            return;
+        int separator = payload.indexOf(':');
+        if (separator <= 0 || separator == payload.length() - 1
+                || payload.indexOf(':', separator + 1) >= 0) {
+            Log.w(TAG, "Ignoring malformed peer grenade pairing");
+            return;
+        }
+        String sequenceText = payload.substring(0, separator);
+        String grenadeText = payload.substring(separator + 1);
+        if (!isDecimal(sequenceText) || !isDecimal(grenadeText)) {
+            Log.w(TAG, "Ignoring non-numeric peer grenade pairing");
+            return;
+        }
+        final long sequence;
+        final int grenadeID;
+        try {
+            sequence = Long.parseLong(sequenceText);
+            grenadeID = Integer.parseInt(grenadeText);
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "Ignoring oversized peer grenade pairing", e);
+            return;
+        }
+        Byte playerID = getPlayerID(ip);
+        if (sequence <= 0 || playerID == null || !Globals.isValidGrenadeID(grenadeID)) {
+            Log.w(TAG, "Ignoring invalid peer grenade pairing");
+            return;
+        }
+        synchronized (mPeerGrenadeLock) {
+            if (sequence <= mLastPeerGrenadeSequences[playerID])
+                return;
+            mLastPeerGrenadeSequences[playerID] = sequence;
+        }
+        updateGrenadePairing(playerID, grenadeID);
+    }
+
+    private static boolean isDecimal(String value) {
+        if (value == null || value.isEmpty())
+            return false;
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (character < '0' || character > '9')
+                return false;
+        }
+        return true;
+    }
+
+    private void updateGrenadePairing(byte playerID, int grenadeID) {
+        if (playerID <= 0 || !Globals.isValidPlayerID(playerID)
+                || !Globals.isValidGrenadeID(grenadeID))
+            return;
+        Globals globals = Globals.getInstance();
+        Globals.getmGrenadePairingsSemaphore();
+        try {
+            // A player owns at most one grenade. Zero is an explicit unpair,
+            // never a valid index to assign.
+            for (int index = 1; index < globals.mGrenadePairings.length; index++) {
+                if (globals.mGrenadePairings[index] == playerID)
+                    globals.mGrenadePairings[index] = Globals.INVALID_PLAYER_ID;
+            }
+            if (grenadeID != 0)
+                globals.mGrenadePairings[grenadeID] = playerID;
+        } finally {
+            globals.mGrenadePairingsSemaphore.release();
+        }
+    }
+
+    /**
+     * Publish this phone's grenade state during a peer-hosted round. Dedicated
+     * games keep using their TCP-authoritative pairing snapshots.
+     */
+    public void publishPeerGrenadePairing() {
+        Globals globals = Globals.getInstance();
+        int playerID = globals.mPlayerID;
+        int grenadeID = globals.mPairedGrenadeID & 0xff;
+        if (playerID <= 0 || !Globals.isValidPlayerID(playerID)
+                || !Globals.isValidGrenadeID(grenadeID))
+            return;
+
+        final long sequence;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !mPeerGame)
+                return;
+            synchronized (mPeerGrenadeLock) {
+                // Reaching this in a real round is not practical, but refusing
+                // to wrap is safer than making every old packet look current.
+                if (mNextPeerGrenadeSequence == Long.MAX_VALUE) {
+                    Log.w(TAG, "Peer grenade sequence exhausted");
+                    return;
+                }
+                sequence = ++mNextPeerGrenadeSequence;
+            }
+        }
+        updateGrenadePairing((byte) playerID, grenadeID);
+        sendUDPMessageAllRepeat(NetMsg.NETMSG_GRENADEPAIR + sequence + ":" + grenadeID,
+                PEER_GRENADE_UPDATE_REPETITIONS);
+    }
+
+    private void resetPeerGrenadeSequences() {
+        synchronized (mPeerGrenadeLock) {
+            mNextPeerGrenadeSequence = 0;
+            for (int index = 0; index < mLastPeerGrenadeSequences.length; index++)
+                mLastPeerGrenadeSequences[index] = 0;
+        }
     }
 
     private Byte getPlayerID(InetAddress ip) {
@@ -486,6 +608,7 @@ public class UDPListenerService extends Service {
             mSendGeneration++;
             endScanningLocked();
             mPeerGame = false;
+            resetPeerGrenadeSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
             Globals.getInstance().mIPTeamMapSemaphore.release();
@@ -645,6 +768,7 @@ public class UDPListenerService extends Service {
             mSendGeneration++;
             endScanningLocked();
             mPeerGame = false;
+            resetPeerGrenadeSequences();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
             Globals.getInstance().mIPTeamMapSemaphore.release();
@@ -811,6 +935,7 @@ public class UDPListenerService extends Service {
             endScanningLocked();
             mIsListService = false;
             mPeerGame = false;
+            resetPeerGrenadeSequences();
             keepListening = false;
             closeListeningSocket();
         }
@@ -872,8 +997,12 @@ public class UDPListenerService extends Service {
     public void startGame() { startGame(false); }
 
     public void startGame(boolean peerGame) {
-        mIsListService = false; // There is no list service while the game is running
-        mPeerGame = peerGame;
+        synchronized (mListenerStateLock) {
+            mIsListService = false; // There is no list service while the game is running
+            if (mPeerGame != peerGame)
+                resetPeerGrenadeSequences();
+            mPeerGame = peerGame;
+        }
     }
 
     public void endGame() {
