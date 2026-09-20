@@ -31,7 +31,7 @@ public class Globals {
 
     /* Highest player ID allowed in the GUI, absolute max is 0x3F or 63. Player ID 0 can technically
     be used but would require code changes to the hit detection if you really need 64 players. */
-    public static final byte MAX_PLAYER_ID = (byte) 0x10;
+    public static final byte MAX_PLAYER_ID = (byte) 20;
 
     /**
      * Network messages may carry arbitrary integers, while UI and map storage are sized for

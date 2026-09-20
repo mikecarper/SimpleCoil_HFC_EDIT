@@ -17,5 +17,15 @@ Timed games also share an end deadline, so a late packet or reconnect does not g
 a player extra game time. Clock estimates refresh while connected to a dedicated
 server. Actual alignment depends on network delays and device scheduling.
 
-All participating phones must run network protocol 07 (this build). Older protocol
+All participating phones must run network protocol 08 (this build). Older protocol
 versions are rejected instead of starting with incompatible countdown behavior.
+
+## Player capacity
+
+Up to 20 players are supported, plus a separate dedicated host phone (21 phones
+total). Two-team games use IDs 1-10 and 11-20. Four-team games use IDs 1-5, 6-10,
+11-15, and 16-20. Existing players should check their displayed team after updating.
+
+The start-alignment target is within one second. Clock exchanges with more than
+500 ms of network delay are rejected and retried. This is not a guarantee under
+Wi-Fi stalls or a suspended device; multi-phone field validation is still needed.

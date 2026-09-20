@@ -87,7 +87,7 @@ public class UDPRegressionTest {
 
     @Test
     public void opponentCannotAwardPointsToOurTeam() throws Exception {
-        register(enemy, 9);
+        register(enemy, 11);
         receive(enemy, NetMsg.NETMSG_TEAMELIMINATED);
         assertTrue(service.events.isEmpty());
     }
@@ -101,7 +101,7 @@ public class UDPRegressionTest {
 
     @Test
     public void teamMembershipUsesCurrentGameMode() throws Exception {
-        register(teammate, 5);
+        register(teammate, 6);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
         receive(teammate, NetMsg.NETMSG_TEAMELIMINATED);
         assertTrue(service.events.isEmpty());
@@ -120,7 +120,7 @@ public class UDPRegressionTest {
 
     @Test
     public void knownPeerAndCurrentServerCanStillEndGame() throws Exception {
-        register(enemy, 9);
+        register(enemy, 11);
         receive(enemy, NetMsg.NETMSG_ENDGAME);
         Globals.getInstance().mServerIP = stranger;
         receive(stranger, NetMsg.NETMSG_ENDGAME);
@@ -142,13 +142,13 @@ public class UDPRegressionTest {
 
     @Test
     public void validHitOutAndEliminationKeepTheirPlayerIds() throws Exception {
-        register(enemy, 9);
+        register(enemy, 11);
         String[] commands = {NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT, NetMsg.NETMSG_ELIMINATED};
         for (String command : commands) receive(enemy, command);
         assertEquals(3, service.events.size());
         for (int index = 0; index < commands.length; index++) {
             assertEquals(commands[index], service.events.get(index).getAction());
-            assertEquals(9, service.events.get(index).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+            assertEquals(11, service.events.get(index).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
         }
     }
 

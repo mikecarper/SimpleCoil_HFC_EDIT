@@ -158,11 +158,11 @@ public class MapRegressionTest {
             showPlayers();
             map.enableGPS(false);
             assertNull(marker(2));
-            assertNull(marker(9));
+            assertNull(marker(11));
             useDummyLocationListener();
             map.enableGPS(true);
             assertNotNull("Cached teammate was not restored", marker(2));
-            assertNotNull("Cached enemy was not restored", marker(9));
+            assertNotNull("Cached enemy was not restored", marker(11));
         });
     }
 
@@ -173,7 +173,7 @@ public class MapRegressionTest {
             Globals.getInstance().mGPSMode = Globals.GPS_TEAMMATE;
             receive(new Intent(NetMsg.NETMSG_GPSSETTING));
             assertNotNull(marker(2));
-            assertNull("Enemy remained visible after teammate-only mode was selected", marker(9));
+            assertNull("Enemy remained visible after teammate-only mode was selected", marker(11));
         });
     }
 
@@ -182,13 +182,13 @@ public class MapRegressionTest {
         scenario.onActivity(current -> {
             Globals.getInstance().mGPSMode = Globals.GPS_TEAMMATE;
             putLocation(2, 10);
-            putLocation(9, 20);
+            putLocation(11, 20);
             receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
             assertNotNull(marker(2));
-            assertNull(marker(9));
+            assertNull(marker(11));
             Globals.getInstance().mGPSMode = Globals.GPS_ALL;
             receive(new Intent(NetMsg.NETMSG_GPSSETTING));
-            assertNotNull("Cached enemy was not restored after changing visibility", marker(9));
+            assertNotNull("Cached enemy was not restored after changing visibility", marker(11));
         });
     }
 
@@ -196,12 +196,12 @@ public class MapRegressionTest {
     public void gameModeChangeRecomputesMarkerTeamsWithoutMovement() {
         scenario.onActivity(current -> {
             Globals.getInstance().mGPSMode = Globals.GPS_TEAMMATE;
-            putLocation(5, 10); // A teammate in two-team mode, an enemy in four-team mode.
+            putLocation(6, 10); // A teammate in two-team mode, an enemy in four-team mode.
             receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
-            assertNotNull(marker(5));
+            assertNotNull(marker(6));
             Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
             receive(new Intent(NetMsg.NETMSG_LISTPLAYERS));
-            assertNull("Old team assignment kept an enemy marker visible", marker(5));
+            assertNull("Old team assignment kept an enemy marker visible", marker(6));
         });
     }
 
@@ -211,7 +211,7 @@ public class MapRegressionTest {
             showPlayers();
             receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE).putExtra(NetMsg.INTENT_FULLUPDATE, true));
             assertNotNull(marker(2));
-            assertNotNull(marker(9));
+            assertNotNull(marker(11));
         });
     }
 
@@ -222,7 +222,7 @@ public class MapRegressionTest {
             set("mLocationListener", null);
             map.enableGPS(false);
             assertNull("Teammate survived GPS disable without a local subscription", marker(2));
-            assertNull(marker(9));
+            assertNull(marker(11));
         });
     }
 
@@ -283,10 +283,10 @@ public class MapRegressionTest {
         scenario.onActivity(current -> {
             showPlayers();
             ComponentObject teammate = marker(2);
-            ComponentObject enemy = marker(9);
+            ComponentObject enemy = marker(11);
             receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
             assertSame(teammate, marker(2));
-            assertSame(enemy, marker(9));
+            assertSame(enemy, marker(11));
         });
     }
 
@@ -295,12 +295,12 @@ public class MapRegressionTest {
         scenario.onActivity(current -> {
             showPlayers();
             ComponentObject teammate = marker(2);
-            ComponentObject enemy = marker(9);
+            ComponentObject enemy = marker(11);
             putLocation(2, 15);
             receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
             assertNotNull(marker(2));
             assertNotSame(teammate, marker(2));
-            assertSame(enemy, marker(9));
+            assertSame(enemy, marker(11));
         });
     }
 
@@ -375,7 +375,7 @@ public class MapRegressionTest {
                 location.hasUpdate = true;
                 receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
                 assertNull(marker(2));
-                assertNotNull(marker(9));
+                assertNotNull(marker(11));
             }
         });
     }
@@ -498,12 +498,12 @@ public class MapRegressionTest {
 
     private void showPlayers() {
         putLocation(2, 10);
-        putLocation(9, 20);
+        putLocation(11, 20);
         receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
         assertNotNull("Teammate marker was not created", marker(2));
-        assertNotNull("Enemy marker was not created", marker(9));
+        assertNotNull("Enemy marker was not created", marker(11));
         assertFalse(Globals.getInstance().mGPSData.get((byte) 2).hasUpdate);
-        assertFalse(Globals.getInstance().mGPSData.get((byte) 9).hasUpdate);
+        assertFalse(Globals.getInstance().mGPSData.get((byte) 11).hasUpdate);
     }
 
     private void putLocation(int playerID, double longitude) {

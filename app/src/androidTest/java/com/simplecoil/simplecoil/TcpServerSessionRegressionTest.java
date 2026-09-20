@@ -343,9 +343,9 @@ public class TcpServerSessionRegressionTest {
             Globals.getInstance().mUseGPS = true;
             Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
             Globals.GPSData location = new Globals.GPSData();
-            location.team = 1; // Player 5's old team in a two-team lobby.
+            location.team = 1; // Player 6's old team in a two-team lobby.
             location.hasUpdate = true;
-            Globals.getInstance().mGPSData.put((byte) 5, location);
+            Globals.getInstance().mGPSData.put((byte) 6, location);
             set(server, "keepListening", true);
             InstrumentationRegistry.getInstrumentation().runOnMainSync(server::sendGPSData);
             Runnable update = (Runnable) get(server, "mGPSRunnable");

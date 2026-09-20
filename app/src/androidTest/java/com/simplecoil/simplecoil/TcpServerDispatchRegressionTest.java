@@ -245,8 +245,8 @@ public class TcpServerDispatchRegressionTest {
             clientLockHeld = false;
             assertQueued(locations);
             InstrumentationRegistry.getInstrumentation().runOnMainSync(server::onDestroy);
-            Globals.getInstance().mGPSData.put((byte) 9, replacement);
-            Globals.getInstance().mGrenadePairings[1] = 9;
+            Globals.getInstance().mGPSData.put((byte) 11, replacement);
+            Globals.getInstance().mGrenadePairings[1] = 11;
         } finally {
             if (clientLockHeld) clientsLock.release();
             locations.release();
@@ -254,8 +254,8 @@ public class TcpServerDispatchRegressionTest {
         }
         assertFalse(worker.isAlive());
         assertSame("Old end task erased a replacement round's GPS", replacement,
-                Globals.getInstance().mGPSData.get((byte) 9));
-        assertEquals(9, Globals.getInstance().mGrenadePairings[1]);
+                Globals.getInstance().mGPSData.get((byte) 11));
+        assertEquals(11, Globals.getInstance().mGrenadePairings[1]);
         assertTrue(server.events.isEmpty());
         assertEquals(1, clientsLock.availablePermits());
     }
@@ -600,7 +600,7 @@ public class TcpServerDispatchRegressionTest {
         MemorySocket teammate = new MemorySocket();
         MemorySocket enemy = new MemorySocket();
         addClient(2, teammate);
-        addClient(9, enemy);
+        addClient(11, enemy);
         clientsLock.acquire();
         Thread worker;
         try {
@@ -633,10 +633,10 @@ public class TcpServerDispatchRegressionTest {
     @Test
     public void disconnectedTeammatesStillQueueMessagesWithoutQueuingForOpponents() throws Exception {
         addClient(2, new MemorySocket());
-        addClient(9, new MemorySocket());
+        addClient(11, new MemorySocket());
         closeClient(1);
         closeClient(2);
-        closeClient(9);
+        closeClient(11);
         clientsLock.acquire();
         Thread worker;
         try {
@@ -646,7 +646,7 @@ public class TcpServerDispatchRegressionTest {
         worker.join(1000);
         assertFalse(worker.isAlive());
         assertTrue(queuedMessages(1).isEmpty());
-        assertTrue(queuedMessages(9).isEmpty());
+        assertTrue(queuedMessages(11).isEmpty());
         assertEquals(1, queuedMessages(2).size());
         assertEquals("team", queuedMessages(2).peek());
     }
@@ -956,16 +956,16 @@ public class TcpServerDispatchRegressionTest {
 
     @Test
     public void hostAndAllPlayersReceiveTheSameStartAndEndDeadlines() throws Exception {
-        addClient(2, new MemorySocket());
+        for (int id = 2; id <= Globals.MAX_PLAYER_ID; id++) addClient(id, new MemorySocket());
         int originalTime = Globals.getInstance().mTimeLimit;
         try {
             Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
             Globals.getInstance().mTimeLimit = 5;
             dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
             JSONObject first = readJson(sockets.get(0));
-            JSONObject second = readJson(sockets.get(1));
             Intent host = server.notifications.get(0);
-            assertEquals(first.toString(), second.toString());
+            for (MemorySocket socket : sockets)
+                assertEquals(first.toString(), readJson(socket).toString());
             assertEquals(first.getLong(TcpServer.JSON_GAMESTART), host.getLongExtra(NetMsg.INTENT_START_AT, 0));
             assertEquals(first.getLong(TcpServer.JSON_GAMESTART) + 300000,
                     host.getLongExtra(NetMsg.INTENT_END_AT, 0));
@@ -1010,6 +1010,34 @@ public class TcpServerDispatchRegressionTest {
                 scheduled.getLongExtra(NetMsg.INTENT_START_AT, 0));
         server.clearScheduledStart();
         assertTrue(server.getScheduledGameStart() == null);
+    }
+
+    @Test
+    public void busyFirstPlayerCannotStarveClockReadinessOfTheTwentiethPlayer() throws Exception {
+        for (int id = 2; id <= 20; id++) addClient(id, new MemorySocket());
+        set(clients.get(20), "clockSynchronized", false);
+        ByteArrayOutputStream flood = new ByteArrayOutputStream();
+        DataOutputStream first = new DataOutputStream(flood);
+        for (int i = 0; i < 500; i++)
+            first.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, i));
+        ByteArrayOutputStream ready = new ByteArrayOutputStream();
+        new DataOutputStream(ready).writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+        set(clients.get(1), "in", new DataInputStream(new ByteArrayInputStream(flood.toByteArray())));
+        set(clients.get(20), "in", new DataInputStream(new ByteArrayInputStream(ready.toByteArray())));
+        Constructor<?> constructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
+                .getDeclaredConstructor(TcpServer.class);
+        constructor.setAccessible(true);
+        Thread reader = new Thread((Runnable) constructor.newInstance(server));
+        reader.setUncaughtExceptionHandler((thread, error) -> failures.add(error));
+        workers.add(reader);
+        long deadline = SystemClock.elapsedRealtime() + 1000;
+        reader.start();
+        while (!server.arePlayerClocksSynchronized() && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        assertTrue("A busy client blocked another player's clock readiness for over a second",
+                server.arePlayerClocksSynchronized());
     }
 
     private void parseClock(int connection, JSONObject json) throws Exception {

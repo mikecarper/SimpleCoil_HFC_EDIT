@@ -95,10 +95,10 @@ public class GameplayRegressionTest {
                 globals.mPlayerSettings.clear();
                 Globals.PlayerSettings first = new Globals.PlayerSettings();
                 first.damage = -5;
-                globals.mPlayerSettings.put((byte) 9, first);
+                globals.mPlayerSettings.put((byte) 11, first);
                 Globals.PlayerSettings second = new Globals.PlayerSettings();
                 second.damage = -7;
-                globals.mPlayerSettings.put((byte) 10, second);
+                globals.mPlayerSettings.put((byte) 12, second);
             } finally {
                 globals.mPlayerSettingsSemaphore.release();
             }
@@ -299,8 +299,8 @@ public class GameplayRegressionTest {
     @Test
     public void telemetryUsesEachBroadcastPacketEvenAfterCharacteristicChanges() {
         scenario.onActivity(activity -> {
-            byte[] first = telemetryPacket(9, 1, 0, 0);
-            byte[] second = telemetryPacket(9, 2, 0, 0);
+            byte[] first = telemetryPacket(11, 1, 0, 0);
+            byte[] second = telemetryPacket(11, 2, 0, 0);
             ((BluetoothGattCharacteristic) get(activity, "mTelemetryCharacteristic")).setValue(second);
             receiveTelemetry(activity, first);
             receiveTelemetry(activity, second);
@@ -446,7 +446,7 @@ public class GameplayRegressionTest {
         scenario.onActivity(activity -> {
             tcp.dedicated = true;
             prepareRoundLives(activity, 5, 3);
-            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Player 9");
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Player 11");
             CountDownTimer pendingSpawn = (CountDownTimer) get(activity, "mSpawnTimer");
             changeLifeOverride(activity, 3);
             assertLifeCount(activity, 0);
@@ -992,7 +992,7 @@ public class GameplayRegressionTest {
     @Test
     public void hitInSecondSlotUsesConfiguredDamageOnce() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 0, 0, 9, 1);
+            telemetry(activity, 0, 0, 11, 1);
             assertEquals(15, get(activity, "mHealth"));
         });
     }
@@ -1000,7 +1000,7 @@ public class GameplayRegressionTest {
     @Test
     public void twoDifferentAttackersApplyTheirOwnDamageOnce() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 9, 1, 10, 1);
+            telemetry(activity, 11, 1, 12, 1);
             assertEquals(8, get(activity, "mHealth"));
         });
     }
@@ -1008,9 +1008,9 @@ public class GameplayRegressionTest {
     @Test
     public void repeatedShotInBothSlotsAndNextPacketCountsOnce() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 9, 1, 9, 1);
+            telemetry(activity, 11, 1, 11, 1);
             assertEquals(15, get(activity, "mHealth"));
-            telemetry(activity, 9, 1, 9, 1);
+            telemetry(activity, 11, 1, 11, 1);
             assertEquals(15, get(activity, "mHealth"));
             assertEquals(1, get(activity, "mHitsTaken"));
         });
@@ -1019,7 +1019,7 @@ public class GameplayRegressionTest {
     @Test
     public void differentShotsFromSameAttackerBothCount() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 9, 1, 9, 2);
+            telemetry(activity, 11, 1, 11, 2);
             assertEquals(10, get(activity, "mHealth"));
         });
     }
@@ -1027,7 +1027,7 @@ public class GameplayRegressionTest {
     @Test
     public void friendlyHitDoesNotAddDamageToEnemyHit() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 2, 1, 9, 1);
+            telemetry(activity, 2, 1, 11, 1);
             assertEquals(15, get(activity, "mHealth"));
         });
     }
@@ -1038,11 +1038,26 @@ public class GameplayRegressionTest {
             set(activity, "mHasLivesLimit", true);
             set(activity, "mEliminationCount", 1);
             set(activity, "mHealth", 5);
-            telemetry(activity, 9, 1, 0, 0);
-            assertTrue(udp.messages.contains(NetMsg.NETMSG_ELIMINATED + ":9"));
+            telemetry(activity, 11, 1, 0, 0);
+            assertTrue(udp.messages.contains(NetMsg.NETMSG_ELIMINATED + ":11"));
             assertTrue(udp.messages.contains(NetMsg.NETMSG_LEAVE + ":all"));
             assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
             assertNull(get(activity, "mSpawnTimer"));
+        });
+    }
+
+    @Test
+    public void twentiethPlayerCanBeConfiguredOnTheBlasterAndScoreHits() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mPlayerID = 20;
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            invoke(activity, "setTeam");
+            assertEquals(20, bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
+            Globals.getInstance().mPlayerID = 1;
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            set(activity, "mNetworkTeam", 1);
+            telemetry(activity, 20, 1, 0, 0);
+            assertEquals(19, get(activity, "mHealth"));
         });
     }
 

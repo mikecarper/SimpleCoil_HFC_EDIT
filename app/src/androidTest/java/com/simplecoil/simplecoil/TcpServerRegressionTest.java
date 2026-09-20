@@ -217,7 +217,7 @@ public class TcpServerRegressionTest {
     public void lossyGrenadeIdsAndOwnersCannotChangeExistingPairings() throws Exception {
         Object player = client(1, 1);
         Globals.getInstance().mGrenadePairings[2] = 1;
-        Globals.getInstance().mGrenadePairings[3] = 9;
+        Globals.getInstance().mGrenadePairings[3] = 11;
         int before = server.messages.size();
         for (String key : new String[]{TcpServer.JSON_PLAYERID, TcpServer.JSON_PAIRED_GRENADE_ID}) {
             int valid = key.equals(TcpServer.JSON_PLAYERID) ? 1 : 3;
@@ -225,7 +225,7 @@ public class TcpServerRegressionTest {
                 parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
                         .put(TcpServer.JSON_PAIRED_GRENADE_ID, 3).put(key, invalid));
                 assertEquals(1, Globals.getInstance().mGrenadePairings[2]);
-                assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+                assertEquals(11, Globals.getInstance().mGrenadePairings[3]);
                 assertEquals(before, server.messages.size());
             }
         }
@@ -235,11 +235,11 @@ public class TcpServerRegressionTest {
     public void newGrenadePairingRemovesThatPlayersPreviousPairing() throws Exception {
         Object player = client(1, 1);
         Globals.getInstance().mGrenadePairings[2] = 1;
-        Globals.getInstance().mGrenadePairings[4] = 9;
+        Globals.getInstance().mGrenadePairings[4] = 11;
         pair(player, 1, 3);
         assertEquals(Globals.INVALID_PLAYER_ID, Globals.getInstance().mGrenadePairings[2]);
         assertEquals(1, Globals.getInstance().mGrenadePairings[3]);
-        assertEquals(9, Globals.getInstance().mGrenadePairings[4]);
+        assertEquals(11, Globals.getInstance().mGrenadePairings[4]);
         assertEquals(2, lastPairings().length());
     }
 
@@ -259,10 +259,10 @@ public class TcpServerRegressionTest {
     public void unpairDoesNotClearAnotherPlayersGrenade() throws Exception {
         Object player = client(1, 1);
         Globals.getInstance().mGrenadePairings[2] = 1;
-        Globals.getInstance().mGrenadePairings[3] = 9;
+        Globals.getInstance().mGrenadePairings[3] = 11;
         pair(player, 1, 0);
         assertEquals(Globals.INVALID_PLAYER_ID, Globals.getInstance().mGrenadePairings[2]);
-        assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+        assertEquals(11, Globals.getInstance().mGrenadePairings[3]);
         assertEquals(1, lastPairings().length());
     }
 
@@ -270,12 +270,12 @@ public class TcpServerRegressionTest {
     public void invalidGrenadeOrSpoofedOwnerCannotRemoveExistingPairings() throws Exception {
         Object player = client(1, 1);
         Globals.getInstance().mGrenadePairings[2] = 1;
-        Globals.getInstance().mGrenadePairings[3] = 9;
+        Globals.getInstance().mGrenadePairings[3] = 11;
         int before = server.messages.size();
         pair(player, 1, Globals.MAX_GRENADE_IDS);
-        pair(player, 9, 0);
+        pair(player, 11, 0);
         assertEquals(1, Globals.getInstance().mGrenadePairings[2]);
-        assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+        assertEquals(11, Globals.getInstance().mGrenadePairings[3]);
         assertEquals(before, server.messages.size());
     }
 
@@ -368,9 +368,9 @@ public class TcpServerRegressionTest {
     @Test
     public void unregisteredConnectionCannotAwardEliminationPoints() throws Exception {
         Object sender = client(1, 0);
-        client(2, 9);
-        eliminate(sender, 9);
-        assertEquals(0, server.getScore((byte) 9).points);
+        client(2, 11);
+        eliminate(sender, 11);
+        assertEquals(0, server.getScore((byte) 11).points);
         assertEquals(0, get(sender, "eliminated"));
     }
 
@@ -378,19 +378,19 @@ public class TcpServerRegressionTest {
     public void eliminationReportsInLobbyDoNotChangeScores() throws Exception {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Object victim = client(1, 1);
-        client(2, 9);
-        eliminate(victim, 9);
-        assertEquals(0, server.getScore((byte) 9).points);
+        client(2, 11);
+        eliminate(victim, 11);
+        assertEquals(0, server.getScore((byte) 11).points);
         assertEquals(0, server.getScore((byte) 1).eliminated);
     }
 
     @Test
     public void eliminationReportsDuringSharedCountdownDoNotChangeScores() throws Exception {
         Object victim = client(1, 1);
-        client(2, 9);
+        client(2, 11);
         set(server, "mScheduledStart", android.os.SystemClock.elapsedRealtime() + 10000);
-        eliminate(victim, 9);
-        assertEquals(0, server.getScore((byte) 9).points);
+        eliminate(victim, 11);
+        assertEquals(0, server.getScore((byte) 11).points);
         assertEquals(0, server.getScore((byte) 1).eliminated);
     }
 
@@ -398,10 +398,10 @@ public class TcpServerRegressionTest {
     public void changingToFourTeamsRecognizesNewEnemies() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
         Object victim = client(1, 1);
-        client(2, 5);
+        client(2, 6);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
-        eliminate(victim, 5);
-        assertEquals(1, server.getScore((byte) 5).points);
+        eliminate(victim, 6);
+        assertEquals(1, server.getScore((byte) 6).points);
         assertEquals(1, server.getScore((byte) 1).eliminated);
     }
 
@@ -409,35 +409,35 @@ public class TcpServerRegressionTest {
     public void mergingTeamsRejectsPreviouslyHostileFriendlyFire() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
         Object victim = client(1, 1);
-        client(2, 5);
+        client(2, 6);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
-        eliminate(victim, 5);
-        assertEquals(0, server.getScore((byte) 5).points);
+        eliminate(victim, 6);
+        assertEquals(0, server.getScore((byte) 6).points);
         assertEquals(0, server.getScore((byte) 1).eliminated);
     }
 
     @Test
     public void gpsTeamReflectsTheCurrentGameMode() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
-        Object player = client(1, 5);
+        Object player = client(1, 6);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
         parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 10.0)
                 .put(TcpServer.JSON_GPSLATITUDE, 20.0));
-        assertEquals(2, Globals.getInstance().mGPSData.get((byte) 5).team);
+        assertEquals(2, Globals.getInstance().mGPSData.get((byte) 6).team);
     }
 
     @Test
     public void zeroCoordinatePlaceholderDoesNotMoveThePlayer() throws Exception {
-        Object player = client(1, 5);
+        Object player = client(1, 6);
         parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 10.0)
                 .put(TcpServer.JSON_GPSLATITUDE, 20.0));
-        Globals.GPSData saved = Globals.getInstance().mGPSData.get((byte) 5);
+        Globals.GPSData saved = Globals.getInstance().mGPSData.get((byte) 6);
         saved.hasUpdate = false;
         double[][] placeholders = {{0, 0}, {10, 0}, {0, 20}};
         for (double[] coordinates : placeholders) {
             parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, coordinates[0])
                     .put(TcpServer.JSON_GPSLATITUDE, coordinates[1]));
-            assertSame(saved, Globals.getInstance().mGPSData.get((byte) 5));
+            assertSame(saved, Globals.getInstance().mGPSData.get((byte) 6));
             assertEquals(10, saved.longitude, 0);
             assertEquals(20, saved.latitude, 0);
             assertFalse(saved.hasUpdate);
@@ -450,8 +450,8 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mScoreLimit = 1;
         Globals.getInstance().mOnlyServerSettings = true;
         Object victim = client(1, 1);
-        client(2, 9);
-        eliminate(victim, 9);
+        client(2, 11);
+        eliminate(victim, 11);
         assertEquals(1, server.endRequests);
     }
 
@@ -462,7 +462,7 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mScoreLimit = 3;
         Object attacker = client(1, 1);
         Object teammate = client(2, 2);
-        Object victim = client(3, 9);
+        Object victim = client(3, 11);
         set(attacker, "points", 1);
         set(teammate, "points", 1);
         eliminate(victim, 1);
@@ -475,7 +475,7 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_SCORE;
         Globals.getInstance().mScoreLimit = 3;
         client(1, 1);
-        Object victim = client(2, 9);
+        Object victim = client(2, 11);
         set(victim, "points", 20);
         eliminate(victim, 1);
         assertEquals(0, server.endRequests);
@@ -485,8 +485,8 @@ public class TcpServerRegressionTest {
     public void disabledScoreLimitDoesNotEndRound() throws Exception {
         Globals.getInstance().mScoreLimit = 1;
         Object victim = client(1, 1);
-        client(2, 9);
-        eliminate(victim, 9);
+        client(2, 11);
+        eliminate(victim, 11);
         assertEquals(0, server.endRequests);
     }
 
@@ -553,7 +553,7 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mScoreLimit = 3;
         client(1, 1);
         Object teammate = client(2, 2);
-        Object victim = client(3, 9);
+        Object victim = client(3, 11);
         set(teammate, "points", 2);
         remove(teammate, 2);
         eliminate(victim, 1);
@@ -614,7 +614,7 @@ public class TcpServerRegressionTest {
     public void partialFrameDoesNotReadUnavailableBytesOrBlockOtherPlayers() throws Exception {
         Object partialSender = client(1, 1);
         Object victim = client(2, 2);
-        client(3, 9);
+        client(3, 11);
         final int[] prematureReads = {0};
         InputStream fragment = new InputStream() {
             private boolean headerByteRead;
@@ -629,9 +629,9 @@ public class TcpServerRegressionTest {
             }
         };
         set(partialSender, "in", new DataInputStream(fragment));
-        eliminate(victim, 9);
+        eliminate(victim, 11);
         assertEquals(0, prematureReads[0]);
-        assertEquals(1, server.getScore((byte) 9).points);
+        assertEquals(1, server.getScore((byte) 11).points);
     }
 
     @Test
@@ -675,7 +675,7 @@ public class TcpServerRegressionTest {
     public void unregisteredConnectionCannotStartGame() throws Exception {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Object sender = client(1, 0);
-        client(2, 9);
+        client(2, 11);
         processMessage(sender, NetMsg.NETMSG_STARTGAME);
         assertEquals(0, server.startRequests);
     }
@@ -683,7 +683,7 @@ public class TcpServerRegressionTest {
     @Test
     public void unregisteredConnectionCannotEndGame() throws Exception {
         Object sender = client(1, 0);
-        client(2, 9);
+        client(2, 11);
         processMessage(sender, NetMsg.NETMSG_ENDGAME);
         assertEquals(0, server.endRequests);
     }
@@ -691,7 +691,7 @@ public class TcpServerRegressionTest {
     @Test
     public void unregisteredConnectionLeavingCannotEndGame() throws Exception {
         Object sender = client(1, 0);
-        client(2, 9);
+        client(2, 11);
         processMessage(sender, NetMsg.NETMSG_LEAVE);
         assertFalse(clients.containsKey(1));
         assertEquals(0, server.endRequests);

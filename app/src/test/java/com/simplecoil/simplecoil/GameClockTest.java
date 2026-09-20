@@ -41,6 +41,30 @@ public class GameClockTest {
         assertEquals(20, clock.toLocalTime(GameClock.MAX_TIMESTAMP));
     }
 
+    @Test public void rejectsSamplesTooUncertainForOneSecondGroupAlignment() {
+        GameClock clock = new GameClock();
+        assertFalse(clock.record(1000, 2000, 2000, 1501));
+        assertEquals(0, clock.samples());
+        assertTrue(clock.record(1000, 2000, 2000, 1500));
+    }
+
+    @Test public void twentyDifferentClocksStayWithinOneSecondEvenWithAsymmetricDelay() {
+        long earliest = Long.MAX_VALUE;
+        long latest = Long.MIN_VALUE;
+        for (int player = 0; player < 20; player++) {
+            long actualOffset = player * 100000L;
+            long outbound = player * 25L;
+            long inbound = 500 - outbound;
+            GameClock clock = new GameClock();
+            assertTrue(clock.record(1000, 1000 + actualOffset + outbound,
+                    1000 + actualOffset + outbound, 1000 + outbound + inbound));
+            long translatedBackToHost = clock.toLocalTime(5000000) + actualOffset;
+            earliest = Math.min(earliest, translatedBackToHost);
+            latest = Math.max(latest, translatedBackToHost);
+        }
+        assertTrue(latest - earliest < 1000);
+    }
+
     @Test public void refreshKeepsPreviousEstimateUntilANewSampleArrives() {
         GameClock clock = new GameClock();
         clock.record(1000, 6010, 6010, 1020);

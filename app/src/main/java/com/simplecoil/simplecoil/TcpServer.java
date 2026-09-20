@@ -1225,6 +1225,8 @@ public class TcpServer extends Service {
                     if (!keepListening)
                         return;
                     for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
+                        if (!keepListening)
+                            break;
                         try {
                             if (entry.getValue().connectionFailed) {
                                 // Writes happen on sender threads. Let this loop update
@@ -1245,7 +1247,10 @@ public class TcpServer extends Service {
                                             // Handle JSON Data
                                             message = message.substring(TCPMESSAGE_PREFIX.length() + TCPPREFIX_JSON.length());
                                             parsePlayerInfo(message, entry.getValue());
-                                            break;
+                                            // Service every client once per pass. A busy early
+                                            // client must not starve later players' clock sync,
+                                            // GPS updates, or heartbeats in a large lobby.
+                                            continue;
                                         } else if (message.startsWith(TCPPREFIX_MESG, TCPMESSAGE_PREFIX.length())) {
                                             // Handle messages
                                             message = message.substring(TCPMESSAGE_PREFIX.length() + TCPPREFIX_MESG.length());

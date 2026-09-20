@@ -53,6 +53,9 @@ public class BluetoothConnectionRegressionTest {
     private FakeGatt replacement;
     private BluetoothAdapter savedDefaultAdapter;
     private Field defaultAdapterField;
+    private Field deviceServiceField;
+    private Object savedDeviceService;
+    private Object fakeDeviceService;
     private boolean denyGattAccess;
     private boolean gattTransportAvailable = true;
     private final List<FakeGatt> connections = new ArrayList<>();
@@ -64,6 +67,8 @@ public class BluetoothConnectionRegressionTest {
         service = new RecordingService();
         savedDefaultAdapter = BluetoothAdapter.getDefaultAdapter();
         assertNotNull(savedDefaultAdapter);
+        deviceServiceField = field(BluetoothDevice.class, "sService");
+        savedDeviceService = deviceServiceField.get(null);
         serviceField("mBluetoothAdapter").set(service, savedDefaultAdapter);
         callback = (BluetoothGattCallback) serviceField("mGattCallback").get(service);
         original = new FakeGatt("00:11:22:33:44:55", 1);
@@ -84,6 +89,9 @@ public class BluetoothConnectionRegressionTest {
             for (FakeGatt connection : connections) connection.gatt.close();
         } finally {
             if (defaultAdapterField != null) defaultAdapterField.set(null, savedDefaultAdapter);
+            // BluetoothDevice caches the fake adapter's binder separately. Do
+            // not leak it into later activity/scan tests in the same process.
+            if (deviceServiceField != null) deviceServiceField.set(null, savedDeviceService);
         }
         for (Thread worker : workers) assertFalse("Bluetooth worker survived cleanup", worker.isAlive());
         assertTrue("Bluetooth worker failed: " + failures, failures.isEmpty());
@@ -101,6 +109,7 @@ public class BluetoothConnectionRegressionTest {
                         return field(BluetoothAdapter.class, "STATE_BLE_QM_ON").getInt(null);
                     throw new AssertionError("Unexpected adapter operation: " + method.getName());
                 });
+        fakeDeviceService = adapterService;
         Class<?> managerType = Class.forName("android.bluetooth.IBluetoothManager");
         Object manager = Proxy.newProxyInstance(managerType.getClassLoader(), new Class<?>[]{managerType},
                 (proxy, method, args) -> {
@@ -119,6 +128,16 @@ public class BluetoothConnectionRegressionTest {
         BluetoothAdapter fakeAdapter = constructor.newInstance(manager);
         defaultAdapterField = field(BluetoothAdapter.class, "sAdapter");
         defaultAdapterField.set(null, fakeAdapter);
+    }
+
+    @Test
+    public void cleanupRestoresTheDeviceBinderCacheForFollowingTests() throws Exception {
+        // Exercise the order-dependent leak even when the test runner happens
+        // to schedule activity tests before connection tests.
+        deviceServiceField.set(null, fakeDeviceService);
+        tearDown();
+        assertSame(savedDefaultAdapter, BluetoothAdapter.getDefaultAdapter());
+        assertSame(savedDeviceService, deviceServiceField.get(null));
     }
 
     @Test
