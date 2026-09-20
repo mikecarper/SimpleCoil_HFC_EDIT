@@ -38,6 +38,9 @@ import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 public class UDPListenerService extends Service {
     private static final String TAG = "UDPSvc";
@@ -65,6 +68,9 @@ public class UDPListenerService extends Service {
     private volatile boolean mScanRunning = false;
     private final Object mListenerStateLock = new Object();
     private boolean mDestroyed;
+    // Queued sends may drain after stopListen(), but not into a replacement lobby.
+    // Separate from discovery's generation, which changes on a successful reply.
+    private long mSendGeneration;
     private volatile long mJoinGeneration;
     private InetAddress mJoinAddress;
     private boolean mBroadcastScan;
@@ -392,6 +398,7 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
+            mSendGeneration++;
             endScanningLocked();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
@@ -518,6 +525,7 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
+            mSendGeneration++;
             endScanningLocked();
             Globals.getmIPTeamMapSemaphore();
             Globals.getInstance().mIPTeamMap.clear();
@@ -574,63 +582,83 @@ public class UDPListenerService extends Service {
     }
 
     public void sendUDPMessage(String message, Byte playerID) {
+        final long generation = getSendGeneration();
+        if (generation < 0)
+            return;
         message = NetMsg.MESSAGE_PREFIX + message;
         Globals.getmTeamIPMapSemaphore();
-        InetAddress ip = Globals.getInstance().mTeamIPMap.get(playerID);
-        Globals.getInstance().mTeamIPMapSemaphore.release();
+        final InetAddress ip;
+        try {
+            ip = Globals.getInstance().mTeamIPMap.get(playerID);
+        } finally {
+            Globals.getInstance().mTeamIPMapSemaphore.release();
+        }
         if (ip == null) {
             Log.e(TAG, "cannot send message to unknown ID " + playerID);
             return;
         }
-        sendUDPMessage(message, ip, LISTEN_PORT);
+        sendDatagrams(message, Collections.singletonList(ip), LISTEN_PORT, 1, generation);
     }
 
     public void sendUDPMessageAll(String message) {
-        final String prefixedMessage = NetMsg.MESSAGE_PREFIX + message;
-        Thread sendThread = new Thread(() -> {
-            synchronized (mSendLock) {
-                Globals.getmIPTeamMapSemaphore();
-                try {
-                    for (InetAddress ip : Globals.getInstance().mIPTeamMap.keySet()) {
-                        sendDatagram(prefixedMessage, ip, LISTEN_PORT);
-                    }
-                } finally {
-                    Globals.getInstance().mIPTeamMapSemaphore.release();
-                }
-                Log.d(TAG, "send all finished");
-            }
-        });
-        sendThread.start();
+        sendUDPMessageAllRepeat(message, 1);
     }
 
     public void sendUDPMessageAllRepeat(String message, final int repeatCount) {
-        final String prefixedMessage = NetMsg.MESSAGE_PREFIX + message;
-        Thread sendThread = new Thread(() -> {
-            synchronized (mSendLock) {
-                int repeat = repeatCount;
-                while (repeat-- > 0) {
-                    Globals.getmIPTeamMapSemaphore();
-                    try {
-                        for (InetAddress ip : Globals.getInstance().mIPTeamMap.keySet()) {
-                            sendDatagram(prefixedMessage, ip, LISTEN_PORT);
-                        }
-                    } finally {
-                        Globals.getInstance().mIPTeamMapSemaphore.release();
-                    }
-                    sleep(50);
-                }
-                Log.d(TAG, "send all repeat finished");
-            }
-        });
-        sendThread.start();
+        final long generation = getSendGeneration();
+        if (generation < 0 || repeatCount <= 0)
+            return;
+        final List<InetAddress> recipients;
+        Globals.getmIPTeamMapSemaphore();
+        try {
+            recipients = new ArrayList<>(Globals.getInstance().mIPTeamMap.keySet());
+        } finally {
+            Globals.getInstance().mIPTeamMapSemaphore.release();
+        }
+        // Freeze recipients before queuing, and never hold the roster lock over
+        // socket I/O. A delayed ENDGAME must not follow players into a new lobby.
+        sendDatagrams(NetMsg.MESSAGE_PREFIX + message, recipients, LISTEN_PORT, repeatCount, generation);
     }
 
     private void sendUDPMessage(final String message, final InetAddress ip, final Integer port) {
+        sendDatagrams(message, Collections.singletonList(ip), port, 1, getSendGeneration());
+    }
+
+    private long getSendGeneration() {
+        synchronized (mListenerStateLock) {
+            return mDestroyed ? -1 : mSendGeneration;
+        }
+    }
+
+    private boolean isCurrentSend(long generation) {
+        synchronized (mListenerStateLock) {
+            return !mDestroyed && generation == mSendGeneration;
+        }
+    }
+
+    private void sendDatagrams(String message, List<InetAddress> recipients, int port, int repeatCount,
+                               long generation) {
+        if (recipients.isEmpty() || !isCurrentSend(generation))
+            return;
         Thread sendThread = new Thread(() -> {
             synchronized (mSendLock) {
-                sendDatagram(message, ip, port);
+                for (int repeat = 0; repeat < repeatCount; repeat++) {
+                    for (InetAddress ip : recipients) {
+                        if (!isCurrentSend(generation) || Thread.currentThread().isInterrupted())
+                            return;
+                        sendDatagram(message, ip, port);
+                    }
+                    if (repeat + 1 < repeatCount) {
+                        try {
+                            Thread.sleep(50);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }
             }
-        });
+        }, "SimpleCoil UDP send");
         sendThread.start();
     }
 
