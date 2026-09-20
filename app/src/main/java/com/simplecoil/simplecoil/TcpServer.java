@@ -579,6 +579,15 @@ public class TcpServer extends Service {
         final List<ClientRecipient> recipients = getClientRecipients();
         if (recipients.isEmpty())
             return;
+        runClientTask(() -> sendGameInfo(id, recipients));
+    }
+
+    // Called with the client lock held, like start/end and registration. Build
+    // snapshots in dispatch order: preparing a lobby snapshot before waiting for
+    // the lock could send GAME_STATE_NONE after a queued start was announced, or
+    // roll back a later score/roster update. Keep the original recipient identities
+    // so a new connection cannot inherit work queued for a previous player.
+    private void sendGameInfo(int id, List<ClientRecipient> recipients) {
         try {
             JSONArray players = new JSONArray();
             Map<Byte, InetAddress> teamIPMap = getTeamIPMapSnapshot();
@@ -636,9 +645,8 @@ public class TcpServer extends Service {
                 }
             }
             final String allMessage = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
-            if (id == SEND_ALL)
-                sendTCPMessageAll(allMessage, false, recipients);
-            else {
+            String idMessage = allMessage;
+            if (id != SEND_ALL) {
                 // Get update data for this specific player
                 ScoreData scoreData = getScore((byte)id);
                 JSONObject playerGameUpdate = new JSONObject();
@@ -663,20 +671,13 @@ public class TcpServer extends Service {
                     playerGameUpdate.put(JSON_TIMEREMAINING, Globals.getInstance().mServerGameTimeRemaining);
                 }
                 game.put(JSON_PLAYERGAMEUPDATE, playerGameUpdate);
-                final String idMessage = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
-
-                runClientTask(() -> {
-                    for (ClientRecipient recipient : recipients) {
-                        if (!isClientTaskActive())
-                            return;
-                        if (!recipient.isCurrent())
-                            continue;
-                        if (recipient.playerID != id)
-                            recipient.client.sendTCPMessage(allMessage, false);
-                        else
-                            recipient.client.sendTCPMessage(idMessage, false);
-                    }
-                });
+                idMessage = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
+            }
+            for (ClientRecipient recipient : recipients) {
+                if (!isClientTaskActive())
+                    return;
+                if (recipient.isCurrent())
+                    recipient.client.sendTCPMessage(recipient.playerID == id ? idMessage : allMessage, false);
             }
         } catch (JSONException e) {
             e.printStackTrace();

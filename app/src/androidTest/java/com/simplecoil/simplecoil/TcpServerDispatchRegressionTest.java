@@ -1001,6 +1001,82 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void queuedLobbyBroadcastCannotCancelANewerSynchronizedStart() throws Exception {
+        assertQueuedRosterKeepsStart(TcpServer.SEND_ALL);
+    }
+
+    @Test
+    public void queuedPersonalizedLobbyUpdateCannotCancelANewerSynchronizedStart() throws Exception {
+        assertQueuedRosterKeepsStart(1);
+    }
+
+    private void assertQueuedRosterKeepsStart(int playerID) throws Exception {
+        addClient(2, new MemorySocket());
+        List<Thread> tasks;
+        clientsLock.acquire();
+        try {
+            assertTrue(server.startGame());
+            queuedWorker();
+            // The host UI still shows the lobby while the start is queued.
+            // Registration or settings changes can queue a roster behind it.
+            server.sendAllGameInfo(playerID);
+            tasks = captureClientTasks();
+            long deadline = SystemClock.elapsedRealtime() + 2000;
+            while (clientsLock.getQueueLength() < 2 && SystemClock.elapsedRealtime() < deadline)
+                Thread.sleep(10);
+            assertEquals("Both senders must be queued before releasing the lock", 2, clientsLock.getQueueLength());
+        } finally { clientsLock.release(); }
+        for (Thread task : tasks) {
+            task.join(2000);
+            assertFalse("Queued start/roster task did not finish", task.isAlive());
+        }
+        for (MemorySocket socket : sockets) {
+            DataInputStream frames = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray()));
+            int prefixLength = TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length();
+            JSONObject start = new JSONObject(frames.readUTF().substring(prefixLength));
+            assertFalse("The test must deliver the start before the roster", start.has(TcpServer.JSON_PLAYERS));
+            JSONObject roster = new JSONObject(frames.readUTF().substring(prefixLength));
+            assertEquals("An old lobby update would end the just-started client round",
+                    Globals.GAME_STATE_RUNNING, roster.getInt(TcpServer.JSON_GAMESTATE));
+            assertEquals(start.getLong(TcpServer.JSON_ROUND_ID), roster.getLong(TcpServer.JSON_ROUND_ID));
+            assertEquals(start.getLong(TcpServer.JSON_GAMESTART), roster.getLong(TcpServer.JSON_GAMESTART));
+            assertEquals(start.getLong(TcpServer.JSON_GAMEDURATION), roster.getLong(TcpServer.JSON_GAMEDURATION));
+            assertEquals(0, frames.available());
+        }
+    }
+
+    @Test
+    public void queuedRosterCannotRestoreDepartedPlayersOrOldNames() throws Exception {
+        addClient(2, new MemorySocket());
+        dispatchThenChange(() -> server.sendAllGameInfo(1), () -> {
+            closeClient(2);
+            clients.remove(2);
+            InetAddress departed = Globals.getInstance().mTeamIPMap.remove((byte) 2);
+            Globals.getInstance().mIPTeamMap.remove(departed);
+            Globals.getInstance().mTeamPlayerNameMap.remove((byte) 2);
+            Globals.getInstance().mTeamPlayerNameMap.put((byte) 1, "Current name");
+        });
+        JSONObject roster = readJson(sockets.get(0));
+        JSONArray players = roster.getJSONArray(TcpServer.JSON_PLAYERS);
+        assertEquals("A queued roster restored a player who already left", 1, players.length());
+        assertEquals("Current name", players.getJSONObject(0).getString(TcpServer.JSON_PLAYERNAME));
+        assertEquals(0, sockets.get(1).bytes.size());
+    }
+
+    @Test
+    public void queuedPersonalizedRosterCannotRollBackScores() throws Exception {
+        dispatchThenChange(() -> server.sendAllGameInfo(1), () -> {
+            set(clients.get(1), "points", 7);
+            set(clients.get(1), "eliminated", 3);
+        });
+        JSONObject roster = readJson(sockets.get(0));
+        JSONObject score = roster.getJSONObject(TcpServer.JSON_PLAYERGAMEUPDATE);
+        assertEquals(7, score.getInt(TcpServer.JSON_PLAYERPOINTS));
+        assertEquals(3, score.getInt(TcpServer.JSON_PLAYERELIMINATED));
+        assertEquals(7, score.getInt(TcpServer.JSON_TEAMPOINTS));
+    }
+
+    @Test
     public void pausedPeerHostCanRecoverItsStartAfterLobbyConnectionCloses() throws Exception {
         server.setDedicated(false);
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
