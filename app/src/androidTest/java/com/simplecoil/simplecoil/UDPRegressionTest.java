@@ -141,6 +141,27 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void udpDiscoveryDoesNotCreateARosterEntryBeforeTcpRegistration() throws Exception {
+        set(service, "mIsListService", true);
+        receive(teammate, NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "2");
+
+        assertTrue("UDP discovery created an unauthenticated player entry",
+                Globals.getInstance().mIPTeamMap.isEmpty());
+        assertTrue("UDP discovery created an unauthenticated endpoint entry",
+                Globals.getInstance().mTeamIPMap.isEmpty());
+    }
+
+    @Test
+    public void udpLeaveCannotRemoveALiveTcpRosterEntry() throws Exception {
+        register(teammate, 2);
+        receive(teammate, NetMsg.NETMSG_LEAVE);
+
+        assertEquals(Byte.valueOf((byte) 2), Globals.getInstance().mIPTeamMap.get(teammate));
+        assertEquals(teammate, Globals.getInstance().mTeamIPMap.get((byte) 2));
+        assertTrue("UDP leave bypassed TCP roster lifecycle", service.events.isEmpty());
+    }
+
+    @Test
     public void validHitOutAndEliminationKeepTheirPlayerIds() throws Exception {
         register(enemy, 11);
         String[] commands = {NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT, NetMsg.NETMSG_ELIMINATED};

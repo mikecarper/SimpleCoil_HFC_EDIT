@@ -199,58 +199,29 @@ public class UDPListenerService extends Service {
                 Globals.getmTeamIPMapSemaphore();
                 try {
                     InetAddress existingPlayerIP = Globals.getInstance().mTeamIPMap.get(team);
-                    if (team == Globals.getInstance().mPlayerID || (existingPlayerIP != null && !existingPlayerIP.equals(ip))) {
+                    if (team == Globals.getInstance().mPlayerID
+                            || (existingPlayerIP != null && !existingPlayerIP.equals(ip))) {
                         Log.e(TAG, "2 Players using same ID!");
                         sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SAMETEAM, ip, LISTEN_PORT);
                         return;
                     }
-                    Globals.getInstance().mTeamIPMap.put(team, ip);
                 } finally {
                     Globals.getInstance().mTeamIPMapSemaphore.release();
                 }
-                Globals.getmIPTeamMapSemaphore();
-                Byte previousTeam;
-                try {
-                    previousTeam = Globals.getInstance().mIPTeamMap.put(ip, team);
-                } finally {
-                    Globals.getInstance().mIPTeamMapSemaphore.release();
-                }
-                if (previousTeam != null && previousTeam.byteValue() != team.byteValue()) {
-                    Globals.getmTeamIPMapSemaphore();
-                    try {
-                        if (ip.equals(Globals.getInstance().mTeamIPMap.get(previousTeam)))
-                            Globals.getInstance().mTeamIPMap.remove(previousTeam);
-                    } finally {
-                        Globals.getInstance().mTeamIPMapSemaphore.release();
-                    }
-                }
-                Log.d(TAG, "player " + team + " found at " + ip.toString());
+                // Discovery only proves that a peer can receive UDP. TCP registration
+                // owns roster membership and endpoints. Recording a JOIN here leaves
+                // ghosts when its sender never completes the TCP handshake.
+                Log.d(TAG, "UDP discovery from player " + team + " at " + ip.toString());
                 sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY, ip, LISTEN_PORT);
             } else if (message.equals(NetMsg.NETMSG_SERVERREPLY)) {
                 completeJoin(ip, NetMsg.NETMSG_SERVERREPLY);
                 return;
             } else if (message.equals(NetMsg.NETMSG_LEAVE)) {
-                // This is a player left message
-                Globals.getmIPTeamMapSemaphore();
-                Byte team;
-                try {
-                    team = Globals.getInstance().mIPTeamMap.remove(ip);
-                } finally {
-                    Globals.getInstance().mIPTeamMapSemaphore.release();
-                }
-                if (team == null) {
-                    Log.w(TAG, "Ignoring leave request from unknown IP " + ip);
-                    return;
-                }
-                Globals.getmTeamIPMapSemaphore();
-                try {
-                    if (ip.equals(Globals.getInstance().mTeamIPMap.get(team)))
-                        Globals.getInstance().mTeamIPMap.remove(team);
-                } finally {
-                    Globals.getInstance().mTeamIPMapSemaphore.release();
-                }
-                Log.d(TAG, "player " + team + " left at " + ip.toString());
-                intent = new Intent(NetMsg.NETMSG_LEAVE);
+                // A UDP datagram cannot prove that a TCP player disconnected.
+                // The TCP server removes roster entries after its authenticated
+                // connection closes, so a stale or spoofed LEAVE cannot evict a
+                // live player from game traffic.
+                Log.d(TAG, "Ignoring UDP leave; TCP owns roster removal");
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
                 if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                         || (getPlayerID(ip) == null && !ip.equals(Globals.getInstance().mServerIP)))
