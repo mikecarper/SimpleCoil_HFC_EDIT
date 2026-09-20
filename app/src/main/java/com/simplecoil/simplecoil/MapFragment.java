@@ -390,6 +390,29 @@ public class MapFragment extends GlobeMapFragment {
     }
 
     private ComponentObject[] mPlayerMarkers = null;
+    // Maply retains marker images while they are displayed. Reuse these immutable
+    // resource bitmaps instead of allocating new native bitmaps for every GPS update.
+    private Bitmap mYouMarkerIcon = null;
+    private Bitmap mTeammateMarkerIcon = null;
+    private Bitmap mEnemyMarkerIcon = null;
+
+    private Bitmap getYouMarkerIcon() {
+        if (mYouMarkerIcon == null && isAdded())
+            mYouMarkerIcon = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_you);
+        return mYouMarkerIcon;
+    }
+
+    private Bitmap getTeammateMarkerIcon() {
+        if (mTeammateMarkerIcon == null && isAdded())
+            mTeammateMarkerIcon = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_teammate);
+        return mTeammateMarkerIcon;
+    }
+
+    private Bitmap getEnemyMarkerIcon() {
+        if (mEnemyMarkerIcon == null && isAdded())
+            mEnemyMarkerIcon = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_enemy);
+        return mEnemyMarkerIcon;
+    }
 
     private void insertYourMarker() {
         if (mapControl == null || mPlayerMarkers == null || !isGPSActive()) return;
@@ -402,7 +425,8 @@ public class MapFragment extends GlobeMapFragment {
 
         if (!isValidLocation(currentBestLocation)) return;
         MarkerInfo markerInfo = new MarkerInfo();
-        Bitmap icon = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_you);
+        Bitmap icon = getYouMarkerIcon();
+        if (icon == null) return;
         Point2d markerSize = new Point2d(72, 72);
 
         ScreenMarker you = new ScreenMarker();
@@ -441,8 +465,9 @@ public class MapFragment extends GlobeMapFragment {
         int currentTeam = -1;
         if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA)
             currentTeam = Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
-        Bitmap teammate = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_teammate);
-        Bitmap enemy = BitmapFactory.decodeResource(requireActivity().getResources(), R.drawable.ic_gps_enemy);
+        Bitmap teammate = getTeammateMarkerIcon();
+        Bitmap enemy = getEnemyMarkerIcon();
+        if (teammate == null || enemy == null) return;
         Globals.getmGPSDataSemaphore();
         try {
             for (Map.Entry<Byte, Globals.GPSData> entry : Globals.getInstance().mGPSData.entrySet()) {

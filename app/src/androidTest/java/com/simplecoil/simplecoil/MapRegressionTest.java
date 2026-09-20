@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.location.Location;
 import android.location.LocationListener;
 import android.os.Bundle;
@@ -301,6 +302,28 @@ public class MapRegressionTest {
             assertNotNull(marker(2));
             assertNotSame(teammate, marker(2));
             assertSame(enemy, marker(11));
+        });
+    }
+
+    @Test
+    public void markerBitmapsAreReusedAcrossLocationAndRosterRefreshes() {
+        scenario.onActivity(current -> {
+            showPlayers();
+            Bitmap teammate = (Bitmap) get("mTeammateMarkerIcon");
+            Bitmap enemy = (Bitmap) get("mEnemyMarkerIcon");
+            assertNotNull(teammate);
+            assertNotNull(enemy);
+
+            map.makeUseOfNewLocation(location(30, 40, 1000));
+            receive(new Intent(NetMsg.NETMSG_LISTPLAYERS));
+            Bitmap local = (Bitmap) get("mYouMarkerIcon");
+            assertNotNull(local);
+
+            putLocation(2, 15);
+            receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
+            assertSame(local, get("mYouMarkerIcon"));
+            assertSame(teammate, get("mTeammateMarkerIcon"));
+            assertSame(enemy, get("mEnemyMarkerIcon"));
         });
     }
 

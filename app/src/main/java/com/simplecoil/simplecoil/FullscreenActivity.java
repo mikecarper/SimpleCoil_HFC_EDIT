@@ -2547,9 +2547,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             Log.w(TAG, "Unable to create sound player for resource " + resId);
             return;
         }
-        mp.start();
-        mp.setOnCompletionListener(MediaPlayer::release);
         mp.setLooping(false);
+        // Install cleanup before playback begins. A very short sound can otherwise
+        // finish before the listener is registered and leak its native player.
+        mp.setOnCompletionListener(MediaPlayer::release);
+        try {
+            mp.start();
+        } catch (IllegalStateException e) {
+            Log.w(TAG, "Unable to start sound player for resource " + resId, e);
+            mp.release();
+        }
     }
 
     private static int validatedHitSource(byte rawSource) {
