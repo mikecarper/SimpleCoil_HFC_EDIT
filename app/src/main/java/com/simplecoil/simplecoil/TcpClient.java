@@ -77,7 +77,7 @@ public class TcpClient extends Service {
     private static final int MAX_PENDING_PERSISTENT_DRAINS = 4;
     // Scoreboards sum values by team, so keep every untrusted row low enough
     // that a supported lobby cannot overflow an integer total.
-    static final int MAX_SCOREBOARD_VALUE = Integer.MAX_VALUE / Globals.MAX_PLAYER_ID;
+    static final int MAX_SCOREBOARD_VALUE = Globals.MAX_SCOREBOARD_VALUE;
     static final String EXTRA_TERMINAL_EVENT_ID = "com.simplecoil.simplecoil.TCP_TERMINAL_EVENT_ID";
     static final String EXTRA_START_EVENT_ID = "com.simplecoil.simplecoil.TCP_START_EVENT_ID";
     private static final AtomicLong terminalEventIds = new AtomicLong();

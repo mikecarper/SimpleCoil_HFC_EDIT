@@ -467,6 +467,19 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void repeatedEliminationsCannotOverflowTheScoreboard() throws Exception {
+        Object victim = client(1, 1);
+        Object attacker = client(2, 11);
+        set(victim, "eliminated", Globals.MAX_SCOREBOARD_VALUE);
+        set(attacker, "points", Globals.MAX_SCOREBOARD_VALUE);
+
+        eliminate(victim, 11);
+
+        assertEquals(Globals.MAX_SCOREBOARD_VALUE, server.getScore((byte) 1).eliminated);
+        assertEquals(Globals.MAX_SCOREBOARD_VALUE, server.getScore((byte) 11).points);
+    }
+
+    @Test
     public void gpsTeamReflectsTheCurrentGameMode() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
         Object player = client(1, 6);

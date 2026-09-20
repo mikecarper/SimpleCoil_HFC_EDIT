@@ -33,6 +33,10 @@ public class Globals {
     be used but would require code changes to the hit detection if you really need 64 players. */
     public static final byte MAX_PLAYER_ID = (byte) 20;
 
+    // Scoreboards aggregate player scores into team totals. Keep each score below
+    // a value whose sum remains representable for every supported player.
+    public static final int MAX_SCOREBOARD_VALUE = Integer.MAX_VALUE / MAX_PLAYER_ID;
+
     /**
      * Network messages may carry arbitrary integers, while UI and map storage are sized for
      * the supported player-ID range.  Keep validation in one place before an ID reaches an

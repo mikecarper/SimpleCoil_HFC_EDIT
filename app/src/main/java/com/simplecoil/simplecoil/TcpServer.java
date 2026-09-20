@@ -1429,8 +1429,13 @@ public class TcpServer extends Service {
                                                     Log.w(TAG, "Ignoring invalid elimination report from player " + entry.getValue().mPlayerID);
                                                     continue;
                                                 }
-                                                entry.getValue().eliminated++;
-                                                scoringPlayer.points++;
+                                                // Keep server-created scoreboards within the same
+                                                // range clients accept. A bad or repeated event must
+                                                // not wrap an int negative and disconnect every peer.
+                                                entry.getValue().eliminated = Math.min(Globals.MAX_SCOREBOARD_VALUE,
+                                                        entry.getValue().eliminated + 1);
+                                                scoringPlayer.points = Math.min(Globals.MAX_SCOREBOARD_VALUE,
+                                                        scoringPlayer.points + 1);
                                                 sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, true);
                                                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                                                     // Send a message to all teammates about the score increase
