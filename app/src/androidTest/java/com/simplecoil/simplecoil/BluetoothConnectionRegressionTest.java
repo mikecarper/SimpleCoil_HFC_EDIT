@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothProfile;
 import android.content.Context;
@@ -37,6 +38,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -51,6 +53,8 @@ public class BluetoothConnectionRegressionTest {
     private FakeGatt replacement;
     private BluetoothAdapter savedDefaultAdapter;
     private Field defaultAdapterField;
+    private boolean denyGattAccess;
+    private boolean gattTransportAvailable = true;
     private final List<FakeGatt> connections = new ArrayList<>();
     private final List<Thread> workers = new ArrayList<>();
     private final List<Throwable> failures = new CopyOnWriteArrayList<>();
@@ -102,6 +106,10 @@ public class BluetoothConnectionRegressionTest {
                 (proxy, method, args) -> {
                     if (method.getName().equals("registerAdapter")) return adapterService;
                     if (method.getName().equals("unregisterAdapter")) return null;
+                    if (method.getName().equals("getBluetoothGatt")) {
+                        if (denyGattAccess) throw new SecurityException("Test permission revocation");
+                        return gattTransportAvailable ? replacement.transport : null;
+                    }
                     if (method.getName().equals("getBleQmState"))
                         return field(BluetoothAdapter.class, "STATE_BLE_QM_ON").getInt(null);
                     throw new AssertionError("Unexpected adapter-manager operation: " + method.getName());
@@ -111,6 +119,126 @@ public class BluetoothConnectionRegressionTest {
         BluetoothAdapter fakeAdapter = constructor.newInstance(manager);
         defaultAdapterField = field(BluetoothAdapter.class, "sAdapter");
         defaultAdapterField.set(null, fakeAdapter);
+    }
+
+    @Test
+    public void connectingToAnotherDeviceClosesThePreviousHandle() throws Exception {
+        assertTrue(service.connect(replacement.address));
+        assertNotSame(original.gatt, serviceField("mBluetoothGatt").get(service));
+        assertEquals(Arrays.asList("unregisterClient"), original.operations);
+        assertEquals(Arrays.asList("registerClient"), replacement.operations);
+        assertEquals(replacement.address, serviceField("mBluetoothDeviceAddress").get(service));
+        assertEquals(1, connectionState());
+        assertTrue(service.events.isEmpty());
+    }
+
+    @Test
+    public void replacementConnectionDiscardsOldOperationsAndCanSendNewCommands() throws Exception {
+        queueOriginalCommands();
+        service.readCharacteristic(original.telemetry);
+        BluetoothGattDescriptor descriptor = new BluetoothGattDescriptor(
+                UUID.fromString(GattAttributes.CLIENT_CHARACTERISTIC_CONFIG),
+                BluetoothGattDescriptor.PERMISSION_WRITE);
+        original.telemetry.addDescriptor(descriptor);
+        descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+        service.writeDescriptor(descriptor);
+
+        BluetoothGatt gatt = connectReplacement();
+        assertTrue(serviceField("mActionAvailable").getBoolean(service));
+        assertNull(serviceField("mActiveCharacteristicWrite").get(service));
+        assertNull(serviceField("mActiveCharacteristicRead").get(service));
+        assertNull(serviceField("mActiveDescriptorWrite").get(service));
+        for (String name : Arrays.asList("mCharacteristicWriteQueue", "mCharacteristicReadQueue",
+                "mDescriptorWriteQueue"))
+            assertTrue("Old operations survived in " + name, ((Queue<?>) serviceField(name).get(service)).isEmpty());
+
+        service.writeCharacteristic(replacement.command, new byte[]{48, 0, 6});
+        service.writeCharacteristic(replacement.command, new byte[]{64, 0, 8});
+        completeCommand(original);
+        assertTrue("A retired command completed the new command", service.events.isEmpty());
+        assertEquals(Arrays.asList("registerClient", "writeCharacteristic"), replacement.operations);
+        completeCommand(gatt, replacement.command);
+        completeCommand(gatt, replacement.command);
+        assertEquals(Arrays.asList("registerClient", "writeCharacteristic", "writeCharacteristic"),
+                replacement.operations);
+        assertEquals(2, service.events.size());
+        assertArrayEquals(new byte[]{48, 0, 6}, service.events.get(0).getByteArrayExtra(BluetoothLeService.EXTRA_DATA));
+        assertArrayEquals(new byte[]{64, 0, 8}, service.events.get(1).getByteArrayExtra(BluetoothLeService.EXTRA_DATA));
+        assertTrue(serviceField("mActionAvailable").getBoolean(service));
+    }
+
+    @Test
+    public void replacingConnectionRetiresOldHandleBeforeFrameworkCleanup() throws Exception {
+        original.duringClose = () -> {
+            callback.onConnectionStateChange(original.gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_DISCONNECTED);
+            callback.onConnectionStateChange(original.gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_CONNECTED);
+            callback.onServicesDiscovered(original.gatt, BluetoothGatt.GATT_SUCCESS);
+            callback.onCharacteristicChanged(original.gatt, original.telemetry);
+        };
+        BluetoothGatt gatt = connectReplacement();
+        assertEquals(Arrays.asList("unregisterClient"), original.operations);
+        assertSame(gatt, serviceField("mBluetoothGatt").get(service));
+        assertEquals(1, connectionState());
+        assertTrue(service.events.isEmpty());
+    }
+
+    @Test
+    public void unavailableNewTransportPreservesTheCurrentConnectionAndQueue() throws Exception {
+        gattTransportAvailable = false;
+        assertRejectedConnectionPreservesOriginal(replacement.address);
+    }
+
+    @Test
+    public void deniedNewConnectionPreservesTheCurrentConnectionAndQueue() throws Exception {
+        denyGattAccess = true;
+        assertRejectedConnectionPreservesOriginal(replacement.address);
+    }
+
+    @Test
+    public void invalidNewAddressPreservesTheCurrentConnectionAndQueue() throws Exception {
+        assertRejectedConnectionPreservesOriginal("00:11:22:33:44:GG");
+    }
+
+    @Test
+    public void firstConnectionStillPublishesTheNewHandle() throws Exception {
+        service.close();
+        BluetoothGatt gatt = connectReplacement();
+        assertSame(gatt, serviceField("mBluetoothGatt").get(service));
+        assertEquals(replacement.address, serviceField("mBluetoothDeviceAddress").get(service));
+        assertEquals(1, connectionState());
+        assertEquals(Arrays.asList("registerClient"), replacement.operations);
+        assertTrue(serviceField("mActionAvailable").getBoolean(service));
+    }
+
+    private BluetoothGatt connectReplacement() throws Exception {
+        assertTrue(service.connect(replacement.address));
+        BluetoothGatt gatt = (BluetoothGatt) serviceField("mBluetoothGatt").get(service);
+        assertNotNull(gatt);
+        assertNotSame(original.gatt, gatt);
+        // Simulate successful framework client registration without connecting a radio.
+        field(BluetoothGatt.class, "mClientIf").setInt(gatt, 3);
+        return gatt;
+    }
+
+    private void queueOriginalCommands() {
+        service.writeCharacteristic(original.command, new byte[]{16, 0, 2});
+        service.writeCharacteristic(original.command, new byte[]{32, 0, 4});
+    }
+
+    private void assertRejectedConnectionPreservesOriginal(String address) throws Exception {
+        queueOriginalCommands();
+        assertFalse(service.connect(address));
+        assertSame(original.gatt, serviceField("mBluetoothGatt").get(service));
+        assertEquals(original.address, serviceField("mBluetoothDeviceAddress").get(service));
+        assertEquals(2, connectionState());
+        assertFalse(serviceField("mActionAvailable").getBoolean(service));
+        assertEquals(1, ((Queue<?>) serviceField("mCharacteristicWriteQueue").get(service)).size());
+        assertEquals(Arrays.asList("writeCharacteristic"), original.operations);
+        completeCommand(original);
+        completeCommand(original);
+        assertEquals(Arrays.asList("writeCharacteristic", "writeCharacteristic"), original.operations);
+        assertEquals(2, service.events.size());
+        assertTrue(serviceField("mActionAvailable").getBoolean(service));
     }
 
     @Test
@@ -289,8 +417,12 @@ public class BluetoothConnectionRegressionTest {
     }
 
     private void completeCommand(FakeGatt connection) throws Exception {
-        field(BluetoothGatt.class, "mDeviceBusy").set(connection.gatt, Boolean.FALSE);
-        callback.onCharacteristicWrite(connection.gatt, connection.command, BluetoothGatt.GATT_SUCCESS);
+        completeCommand(connection.gatt, connection.command);
+    }
+
+    private void completeCommand(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) throws Exception {
+        field(BluetoothGatt.class, "mDeviceBusy").set(gatt, Boolean.FALSE);
+        callback.onCharacteristicWrite(gatt, characteristic, BluetoothGatt.GATT_SUCCESS);
     }
 
     private void assertClosed() throws Exception {
@@ -312,6 +444,7 @@ public class BluetoothConnectionRegressionTest {
     private final class FakeGatt {
         final String address;
         final BluetoothGatt gatt;
+        final Object transport;
         final BluetoothGattCharacteristic command;
         final BluetoothGattCharacteristic telemetry;
         final List<String> operations = new CopyOnWriteArrayList<>();
@@ -322,11 +455,12 @@ public class BluetoothConnectionRegressionTest {
             this.address = address;
             BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address);
             Class<?> transportType = Class.forName("android.bluetooth.IBluetoothGatt");
-            Object transport = Proxy.newProxyInstance(transportType.getClassLoader(), new Class<?>[]{transportType},
+            transport = Proxy.newProxyInstance(transportType.getClassLoader(), new Class<?>[]{transportType},
                     (proxy, method, args) -> {
                         String name = method.getName();
                         if (!name.equals("discoverServices") && !name.equals("clientDisconnect")
-                                && !name.equals("writeCharacteristic") && !name.equals("unregisterClient"))
+                                && !name.equals("writeCharacteristic") && !name.equals("unregisterClient")
+                                && !name.equals("registerClient"))
                             throw new AssertionError("Unexpected Bluetooth transport call: " + name);
                         operations.add(name);
                         if (name.equals("unregisterClient") && duringClose != null) duringClose.run();
@@ -355,6 +489,10 @@ public class BluetoothConnectionRegressionTest {
 
     private static final class RecordingService extends BluetoothLeService {
         final List<Intent> events = new CopyOnWriteArrayList<>();
+
+        RecordingService() {
+            attachBaseContext(InstrumentationRegistry.getInstrumentation().getTargetContext());
+        }
 
         @Override public synchronized void sendBroadcast(Intent intent) {
             // Pause callback publication while the connection monitor is held, so

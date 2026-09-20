@@ -479,6 +479,10 @@ public class BluetoothLeService extends Service {
             Log.w(TAG, "Unable to create GATT connection");
             return false;
         }
+        // Only retire the previous handle after creating its replacement. Its
+        // callbacks cannot finish the new connection's operations, so discard
+        // the old queue as well before publishing the new handle.
+        close();
         mBluetoothGatt = gatt;
         Log.d(TAG, "Trying to create a new connection.");
         mBluetoothDeviceAddress = address;
