@@ -665,6 +665,23 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void stalledClientLockBoundsTheOutboundTaskBacklog() throws Exception {
+        List<Thread> tasks;
+        clientsLock.acquire();
+        try {
+            for (int count = 0; count < TcpServer.MAX_PENDING_CLIENT_TASKS * 3; count++)
+                server.sendTCPMessageAll("burst " + count);
+            tasks = captureClientTasks();
+            assertEquals(TcpServer.MAX_PENDING_CLIENT_TASKS, tasks.size());
+        } finally { clientsLock.release(); }
+        for (Thread task : tasks) {
+            task.join(2000);
+            assertFalse("Bounded TCP sender did not finish", task.isAlive());
+        }
+        assertTrue(captureClientTasks().isEmpty());
+    }
+
+    @Test
     public void normalStartIsSentBeforeTheLocalStartEvent() throws Exception {
         clientsLock.acquire();
         Thread worker;

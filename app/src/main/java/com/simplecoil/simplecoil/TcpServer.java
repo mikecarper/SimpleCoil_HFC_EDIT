@@ -64,6 +64,10 @@ public class TcpServer extends Service {
     public static final int TCP_READ_WAIT_MS = 200;
     public static final int TCP_DEDICATED_READ_WAIT_MS = 100;
     static final int CLOCK_READ_WAIT_MS = 10;
+    // Every network snapshot is generated on a separate task so the caller
+    // never blocks on a slow socket. Bound queued tasks to prevent a chatty
+    // client from exhausting the dedicated host's threads while writes stall.
+    static final int MAX_PENDING_CLIENT_TASKS = 32;
     public static final String TCP_SERVER_PING = "ping";
 
     public static final String TCPMESSAGE_PREFIX = NetMsg.MESSAGE_PREFIX + NetMsg.NETWORK_VERSION;
@@ -145,6 +149,7 @@ public class TcpServer extends Service {
     private volatile Thread mServerThread = null;
     private volatile Thread mClientThread = null;
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
+    private final Semaphore mClientTaskSlots = new Semaphore(MAX_PENDING_CLIENT_TASKS);
     // Guarded by mServerStateLock, including registration before Thread.start().
     private final Set<Thread> mClientTasks = new HashSet<>();
     // Cancellation gets a bounded opportunity to notify clients before sockets
@@ -255,6 +260,13 @@ public class TcpServer extends Service {
         synchronized (mServerStateLock) {
             if (!keepListening || mDestroyed || mCancellationThread != null || (endsRound && mEndingGame))
                 return false;
+            // An end or cancellation is the bounded escape hatch for all other
+            // work. It must still run when ordinary snapshot slots are full.
+            final boolean usesTaskSlot = mClientTaskSlots.tryAcquire();
+            if (!usesTaskSlot && !endsRound && !cancelsServer) {
+                Log.w(TAG, "Dropping stale TCP send because the task backlog is full");
+                return false;
+            }
             if (endsRound)
                 mEndingGame = true;
             if (startsRound)
@@ -276,18 +288,11 @@ public class TcpServer extends Service {
                     if (!Thread.currentThread().isInterrupted())
                         Log.e(TAG, "TCP client task failed", e);
                 } finally {
-                    if (cancelsServer) {
-                        // A cancellation may time out while a registration owns
-                        // the client lock. Do not let that interruption leave the
-                        // old roster visible in the next lobby. Holding this lock
-                        // also keeps a replacement session from inheriting cleanup.
-                        if (!acquired) {
-                            boolean interrupted = Thread.interrupted();
-                            mClientDataSemaphore.acquireUninterruptibly();
-                            acquired = true;
-                            if (interrupted)
-                                Thread.currentThread().interrupt();
-                        }
+                    if (cancelsServer && acquired) {
+                        // Cleanup needs exclusive roster access. If cancellation
+                        // timed out before it acquired that access, the timeout
+                        // has already closed the session and this task must exit
+                        // instead of waiting forever behind the stalled owner.
                         boolean interrupted = Thread.interrupted();
                         try {
                             clearCancelledSessionState();
@@ -301,6 +306,8 @@ public class TcpServer extends Service {
                     }
                     if (acquired)
                         mClientDataSemaphore.release();
+                    if (usesTaskSlot)
+                        mClientTaskSlots.release();
                     synchronized (mServerStateLock) {
                         // Cancellation while waiting for the lock must also
                         // release this reservation so a later round can start.
