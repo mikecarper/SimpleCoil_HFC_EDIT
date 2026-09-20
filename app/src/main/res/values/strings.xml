@@ -37,9 +37,9 @@
     <string name="recoil_label" translatable="false">RECOIL</string>
     <string name="recoil_enabled">On</string>
     <string name="recoil_disabled">Off</string>
-    <string name="score_label">SCORE</string>
+    <string name="score_label">KILLS</string>
     <string name="team_score_label">TEAM</string>
-    <string name="score_limit_label">SCORE (%1$d)</string>
+    <string name="score_limit_label">KILLS (%1$d)</string>
     <string name="team_score_limit_label">TEAM (%1$d)</string>
     <string name="health_label">HEALTH (%1$d)</string>
     //Weapon presets strings
@@ -134,7 +134,7 @@
     <string name="game_unlimited_switch">Unlimited game</string>
     <string name="game_limit_time">Time in minutes</string>
     <string name="game_limit_lives">Lives</string>
-    <string name="game_limit_score">Score</string>
+    <string name="game_limit_score">KILLS</string>
 
     <string name="please_wait">Please Wait</string>
 
@@ -142,7 +142,7 @@
     <string name="title_activity_dedicated_server">DedicatedServerActivity</string>
     <string name="dedicated_time_limit">%1$d minutes</string>
     <string name="dedicated_lives_limit">%1$d lives</string>
-    <string name="dedicated_score_limit">%1$d points</string>
+    <string name="dedicated_score_limit">%1$d KILLS</string>
     <string name="dedicated_unlimited">Unlimited</string>
     <string name="dedicated_limit_separator">, </string>
     <string name="dedicated_game_running">Game Running</string>
@@ -153,12 +153,12 @@
     <string name="gps_mode_teammate">GPS Teammates Only</string>
     <string name="gps_mode_all">GPS All On</string>
     <string name="player_name_not_connected">{Not Connected}</string>
-    <string name="scoreboard_button">Scoreboard</string>
+    <string name="scoreboard_button">KILLS</string>
 
     <string name="player_list_position">%d</string>
     <string name="player_list_id_label">ID</string>
     <string name="player_list_name_label">Name</string>
-    <string name="player_list_points_label">Score</string>
+    <string name="player_list_points_label">KILLS</string>
     <string name="player_list_eliminated_label">Eliminated</string>
     <string name="player_list_team2_total">Team Totals &#8212; One:%1$d  Two:%2$d</string>
     <string name="player_list_team4_total">Team Totals &#8212; One:%1$d  Two:%2$d  Three:%3$d  Four:%4$d</string>
