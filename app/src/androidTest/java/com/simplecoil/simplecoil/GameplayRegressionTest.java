@@ -169,6 +169,22 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void failedPeerHostDiscoveryCancelsItsTcpListener() {
+        scenario.onActivity(activity -> {
+            int[] calls = new int[1];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override public void cancelServer() { calls[0]++; }
+            });
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mIsServer", false);
+            set(activity, "mReady", true);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_FAILEDTOJOIN));
+            assertEquals("Failed UDP discovery left the TCP listener running", 1, calls[0]);
+            assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
     public void firstGrenadeDisarmNotifiesDedicatedServer() {
         assertGrenadeUnpairNotifiesServer(false, 0x3D);
     }
@@ -932,6 +948,12 @@ public class GameplayRegressionTest {
 
     private void finishTcpSession(String action) {
         try {
+            // This helper models a terminal frame from a live TCP worker. The
+            // recording service does not open a real socket, so mark its session
+            // active before invoking the worker's terminal path directly.
+            Field listening = TcpClient.class.getDeclaredField("keepListening");
+            listening.setAccessible(true);
+            listening.setBoolean(tcp, true);
             Method finish = TcpClient.class.getDeclaredMethod("finishServerSession", String.class);
             finish.setAccessible(true);
             finish.invoke(tcp, action);

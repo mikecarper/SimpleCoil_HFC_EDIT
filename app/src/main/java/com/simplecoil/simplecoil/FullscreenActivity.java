@@ -3158,6 +3158,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 setReady();
             } else if (NetMsg.NETMSG_FAILEDTOJOIN.equals(action)) {
                 Toast.makeText(getApplicationContext(), getString(R.string.error_join), Toast.LENGTH_SHORT).show();
+                // Peer hosting starts TCP before UDP announces that discovery is
+                // ready. If that announcement fails, retire the provisional TCP
+                // listener instead of leaving a hidden server bound to the port.
+                if (!mIsServer && mTcpServer != null)
+                    mTcpServer.cancelServer();
                 mReady = false;
                 setReady();
             } else if (NetMsg.NETMSG_SERVERCREATED.equals(action)) {
