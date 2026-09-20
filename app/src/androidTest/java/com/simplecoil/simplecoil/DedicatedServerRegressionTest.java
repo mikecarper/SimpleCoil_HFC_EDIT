@@ -29,6 +29,9 @@ import org.junit.runner.RunWith;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -185,6 +188,37 @@ public class DedicatedServerRegressionTest {
             button(R.id.end_game_button).performClick();
             assertRoundEnded();
             assertEquals(0, tcp.gameEnds);
+        });
+    }
+
+    @Test
+    public void endingARoundRetainsTheConnectedDedicatedLobbyCount() {
+        scenario.onActivity(current -> {
+            Map<Byte, InetAddress> originalRoster = new HashMap<>();
+            Globals.getmTeamIPMapSemaphore();
+            try {
+                originalRoster.putAll(Globals.getInstance().mTeamIPMap);
+                Globals.getInstance().mTeamIPMap.clear();
+                InetAddress loopback = InetAddress.getLoopbackAddress();
+                Globals.getInstance().mTeamIPMap.put((byte) 1, loopback);
+                Globals.getInstance().mTeamIPMap.put((byte) 2, loopback);
+            } finally {
+                Globals.getInstance().mTeamIPMapSemaphore.release();
+            }
+            try {
+                invoke("endGame");
+                TextView playerCount = current.findViewById(R.id.player_count_tv);
+                assertEquals(current.getString(R.string.network_player_count, 2),
+                        playerCount.getText().toString());
+            } finally {
+                Globals.getmTeamIPMapSemaphore();
+                try {
+                    Globals.getInstance().mTeamIPMap.clear();
+                    Globals.getInstance().mTeamIPMap.putAll(originalRoster);
+                } finally {
+                    Globals.getInstance().mTeamIPMapSemaphore.release();
+                }
+            }
         });
     }
 

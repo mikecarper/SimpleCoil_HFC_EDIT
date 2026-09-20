@@ -677,13 +677,15 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
 
     private void endGame() {
-        mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount()));
+        // The dedicated host is not a player, while getPlayerCount() includes the local
+        // endpoint. Ending a round keeps the connected lobby, so retain its real client count.
+        mNetworkPlayerCountTV.setText(getString(R.string.network_player_count,
+                Math.max(0, Globals.getPlayerCount() - 1)));
         mStartGameButton.setEnabled(true);
         mGameModeButton.setEnabled(true);
         mGameLimitButton.setEnabled(true);
         mGPSModeButton.setEnabled(true);
         mGameStatusTV.setText(R.string.dedicated_game_waiting);
-        mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, 0));
         if (mUDPListenerService != null)
             mUDPListenerService.allowJoin(true);
         mEndGameButton.setEnabled(false);
