@@ -1485,6 +1485,30 @@ public class GameplayRegressionTest {
         });
     }
 
+    @Test
+    public void repeatedGrenadeDamageTelemetryOnlyDamagesOnce() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            Globals.getmGrenadePairingsSemaphore();
+            int previousOwner;
+            try {
+                previousOwner = globals.mGrenadePairings[3];
+                globals.mGrenadePairings[3] = 11;
+            } finally { globals.mGrenadePairingsSemaphore.release(); }
+            try {
+                byte[] packet = grenadePacket(false, 0x31);
+                receiveTelemetry(activity, packet);
+                receiveTelemetry(activity, packet);
+                assertEquals("Repeated grenade telemetry applied damage twice", 15, get(activity, "mHealth"));
+                assertEquals(1, get(activity, "mHitsTaken"));
+            } finally {
+                Globals.getmGrenadePairingsSemaphore();
+                try { globals.mGrenadePairings[3] = previousOwner; }
+                finally { globals.mGrenadePairingsSemaphore.release(); }
+            }
+        });
+    }
+
     private void completeWrite(FullscreenActivity activity) {
         completeWrite(activity, GattAttributes.RECOIL_COMMAND_UUID,
                 bluetooth.writes.get(bluetooth.writes.size() - 1), BluetoothGatt.GATT_SUCCESS);
@@ -1507,8 +1531,19 @@ public class GameplayRegressionTest {
 
     private static void receiveTelemetry(FullscreenActivity activity, byte[] packet) {
         BroadcastReceiver receiver = (BroadcastReceiver) get(activity, "mGattUpdateReceiver");
-        receiver.onReceive(activity, new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
-                .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+        // Android 5.1 can move an ActivityScenario behind the instrumentation
+        // activity while its test callback is running. Model an active GATT
+        // delivery without leaving the lifecycle flag changed for teardown.
+        boolean receiverRegistered = (boolean) get(activity, "mGattReceiverRegistered");
+        if (!receiverRegistered)
+            set(activity, "mGattReceiverRegistered", true);
+        try {
+            receiver.onReceive(activity, new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                    .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+        } finally {
+            if (!receiverRegistered)
+                set(activity, "mGattReceiverRegistered", false);
+        }
     }
 
     private static byte[] telemetryPacket(int firstPlayer, int firstShot, int secondPlayer, int secondShot) {

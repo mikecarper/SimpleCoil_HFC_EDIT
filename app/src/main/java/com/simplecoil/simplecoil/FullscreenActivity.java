@@ -2731,9 +2731,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if (hit_by_player1 != 0 || hit_by_player2 != 0) {
                 int healthRemoved = 0;
                 byte hit_by_id = 0;
-                // Only the right-most 3 bits make up the shot ID
-                byte shot_id1 = (byte)(data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x07);
-                byte shot_id2 = (byte)(data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x07);
+                // Only the right-most 3 bits make up a normal shot ID. Grenades
+                // instead use the complete byte for a grenade ID and command, so
+                // retain all of it when filtering repeated telemetry packets.
+                byte shot_id1 = hit_by_player1 == Globals.GRENADE_PLAYER_ID
+                        ? data[RECOIL_OFFSET_HIT_BY1_SHOTID]
+                        : (byte)(data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x07);
+                byte shot_id2 = hit_by_player2 == Globals.GRENADE_PLAYER_ID
+                        ? data[RECOIL_OFFSET_HIT_BY2_SHOTID]
+                        : (byte)(data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x07);
                 //Log.e(TAG, "Hit by " + hit_by_player1);
                 /*if (hit_by_player2 != 0) {
                     Log.e(TAG, "hitdata: " + Integer.toHexString(hit_by_player1) + " " + Integer.toHexString(data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0xFF) + " " + Integer.toHexString(hit_by_player2) + " " + Integer.toHexString(data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0xFF));
@@ -2788,9 +2794,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         }
                     }
                     }
-                    boolean duplicateInPacket = hit_by_player2 == hit_by_player1 && shot_id2 == shot_id1
-                            && (hit_by_player2 != Globals.GRENADE_PLAYER_ID
-                            || data[RECOIL_OFFSET_HIT_BY2_SHOTID] == data[RECOIL_OFFSET_HIT_BY1_SHOTID]);
+                    boolean duplicateInPacket = hit_by_player2 == hit_by_player1 && shot_id2 == shot_id1;
                     if (duplicateInPacket || (mLastHitData1.playerID == hit_by_player2 && mLastHitData1.shotID == shot_id2) || (mLastHitData2.playerID == hit_by_player2 && mLastHitData2.shotID == shot_id2)) {
                         //Log.e(TAG, "Hit by 2 is using same shot ID from a previous hit, filter!");
                     } else if (hit_by_player2 != 0 && survivesDamage(healthRemoved)) {
@@ -2829,13 +2833,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             healthRemoved += secondHitDamage;
                         }
                     }
-                    if (hit_by_player1 > 0 && hit_by_player1 != Globals.GRENADE_PLAYER_ID) {
+                    if (hit_by_player1 > 0) {
                         mLastHitData1.playerID = hit_by_player1;
                         mLastHitData1.shotID = shot_id1;
                     } else {
                         mLastHitData1.playerID = Globals.INVALID_PLAYER_ID;
                     }
-                    if (hit_by_player2 > 0 && hit_by_player2 != Globals.GRENADE_PLAYER_ID) {
+                    if (hit_by_player2 > 0) {
                         mLastHitData2.playerID = hit_by_player2;
                         mLastHitData2.shotID = shot_id2;
                     } else {
