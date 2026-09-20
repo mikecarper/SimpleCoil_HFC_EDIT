@@ -15,6 +15,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ListView;
 import android.widget.Switch;
+import android.widget.TextView;
 
 import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
@@ -646,6 +647,56 @@ public class DedicatedServerRegressionTest {
             receive(NetMsg.NETMSG_PLAYERDATAUPDATE);
             assertEquals(1, changes[0]);
             assertSame(adapter, list.getAdapter());
+        });
+    }
+
+    @Test
+    public void hostScoreboardKeepsTheNameAndPointsOfADepartedPlayer() {
+        assertScoreboardPlayerName(null, "Departed player");
+    }
+
+    @Test
+    public void hostScoreboardPrefersARejoinedPlayersCurrentName() {
+        assertScoreboardPlayerName("Current player", "Current player");
+    }
+
+    private void assertScoreboardPlayerName(String currentName, String expectedName) {
+        scenario.onActivity(current -> {
+            Globals globals = Globals.getInstance();
+            int gameMode = globals.mGameMode;
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            Globals.getmTeamPlayerNameSemaphore();
+            String previousName;
+            try {
+                previousName = globals.mTeamPlayerNameMap.remove((byte) 1);
+                if (currentName != null)
+                    globals.mTeamPlayerNameMap.put((byte) 1, currentName);
+            } finally { globals.mTeamPlayerNameSemaphore.release(); }
+            try {
+                tcp.firstPlayerScore = tcp.new ScoreData();
+                tcp.firstPlayerScore.playerName = "Departed player";
+                tcp.firstPlayerScore.points = 7;
+                tcp.firstPlayerScore.eliminated = 5;
+                receive(NetMsg.NETMSG_PLAYERDATAUPDATE);
+                PlayerDisplayDataListAdapter adapter = current.mPlayerDisplayListAdapter;
+                PlayerDisplayData player = adapter.getItem(1);
+                assertEquals(expectedName, player.playerName);
+                assertEquals(7, player.points);
+                assertEquals(5, player.eliminated);
+                assertFalse(player.isConnected);
+                assertEquals(current.getString(R.string.player_list_team2_total, 7, 0),
+                        adapter.getItem(Globals.MAX_PLAYER_ID + 1).playerName);
+                View row = adapter.getView(1, null, current.findViewById(R.id.player_list));
+                assertEquals(expectedName, ((TextView) row.findViewById(R.id.player_name_tv)).getText().toString());
+            } finally {
+                globals.mGameMode = gameMode;
+                Globals.getmTeamPlayerNameSemaphore();
+                try {
+                    globals.mTeamPlayerNameMap.remove((byte) 1);
+                    if (previousName != null)
+                        globals.mTeamPlayerNameMap.put((byte) 1, previousName);
+                } finally { globals.mTeamPlayerNameSemaphore.release(); }
+            }
         });
     }
 

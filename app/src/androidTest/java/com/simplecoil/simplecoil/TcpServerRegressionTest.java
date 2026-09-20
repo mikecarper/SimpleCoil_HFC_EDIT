@@ -5,6 +5,7 @@ import android.content.Intent;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
@@ -558,6 +559,145 @@ public class TcpServerRegressionTest {
         remove(teammate, 2);
         eliminate(victim, 1);
         assertEquals(1, server.endRequests);
+    }
+
+    @Test
+    public void liveScoreboardIncludesPlayersWhoLeftTheRound() throws Exception {
+        Object departed = client(1, 1);
+        Object remaining = client(2, 2);
+        set(departed, "points", 7);
+        set(departed, "eliminated", 5);
+        set(remaining, "points", 3);
+        remove(departed, 1);
+        assertFalse(Globals.getInstance().mTeamIPMap.containsKey((byte) 1));
+        assertFalse(Globals.getInstance().mTeamPlayerNameMap.containsKey((byte) 1));
+        set(server, "keepListening", true);
+        server.sendPlayerData(TcpServer.SEND_ALL);
+        assertDepartedScore(readScoreboard(outputFor(remaining)));
+    }
+
+    @Test
+    public void finalScoreboardIncludesPlayersWhoRanOutOfLives() throws Exception {
+        Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_LIVES;
+        Object eliminated = client(1, 1);
+        Object remaining = client(2, 2);
+        set(eliminated, "points", 7);
+        set(eliminated, "eliminated", 5);
+        set(remaining, "points", 3);
+        // Running out of lives sends LEAVE, removing the player from the lobby.
+        remove(eliminated, 1);
+        ByteArrayOutputStream output = outputFor(remaining);
+        server.performRealEnd = true;
+        set(server, "keepListening", true);
+        server.endGame();
+        assertTrue(server.roundEnded.await(3, TimeUnit.SECONDS));
+        DataInputStream frames = new DataInputStream(new ByteArrayInputStream(output.toByteArray()));
+        assertDepartedScore(readScoreboard(frames));
+        assertEquals(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME,
+                frames.readUTF());
+        assertNull("Round history must still be cleared for the next game", server.getScore((byte) 1));
+    }
+
+    @Test
+    public void leavingRetainsTheLatestPlayerNameOnlyInRoundHistory() throws Exception {
+        Object departed = client(1, 1);
+        parse(departed, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                .put(TcpServer.JSON_PLAYERNAMECHANGE, "Renamed player"));
+        remove(departed, 1);
+        assertEquals("Renamed player", server.getScore((byte) 1).playerName);
+        assertFalse(Globals.getInstance().mTeamPlayerNameMap.containsKey((byte) 1));
+        assertFalse(Globals.getInstance().mTeamIPMap.containsKey((byte) 1));
+    }
+
+    @Test
+    public void rejoinedPlayerHasOneScoreboardRowWithTheirCurrentName() throws Exception {
+        Object departed = client(1, 1);
+        Object remaining = client(2, 2);
+        set(departed, "points", 7);
+        set(departed, "eliminated", 5);
+        remove(departed, 1);
+        Object replacement = client(3, 1);
+        parse(replacement, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                .put(TcpServer.JSON_PLAYERNAMECHANGE, "Rejoined player"));
+        set(server, "keepListening", true);
+        server.sendPlayerData(TcpServer.SEND_ALL);
+        JSONArray players = readScoreboard(outputFor(remaining));
+        assertEquals(2, players.length());
+        JSONObject score = scoreFor(players, 1);
+        assertEquals("Rejoined player", score.getString(TcpServer.JSON_PLAYERNAME));
+        assertEquals(7, score.getInt(TcpServer.JSON_PLAYERPOINTS));
+        assertEquals(5, score.getInt(TcpServer.JSON_PLAYERELIMINATED));
+        assertTrue(score.has(TcpServer.JSON_PLAYERIP));
+    }
+
+    @Test
+    public void leavingTheLobbyDoesNotAddAPlayerToTheRoundScoreboard() throws Exception {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        Object departed = client(1, 1);
+        Object remaining = client(2, 2);
+        set(departed, "points", 7);
+        remove(departed, 1);
+        set(server, "keepListening", true);
+        server.sendPlayerData(TcpServer.SEND_ALL);
+        JSONArray players = readScoreboard(outputFor(remaining));
+        assertEquals(1, players.length());
+        assertEquals(2, players.getJSONObject(0).getInt(TcpServer.JSON_PLAYERID));
+        assertNull(server.getScore((byte) 1));
+    }
+
+    @Test
+    public void twentyPlayerScoreboardKeepsEveryResultWhenNineteenPlayersLeave() throws Exception {
+        for (int id = 1; id <= 20; id++) {
+            Object player = client(id, id);
+            set(player, "points", id);
+            set(player, "eliminated", 2);
+        }
+        for (int id = 1; id < 20; id++) remove(clients.get(id), id);
+        set(server, "keepListening", true);
+        server.sendPlayerData(TcpServer.SEND_ALL);
+        JSONArray players = readScoreboard(outputFor(clients.get(20)));
+        assertEquals(20, players.length());
+        for (int id = 1; id <= 20; id++) {
+            JSONObject score = scoreFor(players, id);
+            assertEquals("Player " + id, score.getString(TcpServer.JSON_PLAYERNAME));
+            assertEquals(id, score.getInt(TcpServer.JSON_PLAYERPOINTS));
+            assertEquals(2, score.getInt(TcpServer.JSON_PLAYERELIMINATED));
+        }
+        assertEquals("Score history changed the active roster", 1, Globals.getInstance().mTeamIPMap.size());
+    }
+
+    private void assertDepartedScore(JSONArray players) throws Exception {
+        assertEquals("The scoreboard lost a player who already spent their lives", 2, players.length());
+        JSONObject departed = scoreFor(players, 1);
+        assertEquals("Player 1", departed.getString(TcpServer.JSON_PLAYERNAME));
+        assertEquals(7, departed.getInt(TcpServer.JSON_PLAYERPOINTS));
+        assertEquals(5, departed.getInt(TcpServer.JSON_PLAYERELIMINATED));
+        assertFalse("Score history must not restore a departed network endpoint", departed.has(TcpServer.JSON_PLAYERIP));
+        assertEquals(3, scoreFor(players, 2).getInt(TcpServer.JSON_PLAYERPOINTS));
+    }
+
+    private JSONObject scoreFor(JSONArray players, int playerID) throws Exception {
+        for (int i = 0; i < players.length(); i++) {
+            JSONObject player = players.getJSONObject(i);
+            if (player.getInt(TcpServer.JSON_PLAYERID) == playerID)
+                return player;
+        }
+        throw new AssertionError("Missing scoreboard player " + playerID);
+    }
+
+    private ByteArrayOutputStream outputFor(Object player) throws Exception {
+        return (ByteArrayOutputStream) ((Socket) get(player, "clientSocket")).getOutputStream();
+    }
+
+    private JSONArray readScoreboard(ByteArrayOutputStream output) throws Exception {
+        return readScoreboard(new DataInputStream(new ByteArrayInputStream(output.toByteArray())));
+    }
+
+    private JSONArray readScoreboard(DataInputStream frames) throws Exception {
+        String frame = frames.readUTF();
+        String prefix = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON;
+        assertTrue(frame.startsWith(prefix));
+        return new JSONObject(frame.substring(prefix.length())).getJSONArray(TcpServer.JSON_PLAYERDATA);
     }
 
     @Test

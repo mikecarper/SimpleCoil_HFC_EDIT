@@ -787,14 +787,20 @@ public class TcpServer extends Service {
         try {
             JSONArray players = new JSONArray();
             Map<Byte, InetAddress> teamIPMap = getTeamIPMapSnapshot();
-            if (teamIPMap.isEmpty())
+            if (teamIPMap.isEmpty() && mDepartedScores.isEmpty())
                 return;
-            for (Map.Entry<Byte, InetAddress> entry : teamIPMap.entrySet()) {
+            // Scoreboards describe the whole round, not just its current lobby.
+            // Keep departed players' results without restoring their endpoints.
+            for (byte id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+                ScoreData scoreData = getScore(id);
+                boolean inRoster = teamIPMap.containsKey(id);
+                if (!inRoster && scoreData == null)
+                    continue;
                 JSONObject player = new JSONObject();
-                player.put(JSON_PLAYERNAME, Globals.getInstance().getPlayerName(entry.getKey()));
-                player.put(JSON_PLAYERID, entry.getKey());
-                player.put(JSON_PLAYERIP, entry.getValue());
-                ScoreData scoreData = getScore(entry.getKey());
+                player.put(JSON_PLAYERNAME, inRoster ? Globals.getInstance().getPlayerName(id) : scoreData.playerName);
+                player.put(JSON_PLAYERID, id);
+                if (inRoster)
+                    player.put(JSON_PLAYERIP, teamIPMap.get(id));
                 player.put(JSON_PLAYERPOINTS, scoreData == null ? 0 : scoreData.points);
                 player.put(JSON_PLAYERELIMINATED, scoreData == null ? 0 : scoreData.eliminated);
                 players.put(player);
@@ -1052,6 +1058,7 @@ public class TcpServer extends Service {
                 return null;
             scoreData.points = departed.points;
             scoreData.eliminated = departed.eliminated;
+            scoreData.playerName = departed.playerName;
         }
         return scoreData;
     }
@@ -1079,6 +1086,8 @@ public class TcpServer extends Service {
         int points = 0;
         int eliminated = 0;
         boolean isConnected = false;
+        // Retained when a player leaves and their name is removed from the lobby.
+        String playerName = "";
     }
 
     private class ClientData {
@@ -1653,6 +1662,7 @@ public class TcpServer extends Service {
                         ScoreData score = getScore(client.mPlayerID);
                         if (score != null) {
                             score.isConnected = false;
+                            score.playerName = Globals.getInstance().getPlayerName(client.mPlayerID);
                             mDepartedScores.put(client.mPlayerID, score);
                         }
                     } else {

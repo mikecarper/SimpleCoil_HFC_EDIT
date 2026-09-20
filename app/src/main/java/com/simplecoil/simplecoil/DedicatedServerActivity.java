@@ -725,7 +725,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             } else {
                 mPlayerDisplayData[x] = new PlayerDisplayData();
                 mPlayerDisplayData[x].playerID = x;
-                mPlayerDisplayData[x].playerName = playerNames.get(x);
+                String playerName = playerNames.get(x);
+                mPlayerDisplayData[x].playerName = playerName != null ? playerName : scoreData.playerName;
                 mPlayerDisplayData[x].points = scoreData.points;
                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                     int team = Globals.getInstance().calcNetworkTeam(x);
