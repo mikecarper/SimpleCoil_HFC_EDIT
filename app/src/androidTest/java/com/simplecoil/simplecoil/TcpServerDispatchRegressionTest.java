@@ -6,6 +6,8 @@ import android.os.SystemClock;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -110,6 +112,60 @@ public class TcpServerDispatchRegressionTest {
         globals.mUseGPS = originalUseGPS;
         for (Thread worker : workers) assertFalse("Dispatch task survived cleanup", worker.isAlive());
         assertTrue("Dispatch task crashed: " + failures, failures.isEmpty());
+    }
+
+    @Test
+    public void oversizedRenameCannotDisconnectTheLobbyDuringRosterBroadcast() throws Exception {
+        addClient(2, new MemorySocket());
+        JSONObject rename = new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                .put(TcpServer.JSON_PLAYERNAMECHANGE, TcpInputTestData.repeat('a', 65400));
+        TcpInputTestData.assertFitsFrame(rename.toString());
+        Constructor<?> constructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
+                .getDeclaredConstructor(TcpServer.class);
+        constructor.setAccessible(true);
+        Object handler = constructor.newInstance(server);
+        Method parser = handler.getClass().getDeclaredMethod("parsePlayerInfo", String.class, clients.get(1).getClass());
+        parser.setAccessible(true);
+        List<Thread> senders;
+        clientsLock.acquire();
+        try {
+            TcpInputTestData.invokeParser(parser, handler, rename.toString(), clients.get(1));
+            server.sendAllGameInfo(TcpServer.SEND_ALL);
+            senders = captureClientTasks();
+        } finally { clientsLock.release(); }
+        for (Thread sender : senders) {
+            sender.join(2000);
+            assertFalse("Roster sender did not finish", sender.isAlive());
+        }
+        for (MemorySocket socket : sockets) {
+            assertFalse("An oversized name broke another player's TCP connection", socket.closed);
+            String frame = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray())).readUTF();
+            JSONObject roster = new JSONObject(frame.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                    + TcpServer.TCPPREFIX_JSON.length()));
+            assertEquals(2, roster.getJSONArray(TcpServer.JSON_PLAYERS).length());
+        }
+        assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+        assertTrue(server.events.isEmpty());
+    }
+
+    @Test
+    public void maximumLengthNamesKeepAFullRosterWithinTheWireFrame() throws Exception {
+        for (int id = 2; id <= Globals.MAX_PLAYER_ID; id++) addClient(id, new MemorySocket());
+        // Each control character expands to six ASCII bytes in JSON.
+        String name = TcpInputTestData.repeat((char) 1, 20);
+        for (byte id = 1; id <= Globals.MAX_PLAYER_ID; id++)
+            Globals.getInstance().mTeamPlayerNameMap.put(id, name);
+        dispatchThenChange(() -> server.sendAllGameInfo(TcpServer.SEND_ALL), () -> { });
+        for (MemorySocket socket : sockets) {
+            assertFalse(socket.closed);
+            String frame = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray())).readUTF();
+            JSONObject roster = TcpJson.parseObject(frame.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                    + TcpServer.TCPPREFIX_JSON.length()));
+            JSONArray players = roster.getJSONArray(TcpServer.JSON_PLAYERS);
+            assertEquals(Globals.MAX_PLAYER_ID, players.length());
+            for (int i = 0; i < players.length(); i++)
+                assertEquals(name, TcpJson.getPlayerName(players.getJSONObject(i), TcpServer.JSON_PLAYERNAME));
+        }
     }
 
     @Test

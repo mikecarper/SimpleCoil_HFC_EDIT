@@ -3107,7 +3107,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             for (int i = 0; i < 4; i++)
                 teamPoints[i] = 0;
             try {
-                JSONObject json = new JSONObject(message);
+                JSONObject json = TcpJson.parseObject(message);
                 JSONArray players = json.getJSONArray(TcpServer.JSON_PLAYERDATA);
                 Globals.getInstance().getmPlayerSettingsSemaphore();
                 hasSemaphore = true;
@@ -3120,7 +3120,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         continue;
                     }
                     playerData.playerID = (byte) rawPlayerID;
-                    playerData.playerName = player.getString(TcpServer.JSON_PLAYERNAME);
+                    playerData.playerName = TcpJson.getPlayerName(player, TcpServer.JSON_PLAYERNAME);
                     playerData.points = player.getInt(TcpServer.JSON_PLAYERPOINTS);
                     if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                         int team = Globals.getInstance().calcNetworkTeam(playerData.playerID);

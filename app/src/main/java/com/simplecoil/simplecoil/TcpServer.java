@@ -1272,7 +1272,7 @@ public class TcpServer extends Service {
         private void parsePlayerInfo(String message, ClientData client) {
             JSONObject player;
             try {
-                player = new JSONObject(message);
+                player = TcpJson.parseObject(message);
             } catch (JSONException e) {
                 e.printStackTrace();
                 return;
@@ -1413,7 +1413,7 @@ public class TcpServer extends Service {
                 String playerName;
                 try {
                     id = player.getInt(JSON_PLAYERID);
-                    playerName = player.getString(JSON_PLAYERNAMECHANGE);
+                    playerName = TcpJson.getPlayerName(player, JSON_PLAYERNAMECHANGE);
                 } catch (JSONException e) {
                     e.printStackTrace();
                     return;
@@ -1430,7 +1430,6 @@ public class TcpServer extends Service {
                 sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                 return;
             }
-            requestFullGPSUpdate(); // Send all GPS info because of the new client
             boolean rejoin;
             byte id;
             String playerName;
@@ -1442,7 +1441,7 @@ public class TcpServer extends Service {
                     return;
                 }
                 id = (byte) rawPlayerID;
-                playerName = player.getString(JSON_PLAYERNAME);
+                playerName = TcpJson.getPlayerName(player, JSON_PLAYERNAME);
             } catch (JSONException e) {
                 e.printStackTrace();
                 return;
@@ -1453,6 +1452,7 @@ public class TcpServer extends Service {
                 Log.w(TAG, "Ignoring an attempt to change a registered connection's player ID");
                 return;
             }
+            requestFullGPSUpdate(); // Send all GPS info because of the new client
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
                 if (entry.getValue() != client && entry.getValue().mPlayerID == id) {
                     Log.d(TAG, "rejoining " + client.clientID + " to " + entry.getValue().clientID);

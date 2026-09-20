@@ -122,6 +122,56 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void deeplyNestedArraysCannotCrashClientParsing() throws Exception {
+        assertDeepMessageIgnored(true);
+    }
+
+    @Test
+    public void deeplyNestedObjectsCannotCrashClientParsing() throws Exception {
+        assertDeepMessageIgnored(false);
+    }
+
+    private void assertDeepMessageIgnored(boolean arrays) throws Exception {
+        String message = TcpInputTestData.nested(10000, arrays);
+        TcpInputTestData.assertFitsFrame(message);
+        parse(message);
+        assertOriginalRoster();
+        assertTrue(client.events.isEmpty());
+        parse(roster(new JSONArray().put(player(3))));
+        assertEquals("Player 3", globals.getPlayerName((byte) 3));
+        assertEquals(1, client.events.size());
+    }
+
+    @Test
+    public void oversizedRosterNameDoesNotPartiallyApplyTheRosterOrSettings() throws Exception {
+        assertInvalidRosterName(TcpInputTestData.repeat('a', 21));
+    }
+
+    @Test
+    public void nonStringRosterNamesDoNotPartiallyApplyTheRosterOrSettings() throws Exception {
+        for (Object name : new Object[]{JSONObject.NULL, 123, true, new JSONObject(), new JSONArray()})
+            assertInvalidRosterName(name);
+    }
+
+    private void assertInvalidRosterName(Object name) throws Exception {
+        parse(roster(new JSONArray().put(player(3)).put(player(4).put(TcpServer.JSON_PLAYERNAME, name)))
+                .put(TcpServer.JSON_PLAYERSETTINGS, new JSONArray().put(settings(1)))
+                .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, false));
+        assertOriginalRoster();
+        assertOriginalSettings();
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void normalAndEmptyRosterNamesArePreserved() throws Exception {
+        for (String name : new String[]{"", TcpInputTestData.repeat('a', 20), "[]{}'\"\\/"}) {
+            parse(roster(new JSONArray().put(player(3).put(TcpServer.JSON_PLAYERNAME, name))));
+            assertEquals(name, globals.getPlayerName((byte) 3));
+        }
+        assertEquals(3, client.events.size());
+    }
+
+    @Test
     public void malformedLaterSettingsRowDoesNotChangeEarlierPlayers() throws Exception {
         parse(settingsMessage(settings(1), new JSONObject().put(TcpServer.JSON_PLAYERID, 2)));
         assertOriginalSettings();
@@ -648,7 +698,7 @@ public class TcpGameInfoRegressionTest {
     private void parse(String json) throws Exception {
         Method method = TcpClient.class.getDeclaredMethod("parseGameInfo", String.class);
         method.setAccessible(true);
-        method.invoke(client, json);
+        TcpInputTestData.invokeParser(method, client, json);
     }
 
     private void clearMaps() {

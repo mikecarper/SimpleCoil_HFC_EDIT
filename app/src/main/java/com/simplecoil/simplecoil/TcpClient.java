@@ -577,7 +577,7 @@ public class TcpClient extends Service {
             generation = mSessionGeneration;
         }
         try {
-            JSONObject game = new JSONObject(message);
+            JSONObject game = TcpJson.parseObject(message);
             if (game.has(TcpServer.JSON_GRENADE_PAIRINGS)) {
                 int[] pairings = new int[Globals.MAX_GRENADE_IDS];
                 Arrays.fill(pairings, Globals.INVALID_PLAYER_ID);
@@ -722,7 +722,7 @@ public class TcpClient extends Service {
                         }
                         if (teamIPs.containsKey(playerID) || ipTeams.containsKey(playerIP))
                             throw new JSONException("Conflicting player IDs or addresses in roster");
-                        String playerName = player.getString(TcpServer.JSON_PLAYERNAME);
+                        String playerName = TcpJson.getPlayerName(player, TcpServer.JSON_PLAYERNAME);
                         teamIPs.put(playerID, playerIP);
                         ipTeams.put(playerIP, playerID);
                         playerNames.put(playerID, playerName);

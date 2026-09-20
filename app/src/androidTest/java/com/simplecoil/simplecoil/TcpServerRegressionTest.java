@@ -78,6 +78,104 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void deeplyNestedArraysCannotCrashServerParsing() throws Exception {
+        assertDeepMessageIgnored(true);
+    }
+
+    @Test
+    public void deeplyNestedObjectsCannotCrashServerParsing() throws Exception {
+        assertDeepMessageIgnored(false);
+    }
+
+    private void assertDeepMessageIgnored(boolean arrays) throws Exception {
+        Object player = client(1, 0);
+        String message = TcpInputTestData.nested(10000, arrays);
+        TcpInputTestData.assertFitsFrame(message);
+        parse(player, message);
+        assertEquals((byte) 0, get(player, "mPlayerID"));
+        assertTrue(Globals.getInstance().mTeamPlayerNameMap.isEmpty());
+        register(player, 1, false);
+        assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+    }
+
+    @Test
+    public void oversizedPlayerNamesCannotEnterTheLobby() throws Exception {
+        Object player = client(1, 0);
+        for (int length : new int[]{21, 65400}) {
+            JSONObject hello = new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                    .put(TcpServer.JSON_PLAYERNAME, TcpInputTestData.repeat('a', length));
+            TcpInputTestData.assertFitsFrame(hello.toString());
+            parse(player, hello);
+            assertEquals((byte) 0, get(player, "mPlayerID"));
+            assertTrue(Globals.getInstance().mTeamPlayerNameMap.isEmpty());
+            assertTrue(Globals.getInstance().mTeamIPMap.isEmpty());
+        }
+        register(player, 1, false);
+        assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+    }
+
+    @Test
+    public void oversizedRenameCannotReplaceTheExistingPlayerName() throws Exception {
+        Object player = client(1, 1);
+        for (int length : new int[]{21, 65400}) {
+            JSONObject rename = new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                    .put(TcpServer.JSON_PLAYERNAMECHANGE, TcpInputTestData.repeat('a', length));
+            TcpInputTestData.assertFitsFrame(rename.toString());
+            parse(player, rename);
+            assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+            assertEquals(0, server.playerUpdates);
+        }
+    }
+
+    @Test
+    public void oversizedRejoinCannotDisplaceTheExistingConnection() throws Exception {
+        Object original = client(1, 1);
+        Socket originalSocket = (Socket) get(original, "clientSocket");
+        Object replacement = client(2, 0);
+        parse(replacement, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                .put(TcpServer.JSON_REJOIN, true)
+                .put(TcpServer.JSON_PLAYERNAME, TcpInputTestData.repeat('a', 21)));
+        assertSame(originalSocket, get(original, "clientSocket"));
+        assertFalse(originalSocket.isClosed());
+        assertEquals((byte) 0, get(replacement, "mPlayerID"));
+        assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+    }
+
+    @Test
+    public void nonStringNamesCannotEnterTheLobby() throws Exception {
+        Object player = client(1, 0);
+        for (Object name : new Object[]{JSONObject.NULL, 123, true, new JSONObject(), new org.json.JSONArray()}) {
+            parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, 1).put(TcpServer.JSON_PLAYERNAME, name));
+            assertEquals((byte) 0, get(player, "mPlayerID"));
+            assertTrue(Globals.getInstance().mTeamPlayerNameMap.isEmpty());
+        }
+    }
+
+    @Test
+    public void nonStringRenameCannotOverwriteTheExistingPlayerName() throws Exception {
+        Object player = client(1, 1);
+        for (Object name : new Object[]{JSONObject.NULL, 123, true, new JSONObject(), new org.json.JSONArray()}) {
+            parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, 1).put(TcpServer.JSON_PLAYERNAMECHANGE, name));
+            assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+            assertEquals(0, server.playerUpdates);
+        }
+    }
+
+    @Test
+    public void normalAndEmptyNamesStillWorkForRegistrationAndRename() throws Exception {
+        Object player = client(1, 0);
+        String name = TcpInputTestData.repeat('a', 20);
+        parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, 1).put(TcpServer.JSON_PLAYERNAME, name));
+        assertEquals(name, Globals.getInstance().getPlayerName((byte) 1));
+        for (String replacement : new String[]{"", "[]{}'\"\\/", name}) {
+            parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                    .put(TcpServer.JSON_PLAYERNAMECHANGE, replacement));
+            assertEquals(replacement, Globals.getInstance().getPlayerName((byte) 1));
+        }
+        assertEquals(3, server.playerUpdates);
+    }
+
+    @Test
     public void newGrenadePairingRemovesThatPlayersPreviousPairing() throws Exception {
         Object player = client(1, 1);
         Globals.getInstance().mGrenadePairings[2] = 1;
@@ -570,7 +668,13 @@ public class TcpServerRegressionTest {
     }
 
     private void parse(Object client, JSONObject message) throws Exception {
-        invoke(clientHandler, "parsePlayerInfo", new Class<?>[]{String.class, clientType}, message.toString(), client);
+        parse(client, message.toString());
+    }
+
+    private void parse(Object client, String message) throws Exception {
+        Method parser = clientHandler.getClass().getDeclaredMethod("parsePlayerInfo", String.class, clientType);
+        parser.setAccessible(true);
+        TcpInputTestData.invokeParser(parser, clientHandler, message, client);
     }
 
     private void remove(Object client, int connectionID) throws Exception {
