@@ -177,10 +177,70 @@ public class GameplayRegressionTest {
             });
             Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
             set(activity, "mIsServer", false);
+            set(activity, "mPeerHostCreationPending", true);
             set(activity, "mReady", true);
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_FAILEDTOJOIN));
             assertEquals("Failed UDP discovery left the TCP listener running", 1, calls[0]);
             assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
+    public void peerHostDoesNotAdvertiseBeforeTcpListenerIsReady() {
+        scenario.onActivity(activity -> {
+            int[] listenerStarts = new int[1];
+            boolean[] listenerReady = new boolean[1];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override void startTcpServer() { listenerStarts[0]++; }
+                @Override boolean isTcpServerReady() { return listenerReady[0]; }
+            });
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mIsServer", false);
+            set(activity, "mReady", false);
+            PopupMenu menu = new PopupMenu(activity, activity.findViewById(android.R.id.content));
+            assertTrue(activity.onMenuItemClick(menu.getMenu().add(0, R.id.create_server_item, 0, "Host")));
+            assertEquals(1, listenerStarts[0]);
+            assertEquals("Peer host advertised before its TCP listener was ready", 0, udp.serverCreates);
+            listenerReady[0] = true;
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_TCPSERVERREADY));
+            assertEquals(1, udp.serverCreates);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_TCPSERVERREADY));
+            assertEquals("Repeated TCP-ready events restarted UDP hosting", 1, udp.serverCreates);
+        });
+    }
+
+    @Test
+    public void failedPlayerDiscoveryDoesNotCancelAnUnrelatedTcpListener() {
+        scenario.onActivity(activity -> {
+            int[] calls = new int[1];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override public void cancelServer() { calls[0]++; }
+            });
+            set(activity, "mPeerHostCreationPending", false);
+            set(activity, "mReady", true);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_FAILEDTOJOIN));
+            assertEquals("A player discovery failure stopped an unrelated TCP listener", 0, calls[0]);
+        });
+    }
+
+    @Test
+    public void lateUdpSuccessCannotReviveAFailedPeerHost() {
+        scenario.onActivity(activity -> {
+            int[] tcpCancellations = new int[1];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override public void cancelServer() { tcpCancellations[0]++; }
+                @Override boolean isTcpServerReady() { return false; }
+            });
+            set(activity, "mPeerHostCreationPending", true);
+            set(activity, "mPeerUdpServerStarting", true);
+            set(activity, "mIsServer", false);
+            set(activity, "mReady", false);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_TCPSERVERFAILED));
+            assertEquals(1, tcpCancellations[0]);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_SERVERCREATED));
+            assertEquals("Late UDP success revived a failed TCP host", false, get(activity, "mIsServer"));
+            assertEquals(false, get(activity, "mReady"));
+            assertEquals(2, udp.serverCancellations);
         });
     }
 
@@ -1486,9 +1546,17 @@ public class GameplayRegressionTest {
     private static final class RecordingUDPService extends UDPListenerService {
         final List<String> messages = new ArrayList<>();
         int endRequests;
+        int serverCreates;
+        int serverCancellations;
 
         @Override
         public void endGame() { endRequests++; }
+
+        @Override
+        public void createServer() { serverCreates++; }
+
+        @Override
+        public void cancelServer() { serverCancellations++; }
 
         @Override
         public void sendUDPMessage(String message, Byte playerID) {

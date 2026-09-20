@@ -392,6 +392,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (mUDPServiceConnection != this || !mUDPServiceBound || isFinishing() || isDestroyed())
                     return;
                 mUDPListenerService = ((UDPListenerService.LocalBinder) service).getService();
+                startPeerUdpServerIfTcpReady();
                 consumePendingServerEvent();
             }
 
@@ -405,6 +406,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                     endGame();
                 mUDPListenerService = null;
+                mPeerUdpServerStarting = false;
             }
         };
     }
@@ -417,6 +419,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private TcpServer mTcpServer = null;
     private ServiceConnection mTcpServerServiceConnection = null;
     private boolean mTcpServerServiceBound = false;
+    // Peer hosts must not announce a lobby until their TCP listener has bound.
+    private boolean mPeerHostCreationPending;
+    private boolean mPeerUdpServerStarting;
+
+    private void startPeerUdpServerIfTcpReady() {
+        if (!mPeerHostCreationPending || mPeerUdpServerStarting || mTcpServer == null
+                || mUDPListenerService == null || !mTcpServer.isTcpServerReady())
+            return;
+        mPeerUdpServerStarting = true;
+        mUDPListenerService.createServer();
+    }
 
     private void setupTcpClientServiceConnection() {
         if (mTcpClientServiceBound) return;
@@ -485,6 +498,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return;
                 mTcpServer = ((TcpServer.LocalBinder) service).getService();
                 mTcpServer.setDedicated(false);
+                startPeerUdpServerIfTcpReady();
                 consumePendingServerEvent();
             }
 
@@ -902,8 +916,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         return true;
                     }
                     if (!networkServicesReady()) return true;
+                    mPeerHostCreationPending = true;
+                    mPeerUdpServerStarting = false;
                     mTcpServer.startTcpServer();
-                    mUDPListenerService.createServer();
+                    startPeerUdpServerIfTcpReady();
                     setNetworkMenu(NETWORK_TYPE_JOINING);
                     return true;
             }else if (id == R.id.player_name_item) {
@@ -920,6 +936,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return true;
             }else if (id == R.id.cancel_server_item) {
                     if (!networkServicesReady()) return true;
+                    mPeerHostCreationPending = false;
+                    mPeerUdpServerStarting = false;
                     // A host does not receive its own SERVERCANCEL message.
                     // End a live local round before tearing down the listener,
                     // otherwise its weapon and timers remain active after peers
@@ -1879,6 +1897,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         setupUDPServiceConnection();
         setupTcpClientServiceConnection();
         setupTcpServerServiceConnection();
+        startPeerUdpServerIfTcpReady();
         consumePendingServerEvent();
     }
 
@@ -3158,14 +3177,45 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 setReady();
             } else if (NetMsg.NETMSG_FAILEDTOJOIN.equals(action)) {
                 Toast.makeText(getApplicationContext(), getString(R.string.error_join), Toast.LENGTH_SHORT).show();
-                // Peer hosting starts TCP before UDP announces that discovery is
-                // ready. If that announcement fails, retire the provisional TCP
-                // listener instead of leaving a hidden server bound to the port.
-                if (!mIsServer && mTcpServer != null)
+                boolean failedPeerHostCreation = mPeerHostCreationPending;
+                mPeerHostCreationPending = false;
+                mPeerUdpServerStarting = false;
+                // Only the peer-host flow owns a provisional TCP listener. A
+                // normal failed join must not tear down an unrelated listener.
+                if (failedPeerHostCreation && mTcpServer != null)
                     mTcpServer.cancelServer();
                 mReady = false;
-                setReady();
+                setReady(false);
+            } else if (NetMsg.NETMSG_TCPSERVERREADY.equals(action)) {
+                startPeerUdpServerIfTcpReady();
+            } else if (NetMsg.NETMSG_TCPSERVERFAILED.equals(action)) {
+                // Ignore an old failure after a replacement listener is ready.
+                if (mPeerHostCreationPending && (mTcpServer == null || !mTcpServer.isTcpServerReady())) {
+                    mPeerHostCreationPending = false;
+                    mPeerUdpServerStarting = false;
+                    if (mUDPListenerService != null)
+                        mUDPListenerService.cancelServer();
+                    if (mTcpServer != null)
+                        mTcpServer.cancelServer();
+                    mReady = false;
+                    mIsServer = false;
+                    setReady(false);
+                    Toast.makeText(getApplicationContext(), R.string.error_host_start, Toast.LENGTH_SHORT).show();
+                }
             } else if (NetMsg.NETMSG_SERVERCREATED.equals(action)) {
+                if (mIsServer)
+                    return;
+                if (mTcpServer == null || !mTcpServer.isTcpServerReady()
+                        || (!mPeerHostCreationPending && !mPeerUdpServerStarting)) {
+                    // UDP can finish its asynchronous startup after its TCP
+                    // listener has failed or been cancelled. Do not expose a
+                    // lobby that peers cannot join.
+                    if (mUDPListenerService != null)
+                        mUDPListenerService.cancelServer();
+                    return;
+                }
+                mPeerHostCreationPending = false;
+                mPeerUdpServerStarting = false;
                 mReady = true;
                 mIsServer = true;
                 setReady();
@@ -3231,6 +3281,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         intentFilter.addAction(NetMsg.NETMSG_SAMETEAM);
         intentFilter.addAction(NetMsg.NETMSG_SERVERCREATED);
         intentFilter.addAction(NetMsg.NETMSG_SERVERCANCEL);
+        intentFilter.addAction(NetMsg.NETMSG_TCPSERVERREADY);
+        intentFilter.addAction(NetMsg.NETMSG_TCPSERVERFAILED);
         intentFilter.addAction(NetMsg.NETMSG_SERVERREPLY);
         intentFilter.addAction(NetMsg.NETMSG_TEAMELIMINATED);
         intentFilter.addAction(NetMsg.NETMSG_NETWORKCONNECTED);

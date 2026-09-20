@@ -598,7 +598,32 @@ public class DedicatedServerRegressionTest {
     public void currentTcpBindingStillStartsAndDisconnectsTheServer() { assertCurrentBindingWorks(true); }
 
     @Test
-    public void currentUdpBindingStillStartsAndDisconnectsTheServer() { assertCurrentBindingWorks(false); }
+    public void udpBindingWaitsForTcpReadinessBeforeAdvertising() {
+        scenario.onActivity(current -> {
+            tcp.ready = false;
+            ServiceConnection callback = beginBinding(false);
+            callback.onServiceConnected(null, udp.onBind(new Intent()));
+            assertEquals("Dedicated UDP advertised before TCP was listening", 0, udp.listenerStarts);
+            tcp.ready = true;
+            receive(NetMsg.NETMSG_TCPSERVERREADY);
+            assertEquals(1, udp.listenerStarts);
+            receive(NetMsg.NETMSG_TCPSERVERREADY);
+            assertEquals("Repeated TCP-ready events restarted UDP hosting", 1, udp.listenerStarts);
+        });
+    }
+
+    @Test
+    public void staleTcpFailureDoesNotTearDownTheCurrentDedicatedHost() {
+        scenario.onActivity(current -> {
+            tcp.ready = true;
+            tcp.cancellations = 0;
+            udp.listenerStops = 0;
+            set("mTcpServerStartupPending", false);
+            receive(NetMsg.NETMSG_TCPSERVERFAILED);
+            assertEquals(0, tcp.cancellations);
+            assertEquals(0, udp.listenerStops);
+        });
+    }
 
     @Test
     public void udpBindingDuringARoundRestoresTheClosedLobbySetting() { assertJoinSettingRestored(false); }
@@ -610,6 +635,7 @@ public class DedicatedServerRegressionTest {
         scenario.onActivity(current -> {
             Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
             ((Switch) current.findViewById(R.id.allow_join_switch)).setChecked(allowJoin);
+            tcp.ready = true;
             ServiceConnection callback = beginBinding(false);
             callback.onServiceConnected(null, udp.onBind(new Intent()));
             assertEquals(1, udp.listenerStarts);
@@ -882,6 +908,7 @@ public class DedicatedServerRegressionTest {
         int cancellations;
         boolean acceptStart = true;
         boolean dedicated;
+        boolean ready;
         ScoreData firstPlayerScore;
         Intent scheduledStart;
 
@@ -891,6 +918,7 @@ public class DedicatedServerRegressionTest {
         @Override public void stopTcpServer() { listenerStops++; }
         @Override public void cancelServer() { cancellations++; }
         @Override public void setDedicated(boolean value) { dedicated = value; }
+        @Override boolean isTcpServerReady() { return ready; }
         @Override Intent getScheduledGameStart() {
             return scheduledStart == null ? null : new Intent(scheduledStart);
         }

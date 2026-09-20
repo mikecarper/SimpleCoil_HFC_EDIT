@@ -184,6 +184,17 @@ public class TcpServerSessionRegressionTest {
     }
 
     @Test
+    public void successfulBindAnnouncesTcpReadiness() throws Exception {
+        server.startTcpServer();
+        long deadline = SystemClock.elapsedRealtime() + 2000;
+        while (!server.isTcpServerReady() && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        assertTrue("Bound listener never became ready", server.isTcpServerReady());
+        assertTrue("Bound listener never announced readiness",
+                server.broadcasts.contains(NetMsg.NETMSG_TCPSERVERREADY));
+    }
+
+    @Test
     public void failedBindDoesNotResetExistingGameState() throws Exception {
         connect();
         Globals.GPSData gps = new Globals.GPSData();
@@ -195,6 +206,9 @@ public class TcpServerSessionRegressionTest {
         try {
             competingServer.startTcpServer();
             assertTrue("Competing listener did not exit", awaitStopped(competingServer, 2000));
+            assertFalse("Failed listener reported itself ready", competingServer.isTcpServerReady());
+            assertTrue("Failed listener did not announce startup failure",
+                    competingServer.broadcasts.contains(NetMsg.NETMSG_TCPSERVERFAILED));
             assertSame(gps, Globals.getInstance().mGPSData.get((byte) 1));
             assertEquals(9, Globals.getInstance().mGrenadePairings[1]);
             assertTrue((boolean) get(server, "keepListening"));
@@ -699,7 +713,11 @@ public class TcpServerSessionRegressionTest {
 
     private static final class RecordingServer extends TcpServer {
         final CopyOnWriteArrayList<String> messages = new CopyOnWriteArrayList<>();
-        @Override public void sendBroadcast(Intent intent) { }
+        final CopyOnWriteArrayList<String> broadcasts = new CopyOnWriteArrayList<>();
+        @Override public void sendBroadcast(Intent intent) {
+            if (intent != null && intent.getAction() != null)
+                broadcasts.add(intent.getAction());
+        }
         @Override public void sendTCPMessageAll(String message, boolean queueMessage) {
             messages.add(message);
             super.sendTCPMessageAll(message, queueMessage);

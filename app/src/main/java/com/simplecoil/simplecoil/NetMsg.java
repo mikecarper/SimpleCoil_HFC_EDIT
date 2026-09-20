@@ -37,6 +37,8 @@ public class NetMsg {
     public static final String NETMSG_SAMETEAM = "SAMETEAM";
     public static final String NETMSG_SERVERCREATED = "SERVERCREATED";
     public static final String NETMSG_SERVERCANCEL = "SERVERCANCEL";
+    public static final String NETMSG_TCPSERVERREADY = "TCPSERVERREADY";
+    public static final String NETMSG_TCPSERVERFAILED = "TCPSERVERFAILED";
     public static final String NETMSG_TEAMELIMINATED = "TEAMELIMINATED";
     public static final String NETMSG_SERVERREPLY = "SERVERREPLY";
     public static final String NETMSG_GPSLOCUPDATE = "GPSLOCUPDATE";

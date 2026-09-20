@@ -126,6 +126,9 @@ public class TcpServer extends Service {
     private volatile boolean keepListening = false;
     private final Object mServerStateLock = new Object();
     private boolean mDestroyed;
+    // True only after this instance has bound its listening socket and reset the
+    // shared lobby state for the current server session.
+    private boolean mTcpServerReady;
     // Guarded by mServerStateLock from scheduling through cleanup completion.
     private boolean mEndingGame;
     private boolean mStartingGame;
@@ -464,8 +467,10 @@ public class TcpServer extends Service {
                     mScheduledDuration = duration;
                     mStartAnnounced = true;
                     sendBroadcast(getScheduledGameStart());
-                    if (!mIsDedicated)
+                    if (!mIsDedicated) {
                         keepListening = false;
+                        mTcpServerReady = false;
+                    }
                 }
             }, RoundTask.START);
         }
@@ -988,6 +993,7 @@ public class TcpServer extends Service {
                 return;
             }
             keepListening = true;
+            mTcpServerReady = false;
             mStartAnnounced = false;
             mScheduledStart = -1;
             mScheduledDuration = 0;
@@ -1000,6 +1006,7 @@ public class TcpServer extends Service {
         ServerSocket ss = null;
         Socket pendingSocket = null;
         int clientID = 0;
+        boolean startupReady = false;
         try {
             ss = new ServerSocket();
             synchronized (mServerStateLock) {
@@ -1028,6 +1035,13 @@ public class TcpServer extends Service {
             if (!keepListening)
                 return;
             Globals.ClearGrenadePairings(true);
+            synchronized (mServerStateLock) {
+                if (!keepListening || mDestroyed)
+                    return;
+                mTcpServerReady = true;
+                startupReady = true;
+            }
+            sendBroadcast(new Intent(NetMsg.NETMSG_TCPSERVERREADY));
             Log.d(TAG, "TCP Server listening");
             while (keepListening) {
                 try {
@@ -1075,16 +1089,27 @@ public class TcpServer extends Service {
         } finally {
             closeSocket(pendingSocket);
             closeListener(ss);
+            boolean notifyStartupFailure = false;
             synchronized (mServerStateLock) {
                 if (mListenSocket == ss)
                     mListenSocket = null;
                 if (Thread.currentThread() == mServerThread) {
+                    notifyStartupFailure = !startupReady && keepListening && !mDestroyed;
+                    mTcpServerReady = false;
                     keepListening = false;
                     stopGPSDataLocked();
                     mServerThread = null;
                 }
             }
+            if (notifyStartupFailure)
+                sendBroadcast(new Intent(NetMsg.NETMSG_TCPSERVERFAILED));
             Log.d(TAG, "TCP Server done");
+        }
+    }
+
+    boolean isTcpServerReady() {
+        synchronized (mServerStateLock) {
+            return keepListening && !mDestroyed && mTcpServerReady;
         }
     }
 
@@ -1847,6 +1872,7 @@ public class TcpServer extends Service {
             if (cancellationOwner != null && mCancellationThread != cancellationOwner)
                 return;
             keepListening = false;
+            mTcpServerReady = false;
             if (mCancellationTimeout != null) {
                 mShutdownHandler.removeCallbacks(mCancellationTimeout);
                 mCancellationTimeout = null;

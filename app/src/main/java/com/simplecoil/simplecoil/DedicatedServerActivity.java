@@ -100,6 +100,37 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private ServiceConnection mUDPServiceConnection = null;
     private UDPListenerService mUDPListenerService = null;
     private boolean mUDPServiceBound = false;
+    private boolean mUdpServerStarting;
+    private boolean mUdpServerActive;
+    private boolean mTcpServerStartupPending;
+
+    private void startUdpServerIfTcpReady() {
+        if (isFinishing() || isDestroyed() || mUdpServerStarting || mUdpServerActive
+                || mUDPListenerService == null || mTcpServer == null || !mTcpServer.isTcpServerReady())
+            return;
+        mUdpServerStarting = true;
+        mUDPListenerService.createServer();
+        if (!isFinishing() && !isDestroyed() && mUdpServerStarting) {
+            mUDPListenerService.allowJoin(Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                    || mAllowJoinSwitch.isChecked());
+        }
+    }
+
+    private void failDedicatedHostStartup() {
+        if (isFinishing() || isDestroyed())
+            return;
+        mUdpServerStarting = false;
+        mUdpServerActive = false;
+        mTcpServerStartupPending = false;
+        if (mUDPListenerService != null)
+            mUDPListenerService.stopListen();
+        if (mTcpServer != null)
+            mTcpServer.cancelServer();
+        Toast.makeText(getApplicationContext(), R.string.error_host_start, Toast.LENGTH_SHORT).show();
+        // Keep the controls visible so the operator can correct Wi-Fi or the
+        // port conflict instead of being returned to the player screen.
+        mServerIPTV.setText("");
+    }
 
     private void setupUDPServiceConnection() {
         if (mUDPServiceBound || isFinishing() || isDestroyed()) return;
@@ -119,9 +150,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 if (mUDPServiceConnection != this || !mUDPServiceBound || isFinishing() || isDestroyed())
                     return;
                 mUDPListenerService = ((UDPListenerService.LocalBinder) service).getService();
-                mUDPListenerService.createServer();
-                mUDPListenerService.allowJoin(Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
-                        || mAllowJoinSwitch.isChecked());
+                startUdpServerIfTcpReady();
             }
 
             @Override
@@ -129,6 +158,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 if (mUDPServiceConnection != this || !mUDPServiceBound || isFinishing() || isDestroyed())
                     return;
                 mUDPListenerService = null;
+                mUdpServerStarting = false;
+                mUdpServerActive = false;
             }
         };
     }
@@ -160,7 +191,10 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 if (scheduled != null)
                     onGameStarted(scheduled);
                 mTcpServer.clearScheduledStart();
+                mTcpServerStartupPending = true;
                 mTcpServer.startTcpServer();
+                mTcpServerStartupPending = !mTcpServer.isTcpServerReady();
+                startUdpServerIfTcpReady();
             }
 
             @Override
@@ -168,6 +202,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 if (mTcpServerServiceConnection != this || !mTcpServerServiceBound || isFinishing() || isDestroyed())
                     return;
                 mTcpServer = null;
+                mTcpServerStartupPending = false;
             }
         };
     }
@@ -182,6 +217,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mUDPServiceBound = false;
             mUDPServiceConnection = null;
             mUDPListenerService = null;
+            mUdpServerStarting = false;
+            mUdpServerActive = false;
         }
     }
 
@@ -195,6 +232,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mTcpServerServiceBound = false;
             mTcpServerServiceConnection = null;
             mTcpServer = null;
+            mTcpServerStartupPending = false;
         }
     }
 
@@ -329,6 +367,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         super.onResume();
         setupUDPServiceConnection();
         setupTcpServerServiceConnection();
+        startUdpServerIfTcpReady();
     }
 
     @Override
@@ -354,6 +393,9 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         if (mTcpServer != null) {
             mTcpServer.cancelServer();
         }
+        mUdpServerStarting = false;
+        mUdpServerActive = false;
+        mTcpServerStartupPending = false;
         if (mUDPListenerService != null)
             mUDPListenerService.stopListen();
         unbindUDPService();
@@ -666,7 +708,17 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             if (isFinishing() || isDestroyed())
                 return;
             final String action = intent.getAction();
-            if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)) {
+            if (NetMsg.NETMSG_TCPSERVERREADY.equals(action)) {
+                if (mTcpServer != null && mTcpServer.isTcpServerReady())
+                    mTcpServerStartupPending = false;
+                startUdpServerIfTcpReady();
+            } else if (NetMsg.NETMSG_TCPSERVERFAILED.equals(action)) {
+                if (mTcpServerStartupPending && (mTcpServer == null || !mTcpServer.isTcpServerReady()))
+                    failDedicatedHostStartup();
+            } else if (NetMsg.NETMSG_FAILEDTOJOIN.equals(action)) {
+                if (mUdpServerStarting)
+                    failDedicatedHostStartup();
+            } else if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)) {
                 mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount() - 1));
                 if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE && NetMsg.NETMSG_LEAVE.equals(action) && Globals.getPlayerCount() <= 1)
                     endGame(); // Everyone else is out so game is over - this only works in FFA because we don't keep track of who and how many people are on each team
@@ -696,6 +748,14 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 }
             } else if (NetMsg.NETMSG_SERVERCREATED.equals(action)) {
                 // UDP service is listening
+                if (mTcpServer == null || !mTcpServer.isTcpServerReady()
+                        || (!mUdpServerStarting && !mUdpServerActive)) {
+                    if (mUDPListenerService != null)
+                        mUDPListenerService.stopListen();
+                    return;
+                }
+                mUdpServerStarting = false;
+                mUdpServerActive = true;
                 if (Globals.getInstance().mServerIP != null) {
                     String ip = Globals.getInstance().mServerIP.toString();
                     if (ip.startsWith("/"))
@@ -718,8 +778,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         intentFilter.addAction(NetMsg.NETMSG_STARTGAME);
         intentFilter.addAction(NetMsg.NETMSG_ENDGAME);
         intentFilter.addAction(NetMsg.NETMSG_ERROR);
+        intentFilter.addAction(NetMsg.NETMSG_FAILEDTOJOIN);
         intentFilter.addAction(NetMsg.NETMSG_SERVERCREATED);
         intentFilter.addAction(NetMsg.NETMSG_SERVERCANCEL);
+        intentFilter.addAction(NetMsg.NETMSG_TCPSERVERREADY);
+        intentFilter.addAction(NetMsg.NETMSG_TCPSERVERFAILED);
         intentFilter.addAction(NetMsg.NETMSG_PLAYERDATAUPDATE);
         return intentFilter;
     }

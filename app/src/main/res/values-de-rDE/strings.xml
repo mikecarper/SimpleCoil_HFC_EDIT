@@ -45,6 +45,7 @@
     <string name="error_udp_version">Netzwerk Client Version unterschied. Update die APP!</string>
     <string name="error_no_wifi">WLAN muss verbunden sein</string>
     <string name="error_join">Server lobby nicht gefunden!</string>
+    <string name="error_host_start">Server-Lobby konnte nicht gestartet werden!</string>
     <string name="error_server_cancel">Server wurde abgebrochen!</string>
     <string name="error_limit_too_high">Limit ist zu hoch !</string>
     <string name="dialog_game_time_expired">Zeit Limit erreicht!</string>
