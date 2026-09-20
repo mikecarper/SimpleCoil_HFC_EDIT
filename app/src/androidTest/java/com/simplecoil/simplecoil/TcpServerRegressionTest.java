@@ -324,6 +324,32 @@ public class TcpServerRegressionTest {
         assertRepeatedRegistration(true);
     }
 
+    @Test
+    public void duplicateRegistrationWithoutAnExplicitRejoinCannotDisplaceAConnectedPlayer() throws Exception {
+        Object original = client(1, 1);
+        Socket originalSocket = (Socket) get(original, "clientSocket");
+
+        Object unmarkedDuplicate = client(2, 0);
+        Socket unmarkedDuplicateSocket = (Socket) get(unmarkedDuplicate, "clientSocket");
+        register(unmarkedDuplicate, 1, false);
+        assertSame(original, clients.get(1));
+        assertSame(originalSocket, get(original, "clientSocket"));
+        assertFalse(originalSocket.isClosed());
+        assertTrue(unmarkedDuplicateSocket.isClosed());
+        assertFalse(clients.containsKey(2));
+
+        Object falseFlagDuplicate = client(3, 0);
+        Socket falseFlagDuplicateSocket = (Socket) get(falseFlagDuplicate, "clientSocket");
+        parse(falseFlagDuplicate, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                .put(TcpServer.JSON_PLAYERNAME, "Duplicate")
+                .put(TcpServer.JSON_REJOIN, false));
+        assertSame(original, clients.get(1));
+        assertSame(originalSocket, get(original, "clientSocket"));
+        assertFalse(originalSocket.isClosed());
+        assertTrue(falseFlagDuplicateSocket.isClosed());
+        assertFalse(clients.containsKey(3));
+    }
+
     private void assertRepeatedRegistration(boolean rejoin) throws Exception {
         Object client = client(1, 1);
         Socket socket = (Socket) get(client, "clientSocket");

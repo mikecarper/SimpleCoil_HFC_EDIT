@@ -1670,7 +1670,15 @@ public class TcpServer extends Service {
             byte id;
             String playerName;
             try {
-                rejoin = player.has(JSON_REJOIN);
+                // Presence alone is not a reconnect request. In particular, a
+                // normal second player can send {"rejoin":false}; treating that
+                // as true lets it replace an already connected player's socket.
+                Object rejoinValue = player.has(JSON_REJOIN) ? player.get(JSON_REJOIN) : null;
+                if (rejoinValue != null && !(rejoinValue instanceof Boolean)) {
+                    Log.w(TAG, "Ignoring registration with an invalid rejoin flag");
+                    return;
+                }
+                rejoin = Boolean.TRUE.equals(rejoinValue);
                 int rawPlayerID = TcpJson.getInt(player, JSON_PLAYERID);
                 if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0) {
                     Log.w(TAG, "Ignoring client with invalid player ID " + rawPlayerID);
@@ -1688,9 +1696,17 @@ public class TcpServer extends Service {
                 Log.w(TAG, "Ignoring an attempt to change a registered connection's player ID");
                 return;
             }
-            requestFullGPSUpdate(); // Send all GPS info because of the new client
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
                 if (entry.getValue() != client && entry.getValue().mPlayerID == id) {
+                    // An explicit reconnect may replace a dead link that has not
+                    // reached its heartbeat timeout yet. A normal registration
+                    // with a duplicate ID must leave the connected player alone.
+                    if (!rejoin && entry.getValue().clientSocket != null) {
+                        Log.w(TAG, "Ignoring duplicate registration for connected player " + id);
+                        client.close();
+                        mClientData.remove(client.clientID);
+                        return;
+                    }
                     Log.d(TAG, "rejoining " + client.clientID + " to " + entry.getValue().clientID);
                     entry.getValue().rejoin(client.clientSocket);
                     mClientData.remove(client.clientID);
@@ -1704,6 +1720,7 @@ public class TcpServer extends Service {
             if (rejoin && newRegistration)
                 Log.d(TAG, "rejoined client " + client.clientID + " not present so adding as a new player");
             client.mPlayerID = id;
+            requestFullGPSUpdate(); // Send all GPS info because of the accepted client
             ScoreData departed = mDepartedScores.remove(id);
             if (newRegistration && departed != null) {
                 client.points = departed.points;
