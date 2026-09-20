@@ -1314,6 +1314,32 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void offlineHitsUseTheConfiguredLocalDamage() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            int originalDamage = globals.mDamage;
+            boolean receiverRegistered = (boolean) get(activity, "mGattReceiverRegistered");
+            try {
+                set(activity, "mUseNetwork", false);
+                // API-22 can background an ActivityScenario while this test is
+                // running. Exercise the receiver's active-session path directly.
+                set(activity, "mGattReceiverRegistered", true);
+                globals.mDamage = -5;
+
+                telemetry(activity, 11, 1, 0, 0);
+
+                assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
+                assertEquals(1, get(activity, "mHitsTaken"));
+                assertEquals("Offline damage setting was ignored", 15, get(activity, "mHealth"));
+            } finally {
+                globals.mDamage = originalDamage;
+                set(activity, "mUseNetwork", true);
+                set(activity, "mGattReceiverRegistered", receiverRegistered);
+            }
+        });
+    }
+
+    @Test
     public void lastNetworkLifeLeavesWithoutRespawning() {
         scenario.onActivity(activity -> {
             set(activity, "mHasLivesLimit", true);

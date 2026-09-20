@@ -2755,7 +2755,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             mHitsTaken = incrementCounter(mHitsTaken, Globals.MAX_SCOREBOARD_VALUE);
                             String hitsTaken = "" + mHitsTaken;
                             mHitsTakenTV.setText(hitsTaken);
-                            healthRemoved = Globals.DAMAGE_PER_HIT;
+                            // Offline games have no per-player settings snapshot. Use the
+                            // locally configured damage value instead of silently reverting
+                            // every weapon to the one-hit default.
+                            healthRemoved = Globals.getInstance().mDamage;
                             if (mUseNetwork) {
                                 hit_by_id = (byte) (hit_by_player1 >> 2);
                                 //Log.d(TAG, "hit by 1 ID is " + hit_by_id);
@@ -2796,7 +2799,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         } else {
                             mHitsTaken = incrementCounter(mHitsTaken, Globals.MAX_SCOREBOARD_VALUE);
                             mHitsTakenTV.setText(String.valueOf(mHitsTaken));
-                            int secondHitDamage = Globals.DAMAGE_PER_HIT;
+                            int secondHitDamage = Globals.getInstance().mDamage;
                             if (mUseNetwork) {
                                 hit_by_id = (byte) (hit_by_player2 >> 2);
                                 //Log.d(TAG, "hit by 2 ID is " + hit_by_id);
