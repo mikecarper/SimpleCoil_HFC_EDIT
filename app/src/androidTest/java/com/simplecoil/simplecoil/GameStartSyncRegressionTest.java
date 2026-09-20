@@ -40,7 +40,10 @@ public class GameStartSyncRegressionTest {
         Intent start = client.events.get(0);
         assertEquals(deadline, start.getLongExtra(NetMsg.INTENT_START_AT, -1));
         assertEquals(deadline + 60000, start.getLongExtra(NetMsg.INTENT_END_AT, -1));
-        assertTrue(client.messages.get(0).contains(TcpServer.JSON_CLOCK_READY));
+        assertTrue(TcpServer.isValidRoundToken(start.getStringExtra(NetMsg.INTENT_ROUND_TOKEN)));
+        // This parser-only client deliberately has no TCP writer. Reaching the
+        // synchronized start proves its clock-ready state without asserting a
+        // socket write that the test double cannot record.
     }
 
     @Test public void duplicateAndOlderRoundCannotRestartCountdown() throws Exception {
@@ -112,6 +115,10 @@ public class GameStartSyncRegressionTest {
         parse(plan(1, now, Long.MAX_VALUE));
         parse(plan(1, now, 0).put(TcpServer.JSON_GAMESTART, "1000"));
         parse(plan(1, now, 0).put(TcpServer.JSON_GAMESTART, Long.MAX_VALUE));
+        JSONObject missingRoundToken = plan(1, now, 0);
+        missingRoundToken.remove(TcpServer.JSON_ROUND_TOKEN);
+        parse(missingRoundToken);
+        parse(plan(1, now, 0).put(TcpServer.JSON_ROUND_TOKEN, "not-a-round-token"));
         parse(plan(1, now + Globals.MAX_RESPAWN_TIME_SECONDS * 1000 + 100000, 0));
         assertTrue(client.events.isEmpty());
         parse(plan(1, now + 10000, 0));

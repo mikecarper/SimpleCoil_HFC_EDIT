@@ -1501,6 +1501,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             Log.w(TAG, "Ignoring game start before network services are ready");
             return;
         }
+        final boolean peerGame = mUseNetwork && !isDedicatedServerConnection();
+        final String peerRoundToken = start == null ? null
+                : start.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+        if (peerGame && !TcpServer.isValidRoundToken(peerRoundToken)) {
+            // TCP start announcements carry the nonce used to authenticate peer
+            // UDP ENDGAME packets. Never begin a peer round that could accept an
+            // old, unscoped datagram.
+            Log.w(TAG, "Ignoring peer game start without a valid round token");
+            return;
+        }
         mHasSynchronizedStart = start != null && start.hasExtra(NetMsg.INTENT_START_AT);
         mSynchronizedStartAt = mHasSynchronizedStart ? start.getLongExtra(NetMsg.INTENT_START_AT, 0) : 0;
         mSynchronizedEndAt = mHasSynchronizedStart ? start.getLongExtra(NetMsg.INTENT_END_AT, 0) : 0;
@@ -1534,7 +1544,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUseNetwork) {
             displayInGameNetworkingOptions();
             mEndNetworkGameButton.setVisibility(View.VISIBLE);
-            mUDPListenerService.startGame(!isDedicatedServerConnection());
+            mUDPListenerService.startGame(peerGame, peerRoundToken);
             if (!mTcpClient.isDedicatedServer())
                 mTcpClient.stopTcpClient();
         } else {

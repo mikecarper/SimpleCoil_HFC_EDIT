@@ -397,12 +397,17 @@ public class TcpClient extends Service {
 
     private static JSONObject readStartInfo(JSONObject message) throws JSONException {
         long roundID = TcpJson.getLong(message, TcpServer.JSON_ROUND_ID);
+        Object roundTokenValue = message.get(TcpServer.JSON_ROUND_TOKEN);
+        if (!(roundTokenValue instanceof String))
+            throw new JSONException("Invalid synchronized game round token");
+        String roundToken = (String) roundTokenValue;
         long startAt = TcpJson.getLong(message, TcpServer.JSON_GAMESTART);
         long duration = TcpJson.getLong(message, TcpServer.JSON_GAMEDURATION);
         if (roundID <= 0 || !GameClock.validTimestamp(roundID) || !GameClock.validTimestamp(startAt)
-                || duration < 0 || duration > Globals.MAX_GAME_LIMIT * 60000L)
+                || duration < 0 || duration > Globals.MAX_GAME_LIMIT * 60000L
+                || !TcpServer.isValidRoundToken(roundToken))
             throw new JSONException("Invalid synchronized game start");
-        return TcpServer.createStartInfo(roundID, startAt, duration);
+        return TcpServer.createStartInfo(roundID, startAt, duration, roundToken);
     }
 
     private void queueSynchronizedStart(long generation, JSONObject startInfo, Intent intent) throws JSONException {
@@ -431,6 +436,10 @@ public class TcpClient extends Service {
         long startAt = mGameClock.toLocalTime(TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GAMESTART));
         long duration = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GAMEDURATION);
         long roundID = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_ROUND_ID);
+        Object roundTokenValue = mPendingStartInfo.get(TcpServer.JSON_ROUND_TOKEN);
+        if (!(roundTokenValue instanceof String))
+            throw new JSONException("Invalid pending game round token");
+        String roundToken = (String) roundTokenValue;
         long now = SystemClock.elapsedRealtime();
         Intent intent = mPendingStartIntent;
         mPendingStartInfo = null;
@@ -445,6 +454,7 @@ public class TcpClient extends Service {
         intent.putExtra(NetMsg.INTENT_START_AT, startAt)
                 .putExtra(NetMsg.INTENT_END_AT, duration == 0 ? 0 : startAt + duration)
                 .putExtra(NetMsg.INTENT_ROUND_ID, roundID)
+                .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken)
                 .putExtra(EXTRA_START_EVENT_ID, terminalEventIds.incrementAndGet());
         mPendingGameStartEvent = new Intent(intent);
         broadcastIfCurrentSession(generation, intent);

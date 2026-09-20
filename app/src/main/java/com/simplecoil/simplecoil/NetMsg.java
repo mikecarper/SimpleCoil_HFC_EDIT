@@ -20,7 +20,7 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "10";
+    public static final String NETWORK_VERSION = "11";
 
     // All of these messages are straightforward and contain no extra data
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
@@ -58,6 +58,9 @@ public class NetMsg {
     // TEAMELIMINATED:<eliminated player ID>:<sequence>.
     public static final String NETMSG_PEER_ELIMINATED = NETMSG_ELIMINATED + ":";
     public static final String NETMSG_PEER_TEAMELIMINATED = NETMSG_TEAMELIMINATED + ":";
+    // A peer ENDGAME is bound to the synchronized round nonce. This prevents a
+    // delayed datagram from a prior lobby from ending a newly started round.
+    public static final String NETMSG_PEER_ENDGAME = NETMSG_ENDGAME + ":";
 
     // When players join a game in progress, the server can send the player updates on appropriate values.
     // These items are intent extras.
@@ -70,6 +73,7 @@ public class NetMsg {
     public static final String INTENT_START_AT = "START_AT_ELAPSED";
     public static final String INTENT_END_AT = "END_AT_ELAPSED";
     public static final String INTENT_ROUND_ID = "ROUND_ID";
+    public static final String INTENT_ROUND_TOKEN = "ROUND_TOKEN";
     public static final String INTENT_EVENT_SEQUENCE = "EVENT_SEQUENCE";
 
     public static final String INTENT_LONGITUDE = "longitude";

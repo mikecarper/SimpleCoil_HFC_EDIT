@@ -91,6 +91,10 @@ public class UDPListenerService extends Service {
     // round closes that TCP listener after the start announcement, so a player
     // leaving mid-round must be reflected by a validated UDP LEAVE instead.
     private volatile boolean mPeerGame;
+    // A fresh synchronized round gets a nonce from the TCP start announcement.
+    // UDP endpoint membership alone cannot distinguish a delayed prior-round
+    // packet from a current one.
+    private String mPeerRoundToken;
     private static final int PEER_GRENADE_UPDATE_REPETITIONS = 3;
     private static final int PEER_SCORE_UPDATE_REPETITIONS = 3;
     private final Object mPeerGrenadeLock = new Object();
@@ -288,7 +292,14 @@ public class UDPListenerService extends Service {
             } else if (message.startsWith(NetMsg.NETMSG_GRENADEPAIR)) {
                 processPeerGrenadePairing(ip,
                         message.substring(NetMsg.NETMSG_GRENADEPAIR.length()));
+            } else if (message.startsWith(NetMsg.NETMSG_PEER_ENDGAME)) {
+                processPeerEndGame(ip,
+                        message.substring(NetMsg.NETMSG_PEER_ENDGAME.length()));
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
+                // Protocol 11 peer games bind ENDGAME to the current round nonce.
+                // Keep the old fixed form only for TCP-authoritative games.
+                if (mPeerGame)
+                    return;
                 if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                         || (getPlayerID(ip) == null && !ip.equals(Globals.getInstance().mServerIP)))
                     return;
@@ -319,6 +330,18 @@ public class UDPListenerService extends Service {
         }
         if (intent != null)
             sendBroadcast(intent);
+    }
+
+    /** Accept an ENDGAME only from a current peer and only for this exact round. */
+    private void processPeerEndGame(InetAddress ip, String roundToken) {
+        if (getPlayerID(ip) == null)
+            return;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !mPeerGame || !TcpServer.isValidRoundToken(roundToken)
+                    || !roundToken.equals(mPeerRoundToken))
+                return;
+        }
+        sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
     }
 
     /**
@@ -1141,6 +1164,7 @@ public class UDPListenerService extends Service {
             endScanningLocked();
             mIsListService = false;
             mPeerGame = false;
+            mPeerRoundToken = null;
             resetPeerGameSequences();
             keepListening = false;
             closeListeningSocket();
@@ -1200,19 +1224,45 @@ public class UDPListenerService extends Service {
 
     private final IBinder mBinder = new LocalBinder();
 
-    public void startGame() { startGame(false); }
+    public void startGame() { startGame(false, null); }
 
+    /**
+     * Legacy in-process callers that do not receive a synchronized start still
+     * get a unique token. Network peers use the overload below with the shared
+     * token parsed from the host's start announcement.
+     */
     public void startGame(boolean peerGame) {
+        startGame(peerGame, peerGame ? TcpServer.createRoundToken() : null);
+    }
+
+    public void startGame(boolean peerGame, String roundToken) {
+        if (peerGame && !TcpServer.isValidRoundToken(roundToken)) {
+            Log.w(TAG, "Refusing peer game without a valid round token");
+            return;
+        }
         synchronized (mListenerStateLock) {
             mIsListService = false; // There is no list service while the game is running
-            if (mPeerGame != peerGame)
+            if (mPeerGame != peerGame || (peerGame && !roundToken.equals(mPeerRoundToken)))
                 resetPeerGameSequences();
             mPeerGame = peerGame;
+            mPeerRoundToken = peerGame ? roundToken : null;
         }
     }
 
     public void endGame() {
-        sendUDPMessageAllRepeat(NetMsg.NETMSG_ENDGAME, 3);
+        final String message;
+        synchronized (mListenerStateLock) {
+            if (mPeerGame) {
+                if (!TcpServer.isValidRoundToken(mPeerRoundToken)) {
+                    Log.w(TAG, "Not sending peer ENDGAME without a round token");
+                    return;
+                }
+                message = NetMsg.NETMSG_PEER_ENDGAME + mPeerRoundToken;
+            } else {
+                message = NetMsg.NETMSG_ENDGAME;
+            }
+        }
+        sendUDPMessageAllRepeat(message, 3);
     }
 
     public void allowJoin(boolean allowed) { mIsListService = allowed;}

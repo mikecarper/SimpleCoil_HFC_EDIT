@@ -48,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -110,6 +111,7 @@ public class TcpServer extends Service {
     static final String JSON_GAMESTART = "gamestart";
     static final String JSON_GAMEDURATION = "gameduration";
     static final String JSON_ROUND_ID = "roundid";
+    static final String JSON_ROUND_TOKEN = "roundtoken";
     public static final String JSON_PLAYERGAMEUPDATE = "playergameupdate";
 
     public static final String JSON_PLAYERSETTINGS = "playersettings";
@@ -144,6 +146,10 @@ public class TcpServer extends Service {
     private long mScheduledStart = -1;
     private long mScheduledDuration;
     private long mRoundSequence;
+    // Unlike the sequence, this nonce remains unique when a new peer host is
+    // created for the next lobby. It protects UDP messages that can outlive a
+    // closed socket or a prior game session.
+    private String mRoundToken;
     private volatile long mClockSamplingUntil;
     private ServerSocket mListenSocket;
     private volatile Thread mServerThread = null;
@@ -452,6 +458,7 @@ public class TcpServer extends Service {
                 final long startAt;
                 final long duration;
                 final long roundID;
+                final String roundToken;
                 synchronized (mServerStateLock) {
                     if (!isClientTaskActive() || mEndingGame
                             || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
@@ -462,8 +469,11 @@ public class TcpServer extends Service {
                     duration = (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0
                             ? Math.max(0, Math.min(Globals.MAX_GAME_LIMIT, Globals.getInstance().mTimeLimit)) * 60000L : 0;
                     roundID = ++mRoundSequence;
+                    roundToken = createRoundToken();
+                    mRoundToken = roundToken;
                 }
-                String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + createStartInfo(roundID, startAt, duration);
+                String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON
+                        + createStartInfo(roundID, startAt, duration, roundToken);
                 boolean delivered = false;
                 for (ClientRecipient recipient : recipients) {
                     synchronized (mServerStateLock) {
@@ -505,10 +515,12 @@ public class TcpServer extends Service {
         synchronized (mServerStateLock) {
             if (mDestroyed || !mStartAnnounced || mScheduledStart < 0)
                 return null;
+            String roundToken = getRoundTokenLocked();
             return new Intent(NetMsg.NETMSG_STARTGAME)
                     .putExtra(NetMsg.INTENT_START_AT, mScheduledStart)
                     .putExtra(NetMsg.INTENT_END_AT, mScheduledDuration == 0 ? 0 : mScheduledStart + mScheduledDuration)
-                    .putExtra(NetMsg.INTENT_ROUND_ID, mRoundSequence);
+                    .putExtra(NetMsg.INTENT_ROUND_ID, mRoundSequence)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
         }
     }
 
@@ -518,6 +530,7 @@ public class TcpServer extends Service {
                 mStartAnnounced = false;
                 mScheduledStart = -1;
                 mScheduledDuration = 0;
+                mRoundToken = null;
             }
         }
     }
@@ -528,9 +541,39 @@ public class TcpServer extends Service {
         }
     }
 
+    static String createRoundToken() {
+        return UUID.randomUUID().toString();
+    }
+
+    static boolean isValidRoundToken(String token) {
+        if (token == null || token.length() != 36)
+            return false;
+        for (int index = 0; index < token.length(); index++) {
+            if (index == 8 || index == 13 || index == 18 || index == 23) {
+                if (token.charAt(index) != '-')
+                    return false;
+            } else if (Character.digit(token.charAt(index), 16) < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String getRoundTokenLocked() {
+        if (!isValidRoundToken(mRoundToken))
+            mRoundToken = createRoundToken();
+        return mRoundToken;
+    }
+
     static JSONObject createStartInfo(long roundID, long startAt, long duration) {
+        return createStartInfo(roundID, startAt, duration, createRoundToken());
+    }
+
+    static JSONObject createStartInfo(long roundID, long startAt, long duration, String roundToken) {
+        if (!isValidRoundToken(roundToken))
+            throw new IllegalArgumentException("Invalid round token");
         try {
-            return new JSONObject().put(JSON_ROUND_ID, roundID)
+            return new JSONObject().put(JSON_ROUND_ID, roundID).put(JSON_ROUND_TOKEN, roundToken)
                     .put(JSON_GAMESTART, startAt).put(JSON_GAMEDURATION, duration);
         } catch (JSONException e) {
             throw new IllegalArgumentException("Invalid game start", e);
@@ -564,6 +607,7 @@ public class TcpServer extends Service {
                     mStartAnnounced = false;
                     mScheduledStart = -1;
                     mScheduledDuration = 0;
+                    mRoundToken = null;
                     sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
                 }
             }
@@ -774,6 +818,7 @@ public class TcpServer extends Service {
                 if (mScheduledStart >= 0 && (mStartAnnounced
                         || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)) {
                     game.put(JSON_ROUND_ID, mRoundSequence);
+                    game.put(JSON_ROUND_TOKEN, getRoundTokenLocked());
                     game.put(JSON_GAMESTART, mScheduledStart);
                     game.put(JSON_GAMEDURATION, mScheduledDuration);
                     // The UI broadcast may not have run yet. A committed start
@@ -1080,6 +1125,7 @@ public class TcpServer extends Service {
             mStartAnnounced = false;
             mScheduledStart = -1;
             mScheduledDuration = 0;
+            mRoundToken = null;
             mServerThread = new Thread(this::runTcpServer, "SimpleCoil TCP server");
             mServerThread.start();
         }
@@ -1960,6 +2006,7 @@ public class TcpServer extends Service {
             mStartAnnounced = false;
             mScheduledStart = -1;
             mScheduledDuration = 0;
+            mRoundToken = null;
             if (!keepListening || mDestroyed) {
                 stopTcpServer();
                 return;

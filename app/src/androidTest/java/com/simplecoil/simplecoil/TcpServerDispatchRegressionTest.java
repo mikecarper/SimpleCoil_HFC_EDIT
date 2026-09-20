@@ -985,6 +985,8 @@ public class TcpServerDispatchRegressionTest {
         for (MemorySocket socket : sockets) {
             JSONObject start = readJson(socket);
             assertEquals(scheduled.getLongExtra(NetMsg.INTENT_ROUND_ID, 0), start.getLong(TcpServer.JSON_ROUND_ID));
+            assertEquals(scheduled.getStringExtra(NetMsg.INTENT_ROUND_TOKEN),
+                    start.getString(TcpServer.JSON_ROUND_TOKEN));
             assertEquals(scheduled.getLongExtra(NetMsg.INTENT_START_AT, 0), start.getLong(TcpServer.JSON_GAMESTART));
         }
         assertEquals(1, server.events.size());
@@ -1186,6 +1188,8 @@ public class TcpServerDispatchRegressionTest {
             assertEquals(first.getLong(TcpServer.JSON_GAMESTART) + 300000,
                     host.getLongExtra(NetMsg.INTENT_END_AT, 0));
             assertEquals(first.getLong(TcpServer.JSON_ROUND_ID), host.getLongExtra(NetMsg.INTENT_ROUND_ID, 0));
+            assertEquals(first.getString(TcpServer.JSON_ROUND_TOKEN),
+                    host.getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
         } finally { Globals.getInstance().mTimeLimit = originalTime; }
     }
 
@@ -1255,6 +1259,7 @@ public class TcpServerDispatchRegressionTest {
             assertEquals("An old lobby update would end the just-started client round",
                     Globals.GAME_STATE_RUNNING, roster.getInt(TcpServer.JSON_GAMESTATE));
             assertEquals(start.getLong(TcpServer.JSON_ROUND_ID), roster.getLong(TcpServer.JSON_ROUND_ID));
+            assertEquals(start.getString(TcpServer.JSON_ROUND_TOKEN), roster.getString(TcpServer.JSON_ROUND_TOKEN));
             assertEquals(start.getLong(TcpServer.JSON_GAMESTART), roster.getLong(TcpServer.JSON_GAMESTART));
             assertEquals(start.getLong(TcpServer.JSON_GAMEDURATION), roster.getLong(TcpServer.JSON_GAMEDURATION));
             assertEquals(0, frames.available());

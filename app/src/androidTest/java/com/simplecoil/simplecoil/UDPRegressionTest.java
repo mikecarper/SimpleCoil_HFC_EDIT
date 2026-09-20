@@ -134,6 +134,34 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void peerEndGameIsBoundToTheCurrentRoundToken() throws Exception {
+        final String firstRound = "11111111-1111-1111-1111-111111111111";
+        final String secondRound = "22222222-2222-2222-2222-222222222222";
+        register(enemy, 11);
+        service.startGame(true, secondRound);
+
+        receive(enemy, NetMsg.NETMSG_ENDGAME);
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + firstRound);
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + secondRound + "x");
+        assertTrue("A bare, stale, or malformed peer ENDGAME ended the round", service.events.isEmpty());
+
+        service.endGame();
+        assertEquals(NetMsg.NETMSG_PEER_ENDGAME + secondRound, service.sentMessages.get(0));
+        assertEquals(3, (int) service.repeatCounts.get(0));
+
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + secondRound);
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_ENDGAME, service.events.get(0).getAction());
+
+        service.events.clear();
+        service.startGame(true, firstRound);
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + secondRound);
+        assertTrue("A previous round's ENDGAME ended the replacement round", service.events.isEmpty());
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + firstRound);
+        assertEquals(NetMsg.NETMSG_ENDGAME, service.events.get(0).getAction());
+    }
+
+    @Test
     public void fixedCommandsRejectTrailingGarbageWithoutRemovingPlayer() throws Exception {
         register(teammate, 2);
         String[] commands = {NetMsg.NETMSG_SHOTFIRED, NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT,
