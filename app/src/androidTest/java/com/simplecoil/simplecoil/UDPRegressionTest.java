@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -152,6 +153,61 @@ public class UDPRegressionTest {
                 Globals.getInstance().mIPTeamMap.isEmpty());
         assertTrue("UDP discovery created an unauthenticated endpoint entry",
                 Globals.getInstance().mTeamIPMap.isEmpty());
+    }
+
+    @Test
+    public void conflictingDiscoveryDoesNotDeadlockWithLobbyReplacement() throws Exception {
+        Globals globals = Globals.getInstance();
+        Semaphore originalTeams = globals.mTeamIPMapSemaphore;
+        PausingFirstAcquireSemaphore teams = new PausingFirstAcquireSemaphore();
+        Thread discovery = null;
+        Thread replacement = null;
+        Throwable[] failures = new Throwable[2];
+        globals.mTeamIPMapSemaphore = teams;
+        try {
+            set(service, "mIsListService", true);
+            discovery = new Thread(() -> {
+                try {
+                    receive(teammate, NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "1");
+                } catch (Throwable error) {
+                    failures[0] = error;
+                }
+            }, "SimpleCoil duplicate discovery");
+            discovery.start();
+            assertTrue("Duplicate discovery did not acquire the team map",
+                    teams.awaitFirstAcquire(2000));
+
+            replacement = new Thread(() -> {
+                try {
+                    service.joinServer(enemy, 17509);
+                } catch (Throwable error) {
+                    failures[1] = error;
+                }
+            }, "SimpleCoil replace UDP lobby");
+            replacement.start();
+            assertTrue("Lobby replacement did not reach the team map",
+                    awaitQueued(teams, 2000));
+
+            teams.resumeFirstAcquire();
+            discovery.join(2000);
+            replacement.join(2000);
+            assertFalse("Duplicate discovery deadlocked with lobby replacement", discovery.isAlive());
+            assertFalse("Lobby replacement deadlocked with duplicate discovery", replacement.isAlive());
+            assertNull("Duplicate discovery failed", failures[0]);
+            assertNull("Lobby replacement failed", failures[1]);
+            assertEquals(1, service.listenerStarts);
+        } finally {
+            teams.resumeFirstAcquire();
+            if (replacement != null && replacement.isAlive())
+                replacement.interrupt();
+            if (discovery != null && discovery.isAlive())
+                discovery.interrupt();
+            if (replacement != null)
+                replacement.join(2000);
+            if (discovery != null)
+                discovery.join(2000);
+            globals.mTeamIPMapSemaphore = originalTeams;
+        }
     }
 
     @Test
@@ -527,6 +583,13 @@ public class UDPRegressionTest {
         finally { Globals.getInstance().mTeamIPMapSemaphore.release(); }
     }
 
+    private static boolean awaitQueued(Semaphore semaphore, long timeout) throws InterruptedException {
+        long deadline = SystemClock.elapsedRealtime() + timeout;
+        while (!semaphore.hasQueuedThreads() && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        return semaphore.hasQueuedThreads();
+    }
+
     private static Object get(Object object, String name) throws Exception {
         Field field = UDPListenerService.class.getDeclaredField(name);
         field.setAccessible(true);
@@ -554,6 +617,39 @@ public class UDPRegressionTest {
     }
 
     private static void destroy(UDPListenerService target) { runOnMain(target::onDestroy); }
+
+    /** Pauses exactly one successful acquisition so a lock-order race can be reproduced. */
+    private static final class PausingFirstAcquireSemaphore extends Semaphore {
+        private final CountDownLatch firstAcquire = new CountDownLatch(1);
+        private final CountDownLatch resumeFirstAcquire = new CountDownLatch(1);
+        private boolean pauseNextAcquire = true;
+
+        PausingFirstAcquireSemaphore() {
+            super(1);
+        }
+
+        @Override
+        public void acquire() throws InterruptedException {
+            super.acquire();
+            boolean pause;
+            synchronized (this) {
+                pause = pauseNextAcquire;
+                pauseNextAcquire = false;
+            }
+            if (pause) {
+                firstAcquire.countDown();
+                resumeFirstAcquire.await();
+            }
+        }
+
+        boolean awaitFirstAcquire(long timeout) throws InterruptedException {
+            return firstAcquire.await(timeout, TimeUnit.MILLISECONDS);
+        }
+
+        void resumeFirstAcquire() {
+            resumeFirstAcquire.countDown();
+        }
+    }
 
     private static final class RecordingService extends UDPListenerService {
         final List<Intent> events = new CopyOnWriteArrayList<>();

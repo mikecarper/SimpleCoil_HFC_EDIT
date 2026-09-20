@@ -218,17 +218,22 @@ public class UDPListenerService extends Service {
                     return;
                 }
                 Byte team = (byte) playerID;
+                final boolean conflictingPlayerID;
                 Globals.getmTeamIPMapSemaphore();
                 try {
                     InetAddress existingPlayerIP = Globals.getInstance().mTeamIPMap.get(team);
-                    if (team == Globals.getInstance().mPlayerID
-                            || (existingPlayerIP != null && !existingPlayerIP.equals(ip))) {
-                        Log.e(TAG, "2 Players using same ID!");
-                        sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SAMETEAM, ip, LISTEN_PORT);
-                        return;
-                    }
+                    conflictingPlayerID = team == Globals.getInstance().mPlayerID
+                            || (existingPlayerIP != null && !existingPlayerIP.equals(ip));
                 } finally {
                     Globals.getInstance().mTeamIPMapSemaphore.release();
+                }
+                // Setup holds the listener-state lock while replacing the roster.
+                // Do not acquire that lock to send a rejection while holding the
+                // team map lock, or a simultaneous duplicate join can deadlock.
+                if (conflictingPlayerID) {
+                    Log.e(TAG, "2 Players using same ID!");
+                    sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SAMETEAM, ip, LISTEN_PORT);
+                    return;
                 }
                 // Discovery only proves that a peer can receive UDP. TCP registration
                 // owns roster membership and endpoints. Recording a JOIN here leaves
