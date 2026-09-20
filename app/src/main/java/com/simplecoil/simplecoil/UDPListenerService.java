@@ -389,6 +389,10 @@ public class UDPListenerService extends Service {
                 return;
             if (!doneListening) {
                 Log.e(TAG, "Listening is still in progress");
+                // A new host request supersedes an unfinished discovery scan.
+                // Leaving the old scan alive lets a late SERVERREPLY join the
+                // abandoned server after this request reports its failure.
+                stopListen();
                 sendFailedJoin();
                 return;
             }

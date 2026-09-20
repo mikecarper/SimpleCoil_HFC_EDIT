@@ -279,6 +279,29 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void failedHostCreationCancelsAnOlderJoinBeforeItCanSucceed() throws Exception {
+        // A user can select Create Server while a previous discovery request is
+        // still shutting down. Reporting that failure alone leaves the old scan
+        // able to accept a late SERVERREPLY and join a server the user abandoned.
+        set(service, "doneListening", false);
+        set(service, "keepListening", true);
+        set(service, "mScanRunning", true);
+        set(service, "mJoinAddress", teammate);
+        set(service, "mBroadcastScan", false);
+
+        service.createServer();
+
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_FAILEDTOJOIN, service.events.get(0).getAction());
+        assertFalse(flag("keepListening"));
+        assertFalse(flag("mScanRunning"));
+
+        receive(teammate, NetMsg.NETMSG_SERVERREPLY);
+        assertEquals("A late discovery reply restarted the abandoned join", 1, service.events.size());
+        assertNull(Globals.getInstance().mServerIP);
+    }
+
+    @Test
     public void emptyNormalizedAddressDoesNotJoinLocalhost() throws Exception {
         service.joinServer("/ ");
         assertEquals(1, service.events.size());
