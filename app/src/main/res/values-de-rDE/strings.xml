@@ -84,6 +84,7 @@
     <string name="server_ip">Server IP:</string>
     <string name="game_limit_button">Spiel Limit</string>
     <string name="game_limit_title">Setze Spiel Limit (0 für unendlich)</string>
+    <string name="game_unlimited_switch">Unbegrenztes Spiel</string>
     <string name="game_limit_time">Zeit in Minuten</string>
     <string name="game_limit_lives">Leben</string>
     <string name="game_limit_score">Punkte</string>

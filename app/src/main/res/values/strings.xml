@@ -130,6 +130,7 @@
 /n/nThe network support does not require the use of the official hub, but will work with the official hub. Instead of using a server, clients will attempt to find and connect to each other directly over the same Wi-Fi network."</string>
 
     <string name="game_limit_title">Set Game Limit (0 for unlimited):</string>
+    <string name="game_unlimited_switch">Unlimited game</string>
     <string name="game_limit_time">Time in minutes</string>
     <string name="game_limit_lives">Lives</string>
     <string name="game_limit_score">Score</string>

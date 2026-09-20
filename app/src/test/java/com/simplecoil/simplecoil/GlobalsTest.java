@@ -16,4 +16,31 @@ public class GlobalsTest {
     @Test public void wifiWithoutAnAddressDoesNotProduceAnyLocalAddress() {
         assertNull(Globals.fromWifiIPv4Address(0));
     }
+
+    @Test public void clearingLimitsRemovesAllActiveLimitValues() {
+        Globals globals = Globals.getInstance();
+        int gameLimit = globals.mGameLimit;
+        int timeLimit = globals.mTimeLimit;
+        int livesLimit = globals.mLivesLimit;
+        int scoreLimit = globals.mScoreLimit;
+        try {
+            globals.mGameLimit = Globals.GAME_LIMIT_TIME | Globals.GAME_LIMIT_LIVES
+                    | Globals.GAME_LIMIT_SCORE;
+            globals.mTimeLimit = 30;
+            globals.mLivesLimit = 5;
+            globals.mScoreLimit = 100;
+
+            globals.clearGameLimits();
+
+            assertEquals(Globals.GAME_LIMIT_NONE, globals.mGameLimit);
+            assertEquals(0, globals.mTimeLimit);
+            assertEquals(0, globals.mLivesLimit);
+            assertEquals(0, globals.mScoreLimit);
+        } finally {
+            globals.mGameLimit = gameLimit;
+            globals.mTimeLimit = timeLimit;
+            globals.mLivesLimit = livesLimit;
+            globals.mScoreLimit = scoreLimit;
+        }
+    }
 }

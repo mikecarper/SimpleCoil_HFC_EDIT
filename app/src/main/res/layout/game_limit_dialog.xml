@@ -19,7 +19,7 @@
         android:id="@+id/game_unlimited_switch"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Switch" />
+        android:text="@string/game_unlimited_switch" />
 
     <RadioButton
         android:id="@+id/game_limit_time_radio"

@@ -16,8 +16,6 @@
 
 package com.simplecoil.simplecoil;
 
-import static java.lang.Boolean.FALSE;
-
 import android.content.Context;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
@@ -118,8 +116,6 @@ public class Globals {
     public static final int GAME_LIMIT_LIVES = 2;
     public static final int GAME_LIMIT_SCORE = 4;
     public volatile int mGameLimit = GAME_LIMIT_NONE;
-    //mUnlimited Switch in game limit if true it is a unlimited game
-    public volatile boolean mUnlimited = FALSE;
     public volatile int mTimeLimit = 0;
     public volatile int mScoreLimit = 0;
     public volatile int mLivesLimit = 0;
@@ -127,6 +123,17 @@ public class Globals {
 
     public static boolean isValidGameLimit(int limit) {
         return limit >= 0 && limit <= MAX_GAME_LIMIT;
+    }
+
+    /**
+     * Disable every game limit together.  Clear the bit field before the values so a concurrent
+     * reader never observes an enabled limit with a zero value.
+     */
+    void clearGameLimits() {
+        mGameLimit = GAME_LIMIT_NONE;
+        mTimeLimit = 0;
+        mLivesLimit = 0;
+        mScoreLimit = 0;
     }
 
     public static final int GPS_DISABLED = 0;

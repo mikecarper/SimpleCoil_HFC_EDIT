@@ -495,6 +495,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         alertDialogBuilder.setView(view);
 
         final EditText gameLimitET = view.findViewById(R.id.game_limit_et);
+        final Switch gameUnlimitedSwitch = view.findViewById(R.id.game_unlimited_switch);
         final RadioButton gameLimitTime = view.findViewById(R.id.game_limit_time_radio);
         gameLimitTime.setChecked(true);
         final RadioButton gameLimitLives = view.findViewById(R.id.game_limit_lives_radio);
@@ -517,11 +518,27 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             gameLimitLives.setChecked(false);
             gameLimitScore.setChecked(true);
         }));
+        View.OnClickListener updateLimitControls = ignored -> {
+            boolean enabled = !gameUnlimitedSwitch.isChecked();
+            gameLimitET.setEnabled(enabled);
+            gameLimitTime.setEnabled(enabled);
+            gameLimitLives.setEnabled(enabled);
+            gameLimitScore.setEnabled(enabled);
+        };
+        gameUnlimitedSwitch.setChecked(Globals.getInstance().mGameLimit == Globals.GAME_LIMIT_NONE);
+        gameUnlimitedSwitch.setOnClickListener(updateLimitControls);
+        updateLimitControls.onClick(gameUnlimitedSwitch);
 
         alertDialogBuilder
                 .setCancelable(false)
                 .setPositiveButton(R.string.ok,
                         (dialog, id) -> {
+                            if (gameUnlimitedSwitch.isChecked()) {
+                                Globals.getInstance().clearGameLimits();
+                                setGameLimit();
+                                dialog.dismiss();
+                                return;
+                            }
                             if (gameLimitET.getText().toString().isEmpty()) {
                                 dialog.dismiss();
                                 return;
