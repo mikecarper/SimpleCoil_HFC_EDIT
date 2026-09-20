@@ -3,6 +3,7 @@ package com.simplecoil.simplecoil;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
+import android.content.BroadcastReceiver;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
@@ -173,6 +174,32 @@ public class BluetoothLifecycleRegressionTest {
             assertEquals(1, bluetooth.closes);
             assertEquals(current.getString(R.string.connect_status_not_connected), status().getText().toString());
         });
+    }
+
+    @Test
+    public void staleGattDisconnectAfterReceiverUnregistrationIsIgnored() {
+        scenario.onActivity(current -> {
+            set("mGattReceiverRegistered", false);
+            ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(current,
+                    new Intent(BluetoothLeService.ACTION_GATT_DISCONNECTED));
+
+            assertSame(bluetooth, get("mBluetoothLeService"));
+            assertTrue((boolean) get("mConnected"));
+            assertTrue((boolean) get("mCommunicating"));
+        });
+    }
+
+    @Test
+    public void destroyingActivityDismissesTheWeaponDisconnectDialog() {
+        scenario.onActivity(current -> {
+            invoke("showWeaponDisconnect");
+            assertTrue(get("mBlasterDisconnectDialog") != null);
+        });
+
+        scenario.close();
+        scenario = null;
+
+        assertNull(get("mBlasterDisconnectDialog"));
     }
 
     @Test

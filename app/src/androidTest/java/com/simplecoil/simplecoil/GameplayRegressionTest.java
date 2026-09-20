@@ -998,6 +998,20 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void staleNetworkCallbackAfterUnregistrationCannotEndTheRound() {
+        scenario.onActivity(activity -> {
+            boolean registered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            set(activity, "mNetworkReceiverRegistered", false);
+            try {
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME));
+                assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            } finally {
+                set(activity, "mNetworkReceiverRegistered", registered);
+            }
+        });
+    }
+
+    @Test
     public void roundEndClearsReadinessEvenBeforeThePlayerHasSpawned() {
         scenario.onActivity(activity -> {
             Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;

@@ -419,6 +419,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private TcpClient mTcpClient = null;
     private ServiceConnection mTcpClientServiceConnection = null;
     private boolean mTcpClientServiceBound = false;
+    private boolean mGattReceiverRegistered;
+    private boolean mBluetoothReceiverRegistered;
     private boolean mNetworkReceiverRegistered = false;
 
     private TcpServer mTcpServer = null;
@@ -1908,12 +1910,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     protected void onResume() {
         super.onResume();
         ContextCompat.registerReceiver(this, mGattUpdateReceiver, makeGattUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
+        mGattReceiverRegistered = true;
         if (mBluetoothLeService != null && mDeviceAddress != null && !mDeviceAddress.isEmpty()) {
             final boolean result = mBluetoothLeService.connect(mDeviceAddress);
             Log.d(TAG, "Connect request result=" + result);
         }
         IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
         registerReceiver(mBluetoothReceiver, filter);
+        mBluetoothReceiverRegistered = true;
         ContextCompat.registerReceiver(this, mUDPUpdateReceiver, makeUDPUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
         mNetworkReceiverRegistered = true;
         setupUDPServiceConnection();
@@ -1925,16 +1929,25 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onPause() {
+        if (mGattReceiverRegistered) {
+            mGattReceiverRegistered = false;
+            unregisterReceiver(mGattUpdateReceiver);
+        }
+        if (mBluetoothReceiverRegistered) {
+            mBluetoothReceiverRegistered = false;
+            unregisterReceiver(mBluetoothReceiver);
+        }
+        if (mNetworkReceiverRegistered) {
+            mNetworkReceiverRegistered = false;
+            unregisterReceiver(mUDPUpdateReceiver);
+        }
         super.onPause();
-        mNetworkReceiverRegistered = false;
-        unregisterReceiver(mGattUpdateReceiver);
-        unregisterReceiver(mBluetoothReceiver);
-        unregisterReceiver(mUDPUpdateReceiver);
     }
 
     @Override
     protected void onDestroy() {
         clearCombatFeedback();
+        hideWeaponDisconnect();
         stopBLEScan();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
@@ -2080,6 +2093,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private final BroadcastReceiver mBluetoothReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (!mBluetoothReceiverRegistered || isFinishing() || isDestroyed() || intent == null)
+                return;
             final String action = intent.getAction();
             if (action == null)
                 return;
@@ -2330,7 +2345,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private AlertDialog mBlasterDisconnectDialog = null;
 
     private void showWeaponDisconnect() {
-        if (mBlasterDisconnectDialog != null)
+        if (mBlasterDisconnectDialog != null || isFinishing() || isDestroyed())
             return;
         LayoutInflater li = LayoutInflater.from(getApplicationContext());
         View view = li.inflate(R.layout.blaster_disconnected_dialog, null);
@@ -2348,8 +2363,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             dialog.cancel();
                             mBlasterDisconnectDialog = null;
                         });
-        mBlasterDisconnectDialog = alertDialogBuilder.create();
-        mBlasterDisconnectDialog.show();
+        final AlertDialog dialog = alertDialogBuilder.create();
+        dialog.setOnDismissListener(ignored -> {
+            if (mBlasterDisconnectDialog == dialog)
+                mBlasterDisconnectDialog = null;
+        });
+        mBlasterDisconnectDialog = dialog;
+        dialog.show();
     }
 
     private void hideWeaponDisconnect() {
@@ -2363,6 +2383,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private final BroadcastReceiver mGattUpdateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (!mGattReceiverRegistered || isFinishing() || isDestroyed() || intent == null)
+                return;
             final String action = intent.getAction();
             if (BluetoothLeService.ACTION_GATT_CONNECTED.equals(action)) {
                 mConnected = true;
@@ -2929,6 +2951,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private final BroadcastReceiver mUDPUpdateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (!mNetworkReceiverRegistered || isFinishing() || isDestroyed() || intent == null)
+                return;
             if (intent.hasExtra(TcpClient.EXTRA_START_EVENT_ID)) {
                 if (mTcpClient == null || !mUseNetwork || !mReady || !networkServicesReady())
                     return;
