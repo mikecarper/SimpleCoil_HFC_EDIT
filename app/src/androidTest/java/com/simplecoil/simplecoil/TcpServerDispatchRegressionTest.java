@@ -793,6 +793,102 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void lateSynchronizedJoinCancelsQueuedStartUntilTheWholeRosterIsRetried() throws Exception {
+        assertLateJoinCancelsQueuedStart(true);
+    }
+
+    @Test
+    public void lateUnsynchronizedJoinCannotBeSkippedByQueuedStart() throws Exception {
+        assertLateJoinCancelsQueuedStart(false);
+    }
+
+    @Test
+    public void peerHostKeepsLobbyOpenWhenALateJoinCancelsQueuedStart() throws Exception {
+        server.setDedicated(false);
+        assertLateJoinCancelsQueuedStart(true);
+    }
+
+    private void assertLateJoinCancelsQueuedStart(boolean clockReady) throws Exception {
+        MemorySocket newcomer = new MemorySocket();
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> {
+            addClient(2, newcomer);
+            set(clients.get(2), "clockSynchronized", clockReady);
+        });
+        assertNoStartPublished();
+        if (!clockReady) {
+            assertFalse("An unsynchronized newcomer must block a fresh start too", server.startGame());
+            set(clients.get(2), "clockSynchronized", true);
+        }
+        assertWholeRosterCanStartAfterRetry();
+    }
+
+    @Test
+    public void socketRegisteredWhileStartWasQueuedCannotBeLeftInTheLobby() throws Exception {
+        addClient(2, 0, new MemorySocket());
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> {
+            // Model registration completing on an already accepted socket.
+            set(clients.get(2), "mPlayerID", (byte) 2);
+            Globals.getInstance().mTeamIPMap.put((byte) 2, InetAddress.getByName("127.0.0.2"));
+            Globals.getInstance().mIPTeamMap.put(InetAddress.getByName("127.0.0.2"), (byte) 2);
+            Globals.getInstance().mTeamPlayerNameMap.put((byte) 2, "Player 2");
+        });
+        assertNoStartPublished();
+        assertWholeRosterCanStartAfterRetry();
+    }
+
+    @Test
+    public void replacementPlayerCancelsQueuedStartEvenWhenAnotherRecipientRemains() throws Exception {
+        addClient(2, new MemorySocket());
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> {
+            closeClient(1);
+            clients.remove(1);
+            addClient(3, 1, new MemorySocket());
+        });
+        assertNoStartPublished();
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertEquals(0, sockets.get(0).bytes.size());
+        assertStartFrame(new DataInputStream(new ByteArrayInputStream(sockets.get(1).bytes.toByteArray())).readUTF());
+        assertStartFrame(new DataInputStream(new ByteArrayInputStream(sockets.get(2).bytes.toByteArray())).readUTF());
+        assertEquals(1, server.events.size());
+    }
+
+    @Test
+    public void laterUnregisteredSocketDoesNotBlockQueuedStart() throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> addClient(2, 0, new MemorySocket()));
+        assertStartFrame(new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
+        assertEquals(0, sockets.get(1).bytes.size());
+        assertEquals(1, server.events.size());
+    }
+
+    @Test
+    public void disconnectedRecipientDoesNotBlockRemainingSynchronizedPlayers() throws Exception {
+        addClient(2, new MemorySocket());
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> closeClient(2));
+        assertStartFrame(new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
+        assertEquals(0, sockets.get(1).bytes.size());
+        assertEquals(1, server.events.size());
+    }
+
+    private void assertNoStartPublished() {
+        for (MemorySocket socket : sockets)
+            assertEquals("A changed roster received a partial start", 0, socket.bytes.size());
+        assertTrue("A changed roster must not start the host countdown", server.events.isEmpty());
+        assertTrue(server.getScheduledGameStart() == null);
+    }
+
+    private void assertWholeRosterCanStartAfterRetry() throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        Intent scheduled = server.getScheduledGameStart();
+        assertTrue(scheduled != null);
+        for (MemorySocket socket : sockets) {
+            JSONObject start = readJson(socket);
+            assertEquals(scheduled.getLongExtra(NetMsg.INTENT_ROUND_ID, 0), start.getLong(TcpServer.JSON_ROUND_ID));
+            assertEquals(scheduled.getLongExtra(NetMsg.INTENT_START_AT, 0), start.getLong(TcpServer.JSON_GAMESTART));
+        }
+        assertEquals(1, server.events.size());
+    }
+
+    @Test
     public void failedStartWritesDoNotPublishAStartConfirmation() throws Exception {
         set(clients.get(1), "out", new DataOutputStream(new OutputStream() {
             @Override public void write(int value) throws IOException { throw new IOException("Disconnected"); }

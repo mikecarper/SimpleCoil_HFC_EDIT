@@ -364,9 +364,25 @@ public class TcpServer extends Service {
             return runClientTask(() -> {
                 // Send to clients before confirming the start locally. A queued
                 // end takes precedence over a start that has not been delivered.
+                Set<ClientData> startPlayers = new HashSet<>();
                 for (ClientRecipient recipient : recipients) {
-                    if (recipient.canStartGame() && !recipient.client.clockSynchronized)
-                        return;
+                    if (recipient.canStartGame())
+                        startPlayers.add(recipient.client);
+                }
+                // A join, registration, or replacement may have completed while
+                // this start waited for the client lock. Do not start only the
+                // old recipients and leave another connected player behind.
+                // The host can retry against the new roster; registration stays
+                // locked out from this check through delivery of the start.
+                for (ClientRecipient recipient : getClientRecipients()) {
+                    if (recipient.canStartGame()) {
+                        if (!startPlayers.contains(recipient.client)) {
+                            Log.d(TAG, "Cancelling queued start after the player roster changed");
+                            return;
+                        }
+                        if (!recipient.client.clockSynchronized)
+                            return;
+                    }
                 }
                 final long startAt;
                 final long duration;
