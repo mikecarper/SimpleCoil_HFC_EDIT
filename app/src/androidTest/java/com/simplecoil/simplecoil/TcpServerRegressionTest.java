@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
@@ -708,6 +709,64 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void playerRemovalDoesNotDeadlockWithTheGpsPublisher() throws Exception {
+        Object departed = client(1, 1);
+        Globals globals = Globals.getInstance();
+        Semaphore originalLocations = globals.mGPSDataSemaphore;
+        PausingFirstAcquireSemaphore locations = new PausingFirstAcquireSemaphore();
+        Thread removal = null;
+        Thread publisher = null;
+        Throwable[] failures = new Throwable[2];
+        globals.mGPSDataSemaphore = locations;
+        try {
+            globals.mUseGPS = true;
+            set(server, "keepListening", true);
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(server::sendGPSData);
+            Runnable update = (Runnable) get(server, "mGPSRunnable");
+            ((android.os.Handler) get(server, "mGPSHandler")).removeCallbacks(update);
+
+            removal = new Thread(() -> {
+                try {
+                    remove(departed, 1);
+                } catch (Throwable error) {
+                    failures[0] = error;
+                }
+            }, "SimpleCoil remove player");
+            removal.start();
+            assertTrue("Player removal did not acquire the GPS lock",
+                    locations.awaitFirstAcquire(2000));
+
+            publisher = new Thread(update, "SimpleCoil GPS publisher");
+            publisher.setUncaughtExceptionHandler((thread, error) -> failures[1] = error);
+            publisher.start();
+            assertTrue("GPS publisher did not reach the location lock",
+                    awaitQueued(locations, 2000));
+
+            locations.resumeFirstAcquire();
+            removal.join(2000);
+            publisher.join(2000);
+            assertFalse("Player removal deadlocked with the GPS publisher", removal.isAlive());
+            assertFalse("GPS publisher deadlocked with player removal", publisher.isAlive());
+            assertNull("Player removal failed", failures[0]);
+            assertNull("GPS publisher failed", failures[1]);
+            assertEquals("Player removal lost the required full GPS refresh", 20,
+                    get(server, "mGPSIntervalCount"));
+        } finally {
+            locations.resumeFirstAcquire();
+            if (publisher != null && publisher.isAlive())
+                publisher.interrupt();
+            if (removal != null && removal.isAlive())
+                removal.interrupt();
+            if (publisher != null)
+                publisher.join(2000);
+            if (removal != null)
+                removal.join(2000);
+            globals.mGPSDataSemaphore = originalLocations;
+            globals.mUseGPS = false;
+        }
+    }
+
+    @Test
     public void twentyPlayerScoreboardKeepsEveryResultWhenNineteenPlayersLeave() throws Exception {
         for (int id = 1; id <= 20; id++) {
             Object player = client(id, id);
@@ -1030,6 +1089,47 @@ public class TcpServerRegressionTest {
         try { globals.mTeamPlayerNameMap.clear(); } finally { globals.mTeamPlayerNameSemaphore.release(); }
         Globals.getmGPSDataSemaphore();
         try { globals.mGPSData.clear(); } finally { globals.mGPSDataSemaphore.release(); }
+    }
+
+    private static boolean awaitQueued(Semaphore semaphore, long timeout) throws InterruptedException {
+        long deadline = android.os.SystemClock.elapsedRealtime() + timeout;
+        while (!semaphore.hasQueuedThreads()
+                && android.os.SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        return semaphore.hasQueuedThreads();
+    }
+
+    /** Pauses exactly one successful acquisition so a lock-order race can be reproduced. */
+    private static final class PausingFirstAcquireSemaphore extends Semaphore {
+        private final CountDownLatch firstAcquire = new CountDownLatch(1);
+        private final CountDownLatch resumeFirstAcquire = new CountDownLatch(1);
+        private boolean pauseNextAcquire = true;
+
+        PausingFirstAcquireSemaphore() {
+            super(1);
+        }
+
+        @Override
+        public void acquire() throws InterruptedException {
+            super.acquire();
+            boolean pause;
+            synchronized (this) {
+                pause = pauseNextAcquire;
+                pauseNextAcquire = false;
+            }
+            if (pause) {
+                firstAcquire.countDown();
+                resumeFirstAcquire.await();
+            }
+        }
+
+        boolean awaitFirstAcquire(long timeout) throws InterruptedException {
+            return firstAcquire.await(timeout, TimeUnit.MILLISECONDS);
+        }
+
+        void resumeFirstAcquire() {
+            resumeFirstAcquire.countDown();
+        }
     }
 
     private static final class RecordingServer extends TcpServer {

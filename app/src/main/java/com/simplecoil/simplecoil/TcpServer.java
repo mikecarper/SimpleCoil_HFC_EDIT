@@ -1930,10 +1930,13 @@ public class TcpServer extends Service {
                     Globals.getmGPSDataSemaphore();
                     try {
                         Globals.getInstance().mGPSData.remove(client.mPlayerID);
-                        requestFullGPSUpdate(); // Force a full GPS update when someone leaves
                     } finally {
                         Globals.getInstance().mGPSDataSemaphore.release();
                     }
+                    // The periodic publisher takes the server-state lock before the GPS lock.
+                    // Do not invert that order while removing a player, or a disconnect that
+                    // races a GPS tick can leave both workers waiting forever.
+                    requestFullGPSUpdate(); // Force a full GPS update when someone leaves
                     client.close();
                     mClientData.remove(clientID);
                     sendAllGameInfo(SEND_ALL);
