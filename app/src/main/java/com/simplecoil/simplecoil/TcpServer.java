@@ -55,6 +55,9 @@ public class TcpServer extends Service {
     private static final String TAG = "TCPServer";
 
     public static final int SEND_ALL = -100;
+    // Rejoin feedback is useful, but a disconnected player must not retain an
+    // unlimited round's worth of game events in the host process.
+    static final int MAX_QUEUED_CLIENT_EVENTS = 64;
 
     public static final int TCP_SERVER_PORT = 17510;
     // Amount of time to sleep before checking if data is available. Lower is more responsive but may gobble up more CPU time
@@ -1247,10 +1250,8 @@ public class TcpServer extends Service {
 
         public synchronized boolean sendTCPMessage(final String message, boolean queueFailed) {
             if (out == null) {
-                if (queueFailed) {
-                    Log.e(TAG, "queuing: " + message);
-                    messageQueue.add(message);
-                }
+                if (queueFailed)
+                    queueMessage(message);
                 return false;
             }
             try {
@@ -1262,16 +1263,22 @@ public class TcpServer extends Service {
             } catch (IOException e) {
                 //Log.e(TAG, "IO Error:", e);
                 e.printStackTrace();
-                if (queueFailed) {
-                    Log.e(TAG, "queuing: " + message);
-                    messageQueue.add(message);
-                }
+                if (queueFailed)
+                    queueMessage(message);
                 // The failed write may have emitted only part of its frame.
                 // Keep pending events, but never append to that damaged stream.
                 close();
                 connectionFailed = true;
                 return false;
             }
+        }
+
+        private void queueMessage(String message) {
+            if (messageQueue == null)
+                messageQueue = new LinkedList<>();
+            while (messageQueue.size() >= MAX_QUEUED_CLIENT_EVENTS)
+                messageQueue.poll();
+            messageQueue.offer(message);
         }
 
         public synchronized void close() {

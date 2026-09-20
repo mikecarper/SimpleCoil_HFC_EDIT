@@ -161,6 +161,15 @@ public class TcpClientRegressionTest {
     }
 
     @Test
+    public void persistentEventQueueKeepsRecentEventsWithinItsLimit() {
+        for (int index = 0; index < TcpClient.MAX_QUEUED_PERSISTENT_MESSAGES + 3; index++)
+            client.sendTCPMessage("event " + index, true);
+
+        assertEquals(TcpClient.MAX_QUEUED_PERSISTENT_MESSAGES, pending.size());
+        assertEquals("event 3", pending.peek());
+    }
+
+    @Test
     public void failedRegistrationPreventsReplayOnAPartiallyWrittenStream() throws Exception {
         client.sendTCPMessage("event", true);
         final int[] flushes = {0};

@@ -800,6 +800,18 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void disconnectedClientQueueKeepsRecentEventsWithinItsLimit() throws Exception {
+        Object player = client(1, 1);
+        invoke(player, "close", new Class<?>[0]);
+        for (int index = 0; index < TcpServer.MAX_QUEUED_CLIENT_EVENTS + 3; index++)
+            queue(player, "event " + index);
+
+        Queue<?> pending = (Queue<?>) get(player, "messageQueue");
+        assertEquals(TcpServer.MAX_QUEUED_CLIENT_EVENTS, pending.size());
+        assertEquals("event 3", pending.peek());
+    }
+
+    @Test
     public void partialFrameDoesNotReadUnavailableBytesOrBlockOtherPlayers() throws Exception {
         Object partialSender = client(1, 1);
         Object victim = client(2, 2);

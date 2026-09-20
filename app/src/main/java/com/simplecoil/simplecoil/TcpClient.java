@@ -65,6 +65,9 @@ public class TcpClient extends Service {
     private static final int CONNECTION_TIMEOUT_MS = 1000;
     private static final int RECONNECT_RETRY_DELAY_MS = 1000;
     private static final int SHUTDOWN_FLUSH_TIMEOUT_MS = 1000;
+    // A disconnected player can retain elimination reports until it rejoins.
+    // Keep that recovery buffer finite on memory-constrained game phones.
+    static final int MAX_QUEUED_PERSISTENT_MESSAGES = 64;
     // Scoreboards sum values by team, so keep every untrusted row low enough
     // that a supported lobby cannot overflow an integer total.
     static final int MAX_SCOREBOARD_VALUE = Integer.MAX_VALUE / Globals.MAX_PLAYER_ID;
@@ -166,6 +169,8 @@ public class TcpClient extends Service {
         if (queueMessage) {
             // Record persistent events before scheduling work, so a reconnect
             // cannot drain the queue before an old writer reports its failure.
+            while (messageQueue.size() >= MAX_QUEUED_PERSISTENT_MESSAGES)
+                messageQueue.poll();
             messageQueue.offer(message);
             sendQueuedMessages();
             return;
