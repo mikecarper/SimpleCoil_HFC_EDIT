@@ -2402,6 +2402,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mp.setLooping(false);
     }
 
+    private static int validatedHitSource(byte rawSource) {
+        int source = rawSource & 0xff;
+        int playerID = source >> 2;
+        // Grenade packets use a special source byte, not a normal player ID.
+        // Unsupported sources must not cause damage, consume lives, or earn points.
+        return source == Globals.GRENADE_PLAYER_ID
+                || (playerID > 0 && Globals.isValidPlayerID(playerID)) ? source : 0;
+    }
+
     /* Telemetry data is 20 bytes of raw data in the following format:
        00 seems to be part of a continuous counter, first byte always 0 and second byte counts 0 to F, increments with each packet sent
        01 player ID, 01, 02, 03, etc. 00 when not set
@@ -2432,11 +2441,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             byte shotsRemaining = data[RECOIL_OFFSET_SHOTS_REMAINING];
             //byte status = data[RECOIL_OFFSET_STATUS];
             //int buttons = data[RECOIL_OFFSET_BUTTONS];
-            // bytes are always signed in Java and if you don't do the & 0xFF here, you will get negative numbers in the hit by player field when using player IDs > 32
-            int hit_by_player1 = (data[RECOIL_OFFSET_HIT_BY1] & 0xFF);
+            int hit_by_player1 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY1]);
             // Often, hit_by_player2 is the same player ID as player1
-            // bytes are always signed in Java and if you don't do the & 0xFF here, you will get negative numbers in the hit by player field when using player IDs > 32
-            int hit_by_player2 = (data[RECOIL_OFFSET_HIT_BY2] & 0xFF);
+            int hit_by_player2 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY2]);
             byte trigger_counter = (byte)(data[RECOIL_OFFSET_RELOAD_TRIGGER_COUNTER] & (byte)0x0F);
             byte reload_counter = (byte)(data[RECOIL_OFFSET_RELOAD_TRIGGER_COUNTER] & (byte)0xF0);
             byte thumb_counter = data[RECOIL_OFFSET_THUMB_COUNTER];
@@ -2734,7 +2741,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
             /* Since setting player ID is somewhat unreliable, we use this to make sure that we are
                displaying the actual ID that the tagger is currently using. */
-            if (mLastTeam != player_id) {
+            // Zero is an unconfigured/reset blaster, not a new player selection.
+            // Invalid status bytes must not become reload or network identities.
+            if (player_id > 0 && Globals.isValidPlayerID(player_id) && mLastTeam != player_id) {
                 Log.d(TAG, "Player ID changed to " + player_id);
                 mLastTeam = player_id;
                 Globals.getInstance().mPlayerID = player_id;

@@ -1061,6 +1061,123 @@ public class GameplayRegressionTest {
         });
     }
 
+    @Test
+    public void zeroBlasterStatusCannotEraseTheSelectedPlayerId() {
+        assertInvalidTelemetryPlayerIdIgnored(0);
+    }
+
+    @Test
+    public void unsupportedBlasterStatusCannotReplaceTheSelectedPlayerId() {
+        assertInvalidTelemetryPlayerIdIgnored(21);
+    }
+
+    @Test
+    public void unsignedBlasterStatusCannotInstallANegativePlayerId() {
+        assertInvalidTelemetryPlayerIdIgnored(255);
+    }
+
+    private void assertInvalidTelemetryPlayerIdIgnored(int playerID) {
+        scenario.onActivity(activity -> {
+            byte[] packet = telemetryPacket(0, 0, 0, 0);
+            packet[FullscreenActivity.RECOIL_OFFSET_TEAM] = (byte) playerID;
+            packet[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = 29;
+            receiveTelemetry(activity, packet);
+            assertEquals("Invalid telemetry replaced our registered player ID", 1, Globals.getInstance().mPlayerID);
+            assertEquals((byte) 1, get(activity, "mLastTeam"));
+            assertEquals(1, get(activity, "mNetworkTeam"));
+            assertEquals("Other valid fields in the packet should still be processed", (byte) 29,
+                    get(activity, "mLastShotCount"));
+            invoke(activity, "startReload");
+            assertEquals("Reload must still configure our selected ID", 1,
+                    bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
+        });
+    }
+
+    @Test
+    public void unsupportedFirstHitCannotTakeTheLastLife() {
+        assertUnsupportedHitIgnored(false);
+    }
+
+    @Test
+    public void unsupportedSecondHitCannotTakeTheLastLife() {
+        assertUnsupportedHitIgnored(true);
+    }
+
+    private void assertUnsupportedHitIgnored(boolean secondSlot) {
+        scenario.onActivity(activity -> {
+            set(activity, "mHealth", 1);
+            set(activity, "mHasLivesLimit", true);
+            set(activity, "mEliminationCount", 1);
+            byte[] packet = telemetryPacket(0, 0, 0, 0);
+            packet[secondSlot ? FullscreenActivity.RECOIL_OFFSET_HIT_BY2
+                    : FullscreenActivity.RECOIL_OFFSET_HIT_BY1] = (byte) (21 << 2);
+            receiveTelemetry(activity, packet);
+            assertEquals("An unsupported attacker consumed our last life", 1, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mEliminationCount"));
+            assertEquals(0, get(activity, "mHitsTaken"));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertTrue(udp.messages.isEmpty());
+            assertTrue(tcp.messages.isEmpty());
+        });
+    }
+
+    @Test
+    public void invalidHitSlotDoesNotHideAValidHitInTheSamePacket() {
+        scenario.onActivity(activity -> {
+            telemetry(activity, 21, 1, 11, 1);
+            assertEquals(15, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mHitsTaken"));
+        });
+    }
+
+    @Test
+    public void reservedAndUnsignedHitSourcesCannotCauseDamage() {
+        scenario.onActivity(activity -> {
+            for (int source : new int[]{1, 2, 3, 84, 127, 128, 164, 166, 168, 255}) {
+                byte[] packet = telemetryPacket(0, 0, 0, 0);
+                packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY1] = (byte) source;
+                receiveTelemetry(activity, packet);
+                assertEquals("Invalid source " + source + " caused damage", 20, get(activity, "mHealth"));
+                assertEquals("Invalid source " + source + " counted as a hit", 0, get(activity, "mHitsTaken"));
+            }
+            assertTrue(udp.messages.isEmpty());
+        });
+    }
+
+    @Test
+    public void validTwentiethPlayerStatusStillUpdatesTheDisplayedTeam() {
+        scenario.onActivity(activity -> {
+            byte[] packet = telemetryPacket(0, 0, 0, 0);
+            packet[FullscreenActivity.RECOIL_OFFSET_TEAM] = 20;
+            receiveTelemetry(activity, packet);
+            assertEquals(20, Globals.getInstance().mPlayerID);
+            assertEquals((byte) 20, get(activity, "mLastTeam"));
+            assertEquals(2, get(activity, "mNetworkTeam"));
+        });
+    }
+
+    @Test
+    public void grenadeDamageStillUsesThePairedOwnersSettings() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            Globals.getmGrenadePairingsSemaphore();
+            int previousOwner;
+            try {
+                previousOwner = globals.mGrenadePairings[3];
+                globals.mGrenadePairings[3] = 11;
+            } finally { globals.mGrenadePairingsSemaphore.release(); }
+            try {
+                receiveTelemetry(activity, grenadePacket(false, 0x31));
+                assertEquals(15, get(activity, "mHealth"));
+                assertEquals(1, get(activity, "mHitsTaken"));
+            } finally {
+                Globals.getmGrenadePairingsSemaphore();
+                try { globals.mGrenadePairings[3] = previousOwner; }
+                finally { globals.mGrenadePairingsSemaphore.release(); }
+            }
+        });
+    }
+
     private void completeWrite(FullscreenActivity activity) {
         completeWrite(activity, GattAttributes.RECOIL_COMMAND_UUID,
                 bluetooth.writes.get(bluetooth.writes.size() - 1), BluetoothGatt.GATT_SUCCESS);
