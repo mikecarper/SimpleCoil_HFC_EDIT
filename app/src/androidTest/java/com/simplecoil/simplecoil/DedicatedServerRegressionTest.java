@@ -52,6 +52,7 @@ public class DedicatedServerRegressionTest {
     private long originalRespawnTime;
     private long originalTimeRemaining;
     private boolean originalUseGPS;
+    private boolean originalOnlyServerSettings;
 
     @Before
     public void setUp() {
@@ -68,7 +69,9 @@ public class DedicatedServerRegressionTest {
         originalRespawnTime = globals.mRespawnTime;
         originalTimeRemaining = globals.mServerGameTimeRemaining;
         originalUseGPS = globals.mUseGPS;
+        originalOnlyServerSettings = globals.mOnlyServerSettings;
         globals.mGameState = Globals.GAME_STATE_NONE;
+        globals.mOnlyServerSettings = true;
         scenario = ActivityScenario.launch(DedicatedServerActivity.class);
         scenario.onActivity(current -> {
             activity = current;
@@ -126,6 +129,118 @@ public class DedicatedServerRegressionTest {
         globals.mRespawnTime = originalRespawnTime;
         globals.mServerGameTimeRemaining = originalTimeRemaining;
         globals.mUseGPS = originalUseGPS;
+        globals.mOnlyServerSettings = originalOnlyServerSettings;
+    }
+
+    @Test
+    public void retainedServerOnlyPolicyIsShownWhenOpeningTheHostControls() {
+        scenario.onActivity(current -> {
+            Switch control = current.findViewById(R.id.only_server_settings_switch);
+            assertTrue("The host switch disagrees with the active policy", control.isChecked());
+            assertTrue(Globals.getInstance().mOnlyServerSettings);
+            assertEquals(0, tcp.gameInfoUpdates);
+        });
+    }
+
+    @Test
+    public void retainedServerOnlyPolicyCanBeDisabledWithOneClickAndEnabledAgain() {
+        scenario.onActivity(current -> {
+            Switch control = current.findViewById(R.id.only_server_settings_switch);
+            control.performClick();
+            assertFalse("One click should disable the retained policy", Globals.getInstance().mOnlyServerSettings);
+            assertFalse(control.isChecked());
+            assertEquals(1, tcp.gameInfoUpdates);
+            control.performClick();
+            assertTrue(Globals.getInstance().mOnlyServerSettings);
+            assertTrue(control.isChecked());
+            assertEquals(2, tcp.gameInfoUpdates);
+        });
+    }
+
+    @Test
+    public void timedRoundEndsLocallyIfTheTcpServiceDisconnects() {
+        scenario.onActivity(current -> {
+            CountDownTimer timer = startTimedRound();
+            disconnectTcpService();
+            timer.onFinish();
+            assertRoundEnded();
+            assertEquals(0, tcp.gameEnds);
+            timer.onTick(41000);
+            assertEquals(0, Globals.getInstance().mServerGameTimeRemaining);
+        });
+    }
+
+    @Test
+    public void endButtonStillEndsTheRoundIfTheTcpServiceDisconnects() {
+        scenario.onActivity(current -> {
+            receive(NetMsg.NETMSG_STARTGAME);
+            assertNotNull(get("mSpawnTimer"));
+            disconnectTcpService();
+            button(R.id.end_game_button).performClick();
+            assertRoundEnded();
+            assertEquals(0, tcp.gameEnds);
+        });
+    }
+
+    @Test
+    public void timedRoundWithATcpServiceStillWaitsForServerCleanup() {
+        scenario.onActivity(current -> {
+            startTimedRound().onFinish();
+            assertEquals(1, tcp.gameEnds);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertFalse(button(R.id.start_game_button).isEnabled());
+            receive(NetMsg.NETMSG_ENDGAME);
+            assertRoundEnded();
+        });
+    }
+
+    @Test
+    public void endButtonWithATcpServiceStillRequestsServerCleanup() {
+        scenario.onActivity(current -> {
+            receive(NetMsg.NETMSG_STARTGAME);
+            button(R.id.end_game_button).performClick();
+            assertEquals(1, tcp.gameEnds);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            receive(NetMsg.NETMSG_ENDGAME);
+            assertRoundEnded();
+        });
+    }
+
+    @Test
+    public void destroyedEndButtonCannotEndAnotherScreensRound() {
+        closeActivity();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            button(R.id.end_game_button).performClick();
+            assertEquals(0, tcp.gameEnds);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+    }
+
+    private CountDownTimer startTimedRound() {
+        Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
+        Globals.getInstance().mTimeLimit = 5;
+        receive(NetMsg.NETMSG_STARTGAME);
+        CountDownTimer timer = (CountDownTimer) get("mGameCountdownTimer");
+        assertNotNull(timer);
+        timer.cancel();
+        timer.onTick(42000);
+        return timer;
+    }
+
+    private void disconnectTcpService() {
+        ((ServiceConnection) get("mTcpServerServiceConnection")).onServiceDisconnected(null);
+        assertNull(get("mTcpServer"));
+    }
+
+    private void assertRoundEnded() {
+        assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+        assertEquals(0, Globals.getInstance().mServerGameTimeRemaining);
+        assertNull(get("mSpawnTimer"));
+        assertNull(get("mGameCountdownTimer"));
+        assertTrue(button(R.id.start_game_button).isEnabled());
+        assertFalse(button(R.id.end_game_button).isEnabled());
+        assertTrue(udp.allowJoin);
     }
 
     @Test
@@ -578,6 +693,8 @@ public class DedicatedServerRegressionTest {
 
     private static final class RecordingTcpServer extends TcpServer {
         int gameStarts;
+        int gameEnds;
+        int gameInfoUpdates;
         int listenerStarts;
         int listenerStops;
         boolean acceptStart = true;
@@ -585,11 +702,12 @@ public class DedicatedServerRegressionTest {
         ScoreData firstPlayerScore;
 
         @Override public boolean startGame() { gameStarts++; return acceptStart; }
+        @Override public void endGame() { gameEnds++; }
         @Override void startTcpServer() { listenerStarts++; }
         @Override public void stopTcpServer() { listenerStops++; }
         @Override public void setDedicated(boolean value) { dedicated = value; }
         @Override public void sendTCPMessageAll(String message) { }
-        @Override public void sendAllGameInfo(int playerID) { }
+        @Override public void sendAllGameInfo(int playerID) { gameInfoUpdates++; }
         @Override public ScoreData getScore(byte playerID) { return playerID == 1 ? firstPlayerScore : null; }
     }
 

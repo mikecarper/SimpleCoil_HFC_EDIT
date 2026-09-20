@@ -224,10 +224,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         }
         mEndGameButton = findViewById(R.id.end_game_button);
         if (mEndGameButton != null) {
-            mEndGameButton.setOnClickListener((v -> {
-                if (mTcpServer != null)
-                    mTcpServer.endGame();
-            }));
+            mEndGameButton.setOnClickListener(v -> requestEndGame());
         }
         mStartGameButton = findViewById(R.id.start_game_button);
         if (mStartGameButton != null) {
@@ -272,6 +269,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 mUDPListenerService.allowJoin(mAllowJoinSwitch.isChecked());
         }));
         mOnlyServerSettingsSwitch = findViewById(R.id.only_server_settings_switch);
+        mOnlyServerSettingsSwitch.setChecked(Globals.getInstance().mOnlyServerSettings);
         mOnlyServerSettingsSwitch.setOnClickListener((v -> {
             Globals.getInstance().mOnlyServerSettings = mOnlyServerSettingsSwitch.isChecked();
             if (mTcpServer != null)
@@ -566,6 +564,17 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         }
     }
 
+    private void requestEndGame() {
+        if (isFinishing() || isDestroyed())
+            return;
+        if (mTcpServer != null) {
+            mTcpServer.endGame();
+        } else {
+            // No service remains to send the ENDGAME broadcast that resets the UI.
+            endGame();
+        }
+    }
+
     private void endGame() {
         mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount()));
         mStartGameButton.setEnabled(true);
@@ -739,8 +748,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 mGameCountdownTimer = null;
                 Log.d(TAG, "Game time ended!");
                 Toast.makeText(getApplicationContext(), getString(R.string.dialog_game_time_expired), Toast.LENGTH_SHORT).show();
-                if (mTcpServer != null)
-                    mTcpServer.endGame();
+                requestEndGame();
                 Globals.getInstance().mServerGameTimeRemaining = 0;
             }
         };
