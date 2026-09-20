@@ -703,7 +703,8 @@ public class UDPListenerService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.i(TAG, "UDP Service started");
-        return START_STICKY;
+        // A resurrected listener has no owning activity or known lobby session.
+        return START_NOT_STICKY;
     }
 
     public class LocalBinder extends Binder {

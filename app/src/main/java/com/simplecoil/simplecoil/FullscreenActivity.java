@@ -551,6 +551,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
     }
 
+    // These services are intentionally kept alive while moving between the player and
+    // dedicated-host screens.  Once the player task is actually finishing, however,
+    // leaving them started keeps sockets and receivers alive with no UI to own them.
+    private void stopNetworkServices() {
+        stopService(new Intent(getBaseContext(), UDPListenerService.class));
+        stopService(new Intent(getBaseContext(), TcpClient.class));
+        stopService(new Intent(getBaseContext(), TcpServer.class));
+    }
+
     private boolean networkServicesReady() {
         return mUDPListenerService != null && mTcpClient != null && mTcpServer != null;
     }
@@ -1943,6 +1952,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         unbindUDPService();
         unbindTcpClientService();
         unbindTcpServerService();
+        if (isFinishing())
+            stopNetworkServices();
         super.onDestroy();
     }
 

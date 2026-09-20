@@ -1,8 +1,11 @@
 package com.simplecoil.simplecoil;
 
+import android.app.ActivityManager;
+import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.os.IBinder;
+import android.os.SystemClock;
 
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -165,6 +168,32 @@ public class FullscreenServiceLifecycleRegressionTest {
         assertCurrentConnectionWorks(SERVICE_TCP_SERVER);
     }
 
+    @Test
+    public void explicitNetworkShutdownStopsStartedServices() {
+        scenario.onActivity(current -> {
+            current.startService(new Intent(current, UDPListenerService.class));
+            current.startService(new Intent(current, TcpClient.class));
+            current.startService(new Intent(current, TcpServer.class));
+            assertTrue(isServiceRunning(current, UDPListenerService.class));
+            assertTrue(isServiceRunning(current, TcpClient.class));
+            assertTrue(isServiceRunning(current, TcpServer.class));
+            invoke("stopNetworkServices");
+        });
+        waitForServiceToStop(UDPListenerService.class);
+        waitForServiceToStop(TcpClient.class);
+        waitForServiceToStop(TcpServer.class);
+    }
+
+    @Test
+    public void networkServicesDoNotRequestStickyRestart() {
+        assertEquals(android.app.Service.START_NOT_STICKY,
+                udp.onStartCommand(new Intent(), 0, 1));
+        assertEquals(android.app.Service.START_NOT_STICKY,
+                tcpClient.onStartCommand(new Intent(), 0, 1));
+        assertEquals(android.app.Service.START_NOT_STICKY,
+                tcpServer.onStartCommand(new Intent(), 0, 1));
+    }
+
     private void assertCurrentConnectionWorks(int service) {
         scenario.onActivity(current -> {
             ServiceConnection callback = beginBinding(service);
@@ -174,6 +203,25 @@ public class FullscreenServiceLifecycleRegressionTest {
             callback.onServiceDisconnected(null);
             assertNull(get(serviceField(service)));
         });
+    }
+
+    private void waitForServiceToStop(Class<?> serviceClass) {
+        long deadline = SystemClock.elapsedRealtime() + 2000;
+        while (isServiceRunning(activity, serviceClass) && SystemClock.elapsedRealtime() < deadline)
+            SystemClock.sleep(10);
+        assertFalse(serviceClass.getSimpleName() + " remained running", isServiceRunning(activity, serviceClass));
+    }
+
+    private static boolean isServiceRunning(Context context, Class<?> serviceClass) {
+        ActivityManager manager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+        if (manager == null)
+            return false;
+        String className = serviceClass.getName();
+        for (ActivityManager.RunningServiceInfo info : manager.getRunningServices(Integer.MAX_VALUE)) {
+            if (info.service != null && className.equals(info.service.getClassName()))
+                return true;
+        }
+        return false;
     }
 
     private ServiceConnection beginBinding(int service) {

@@ -168,6 +168,13 @@ public class TcpServer extends Service {
     }
 
     @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        // A server cannot safely resume after its owning activity and lobby state
+        // have gone away.
+        return START_NOT_STICKY;
+    }
+
+    @Override
     public boolean onUnbind(Intent intent) {
         return super.onUnbind(intent);
     }

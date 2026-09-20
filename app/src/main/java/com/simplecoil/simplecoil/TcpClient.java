@@ -99,6 +99,13 @@ public class TcpClient extends Service {
     }
 
     @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        // Reconnecting after a process restart must be initiated by the UI so it
+        // uses the current lobby and player state.
+        return START_NOT_STICKY;
+    }
+
+    @Override
     public boolean onUnbind(Intent intent) {
         return super.onUnbind(intent);
     }
