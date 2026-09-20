@@ -374,8 +374,8 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                         playerSettings.allowShotModeSingle = mShotModeSingle.isChecked();
                         playerSettings.allowShotModeBurst3 = mShotModeBurst3.isChecked();
                         playerSettings.allowShotModeAuto = mShotModeAuto.isChecked();
-                       //TODO check
-                        // Globals.getInstance().mAllowPlayerSettings = mAllowPlayerSettingsSwitch.isChecked();
+                        // Saving local host settings must not depend on a live service binding.
+                        Globals.getInstance().mAllowPlayerSettings = mAllowPlayerSettingsSwitch.isChecked();
 
                         if (mFiringModeButton.getText().equals(getContext().getString(R.string.firing_mode_outdoor_no_cone))) {
                             playerSettings.firingMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;

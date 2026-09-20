@@ -768,13 +768,19 @@ public class TcpServer extends Service {
     }
 
     public void sendPlayerSettings(int playerID, boolean applyAll, boolean allowPlayerSettings) {
+        // A host policy change is local state even when nobody is connected yet.
+        Globals.getInstance().mAllowPlayerSettings = allowPlayerSettings;
+        sendPlayerSettingsUpdate(playerID, applyAll);
+    }
+
+    private void sendPlayerSettingsUpdate(int playerID, boolean applyAll) {
         JSONArray players = getPlayerSettings(playerID, applyAll);
         if (players == null)
             return;
         try {
             JSONObject game = new JSONObject();
-            game.put(JSON_ALLOWPLAYERSETTINGS, allowPlayerSettings);
-            Globals.getInstance().mAllowPlayerSettings = allowPlayerSettings;
+            // A reply must not restore a policy captured before waiting for settings.
+            game.put(JSON_ALLOWPLAYERSETTINGS, Globals.getInstance().mAllowPlayerSettings);
             game.put(JSON_PLAYERSETTINGS, players);
             String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
             sendTCPMessageAll(message);
@@ -1340,9 +1346,10 @@ public class TcpServer extends Service {
                 if (!Globals.getInstance().mAllowPlayerSettings || Globals.getInstance().mOnlyServerSettings
                         || client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)) {
                     Log.e(TAG, "Player " + client.mPlayerID + "not allowed to send player settings");
-                    sendPlayerSettings(SEND_ALL, false, Globals.getInstance().mAllowPlayerSettings);
+                    sendPlayerSettingsUpdate(SEND_ALL, false);
                     return;
                 }
+                boolean applied = false;
                 try {
                     int playerID = player.getInt(JSON_PLAYERID);
                     int health = player.getInt(JSON_HEALTH);
@@ -1360,28 +1367,35 @@ public class TcpServer extends Service {
                     if (playerID != client.mPlayerID || !Globals.isValidPlayerSettings(health, reloadShots,
                             reloadTime, spawnTime, damage, lives, allowSingle, allowBurst, allowAuto, firingMode)) {
                         Log.w(TAG, "Ignoring invalid player settings from " + client.mPlayerID);
-                        sendPlayerSettings(SEND_ALL, false, Globals.getInstance().mAllowPlayerSettings);
+                        sendPlayerSettingsUpdate(SEND_ALL, false);
                         return;
                     }
                     Globals.getmPlayerSettingsSemaphore();
                     try {
-                        Globals.PlayerSettings settings = Globals.getInstance().mPlayerSettings.get(client.mPlayerID);
-                        if (settings == null) {
-                            settings = new Globals.PlayerSettings();
-                            Globals.getInstance().mPlayerSettings.put(client.mPlayerID, settings);
+                        // The host can revoke permission while this request waits for the lock.
+                        if (!Globals.getInstance().mAllowPlayerSettings || Globals.getInstance().mOnlyServerSettings
+                                || playerID != client.mPlayerID) {
+                            Log.w(TAG, "Ignoring player settings after permission or identity changed");
+                        } else {
+                            Globals.PlayerSettings settings = Globals.getInstance().mPlayerSettings.get(client.mPlayerID);
+                            if (settings == null) {
+                                settings = new Globals.PlayerSettings();
+                                Globals.getInstance().mPlayerSettings.put(client.mPlayerID, settings);
+                            }
+                            settings.health = health;
+                            settings.shots = (byte) reloadShots;
+                            settings.reloadTime = reloadTime;
+                            settings.reloadOnEmpty = reloadOnEmpty;
+                            settings.spawnTime = spawnTime;
+                            settings.damage = damage;
+                            settings.overrideLives = overrideLives;
+                            settings.lives = lives;
+                            settings.allowShotModeAuto = allowAuto;
+                            settings.allowShotModeBurst3 = allowBurst;
+                            settings.allowShotModeSingle = allowSingle;
+                            settings.firingMode = firingMode;
+                            applied = true;
                         }
-                        settings.health = health;
-                        settings.shots = (byte) reloadShots;
-                        settings.reloadTime = reloadTime;
-                        settings.reloadOnEmpty = reloadOnEmpty;
-                        settings.spawnTime = spawnTime;
-                        settings.damage = damage;
-                        settings.overrideLives = overrideLives;
-                        settings.lives = lives;
-                        settings.allowShotModeAuto = allowAuto;
-                        settings.allowShotModeBurst3 = allowBurst;
-                        settings.allowShotModeSingle = allowSingle;
-                        settings.firingMode = firingMode;
                     } finally {
                         Globals.getInstance().mPlayerSettingsSemaphore.release();
                     }
@@ -1389,8 +1403,9 @@ public class TcpServer extends Service {
                     Log.w(TAG, "Ignoring malformed player settings from " + client.mPlayerID, e);
                     return;
                 }
-                sendPlayerSettings(SEND_ALL, false, Globals.getInstance().mAllowPlayerSettings);
-                sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+                sendPlayerSettingsUpdate(SEND_ALL, false);
+                if (applied)
+                    sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                 return;
             }
             if (player.has(JSON_PLAYERNAMECHANGE)) {

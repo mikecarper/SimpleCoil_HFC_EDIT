@@ -206,6 +206,80 @@ public class PlayerSettingsRegressionTest {
         });
     }
 
+    @Test
+    public void serverPolicyCanBeDisabledWhileTheServiceBindingIsMissing() {
+        assertPolicySavedWithoutBinding(true, false);
+    }
+
+    @Test
+    public void serverPolicyCanBeEnabledWhileTheServiceBindingIsMissing() {
+        assertPolicySavedWithoutBinding(false, true);
+    }
+
+    private void assertPolicySavedWithoutBinding(boolean original, boolean replacement) {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mAllowPlayerSettings = original;
+            dialog.setServer((byte) 1, null);
+            dialog.show();
+            toggle(R.id.allow_player_settings_switch).setChecked(replacement);
+        });
+        click(DialogInterface.BUTTON_POSITIVE);
+        scenario.onActivity(activity -> {
+            assertEquals(replacement, Globals.getInstance().mAllowPlayerSettings);
+            assertFalse(dialog.isShowing());
+            dialog = new PlayerSettingsAlertDialog(activity);
+            dialog.setServer((byte) 1, null);
+            dialog.show();
+            assertEquals(replacement, toggle(R.id.allow_player_settings_switch).isChecked());
+        });
+    }
+
+    @Test
+    public void serverPolicyIsSavedBeforePublishingTheSettings() {
+        scenario.onActivity(activity -> Globals.getInstance().mAllowPlayerSettings = true);
+        show(true);
+        scenario.onActivity(activity -> toggle(R.id.allow_player_settings_switch).setChecked(false));
+        click(DialogInterface.BUTTON_POSITIVE);
+        scenario.onActivity(activity -> {
+            assertFalse(Globals.getInstance().mAllowPlayerSettings);
+            assertEquals(1, server.saves);
+            assertFalse(server.policyAtSave);
+        });
+    }
+
+    @Test
+    public void cancellingServerSettingsDoesNotChangeThePolicy() {
+        scenario.onActivity(activity -> Globals.getInstance().mAllowPlayerSettings = true);
+        show(true);
+        scenario.onActivity(activity -> toggle(R.id.allow_player_settings_switch).setChecked(false));
+        click(DialogInterface.BUTTON_NEGATIVE);
+        scenario.onActivity(activity -> {
+            assertTrue(Globals.getInstance().mAllowPlayerSettings);
+            assertEquals(0, server.saves);
+        });
+    }
+
+    @Test
+    public void invalidServerSettingsDoNotChangeThePolicyUntilCorrected() {
+        scenario.onActivity(activity -> Globals.getInstance().mAllowPlayerSettings = true);
+        show(true);
+        enterInvalidShotModes();
+        scenario.onActivity(activity -> toggle(R.id.allow_player_settings_switch).setChecked(false));
+        click(DialogInterface.BUTTON_POSITIVE);
+        scenario.onActivity(activity -> {
+            assertTrue(Globals.getInstance().mAllowPlayerSettings);
+            assertEquals(0, server.saves);
+            assertTrue(dialog.isShowing());
+            toggle(R.id.shot_mode_single).setChecked(true);
+        });
+        click(DialogInterface.BUTTON_POSITIVE);
+        scenario.onActivity(activity -> {
+            assertFalse(Globals.getInstance().mAllowPlayerSettings);
+            assertEquals(1, server.saves);
+            assertFalse(dialog.isShowing());
+        });
+    }
+
     private void show(boolean isServer) {
         scenario.onActivity(activity -> {
             if (isServer) dialog.setServer((byte) 1, server);
@@ -247,6 +321,10 @@ public class PlayerSettingsRegressionTest {
 
     private static final class RecordingServer extends TcpServer {
         int saves;
-        @Override public void sendPlayerSettings(int id, boolean applyAll, boolean allowSettings) { saves++; }
+        boolean policyAtSave;
+        @Override public void sendPlayerSettings(int id, boolean applyAll, boolean allowSettings) {
+            saves++;
+            policyAtSave = Globals.getInstance().mAllowPlayerSettings;
+        }
     }
 }
