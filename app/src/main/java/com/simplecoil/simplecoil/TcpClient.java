@@ -65,6 +65,9 @@ public class TcpClient extends Service {
     private static final int CONNECTION_TIMEOUT_MS = 1000;
     private static final int RECONNECT_RETRY_DELAY_MS = 1000;
     private static final int SHUTDOWN_FLUSH_TIMEOUT_MS = 1000;
+    // Scoreboards sum values by team, so keep every untrusted row low enough
+    // that a supported lobby cannot overflow an integer total.
+    static final int MAX_SCOREBOARD_VALUE = Integer.MAX_VALUE / Globals.MAX_PLAYER_ID;
     static final String EXTRA_TERMINAL_EVENT_ID = "com.simplecoil.simplecoil.TCP_TERMINAL_EVENT_ID";
     static final String EXTRA_START_EVENT_ID = "com.simplecoil.simplecoil.TCP_START_EVENT_ID";
     private static final AtomicLong terminalEventIds = new AtomicLong();
@@ -852,6 +855,23 @@ public class TcpClient extends Service {
                 return;
             }
             if (game.has(TcpServer.JSON_PLAYERDATA)) {
+                JSONArray playerData = game.getJSONArray(TcpServer.JSON_PLAYERDATA);
+                if (playerData.length() > Globals.MAX_PLAYER_ID)
+                    throw new JSONException("Too many players in scoreboard snapshot");
+                boolean[] seenPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
+                for (int x = 0; x < playerData.length(); x++) {
+                    JSONObject player = playerData.getJSONObject(x);
+                    int playerID = TcpJson.getInt(player, TcpServer.JSON_PLAYERID);
+                    int points = TcpJson.getInt(player, TcpServer.JSON_PLAYERPOINTS);
+                    int eliminated = TcpJson.getInt(player, TcpServer.JSON_PLAYERELIMINATED);
+                    if (!Globals.isValidPlayerID(playerID) || playerID <= 0 || seenPlayers[playerID]
+                            || points < 0 || points > MAX_SCOREBOARD_VALUE
+                            || eliminated < 0 || eliminated > MAX_SCOREBOARD_VALUE) {
+                        throw new JSONException("Invalid player-data scoreboard snapshot");
+                    }
+                    TcpJson.getPlayerName(player, TcpServer.JSON_PLAYERNAME);
+                    seenPlayers[playerID] = true;
+                }
                 Intent intent = new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE);
                 intent.putExtra(NetMsg.INTENT_PLAYERDATA, message);
                 broadcastIfCurrentSession(generation, intent);

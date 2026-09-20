@@ -612,6 +612,40 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void oversizedPlayerDataDoesNotPublishAScoreboard() throws Exception {
+        JSONArray players = new JSONArray();
+        for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++)
+            players.put(scoreboardPlayer(id));
+        players.put(scoreboardPlayer(1));
+        parse(new JSONObject().put(TcpServer.JSON_PLAYERDATA, players));
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void conflictingPlayerDataDoesNotPublishAScoreboard() throws Exception {
+        parse(new JSONObject().put(TcpServer.JSON_PLAYERDATA,
+                new JSONArray().put(scoreboardPlayer(2)).put(scoreboardPlayer(2))));
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void invalidPlayerDataScoresDoNotPublishAScoreboard() throws Exception {
+        for (int invalid : new int[]{-1, TcpClient.MAX_SCOREBOARD_VALUE + 1}) {
+            parse(new JSONObject().put(TcpServer.JSON_PLAYERDATA,
+                    new JSONArray().put(scoreboardPlayer(2).put(TcpServer.JSON_PLAYERPOINTS, invalid))));
+            assertTrue(client.events.isEmpty());
+        }
+    }
+
+    @Test
+    public void validPlayerDataPublishesAScoreboard() throws Exception {
+        parse(new JSONObject().put(TcpServer.JSON_PLAYERDATA,
+                new JSONArray().put(scoreboardPlayer(2))));
+        assertEquals(1, client.events.size());
+        assertEquals(NetMsg.NETMSG_PLAYERDATAUPDATE, client.events.get(0).getAction());
+    }
+
+    @Test
     public void emptyRemoteAddressCannotBeResolvedAsLocalhost() throws Exception {
         parse(roster(new JSONArray().put(player(3).put(TcpServer.JSON_PLAYERIP, "/"))));
         assertOriginalRoster();
@@ -851,6 +885,13 @@ public class TcpGameInfoRegressionTest {
     private static JSONObject player(int id) throws Exception {
         return new JSONObject().put(TcpServer.JSON_PLAYERID, id).put(TcpServer.JSON_PLAYERNAME, "Player " + id)
                 .put(TcpServer.JSON_PLAYERIP, "/127.0.0." + id);
+    }
+
+    private static JSONObject scoreboardPlayer(int id) throws Exception {
+        return new JSONObject().put(TcpServer.JSON_PLAYERID, id)
+                .put(TcpServer.JSON_PLAYERNAME, "Player " + id)
+                .put(TcpServer.JSON_PLAYERPOINTS, 1)
+                .put(TcpServer.JSON_PLAYERELIMINATED, 0);
     }
 
     private static JSONObject roster(JSONArray players) throws Exception {

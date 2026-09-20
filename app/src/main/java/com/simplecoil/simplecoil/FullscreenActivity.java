@@ -90,6 +90,7 @@ import java.util.Locale;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * An example full-screen activity that shows and hides the system UI (i.e.
@@ -280,6 +281,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean mUseNetwork = false;
     private int mScore = 0;
     private int mTeamScore = 0;
+    // A dedicated host can send a scoreboard only in response to a request or
+    // when a round ends. Do not let repeated network frames create unbounded UI
+    // parser threads or stack dialogs on top of the game.
+    private final AtomicBoolean mPlayerDataDialogActive = new AtomicBoolean();
     private volatile boolean mReady = false;
     private int mNetworkTeam = 0;
     private boolean mIsServer = false;
@@ -3343,37 +3348,51 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 //TODO player presets
     private void displayPlayerData(final String message) {
         if (message == null || isFinishing() || isDestroyed()) return;
+        if (!mPlayerDataDialogActive.compareAndSet(false, true)) {
+            Log.w(TAG, "Ignoring duplicate player-data response while a scoreboard is active");
+            return;
+        }
         new Thread(() -> {
+            boolean dialogPosted = false;
             PlayerDisplayData[] playerDisplayData = new PlayerDisplayData[Globals.MAX_PLAYER_ID + 2];
             for (int x = 1; x <= Globals.MAX_PLAYER_ID; x++)
                 playerDisplayData[x] = null;
 
             boolean hasSemaphore = false;
-            int[] teamPoints = new int[4];
+            long[] teamPoints = new long[4];
+            boolean[] seenPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
             for (int i = 0; i < 4; i++)
                 teamPoints[i] = 0;
             try {
                 JSONObject json = TcpJson.parseObject(message);
                 JSONArray players = json.getJSONArray(TcpServer.JSON_PLAYERDATA);
+                if (players.length() > Globals.MAX_PLAYER_ID)
+                    throw new JSONException("Too many players in player-data response");
                 Globals.getInstance().getmPlayerSettingsSemaphore();
                 hasSemaphore = true;
                 for (int x = 0; x < players.length(); x++) {
                     JSONObject player = players.getJSONObject(x);
                     PlayerDisplayData playerData = new PlayerDisplayData();
                     int rawPlayerID = TcpJson.getInt(player, TcpServer.JSON_PLAYERID);
-                    if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID >= playerDisplayData.length) {
+                    if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0
+                            || rawPlayerID >= playerDisplayData.length || seenPlayers[rawPlayerID]) {
                         Log.w(TAG, "Ignoring player data for invalid player ID " + rawPlayerID);
-                        continue;
+                        throw new JSONException("Invalid player ID in player-data response");
                     }
+                    seenPlayers[rawPlayerID] = true;
                     playerData.playerID = (byte) rawPlayerID;
                     playerData.playerName = TcpJson.getPlayerName(player, TcpServer.JSON_PLAYERNAME);
                     playerData.points = TcpJson.getInt(player, TcpServer.JSON_PLAYERPOINTS);
+                    if (playerData.points < 0 || playerData.points > TcpClient.MAX_SCOREBOARD_VALUE)
+                        throw new JSONException("Invalid player points in player-data response");
                     if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                         int team = Globals.getInstance().calcNetworkTeam(playerData.playerID);
                         if (team >= 1 && team <= teamPoints.length)
                             teamPoints[team - 1] += playerData.points;
                     }
                     playerData.eliminated = TcpJson.getInt(player, TcpServer.JSON_PLAYERELIMINATED);
+                    if (playerData.eliminated < 0 || playerData.eliminated > TcpClient.MAX_SCOREBOARD_VALUE)
+                        throw new JSONException("Invalid eliminations in player-data response");
                     Globals.PlayerSettings playerSettings = Globals.getInstance().mPlayerSettings.get(playerData.playerID);
                     if (playerSettings == null) {
                         playerData.overrideLives = false;
@@ -3390,32 +3409,50 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 Log.w(TAG, "Ignoring invalid player-data response", e);
                 if (hasSemaphore)
                     Globals.getInstance().mPlayerSettingsSemaphore.release();
+                mPlayerDataDialogActive.set(false);
                 return;
             }
-            if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
-                String total;
-                if (Globals.getInstance().mGameMode == Globals.GAME_MODE_2TEAMS) {
-                    total = getString(R.string.player_list_team2_total, teamPoints[0], teamPoints[1]);
-                } else {
-                    total = getString(R.string.player_list_team4_total, teamPoints[0], teamPoints[1], teamPoints[2], teamPoints[3]);
+            try {
+                if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
+                    String total;
+                    if (Globals.getInstance().mGameMode == Globals.GAME_MODE_2TEAMS) {
+                        total = getString(R.string.player_list_team2_total, teamPoints[0], teamPoints[1]);
+                    } else {
+                        total = getString(R.string.player_list_team4_total, teamPoints[0], teamPoints[1], teamPoints[2], teamPoints[3]);
+                    }
+                    playerDisplayData[Globals.MAX_PLAYER_ID + 1] = new PlayerDisplayData();
+                    playerDisplayData[Globals.MAX_PLAYER_ID + 1].playerName = total;
                 }
-                playerDisplayData[Globals.MAX_PLAYER_ID + 1] = new PlayerDisplayData();
-                playerDisplayData[Globals.MAX_PLAYER_ID + 1].playerName = total;
+                final PlayerDisplayDataListAdapter playerDisplayListAdapter = new PlayerDisplayDataListAdapter(FullscreenActivity.this, playerDisplayData, true);
+                runOnUiThread(() -> {
+                    try {
+                        if (isFinishing() || isDestroyed()) {
+                            mPlayerDataDialogActive.set(false);
+                            return;
+                        }
+                        AlertDialog.Builder alertDialog = new AlertDialog.Builder(FullscreenActivity.this);
+                        alertDialog.setNegativeButton(R.string.ok,
+                                (dialog, id) -> dialog.cancel());
+                        LayoutInflater inflater = getLayoutInflater();
+                        View view = inflater.inflate(R.layout.player_data_dialog, null);
+                        alertDialog.setView(view);
+                        ListView listView = view.findViewById(R.id.player_list);
+                        listView.setAdapter(playerDisplayListAdapter);
+                        AlertDialog dialog = alertDialog.create();
+                        dialog.setOnDismissListener(ignored -> mPlayerDataDialogActive.set(false));
+                        dialog.show();
+                    } catch (RuntimeException e) {
+                        Log.w(TAG, "Unable to display player-data response", e);
+                        mPlayerDataDialogActive.set(false);
+                    }
+                });
+                dialogPosted = true;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Unable to prepare player-data response", e);
+            } finally {
+                if (!dialogPosted)
+                    mPlayerDataDialogActive.set(false);
             }
-            final PlayerDisplayDataListAdapter playerDisplayListAdapter = new PlayerDisplayDataListAdapter(FullscreenActivity.this, playerDisplayData, true);
-
-            runOnUiThread(() -> {
-                if (isFinishing() || isDestroyed()) return;
-                AlertDialog.Builder alertDialog = new AlertDialog.Builder(FullscreenActivity.this);
-                alertDialog.setNegativeButton(R.string.ok,
-                        (dialog, id) -> dialog.cancel());
-                LayoutInflater inflater = getLayoutInflater();
-                View view = inflater.inflate(R.layout.player_data_dialog, null);
-                alertDialog.setView(view);
-                ListView listView = view.findViewById(R.id.player_list);
-                listView.setAdapter(playerDisplayListAdapter);
-                alertDialog.show();
-            });
         }).start();
     }
 //TODO presets ??
