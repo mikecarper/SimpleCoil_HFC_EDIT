@@ -342,6 +342,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final String PREF_FIRING_MODE = "FiringMode";
     private static final String PREF_SHOT_MODE = "ShotMode";
     private static final String PREF_RECOIL_ENABLED = "RecoilEnabled";
+    static final String PREF_VIBRATE_ON_HIT = "VibrateOnHit";
     public static final String PREF_GAME_MODE = "GameMode";
     public static final String PREF_LIMIT_TIME = "TimeLimit";
     public static final String PREF_LIMIT_LIVES = "LivesLimit";
@@ -860,6 +861,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Globals.getInstance().mPlayerID = Globals.isValidPlayerID(savedPlayerID) ? (byte) savedPlayerID : 0;
         getFiringMode();
         mRecoilEnabled = readBooleanPreference(sharedPreferences, PREF_RECOIL_ENABLED, true);
+        Globals.getInstance().mVibrateOnHit = readBooleanPreference(sharedPreferences,
+                PREF_VIBRATE_ON_HIT, false);
         mCurrentShotMode = readIntPreference(sharedPreferences, PREF_SHOT_MODE, Globals.SHOT_MODE_SINGLE);
         int savedGameMode = readIntPreference(sharedPreferences, PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
         Globals.getInstance().mGameMode = Globals.isValidGameMode(savedGameMode) ? savedGameMode : Globals.GAME_MODE_2TEAMS;
@@ -2678,6 +2681,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         connectionTestHandler.postDelayed(mConnectionTestRunnable, CONNECTION_TEST_INTERVAL_MILLISECONDS);
     }
 
+    private void vibrateOnHit() {
+        if (!Globals.getInstance().mVibrateOnHit || vibrator == null)
+            return;
+        try {
+            vibrator.vibrate(HIT_VIBRATE_DURATION_MILLISECONDS);
+        } catch (SecurityException e) {
+            Log.w(TAG, "Unable to vibrate for a hit", e);
+        }
+    }
+
     private void stopConnectionTest() {
         if (connectionTestHandler != null)
             connectionTestHandler.removeCallbacksAndMessages(null);
@@ -3000,10 +3013,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                     // Show the "you're being hit" animation
                                     mHitIV.setVisibility(View.VISIBLE);
                                     mHitIV.setBackgroundResource(R.drawable.hit_animation);
-                                    //TODO vibration toogle
-                                    if(false) {
-                                        vibrator.vibrate(HIT_VIBRATE_DURATION_MILLISECONDS);
-                                    }
+                                    vibrateOnHit();
                                     playSound(R.raw.hit, getApplicationContext());
                                     Animation animationFadeOut = AnimationUtils.loadAnimation(getApplicationContext(), R.anim.fadeout);
                                     mHitIV.startAnimation(animationFadeOut);
@@ -3026,10 +3036,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                             HIT_ANIMATION_DURATION_MILLISECONDS);
                                 }
                             } else {
-                                //TODO vibration toggle
-                                if(false){
-                                    vibrator.vibrate(HIT_VIBRATE_DURATION_MILLISECONDS);
-                                }
+                                vibrateOnHit();
                                 playSound(R.raw.eliminated, getApplicationContext());
                                 if (mHasLivesLimit)
                                     mEliminationCount = Math.max(0, boundedCounter(mEliminationCount,

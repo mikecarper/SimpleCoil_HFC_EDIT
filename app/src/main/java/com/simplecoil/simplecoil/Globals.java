@@ -78,6 +78,9 @@ public class Globals {
     public volatile int mOverrideLivesVal = 0;
     public volatile boolean mAllowPlayerSettings = true;
     public volatile boolean mReloadOnEmpty = false; // Primarily intended for instagib
+    // This is local phone feedback, not a weapon setting that a server can impose.
+    // Keep the historical default off until the player explicitly enables it.
+    public volatile boolean mVibrateOnHit = false;
    //TODO checks // add new presets in player settings alert dialog and in the menu list item(frontend)
    // public static final int PLAYER_PRESET_DEFAULT = 0;
    // public static final int PLAYER_PRESET_RECON = 1;

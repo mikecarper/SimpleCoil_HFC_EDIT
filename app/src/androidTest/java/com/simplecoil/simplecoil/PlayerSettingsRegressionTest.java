@@ -1,6 +1,9 @@
 package com.simplecoil.simplecoil;
 
 import android.content.DialogInterface;
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.view.View;
 import android.widget.EditText;
 import android.widget.Switch;
 
@@ -30,6 +33,8 @@ public class PlayerSettingsRegressionTest {
     private RecordingServer server;
     private final Map<Field, Object> originalGlobals = new HashMap<>();
     private Map<Byte, Globals.PlayerSettings> originalSettings;
+    private SharedPreferences preferences;
+    private Object originalVibrationPreference;
 
     @Before
     public void setUp() throws Exception {
@@ -37,7 +42,7 @@ public class PlayerSettingsRegressionTest {
         String[] savedFields = {"mFullHealth", "mFullReload", "mReloadTime", "mReloadOnEmpty",
                 "mRespawnTime", "mDamage", "mOverrideLives", "mOverrideLivesVal",
                 "mAllowSingleShotMode", "mAllowBurst3ShotMode", "mAllowAutoShotMode",
-                "mCurrentFiringMode", "mAllowPlayerSettings", "mGameState", "mUseGPS",
+                "mCurrentFiringMode", "mVibrateOnHit", "mAllowPlayerSettings", "mGameState", "mUseGPS",
                 "mGameMode", "mGameLimit", "mTimeLimit", "mLivesLimit", "mScoreLimit", "mPlayerID"};
         for (String name : savedFields) {
             Field field = Globals.class.getDeclaredField(name);
@@ -50,6 +55,9 @@ public class PlayerSettingsRegressionTest {
         } finally { globals.mPlayerSettingsSemaphore.release(); }
         globals.mGameState = Globals.GAME_STATE_NONE;
         globals.mUseGPS = false;
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        preferences = context.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
+        originalVibrationPreference = preferences.getAll().get(FullscreenActivity.PREF_VIBRATE_ON_HIT);
         scenario = ActivityScenario.launch(FullscreenActivity.class);
         scenario.onActivity(activity -> {
             globals.mFullHealth = 20;
@@ -87,6 +95,15 @@ public class PlayerSettingsRegressionTest {
         }
         for (Map.Entry<Field, Object> entry : originalGlobals.entrySet())
             entry.getKey().set(globals, entry.getValue());
+        if (preferences != null) {
+            SharedPreferences.Editor editor = preferences.edit();
+            if (originalVibrationPreference instanceof Boolean)
+                editor.putBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT,
+                        (Boolean) originalVibrationPreference);
+            else
+                editor.remove(FullscreenActivity.PREF_VIBRATE_ON_HIT);
+            editor.commit();
+        }
     }
 
     @Test
@@ -218,6 +235,25 @@ public class PlayerSettingsRegressionTest {
                     Globals.getInstance().mCurrentFiringMode);
             assertEquals(1, client.saves);
         });
+    }
+
+    @Test
+    public void localVibrationPreferenceIsSavedAndServerSettingsDoNotExposeIt() {
+        scenario.onActivity(activity -> Globals.getInstance().mVibrateOnHit = false);
+        show(false);
+        scenario.onActivity(activity -> {
+            assertFalse(toggle(R.id.vibrate_phone_switch).isChecked());
+            toggle(R.id.vibrate_phone_switch).setChecked(true);
+        });
+        click(DialogInterface.BUTTON_POSITIVE);
+        scenario.onActivity(activity -> {
+            assertTrue(Globals.getInstance().mVibrateOnHit);
+            assertTrue(preferences.getBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT, false));
+            dialog = new PlayerSettingsAlertDialog(activity);
+        });
+        show(true);
+        scenario.onActivity(activity -> assertEquals(View.GONE,
+                toggle(R.id.vibrate_phone_switch).getVisibility()));
     }
 
     @Test

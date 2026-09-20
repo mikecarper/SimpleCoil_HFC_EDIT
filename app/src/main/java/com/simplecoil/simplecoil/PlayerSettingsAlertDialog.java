@@ -171,6 +171,9 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         }
         mApplyAllSwitch.setChecked(false);
         mAllowPlayerSettingsSwitch.setChecked(Globals.getInstance().mAllowPlayerSettings);
+        // Vibration is a local accessibility/feedback preference, never a
+        // remote player's game rule.
+        mVibratePhoneSwitch.setVisibility(View.GONE);
     }
 
     public void setLocal(TcpClient tcpClient) {
@@ -190,6 +193,8 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         mShotModeSingle.setChecked(Globals.getInstance().mAllowSingleShotMode);
         mShotModeBurst3.setChecked(Globals.getInstance().mAllowBurst3ShotMode);
         mShotModeAuto.setChecked(Globals.getInstance().mAllowAutoShotMode);
+        mVibratePhoneSwitch.setVisibility(View.VISIBLE);
+        mVibratePhoneSwitch.setChecked(Globals.getInstance().mVibrateOnHit);
         mAllowPlayerSettingsSwitch.setVisibility(View.GONE);
         mFiringModeButton.setVisibility(View.GONE);
         mApplyAllSwitch.setVisibility(View.GONE);
@@ -315,6 +320,8 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
             // in sync with the reset label rather than retaining a prior range.
             if (!isServer)
                 Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;
+            if (!isServer)
+                mVibratePhoneSwitch.setChecked(false);
             mLivesET.setText("" + 0);
 
         });
@@ -351,6 +358,10 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
                         Globals.getInstance().mAllowSingleShotMode = mShotModeSingle.isChecked();
                         Globals.getInstance().mAllowBurst3ShotMode = mShotModeBurst3.isChecked();
                         Globals.getInstance().mAllowAutoShotMode = mShotModeAuto.isChecked();
+                        Globals.getInstance().mVibrateOnHit = mVibratePhoneSwitch.isChecked();
+                        mContext.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE)
+                                .edit().putBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT,
+                                        Globals.getInstance().mVibrateOnHit).apply();
                       //TODO check
                        // Globals.getInstance().mAllowPlayerSettings = mAllowPlayerSettingsSwitch.isChecked();
 
