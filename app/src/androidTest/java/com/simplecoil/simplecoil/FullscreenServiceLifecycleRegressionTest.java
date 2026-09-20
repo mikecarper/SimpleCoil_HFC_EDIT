@@ -15,6 +15,8 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
@@ -194,6 +196,33 @@ public class FullscreenServiceLifecycleRegressionTest {
                 tcpServer.onStartCommand(new Intent(), 0, 1));
     }
 
+    @Test
+    public void peerHostNameChangePublishesTheLobbySnapshot() {
+        scenario.onActivity(current -> {
+            set("mReady", true);
+            set("mIsServer", true);
+
+            current.publishPlayerNameChange();
+
+            assertEquals(1, tcpServer.gameInfoRequests.size());
+            assertEquals(TcpServer.SEND_ALL, (int) tcpServer.gameInfoRequests.get(0));
+            assertEquals(0, tcpClient.playerNameChangeCount);
+        });
+    }
+
+    @Test
+    public void joinedPlayerNameChangeUsesTheTcpClient() {
+        scenario.onActivity(current -> {
+            set("mReady", true);
+            set("mIsServer", false);
+
+            current.publishPlayerNameChange();
+
+            assertTrue(tcpServer.gameInfoRequests.isEmpty());
+            assertEquals(1, tcpClient.playerNameChangeCount);
+        });
+    }
+
     private void assertCurrentConnectionWorks(int service) {
         scenario.onActivity(current -> {
             ServiceConnection callback = beginBinding(service);
@@ -341,7 +370,21 @@ public class FullscreenServiceLifecycleRegressionTest {
 
     private static final class RecordingUDPService extends UDPListenerService { }
 
-    private static final class RecordingTcpClient extends TcpClient { }
+    private static final class RecordingTcpClient extends TcpClient {
+        int playerNameChangeCount;
 
-    private static final class RecordingTcpServer extends TcpServer { }
+        @Override
+        public void sendPlayerNameChange() {
+            playerNameChangeCount++;
+        }
+    }
+
+    private static final class RecordingTcpServer extends TcpServer {
+        final List<Integer> gameInfoRequests = new ArrayList<>();
+
+        @Override
+        public void sendAllGameInfo(int id) {
+            gameInfoRequests.add(id);
+        }
+    }
 }

@@ -1137,18 +1137,30 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             editor.putString(PREF_PLAYER_NAME, Globals.getInstance().mPlayerName);
                             editor.apply();
                             mPlayerNameTV.setText(Globals.getInstance().mPlayerName);
-                            if (mReady && mTcpClient != null) {
-                                mTcpClient.sendPlayerNameChange();
-                            } else {
-                                displayAllNetworkingOptions(true);
-                                setNetworkMenu(NETWORK_TYPE_ENABLED);
-                            }
+                            publishPlayerNameChange();
                             dialog.dismiss();
                         })
                 .setNegativeButton(R.string.cancel,
                         (dialog, id) -> dialog.cancel());
         AlertDialog alertDialog = alertDialogBuilder.create();
         alertDialog.show();
+    }
+
+    // A peer host does not have a connected TcpClient. Publish its changed name
+    // through the server's lobby snapshot so every joined player sees it.
+    void publishPlayerNameChange() {
+        if (!mReady) {
+            displayAllNetworkingOptions(true);
+            setNetworkMenu(NETWORK_TYPE_ENABLED);
+            return;
+        }
+        if (mIsServer) {
+            if (mTcpServer != null)
+                mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+            return;
+        }
+        if (mTcpClient != null)
+            mTcpClient.sendPlayerNameChange();
     }
 
     private void requestServerIP() {
