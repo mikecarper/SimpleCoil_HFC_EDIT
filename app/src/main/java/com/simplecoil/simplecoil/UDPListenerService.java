@@ -466,6 +466,17 @@ public class UDPListenerService extends Service {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
                 return;
+            // Match the replacement behavior of explicit-address joins. If a
+            // prior scan is still listening, a new Join request supersedes it
+            // even when Wi-Fi has already lost its DHCP lease. Otherwise a
+            // late reply can attach this player to the abandoned server after
+            // the new request has reported failure.
+            if (!doneListening) {
+                Log.e(TAG, "Listening is still in progress");
+                stopListen();
+                sendFailedJoin();
+                return;
+            }
             mBroadcastAddress = getBroadcastAddress();
             if (mBroadcastAddress == null) {
                 sendFailedJoin();

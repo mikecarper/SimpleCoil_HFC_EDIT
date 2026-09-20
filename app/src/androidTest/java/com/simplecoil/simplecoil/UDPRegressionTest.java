@@ -357,6 +357,29 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void failedBroadcastJoinCancelsAnOlderJoinBeforeDhcpLookup() throws Exception {
+        // The normal Join button must retire an active scan before checking the
+        // current Wi-Fi lease. A lost lease used to report failure but leave the
+        // old scan able to accept a late SERVERREPLY.
+        set(service, "doneListening", false);
+        set(service, "keepListening", true);
+        set(service, "mScanRunning", true);
+        set(service, "mJoinAddress", teammate);
+        set(service, "mBroadcastScan", false);
+
+        service.joinServer();
+
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_FAILEDTOJOIN, service.events.get(0).getAction());
+        assertFalse(flag("keepListening"));
+        assertFalse(flag("mScanRunning"));
+
+        receive(teammate, NetMsg.NETMSG_SERVERREPLY);
+        assertEquals("A late discovery reply restarted the abandoned join", 1, service.events.size());
+        assertNull(Globals.getInstance().mServerIP);
+    }
+
+    @Test
     public void emptyNormalizedAddressDoesNotJoinLocalhost() throws Exception {
         service.joinServer("/ ");
         assertEquals(1, service.events.size());
@@ -539,6 +562,14 @@ public class UDPRegressionTest {
         boolean blockFirstLookup;
         final CountDownLatch lookupStarted = new CountDownLatch(1);
         final CountDownLatch releaseLookup = new CountDownLatch(1);
+
+        RecordingService() {
+            // These parser tests construct the service directly. Give that
+            // test double the same application context Android gives a real
+            // bound service, including after a join clears its cached IP.
+            attachBaseContext(InstrumentationRegistry.getInstrumentation().getTargetContext());
+        }
+
         @Override public void sendBroadcast(Intent intent) { events.add(new Intent(intent)); }
         @Override public void startListenForUDPMessage() {
             if (realListener) super.startListenForUDPMessage();

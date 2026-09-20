@@ -310,6 +310,11 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
             mShotModeBurst3.setChecked(true);
             mShotModeSingle.setChecked(true);
             mFiringModeButton.setText(R.string.firing_mode_outdoor_no_cone);
+            // Local dialogs hide the range selector, so Reset defaults is the
+            // only way to restore its value. Keep the value sent to the server
+            // in sync with the reset label rather than retaining a prior range.
+            if (!isServer)
+                Globals.getInstance().mCurrentFiringMode = Globals.FIRING_MODE_OUTDOOR_NO_CONE;
             mLivesET.setText("" + 0);
 
         });

@@ -207,6 +207,20 @@ public class PlayerSettingsRegressionTest {
     }
 
     @Test
+    public void localResetRestoresTheDefaultFiringRangeBeforePublishing() {
+        scenario.onActivity(activity -> Globals.getInstance().mCurrentFiringMode =
+                Globals.FIRING_MODE_INDOOR_NO_CONE);
+        show(false);
+        scenario.onActivity(activity -> dialog.findViewById(R.id.reset_defaults_button).performClick());
+        click(DialogInterface.BUTTON_POSITIVE);
+        scenario.onActivity(activity -> {
+            assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE,
+                    Globals.getInstance().mCurrentFiringMode);
+            assertEquals(1, client.saves);
+        });
+    }
+
+    @Test
     public void serverPolicyCanBeDisabledWhileTheServiceBindingIsMissing() {
         assertPolicySavedWithoutBinding(true, false);
     }
