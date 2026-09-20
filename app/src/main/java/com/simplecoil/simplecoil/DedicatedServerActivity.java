@@ -699,10 +699,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
 
     private void endGame() {
-        // The dedicated host is not a player, while getPlayerCount() includes the local
-        // endpoint. Ending a round keeps the connected lobby, so retain its real client count.
-        mNetworkPlayerCountTV.setText(getString(R.string.network_player_count,
-                Math.max(0, Globals.getPlayerCount() - 1)));
+        // TcpServer ends the current dedicated session by notifying and closing every
+        // client before this broadcast reaches the UI.  Do not leave a stale lobby
+        // count on screen: Start would otherwise appear possible even though there
+        // are no registered sockets left to receive it.
+        mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, 0));
         mStartGameButton.setEnabled(true);
         mGameModeButton.setEnabled(true);
         mGameLimitButton.setEnabled(true);

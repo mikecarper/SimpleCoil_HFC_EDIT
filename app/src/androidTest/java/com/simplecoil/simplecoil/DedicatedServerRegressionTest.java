@@ -192,7 +192,7 @@ public class DedicatedServerRegressionTest {
     }
 
     @Test
-    public void endingARoundRetainsTheConnectedDedicatedLobbyCount() {
+    public void endingARoundShowsNoPlayersAfterTcpServerClearsTheLobby() {
         scenario.onActivity(current -> {
             Map<Byte, InetAddress> originalRoster = new HashMap<>();
             Globals.getmTeamIPMapSemaphore();
@@ -208,7 +208,7 @@ public class DedicatedServerRegressionTest {
             try {
                 invoke("endGame");
                 TextView playerCount = current.findViewById(R.id.player_count_tv);
-                assertEquals(current.getString(R.string.network_player_count, 2),
+                assertEquals(current.getString(R.string.network_player_count, 0),
                         playerCount.getText().toString());
             } finally {
                 Globals.getmTeamIPMapSemaphore();
