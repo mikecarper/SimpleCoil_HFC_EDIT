@@ -520,7 +520,8 @@ public class TcpServer extends Service {
                     .putExtra(NetMsg.INTENT_START_AT, mScheduledStart)
                     .putExtra(NetMsg.INTENT_END_AT, mScheduledDuration == 0 ? 0 : mScheduledStart + mScheduledDuration)
                     .putExtra(NetMsg.INTENT_ROUND_ID, mRoundSequence)
-                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken)
+                    .putExtra(NetMsg.INTENT_PEER_GAME, !mIsDedicated);
         }
     }
 

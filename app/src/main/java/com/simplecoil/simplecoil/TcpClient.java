@@ -455,6 +455,7 @@ public class TcpClient extends Service {
                 .putExtra(NetMsg.INTENT_END_AT, duration == 0 ? 0 : startAt + duration)
                 .putExtra(NetMsg.INTENT_ROUND_ID, roundID)
                 .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken)
+                .putExtra(NetMsg.INTENT_PEER_GAME, !mIsDedicatedServer)
                 .putExtra(EXTRA_START_EVENT_ID, terminalEventIds.incrementAndGet());
         mPendingGameStartEvent = new Intent(intent);
         broadcastIfCurrentSession(generation, intent);

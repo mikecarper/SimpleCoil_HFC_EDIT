@@ -1079,6 +1079,36 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void peerEndAfterPausedStartIsAppliedAfterTheStartOnResume() {
+        scenario.onActivity(activity -> {
+            final String roundToken = "99999999-9999-9999-9999-999999999999";
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mReady", true);
+            set(activity, "mActivePeerRoundToken", null);
+            boolean wasRegistered = (boolean) get(activity, "mNetworkReceiverRegistered");
+            if (wasRegistered)
+                activity.onPause();
+            try {
+                // This reproduces a TCP start and a matching UDP ENDGAME both
+                // arriving while the activity's receiver is paused.
+                udp.preparePeerRound(roundToken);
+                retainPeerEndGame(udp, roundToken);
+                queuePendingPeerStart(roundToken);
+            } finally {
+                activity.onResume();
+                if (!wasRegistered)
+                    activity.onPause();
+            }
+            assertEquals("The resumed peer round remained active after its retained ENDGAME",
+                    Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull("The resumed activity did not consume the pending peer start",
+                    tcp.consumePendingGameStart(0));
+            assertNull("The resumed activity did not consume the retained peer ENDGAME",
+                    udp.consumePendingPeerEndGame());
+        });
+    }
+
+    @Test
     public void serverCancellationReceivedWhilePausedIsAppliedOnResume() {
         receiveWhilePaused(NetMsg.NETMSG_SERVERCANCEL);
         scenario.onActivity(activity -> assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState));
@@ -1202,6 +1232,21 @@ public class GameplayRegressionTest {
             field.setAccessible(true);
             field.set(service, new Intent(NetMsg.NETMSG_ENDGAME)
                     .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken));
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private void queuePendingPeerStart(String roundToken) {
+        try {
+            Field field = TcpClient.class.getDeclaredField("mPendingGameStartEvent");
+            field.setAccessible(true);
+            field.set(tcp, new Intent(NetMsg.NETMSG_STARTGAME)
+                    .putExtra(NetMsg.INTENT_START_AT, SystemClock.elapsedRealtime() + 5000)
+                    .putExtra(NetMsg.INTENT_END_AT, 0L)
+                    .putExtra(NetMsg.INTENT_ROUND_ID, 1L)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken)
+                    .putExtra(NetMsg.INTENT_PEER_GAME, true));
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }

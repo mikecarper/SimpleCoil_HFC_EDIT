@@ -549,24 +549,29 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void consumePendingServerEvent() {
         if (!mNetworkReceiverRegistered)
             return;
-        Intent event;
-        if (mUDPListenerService != null) {
-            event = mUDPListenerService.consumePendingPeerEndGame();
+        if (mTcpClient != null) {
+            Intent event = mTcpClient.consumePendingTerminalEvent();
             if (event != null) {
                 mUDPUpdateReceiver.onReceive(this, event);
                 return;
             }
+            if (mUseNetwork && mReady && networkServicesReady()) {
+                event = mIsServer ? mTcpServer.getScheduledGameStart()
+                        : mTcpClient.consumePendingGameStart(0);
+                if (event != null)
+                    mUDPUpdateReceiver.onReceive(this, event);
+            }
         }
-        if (mTcpClient == null)
+        // A synchronized peer STARTGAME must be applied before its retained
+        // ENDGAME. That start installs the listener/UI token which authenticates
+        // the terminal event and prevents it crossing into a dedicated round.
+        consumePendingPeerEndGame();
+    }
+
+    private void consumePendingPeerEndGame() {
+        if (mUDPListenerService == null)
             return;
-        event = mTcpClient.consumePendingTerminalEvent();
-        if (event != null) {
-            mUDPUpdateReceiver.onReceive(this, event);
-            return;
-        }
-        if (!mUseNetwork || !mReady || !networkServicesReady())
-            return;
-        event = mIsServer ? mTcpServer.getScheduledGameStart() : mTcpClient.consumePendingGameStart(0);
+        Intent event = mUDPListenerService.consumePendingPeerEndGame();
         if (event != null)
             mUDPUpdateReceiver.onReceive(this, event);
     }
@@ -3358,8 +3363,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             != intent.getLongExtra(NetMsg.INTENT_ROUND_ID, -1))
                         return;
                 }
-                if (mUseNetwork && mReady && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
+                if (mUseNetwork && mReady && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
                     startGame(intent);
+                    // An ENDGAME received between the TCP start broadcast and
+                    // this activity becoming active is deliberately silent in
+                    // UDPListenerService. Apply it only after startGame has
+                    // installed the matching peer-round token.
+                    consumePendingPeerEndGame();
+                }
             } else if (NetMsg.NETMSG_CLOCKSYNCWAITING.equals(action)) {
                 Toast.makeText(getApplicationContext(), R.string.clock_sync_waiting, Toast.LENGTH_SHORT).show();
             } else if (NetMsg.NETMSG_ENDGAME.equals(action)) {

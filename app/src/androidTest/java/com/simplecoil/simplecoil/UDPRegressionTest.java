@@ -184,6 +184,35 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void peerEndDuringPausedStartIsRetainedUntilTheRoundBecomesActive() throws Exception {
+        register(enemy, 11);
+
+        // TcpClient broadcasts starts asynchronously. Exercise an ENDGAME that
+        // arrives before UDPListenerService has handled that start broadcast.
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
+        assertTrue("A pre-start peer ENDGAME was delivered as a live event", service.events.isEmpty());
+        assertNull("A pre-start peer ENDGAME was consumable before its round was active",
+                service.consumePendingPeerEndGame());
+
+        service.startGame(true, PEER_ROUND_TOKEN);
+        Intent pendingEvent = service.consumePendingPeerEndGame();
+        assertNotNull("A matching peer ENDGAME was lost while the activity was paused", pendingEvent);
+        assertEquals(PEER_ROUND_TOKEN,
+                pendingEvent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
+    }
+
+    @Test
+    public void candidatePeerEndCannotCrossThroughADedicatedStart() throws Exception {
+        register(enemy, 11);
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
+
+        service.startGame(false, null);
+        service.startGame(true, PEER_ROUND_TOKEN);
+        assertNull("A tokened peer ENDGAME crossed through a dedicated round",
+                service.consumePendingPeerEndGame());
+    }
+
+    @Test
     public void stalePeerScoreAndLeaveCannotCrossIntoANewRound() throws Exception {
         final String oldRound = "33333333-3333-3333-3333-333333333333";
         final String currentRound = "44444444-4444-4444-4444-444444444444";

@@ -77,6 +77,9 @@ public class NetMsg {
     public static final String INTENT_END_AT = "END_AT_ELAPSED";
     public static final String INTENT_ROUND_ID = "ROUND_ID";
     public static final String INTENT_ROUND_TOKEN = "ROUND_TOKEN";
+    // Internal synchronized-start metadata. Peer rounds need their token in
+    // the UDP service before a paused activity can process the start itself.
+    public static final String INTENT_PEER_GAME = "PEER_GAME";
     public static final String INTENT_EVENT_SEQUENCE = "EVENT_SEQUENCE";
 
     public static final String INTENT_LONGITUDE = "longitude";

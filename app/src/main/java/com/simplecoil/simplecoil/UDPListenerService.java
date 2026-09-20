@@ -17,8 +17,10 @@
 package com.simplecoil.simplecoil;
 
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.net.DhcpInfo;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
@@ -28,6 +30,8 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
 import android.widget.Toast;
+
+import androidx.core.content.ContextCompat;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -95,6 +99,10 @@ public class UDPListenerService extends Service {
     // UDP endpoint membership alone cannot distinguish a delayed prior-round
     // packet from a current one.
     private String mPeerRoundToken;
+    // A synchronized peer start can reach TcpClient while the activity is
+    // paused. Keep its expected token separately until the activity makes the
+    // round active, so an immediate matching peer ENDGAME is not discarded.
+    private String mPendingPeerRoundToken;
     // The activity unregisters its UDP receiver while paused. Retain the one
     // terminal event that must still be applied when it returns, but never let
     // it survive a replacement peer round or a stopped listener.
@@ -131,6 +139,17 @@ public class UDPListenerService extends Service {
     private boolean mBroadcastScan;
     private CountDownTimer mJoinTimer;
     private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    private boolean mPeerStartReceiverRegistered;
+
+    private final BroadcastReceiver mPeerStartReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null || !NetMsg.NETMSG_STARTGAME.equals(intent.getAction())
+                    || !intent.getBooleanExtra(NetMsg.INTENT_PEER_GAME, false))
+                return;
+            preparePeerRound(intent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
+        }
+    };
 
     public static final String INTENT_PLAYERID = "playerid";
     public static final String INTENT_MESSAGE = "message";
@@ -348,8 +367,18 @@ public class UDPListenerService extends Service {
         if (!TcpServer.isValidRoundToken(roundToken))
             return;
         final Intent intent;
+        final boolean deliverNow;
         synchronized (mListenerStateLock) {
-            if (!isCurrentPeerRoundLocked(roundToken) || getPlayerID(ip) == null)
+            boolean activePeerRound = isCurrentPeerRoundLocked(roundToken);
+            // TCP broadcasts are asynchronous, so a peer ENDGAME can arrive
+            // after TcpClient has announced a synchronized start but before
+            // this service's start receiver runs. Retain a candidate only
+            // while no peer round is active. It is never broadcast in that
+            // state and can only be consumed after startGame() installs the
+            // exact same token.
+            boolean candidatePeerRound = !mPeerGame && (mPendingPeerRoundToken == null
+                    || roundToken.equals(mPendingPeerRoundToken));
+            if ((!activePeerRound && !candidatePeerRound) || getPlayerID(ip) == null)
                 return;
             // Broadcast delivery is asynchronous with a concurrent round start.
             // Preserve the nonce so the activity can reject an old event after
@@ -357,18 +386,49 @@ public class UDPListenerService extends Service {
             intent = new Intent(NetMsg.NETMSG_ENDGAME)
                     .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
             mPendingPeerEndGame = new Intent(intent);
+            // A pre-UI start belongs to no active round yet. Do not let a
+            // dedicated activity react to it; FullscreenActivity consumes it
+            // after it has made the matching peer round active.
+            deliverNow = activePeerRound;
         }
-        sendBroadcast(intent);
+        if (deliverNow)
+            sendBroadcast(intent);
     }
 
-    /** Returns and clears a peer ENDGAME received while no activity receiver was registered. */
+    /**
+     * Returns and clears a peer ENDGAME received while no activity receiver was
+     * registered. A pending synchronized start must become active first so an
+     * ENDGAME cannot be applied to an unrelated dedicated round.
+     */
     Intent consumePendingPeerEndGame() {
         synchronized (mListenerStateLock) {
-            if (mPendingPeerEndGame == null)
+            if (mPendingPeerEndGame == null || !mPeerGame)
+                return null;
+            String pendingRoundToken =
+                    mPendingPeerEndGame.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+            if (pendingRoundToken == null || !pendingRoundToken.equals(mPeerRoundToken))
                 return null;
             Intent pendingEvent = new Intent(mPendingPeerEndGame);
             mPendingPeerEndGame = null;
             return pendingEvent;
+        }
+    }
+
+    // Receives the token from a local synchronized TCP start broadcast. Package
+    // visibility also lets focused regression tests exercise this paused-start
+    // handoff without creating a second Android service process.
+    void preparePeerRound(String roundToken) {
+        if (!TcpServer.isValidRoundToken(roundToken))
+            return;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || (mPeerGame && roundToken.equals(mPeerRoundToken)))
+                return;
+            if (!mPeerGame) {
+                mPendingPeerRoundToken = roundToken;
+                if (mPendingPeerEndGame != null && !roundToken.equals(
+                        mPendingPeerEndGame.getStringExtra(NetMsg.INTENT_ROUND_TOKEN)))
+                    mPendingPeerEndGame = null;
+            }
         }
     }
 
@@ -935,6 +995,7 @@ public class UDPListenerService extends Service {
             endScanningLocked();
             mPeerGame = false;
             mPeerRoundToken = null;
+            mPendingPeerRoundToken = null;
             mPendingPeerEndGame = null;
             resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
@@ -1097,6 +1158,7 @@ public class UDPListenerService extends Service {
             endScanningLocked();
             mPeerGame = false;
             mPeerRoundToken = null;
+            mPendingPeerRoundToken = null;
             mPendingPeerEndGame = null;
             resetPeerGameSequences();
             Globals.getmIPTeamMapSemaphore();
@@ -1271,6 +1333,7 @@ public class UDPListenerService extends Service {
             mIsListService = false;
             mPeerGame = false;
             mPeerRoundToken = null;
+            mPendingPeerRoundToken = null;
             mPendingPeerEndGame = null;
             resetPeerGameSequences();
             keepListening = false;
@@ -1287,6 +1350,9 @@ public class UDPListenerService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        ContextCompat.registerReceiver(this, mPeerStartReceiver,
+                new IntentFilter(NetMsg.NETMSG_STARTGAME), ContextCompat.RECEIVER_NOT_EXPORTED);
+        mPeerStartReceiverRegistered = true;
     }
 
     @Override
@@ -1298,6 +1364,14 @@ public class UDPListenerService extends Service {
         }
         mSendExecutor.shutdownNow();
         mLookupExecutor.shutdownNow();
+        if (mPeerStartReceiverRegistered) {
+            mPeerStartReceiverRegistered = false;
+            try {
+                unregisterReceiver(mPeerStartReceiver);
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "Peer-start receiver was already unregistered", e);
+            }
+        }
         super.onDestroy();
     }
 
@@ -1349,12 +1423,24 @@ public class UDPListenerService extends Service {
         }
         synchronized (mListenerStateLock) {
             mIsListService = false; // There is no list service while the game is running
-            if (mPeerGame != peerGame || (peerGame && !roundToken.equals(mPeerRoundToken))) {
-                resetPeerGameSequences();
+            boolean peerRoundChanged = mPeerGame != peerGame
+                    || (peerGame && !roundToken.equals(mPeerRoundToken));
+            if (!peerGame) {
+                // Candidate tokened ENDGAME packets are meaningful only to a
+                // peer start. A dedicated start must always discard one, even
+                // when the listener was already in non-peer mode.
+                mPendingPeerRoundToken = null;
                 mPendingPeerEndGame = null;
+            } else if (peerRoundChanged) {
+                resetPeerGameSequences();
+                if (mPendingPeerEndGame == null || !peerGame
+                        || !roundToken.equals(mPendingPeerEndGame.getStringExtra(NetMsg.INTENT_ROUND_TOKEN)))
+                    mPendingPeerEndGame = null;
             }
             mPeerGame = peerGame;
             mPeerRoundToken = peerGame ? roundToken : null;
+            if (peerGame)
+                mPendingPeerRoundToken = null;
         }
     }
 
