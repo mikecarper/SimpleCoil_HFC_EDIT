@@ -195,6 +195,44 @@ public class TcpServerSessionRegressionTest {
     }
 
     @Test
+    public void successfulBindClearsRosterFromPreviousListenerSession() throws Exception {
+        Globals globals = Globals.getInstance();
+        InetAddress endpoint = InetAddress.getByName("192.0.2.20");
+        clearSharedRoster();
+        try {
+            Globals.getmIPTeamMapSemaphore();
+            try { globals.mIPTeamMap.put(endpoint, (byte) 1); }
+            finally { globals.mIPTeamMapSemaphore.release(); }
+            Globals.getmTeamIPMapSemaphore();
+            try { globals.mTeamIPMap.put((byte) 1, endpoint); }
+            finally { globals.mTeamIPMapSemaphore.release(); }
+            Globals.getmTeamPlayerNameSemaphore();
+            try { globals.mTeamPlayerNameMap.put((byte) 1, "Old player"); }
+            finally { globals.mTeamPlayerNameSemaphore.release(); }
+            Globals.getmGPSDataSemaphore();
+            try { globals.mGPSData.put((byte) 1, new Globals.GPSData()); }
+            finally { globals.mGPSDataSemaphore.release(); }
+            Globals.getmGrenadePairingsSemaphore();
+            try { globals.mGrenadePairings[3] = 1; }
+            finally { globals.mGrenadePairingsSemaphore.release(); }
+
+            server.startTcpServer();
+            long deadline = SystemClock.elapsedRealtime() + 2000;
+            while (!server.isTcpServerReady() && SystemClock.elapsedRealtime() < deadline)
+                Thread.sleep(10);
+            assertTrue("Bound listener never became ready", server.isTcpServerReady());
+            assertEquals("New listener retained a phantom player", 1, Globals.getPlayerCount());
+            assertTrue(globals.mIPTeamMap.isEmpty());
+            assertTrue(globals.mTeamIPMap.isEmpty());
+            assertTrue(globals.mTeamPlayerNameMap.isEmpty());
+            assertTrue(globals.mGPSData.isEmpty());
+            assertEquals(Globals.INVALID_PLAYER_ID, globals.mGrenadePairings[3]);
+        } finally {
+            clearSharedRoster();
+        }
+    }
+
+    @Test
     public void failedBindDoesNotResetExistingGameState() throws Exception {
         connect();
         Globals.GPSData gps = new Globals.GPSData();

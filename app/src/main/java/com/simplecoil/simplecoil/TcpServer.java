@@ -584,7 +584,9 @@ public class TcpServer extends Service {
         Globals globals = Globals.getInstance();
         Globals.getmGPSDataSemaphore();
         try {
-            if (globals.mGPSData != null)
+            if (globals.mGPSData == null)
+                globals.mGPSData = new HashMap<>();
+            else
                 globals.mGPSData.clear();
         } finally {
             globals.mGPSDataSemaphore.release();
@@ -1035,23 +1037,17 @@ public class TcpServer extends Service {
             ss.bind(new InetSocketAddress(TCP_SERVER_PORT));
             ss.setSoTimeout(1000);
             // A failed bind must not erase another server's active round state.
+            // Once bound, this listener owns a fresh lobby: stopTcpServer() is
+            // also used for non-destructive lifecycle shutdown, so its old
+            // roster must not be allowed to appear in this new session.
             mDepartedScores.clear();
             if (mClientData == null)
                 mClientData = new ConcurrentHashMap<>();
             else
                 mClientData.clear();
-            Globals.getmGPSDataSemaphore();
-            try {
-                if (Globals.getInstance().mGPSData == null)
-                    Globals.getInstance().mGPSData = new HashMap<>();
-                else
-                    Globals.getInstance().mGPSData.clear();
-            } finally {
-                Globals.getInstance().mGPSDataSemaphore.release();
-            }
+            clearSharedRosterState();
             if (!keepListening)
                 return;
-            Globals.ClearGrenadePairings(true);
             synchronized (mServerStateLock) {
                 if (!keepListening || mDestroyed)
                     return;
