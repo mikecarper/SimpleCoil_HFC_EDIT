@@ -47,6 +47,7 @@ public class BluetoothQueueRegressionTest {
     private final List<String> operations = new ArrayList<>();
     private final List<byte[]> descriptorValues = new ArrayList<>();
     private boolean denyNotifications;
+    private boolean completeWritesSynchronously;
 
     @Before
     public void setUp() throws Exception {
@@ -65,6 +66,12 @@ public class BluetoothQueueRegressionTest {
                         operations.add(name);
                         if (name.equals("writeDescriptor"))
                             descriptorValues.add(((byte[]) args[args.length - 1]).clone());
+                        if (name.equals("writeCharacteristic") && completeWritesSynchronously) {
+                            // A framework callback can race the return from writeCharacteristic().
+                            // Model that reentrant completion without using a radio.
+                            field(BluetoothGatt.class, "mDeviceBusy").set(gatt, Boolean.FALSE);
+                            callback.onCharacteristicWrite(gatt, command, BluetoothGatt.GATT_SUCCESS);
+                        }
                     } else if (!name.equals("unregisterClient")) {
                         throw new AssertionError("Unexpected Bluetooth transport call: " + name);
                     }
@@ -196,6 +203,17 @@ public class BluetoothQueueRegressionTest {
         assertEquals(BluetoothLeService.DESCRIPTOR_WRITE_FINISHED, service.broadcasts.get(0).getAction());
         completeWrite();
         assertWriteResult(1, new byte[]{16, 0, 2}, BluetoothGatt.GATT_SUCCESS);
+        assertTrue(isAvailable());
+    }
+
+    @Test
+    public void synchronousWriteCompletionDoesNotLeaveTheNextCommandQueued() throws Exception {
+        completeWritesSynchronously = true;
+        service.writeCharacteristic(command, new byte[]{16, 0, 2});
+        service.writeCharacteristic(command, new byte[]{32, 0, 4});
+        assertEquals(Arrays.asList("writeCharacteristic", "writeCharacteristic"), operations);
+        assertWriteResult(0, new byte[]{16, 0, 2}, BluetoothGatt.GATT_SUCCESS);
+        assertWriteResult(1, new byte[]{32, 0, 4}, BluetoothGatt.GATT_SUCCESS);
         assertTrue(isAvailable());
     }
 

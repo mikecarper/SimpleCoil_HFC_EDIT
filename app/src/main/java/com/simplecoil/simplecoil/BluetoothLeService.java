@@ -157,28 +157,37 @@ public class BluetoothLeService extends Service {
 
     private boolean startCharacteristicWrite(BluetoothGatt gatt, CharacteristicWrite write) {
         write.prepare();
+        // Android can dispatch a completion before writeCharacteristic() returns.
+        // Mark the transport busy before calling into the framework so that
+        // callback cannot be overwritten by a stale false assignment afterward.
+        mActionAvailable = false;
         mActiveCharacteristicWrite = write;
         if (gatt.writeCharacteristic(write.characteristic))
             return true;
         mActiveCharacteristicWrite = null;
+        mActionAvailable = true;
         broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
         return false;
     }
 
     private boolean startDescriptorWrite(BluetoothGatt gatt, DescriptorWrite write) {
         write.prepare();
+        mActionAvailable = false;
         mActiveDescriptorWrite = write;
         if (gatt.writeDescriptor(write.descriptor))
             return true;
         mActiveDescriptorWrite = null;
+        mActionAvailable = true;
         return false;
     }
 
     private boolean startCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+        mActionAvailable = false;
         mActiveCharacteristicRead = characteristic;
         if (gatt.readCharacteristic(characteristic))
             return true;
         mActiveCharacteristicRead = null;
+        mActionAvailable = true;
         return false;
     }
 
@@ -548,7 +557,6 @@ public class BluetoothLeService extends Service {
         try {
             if (startCharacteristicRead(mBluetoothGatt, characteristic)) {
                 Log.d(TAG, "read the char");
-                mActionAvailable = false;
             } else {
                 Log.d(TAG, "failed to read the char");
             }
@@ -580,7 +588,6 @@ public class BluetoothLeService extends Service {
         try {
             if (startCharacteristicWrite(mBluetoothGatt, write)) {
                 //Log.d(TAG, "wrote char");
-                mActionAvailable = false;
             } else {
                 Log.d(TAG, "failed to write char");
             }
@@ -603,7 +610,6 @@ public class BluetoothLeService extends Service {
         try {
             if (startDescriptorWrite(mBluetoothGatt, new DescriptorWrite(descriptor))) {
                 //Log.d(TAG, "wrote descriptor success");
-                mActionAvailable = false;
             } else {
                 Log.d(TAG, "wrote descriptor FAIL");
             }
