@@ -3,8 +3,11 @@ package com.simplecoil.simplecoil;
 import android.content.BroadcastReceiver;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.database.DataSetObserver;
 import android.os.CountDownTimer;
+import android.view.View;
 import android.widget.Button;
+import android.widget.ListView;
 import android.widget.Switch;
 
 import androidx.test.core.app.ActivityScenario;
@@ -267,6 +270,51 @@ public class DedicatedServerRegressionTest {
     @Test
     public void destroyedActivityCannotRestartUdpFromALateBinding() { assertDestroyedConnectIgnored(false); }
 
+    @Test
+    public void scoreboardUpdatesNotifyTheExistingAdapterWithFreshScores() {
+        scenario.onActivity(current -> {
+            PlayerDisplayDataListAdapter adapter = current.mPlayerDisplayListAdapter;
+            ListView list = current.findViewById(R.id.player_list);
+            tcp.firstPlayerScore = tcp.new ScoreData();
+            tcp.firstPlayerScore.points = 7;
+            int[] changes = {0};
+            adapter.registerDataSetObserver(new DataSetObserver() {
+                @Override public void onChanged() {
+                    changes[0]++;
+                    assertEquals(7, adapter.getItem(1).points);
+                }
+            });
+            receive(NetMsg.NETMSG_PLAYERDATAUPDATE);
+            assertEquals(1, changes[0]);
+            assertSame(adapter, list.getAdapter());
+        });
+    }
+
+    @Test
+    public void liveScoreboardUpdatePreservesTheScrolledPosition() {
+        scenario.onActivity(current -> {
+            ListView list = current.findViewById(R.id.player_list);
+            // Use a fixed viewport so this checks scrolling on both phones and tablets.
+            layoutScoreboard(list);
+            list.setSelectionFromTop(8, -7);
+            layoutScoreboard(list);
+            int position = list.getFirstVisiblePosition();
+            assertTrue("The fixture must scroll below the header", position > 0);
+            int top = list.getChildAt(0).getTop();
+            receive(NetMsg.NETMSG_PLAYERDATAUPDATE);
+            layoutScoreboard(list);
+            assertEquals(position, list.getFirstVisiblePosition());
+            assertEquals(top, list.getChildAt(0).getTop());
+        });
+    }
+
+    private static void layoutScoreboard(ListView list) {
+        list.forceLayout();
+        list.measure(View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(150, View.MeasureSpec.EXACTLY));
+        list.layout(0, 0, 400, 150);
+    }
+
     private void assertDestroyedConnectIgnored(boolean isTcp) {
         ServiceConnection[] callback = new ServiceConnection[1];
         scenario.onActivity(current -> callback[0] = beginBinding(isTcp));
@@ -330,12 +378,14 @@ public class DedicatedServerRegressionTest {
         int listenerStarts;
         boolean acceptStart = true;
         boolean dedicated;
+        ScoreData firstPlayerScore;
 
         @Override public boolean startGame() { gameStarts++; return acceptStart; }
         @Override void startTcpServer() { listenerStarts++; }
         @Override public void setDedicated(boolean value) { dedicated = value; }
         @Override public void sendTCPMessageAll(String message) { }
         @Override public void sendAllGameInfo(int playerID) { }
+        @Override public ScoreData getScore(byte playerID) { return playerID == 1 ? firstPlayerScore : null; }
     }
 
     private static final class RecordingUDPService extends UDPListenerService {

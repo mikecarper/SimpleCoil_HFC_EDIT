@@ -715,11 +715,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 }
             }
         }
-        if (mPlayerDisplayListAdapter != null) {
+        if (mPlayerDisplayListAdapter != null)
             mPlayerDisplayListAdapter.setData(mPlayerDisplayData);
-            if (mPlayerDisplayList != null)
-                mPlayerDisplayList.setAdapter(mPlayerDisplayListAdapter);
-        }
     }
 
     private void startGameCountdown() {

@@ -25,22 +25,28 @@ import android.widget.ArrayAdapter;
 import android.widget.ImageView;
 import android.widget.TextView;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+
 public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData> {
     private final Activity context;
-    private PlayerDisplayData[] data;
     private final boolean isClient;
 
 
     public PlayerDisplayDataListAdapter(Activity context,
                                         PlayerDisplayData[] data, boolean isClient) {
-        super(context, R.layout.player_display_data, data);
+        super(context, R.layout.player_display_data, new ArrayList<>(Arrays.asList(data)));
         this.context = context;
-        this.data = data;
         this.isClient = isClient;
     }
 
     public void setData(PlayerDisplayData[] data) {
-        this.data = data;
+        // Keep ArrayAdapter's count and item lookup in sync with rendered rows,
+        // and notify ListView only after the complete replacement is installed.
+        setNotifyOnChange(false);
+        clear();
+        addAll(Arrays.asList(data));
+        notifyDataSetChanged();
     }
     //TODO add player and weapon presetto display
     @Override
@@ -65,9 +71,11 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
             else
                 playerEliminatedTV.setText(R.string.player_list_eliminated_label);
             return rowView;
-        } else if (position > Globals.MAX_PLAYER_ID) {
-            if (data[position] != null && data[position].playerName != null)
-                playerIDTV.setText(data[position].playerName);
+        }
+        PlayerDisplayData player = getItem(position);
+        if (position > Globals.MAX_PLAYER_ID) {
+            if (player != null && player.playerName != null)
+                playerIDTV.setText(player.playerName);
             return rowView;
         }
         switch (Globals.getInstance().mGameMode) {
@@ -92,7 +100,7 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
                     playerIDTV.setText("1-" + position);
                 break;
         }
-        if (data[position] == null) {
+        if (player == null) {
             playerNameTV.setText(R.string.player_name_not_connected);
             playerPointsTV.setText("");
             playerEliminatedTV.setText("");
@@ -102,23 +110,23 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
             }
             return rowView;
         }
-        playerNameTV.setText(data[position].playerName);
-        playerPointsTV.setText("" + data[position].points);
-        if (data[position].overrideLives) {
-            if (data[position].lives != 0)
-                playerEliminatedTV.setText("" + (data[position].lives - data[position].eliminated));
+        playerNameTV.setText(player.playerName);
+        playerPointsTV.setText("" + player.points);
+        if (player.overrideLives) {
+            if (player.lives != 0)
+                playerEliminatedTV.setText("" + Math.max(0, player.lives - player.eliminated));
             else
-                playerEliminatedTV.setText("" + data[position].eliminated);
+                playerEliminatedTV.setText("" + player.eliminated);
         } else {
             if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_LIVES) != 0)
-                playerEliminatedTV.setText("" + (Globals.getInstance().mLivesLimit - data[position].eliminated));
+                playerEliminatedTV.setText("" + Math.max(0, Globals.getInstance().mLivesLimit - player.eliminated));
             else
-                playerEliminatedTV.setText("" + data[position].eliminated);
+                playerEliminatedTV.setText("" + player.eliminated);
         }
         if (!isClient) {
             ImageView networkStatus = rowView.findViewById(R.id.network_status_iv);
             networkStatus.setVisibility(View.VISIBLE);
-            if (data[position].isConnected)
+            if (player.isConnected)
                 networkStatus.setImageResource(R.drawable.ic_network_connected_24dp);
             else
                 networkStatus.setImageResource(R.drawable.ic_network_disconnected_24dp);
