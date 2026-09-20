@@ -817,6 +817,34 @@ public class DedicatedServerRegressionTest {
         });
     }
 
+    @Test
+    public void staleSynchronizedStartCannotBeginAnotherLobbyRound() {
+        scenario.onActivity(current -> {
+            long deadline = SystemClock.elapsedRealtime() + 5000;
+            Intent stale = new Intent(NetMsg.NETMSG_STARTGAME)
+                    .putExtra(NetMsg.INTENT_START_AT, deadline)
+                    .putExtra(NetMsg.INTENT_END_AT, 0L)
+                    .putExtra(NetMsg.INTENT_ROUND_ID, 4L);
+            ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity, stale);
+            assertEquals("A completed or cancelled round restarted the host UI",
+                    Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertNull(get("mSpawnTimer"));
+
+            tcp.scheduledStart = new Intent(NetMsg.NETMSG_STARTGAME)
+                    .putExtra(NetMsg.INTENT_START_AT, deadline)
+                    .putExtra(NetMsg.INTENT_END_AT, 0L)
+                    .putExtra(NetMsg.INTENT_ROUND_ID, 5L);
+            ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity, stale);
+            assertEquals("A prior round start overtook the current lobby", Globals.GAME_STATE_NONE,
+                    Globals.getInstance().mGameState);
+
+            ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity,
+                    new Intent(tcp.scheduledStart));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertNotNull(get("mSpawnTimer"));
+        });
+    }
+
     private void receive(String action) {
         ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity, new Intent(action));
     }
@@ -855,6 +883,7 @@ public class DedicatedServerRegressionTest {
         boolean acceptStart = true;
         boolean dedicated;
         ScoreData firstPlayerScore;
+        Intent scheduledStart;
 
         @Override public boolean startGame() { gameStarts++; return acceptStart; }
         @Override public void endGame() { gameEnds++; }
@@ -862,6 +891,10 @@ public class DedicatedServerRegressionTest {
         @Override public void stopTcpServer() { listenerStops++; }
         @Override public void cancelServer() { cancellations++; }
         @Override public void setDedicated(boolean value) { dedicated = value; }
+        @Override Intent getScheduledGameStart() {
+            return scheduledStart == null ? null : new Intent(scheduledStart);
+        }
+        @Override void clearScheduledStart() { scheduledStart = null; }
         @Override public void sendTCPMessageAll(String message) { }
         @Override public void sendAllGameInfo(int playerID) { gameInfoUpdates++; }
         @Override public ScoreData getScore(byte playerID) { return playerID == 1 ? firstPlayerScore : null; }

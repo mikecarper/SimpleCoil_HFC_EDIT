@@ -672,6 +672,17 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     endGame(); // Everyone else is out so game is over - this only works in FFA because we don't keep track of who and how many people are on each team
                 getPlayerDisplayData();
             } else if (NetMsg.NETMSG_STARTGAME.equals(action)) {
+                // A delayed broadcast from a completed or cancelled round must not
+                // restart the dedicated host. Legacy peers do not include a round
+                // ID, so preserve their existing start behavior.
+                if (intent.hasExtra(NetMsg.INTENT_ROUND_ID) && mTcpServer != null) {
+                    Intent scheduled = mTcpServer.getScheduledGameStart();
+                    if (scheduled == null || scheduled.getLongExtra(NetMsg.INTENT_ROUND_ID, 0)
+                            != intent.getLongExtra(NetMsg.INTENT_ROUND_ID, -1)) {
+                        Log.w(TAG, "Ignoring stale synchronized game start");
+                        return;
+                    }
+                }
                 onGameStarted(intent);
             } else if (NetMsg.NETMSG_ENDGAME.equals(action)) {
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
