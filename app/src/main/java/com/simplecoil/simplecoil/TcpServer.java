@@ -1137,7 +1137,11 @@ public class TcpServer extends Service {
 
     public ScoreData getScore(byte playerID) {
         int clientID = clientIDFromPlayerID(playerID);
-        ClientData client = clientID < 0 ? null : mClientData.get(clientID);
+        // The dedicated-host UI can render before the asynchronous listener has
+        // initialized its client map. Treat that empty startup window like an
+        // empty scoreboard instead of dereferencing a null map.
+        Map<Integer, ClientData> clients = mClientData;
+        ClientData client = clientID < 0 || clients == null ? null : clients.get(clientID);
         ScoreData scoreData = new ScoreData();
         if (client != null) {
             // These fields are volatile. The client monitor also guards socket
@@ -1750,6 +1754,31 @@ public class TcpServer extends Service {
             }
             if (client.clientSocket == null)
                 return; // A replacement socket can fail while its streams are opened.
+            InetAddress inetAddress = client.clientSocket.getInetAddress();
+            if (inetAddress == null) {
+                Log.w(TAG, "Ignoring registration without a peer address");
+                client.close();
+                mClientData.remove(client.clientID);
+                return;
+            }
+            // UDP gameplay messages are attributed by source address. One
+            // address therefore cannot safely represent two live player IDs:
+            // accepting that registration overwrites the reverse map while
+            // leaving the old player mapped to the same endpoint.
+            Byte endpointPlayerID;
+            Globals.getmIPTeamMapSemaphore();
+            try {
+                endpointPlayerID = Globals.getInstance().mIPTeamMap.get(inetAddress);
+            } finally {
+                Globals.getInstance().mIPTeamMapSemaphore.release();
+            }
+            if (endpointPlayerID != null && endpointPlayerID.byteValue() != id) {
+                Log.w(TAG, "Ignoring registration from an endpoint already owned by player "
+                        + endpointPlayerID);
+                client.close();
+                mClientData.remove(client.clientID);
+                return;
+            }
             boolean newRegistration = client.mPlayerID == 0;
             if (rejoin && newRegistration)
                 Log.d(TAG, "rejoined client " + client.clientID + " not present so adding as a new player");
@@ -1761,7 +1790,6 @@ public class TcpServer extends Service {
                 client.eliminated = departed.eliminated;
             }
             Log.d(TAG, "network team is " + client.getNetworkTeam());
-            InetAddress inetAddress = client.clientSocket.getInetAddress();
             Log.d(TAG, "client " + client.clientID + " player '" + playerName + "' (" + client.mPlayerID + ") found at " + inetAddress.toString());
             updatePlayerEndpoint(client.mPlayerID, inetAddress);
             updatePlayerName(client.mPlayerID, playerName);

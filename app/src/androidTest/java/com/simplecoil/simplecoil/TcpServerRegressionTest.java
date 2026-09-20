@@ -373,6 +373,29 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void scoreLookupBeforeTcpStartupReturnsNoScore() throws Exception {
+        set(server, "mClientData", null);
+        assertNull("An empty startup scoreboard must not crash", server.getScore((byte) 1));
+    }
+
+    @Test
+    public void oneEndpointCannotRegisterAsTwoDifferentPlayers() throws Exception {
+        Object original = client(1, 1);
+        Object duplicateEndpoint = client(2, 0, new MemorySocket(1));
+        Socket duplicateSocket = (Socket) get(duplicateEndpoint, "clientSocket");
+
+        register(duplicateEndpoint, 2, false);
+
+        assertSame(original, clients.get(1));
+        assertFalse(((Socket) get(original, "clientSocket")).isClosed());
+        assertTrue("The conflicting socket was left connected", duplicateSocket.isClosed());
+        assertFalse("The conflicting endpoint entered the client roster", clients.containsKey(2));
+        assertEquals(Byte.valueOf((byte) 1), Globals.getInstance().mIPTeamMap.get(
+                ((Socket) get(original, "clientSocket")).getInetAddress()));
+        assertFalse(Globals.getInstance().mTeamIPMap.containsKey((byte) 2));
+    }
+
+    @Test
     public void removingAlreadyClosedClientDoesNotCrashOrLeaveEndpoints() throws Exception {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Object client = client(1, 1);
@@ -883,9 +906,13 @@ public class TcpServerRegressionTest {
     }
 
     private Object client(int connectionID, int playerID) throws Exception {
+        return client(connectionID, playerID, new MemorySocket(connectionID));
+    }
+
+    private Object client(int connectionID, int playerID, Socket socket) throws Exception {
         Object client = innerInstance("ClientData");
         invoke(client, "initialize", new Class<?>[]{Socket.class, int.class},
-                new MemorySocket(connectionID), connectionID);
+                socket, connectionID);
         clients.put(connectionID, client);
         if (playerID != 0)
             register(client, playerID, false);
