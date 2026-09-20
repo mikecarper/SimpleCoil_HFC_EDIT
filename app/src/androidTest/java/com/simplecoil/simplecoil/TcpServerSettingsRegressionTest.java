@@ -179,6 +179,39 @@ public class TcpServerSettingsRegressionTest {
     }
 
     @Test
+    public void overflowingIntegerSettingsCannotBypassTheirBounds() throws Exception {
+        for (String key : new String[]{TcpServer.JSON_PLAYERID, TcpServer.JSON_HEALTH,
+                TcpServer.JSON_RELOAD_SHOTS, TcpServer.JSON_DAMAGE, TcpServer.JSON_LIVESLIMIT,
+                TcpServer.JSON_FIRING_MODE}) {
+            JSONObject message = settingsMessage();
+            message.put(key, 4294967296L + message.getInt(key));
+            assertMalformedSettingsIgnored(message);
+        }
+    }
+
+    @Test
+    public void fractionalAndStringSettingsCannotBeSilentlyCoerced() throws Exception {
+        for (String key : new String[]{TcpServer.JSON_PLAYERID, TcpServer.JSON_HEALTH,
+                TcpServer.JSON_RELOAD_SHOTS, TcpServer.JSON_DAMAGE, TcpServer.JSON_LIVESLIMIT,
+                TcpServer.JSON_FIRING_MODE, TcpServer.JSON_RELOAD_TIME, TcpServer.JSON_SPAWN_TIME}) {
+            long valid = settingsMessage().getLong(key);
+            for (Object invalid : new Object[]{valid + 0.25, "" + valid})
+                assertMalformedSettingsIgnored(settingsMessage().put(key, invalid));
+        }
+    }
+
+    private void assertMalformedSettingsIgnored(JSONObject message) throws Exception {
+        parse(message);
+        Globals.PlayerSettings settings = Globals.getInstance().mPlayerSettings.get((byte) 1);
+        assertEquals(Globals.MAX_HEALTH, settings.health);
+        assertEquals(Globals.RELOAD_COUNT, settings.shots);
+        assertFalse(settings.overrideLives);
+        assertTrue(server.messages.isEmpty());
+        assertTrue(server.events.isEmpty());
+        assertEquals(1, settingsLock.availablePermits());
+    }
+
+    @Test
     public void disabledPlayerSettingsRejectEditsAndReplyWithCurrentSettings() throws Exception {
         Globals.getInstance().mAllowPlayerSettings = false;
         parse(settingsMessage());

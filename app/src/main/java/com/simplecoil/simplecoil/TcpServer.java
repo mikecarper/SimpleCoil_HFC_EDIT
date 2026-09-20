@@ -1281,8 +1281,8 @@ public class TcpServer extends Service {
                 final int grenadeID;
                 final int playerID;
                 try {
-                    grenadeID = player.getInt(JSON_PAIRED_GRENADE_ID);
-                    playerID = player.getInt(JSON_PLAYERID);
+                    grenadeID = TcpJson.getInt(player, JSON_PAIRED_GRENADE_ID);
+                    playerID = TcpJson.getInt(player, JSON_PLAYERID);
                 } catch (JSONException e) {
                     e.printStackTrace();
                     return;
@@ -1351,19 +1351,19 @@ public class TcpServer extends Service {
                 }
                 boolean applied = false;
                 try {
-                    int playerID = player.getInt(JSON_PLAYERID);
-                    int health = player.getInt(JSON_HEALTH);
-                    int reloadShots = player.getInt(JSON_RELOAD_SHOTS);
-                    long reloadTime = player.getLong(JSON_RELOAD_TIME);
+                    int playerID = TcpJson.getInt(player, JSON_PLAYERID);
+                    int health = TcpJson.getInt(player, JSON_HEALTH);
+                    int reloadShots = TcpJson.getInt(player, JSON_RELOAD_SHOTS);
+                    long reloadTime = TcpJson.getLong(player, JSON_RELOAD_TIME);
                     boolean reloadOnEmpty = player.getBoolean(JSON_RELOAD_ON_EMPTY);
-                    long spawnTime = player.getLong(JSON_SPAWN_TIME);
-                    int damage = player.getInt(JSON_DAMAGE);
+                    long spawnTime = TcpJson.getLong(player, JSON_SPAWN_TIME);
+                    int damage = TcpJson.getInt(player, JSON_DAMAGE);
                     boolean overrideLives = player.has(JSON_LIVESLIMIT);
-                    int lives = overrideLives ? player.getInt(JSON_LIVESLIMIT) : 0;
+                    int lives = overrideLives ? TcpJson.getInt(player, JSON_LIVESLIMIT) : 0;
                     boolean allowAuto = player.getBoolean(JSON_SHOT_MODE_AUTO);
                     boolean allowBurst = player.getBoolean(JSON_SHOT_MODE_BURST3);
                     boolean allowSingle = player.getBoolean(JSON_SHOT_MODE_SINGLE);
-                    int firingMode = player.getInt(JSON_FIRING_MODE);
+                    int firingMode = TcpJson.getInt(player, JSON_FIRING_MODE);
                     if (playerID != client.mPlayerID || !Globals.isValidPlayerSettings(health, reloadShots,
                             reloadTime, spawnTime, damage, lives, allowSingle, allowBurst, allowAuto, firingMode)) {
                         Log.w(TAG, "Ignoring invalid player settings from " + client.mPlayerID);
@@ -1412,7 +1412,7 @@ public class TcpServer extends Service {
                 int id;
                 String playerName;
                 try {
-                    id = player.getInt(JSON_PLAYERID);
+                    id = TcpJson.getInt(player, JSON_PLAYERID);
                     playerName = TcpJson.getPlayerName(player, JSON_PLAYERNAMECHANGE);
                 } catch (JSONException e) {
                     e.printStackTrace();
@@ -1435,7 +1435,7 @@ public class TcpServer extends Service {
             String playerName;
             try {
                 rejoin = player.has(JSON_REJOIN);
-                int rawPlayerID = player.getInt(JSON_PLAYERID);
+                int rawPlayerID = TcpJson.getInt(player, JSON_PLAYERID);
                 if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0) {
                     Log.w(TAG, "Ignoring client with invalid player ID " + rawPlayerID);
                     return;

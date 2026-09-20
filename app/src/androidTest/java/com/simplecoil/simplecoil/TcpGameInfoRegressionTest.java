@@ -172,6 +172,123 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
+    public void lossyRosterIdsCannotReplacePlayersOrBundledSettings() throws Exception {
+        for (Object id : new Object[]{4294967299L, -4294967293L, 3.75, "3"}) {
+            parse(roster(new JSONArray().put(player(3).put(TcpServer.JSON_PLAYERID, id)))
+                    .put(TcpServer.JSON_PLAYERSETTINGS, new JSONArray().put(settings(1)))
+                    .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, false));
+            assertOriginalRoster();
+            assertOriginalSettings();
+        }
+    }
+
+    @Test
+    public void lossySettingsFieldsRejectTheCompleteSnapshot() throws Exception {
+        for (String key : new String[]{TcpServer.JSON_PLAYERID, TcpServer.JSON_HEALTH,
+                TcpServer.JSON_RELOAD_SHOTS, TcpServer.JSON_DAMAGE, TcpServer.JSON_LIVESLIMIT,
+                TcpServer.JSON_FIRING_MODE}) {
+            int valid = settings(2).getInt(key);
+            for (Object invalid : new Object[]{4294967296L + valid, valid + 0.25, "" + valid}) {
+                parse(settingsMessage(settings(1), settings(2).put(key, invalid)));
+                assertOriginalSettings();
+            }
+        }
+    }
+
+    @Test
+    public void fractionalReloadAndSpawnTimesDoNotChangePlayerSettings() throws Exception {
+        for (String key : new String[]{TcpServer.JSON_RELOAD_TIME, TcpServer.JSON_SPAWN_TIME}) {
+            long valid = settings(1).getLong(key);
+            for (Object invalid : new Object[]{valid + 0.25, "" + valid}) {
+                parse(settingsMessage(settings(1).put(key, invalid)));
+                assertOriginalSettings();
+            }
+        }
+    }
+
+    @Test
+    public void lossyGameLimitsDoNotReplaceTheRosterOrLimits() throws Exception {
+        for (String key : new String[]{TcpServer.JSON_TIMELIMIT, TcpServer.JSON_LIVESLIMIT,
+                TcpServer.JSON_SCORELIMIT}) {
+            for (Object invalid : new Object[]{4294967303L, 7.75, "7"}) {
+                parse(roster(new JSONArray().put(player(3)))
+                        .put(TcpServer.JSON_LIMITS, new JSONObject().put(key, invalid)));
+                assertOriginalRoster();
+                assertEquals(Globals.GAME_LIMIT_TIME, globals.mGameLimit);
+                assertEquals(5, globals.mTimeLimit);
+                assertTrue(client.events.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    public void lossyGameModesAndStatesCannotPublishARosterUpdate() throws Exception {
+        for (String key : new String[]{TcpServer.JSON_GAMEMODE, TcpServer.JSON_USEGPS,
+                TcpServer.JSON_GAMESTATE}) {
+            for (Object invalid : new Object[]{4294967297L, 1.75, "1"}) {
+                parse(roster(new JSONArray().put(player(3))).put(TcpServer.JSON_DEDICATED, true)
+                        .put(TcpServer.JSON_GAMESTATE, Globals.GAME_STATE_RUNNING).put(key, invalid));
+                assertOriginalRoster();
+                assertTrue(client.events.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    public void lossyScoresAndDeathsCannotPublishAGameUpdate() throws Exception {
+        for (String key : new String[]{TcpServer.JSON_PLAYERPOINTS, TcpServer.JSON_PLAYERELIMINATED,
+                TcpServer.JSON_TEAMPOINTS}) {
+            for (Object invalid : new Object[]{4294967303L, 7.75, "7"}) {
+                JSONObject update = new JSONObject().put(TcpServer.JSON_PLAYERPOINTS, 7)
+                        .put(TcpServer.JSON_PLAYERELIMINATED, 2).put(TcpServer.JSON_TEAMPOINTS, 11)
+                        .put(key, invalid);
+                parse(roster(new JSONArray().put(player(3))).put(TcpServer.JSON_PLAYERGAMEUPDATE, update));
+                assertOriginalRoster();
+                assertTrue(client.events.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    public void fractionalRemainingTimeCannotBecomeAnEndOfRoundNotification() throws Exception {
+        for (Object remaining : new Object[]{-0.5, 45.75, "45"}) {
+            JSONObject update = new JSONObject().put(TcpServer.JSON_PLAYERPOINTS, 7)
+                    .put(TcpServer.JSON_PLAYERELIMINATED, 2).put(TcpServer.JSON_TIMEREMAINING, remaining);
+            parse(roster(new JSONArray().put(player(3))).put(TcpServer.JSON_DEDICATED, true)
+                    .put(TcpServer.JSON_GAMESTATE, Globals.GAME_STATE_RUNNING)
+                    .put(TcpServer.JSON_PLAYERGAMEUPDATE, update));
+            assertOriginalRoster();
+            assertTrue(client.events.isEmpty());
+        }
+    }
+
+    @Test
+    public void lossyPairingFieldsCannotOverwriteTheGrenadeSnapshot() throws Exception {
+        int[] before = globals.mGrenadePairings.clone();
+        for (String key : new String[]{TcpServer.JSON_PAIRED_GRENADE_ID, TcpServer.JSON_PLAYERID}) {
+            for (Object invalid : new Object[]{4294967299L, 3.75, "3"}) {
+                parse(new JSONObject().put(TcpServer.JSON_GRENADE_PAIRINGS,
+                        new JSONArray().put(pairing(2, 3)).put(pairing(3, 4).put(key, invalid))));
+                assertArrayEquals(before, globals.mGrenadePairings);
+                assertTrue(client.events.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    public void lossyGpsIdsAndTeamsCannotEraseTheLocationSnapshot() throws Exception {
+        Globals.GPSData original = putGPS(2, 1);
+        for (String key : new String[]{TcpServer.JSON_PLAYERID, TcpServer.JSON_TEAM}) {
+            for (Object invalid : new Object[]{4294967299L, 3.75, "3"}) {
+                parse(gpsUpdate(true, gps(3, 2).put(key, invalid)));
+                assertEquals(1, globals.mGPSData.size());
+                assertSame(original, globals.mGPSData.get((byte) 2));
+                assertTrue(client.events.isEmpty());
+            }
+        }
+    }
+
+    @Test
     public void malformedLaterSettingsRowDoesNotChangeEarlierPlayers() throws Exception {
         parse(settingsMessage(settings(1), new JSONObject().put(TcpServer.JSON_PLAYERID, 2)));
         assertOriginalSettings();

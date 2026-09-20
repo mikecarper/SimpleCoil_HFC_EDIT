@@ -176,6 +176,62 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void lossyPlayerIdsCannotRegisterAsAnotherPlayer() throws Exception {
+        Object player = client(1, 0);
+        for (Object id : new Object[]{4294967297L, -4294967295L, 1.75, "1", "1.75"}) {
+            parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, id)
+                    .put(TcpServer.JSON_PLAYERNAME, "Invalid ID"));
+            assertEquals((byte) 0, get(player, "mPlayerID"));
+            assertTrue(Globals.getInstance().mTeamPlayerNameMap.isEmpty());
+            assertTrue(Globals.getInstance().mTeamIPMap.isEmpty());
+        }
+        register(player, 1, false);
+        assertEquals((byte) 1, get(player, "mPlayerID"));
+    }
+
+    @Test
+    public void overflowingRejoinIdCannotDisplaceTheExistingConnection() throws Exception {
+        Object original = client(1, 1);
+        Socket originalSocket = (Socket) get(original, "clientSocket");
+        Object replacement = client(2, 0);
+        parse(replacement, new JSONObject().put(TcpServer.JSON_PLAYERID, 4294967297L)
+                .put(TcpServer.JSON_REJOIN, true).put(TcpServer.JSON_PLAYERNAME, "Replacement"));
+        assertSame(originalSocket, get(original, "clientSocket"));
+        assertFalse(originalSocket.isClosed());
+        assertEquals((byte) 0, get(replacement, "mPlayerID"));
+        assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+    }
+
+    @Test
+    public void lossyRenameIdsCannotPassTheIdentityCheck() throws Exception {
+        Object player = client(1, 1);
+        for (Object id : new Object[]{4294967297L, 1.75, "1"}) {
+            parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, id)
+                    .put(TcpServer.JSON_PLAYERNAMECHANGE, "Invalid rename"));
+            assertEquals("Player 1", Globals.getInstance().getPlayerName((byte) 1));
+            assertEquals(0, server.playerUpdates);
+        }
+    }
+
+    @Test
+    public void lossyGrenadeIdsAndOwnersCannotChangeExistingPairings() throws Exception {
+        Object player = client(1, 1);
+        Globals.getInstance().mGrenadePairings[2] = 1;
+        Globals.getInstance().mGrenadePairings[3] = 9;
+        int before = server.messages.size();
+        for (String key : new String[]{TcpServer.JSON_PLAYERID, TcpServer.JSON_PAIRED_GRENADE_ID}) {
+            int valid = key.equals(TcpServer.JSON_PLAYERID) ? 1 : 3;
+            for (Object invalid : new Object[]{4294967296L + valid, valid + 0.75, "" + valid}) {
+                parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                        .put(TcpServer.JSON_PAIRED_GRENADE_ID, 3).put(key, invalid));
+                assertEquals(1, Globals.getInstance().mGrenadePairings[2]);
+                assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+                assertEquals(before, server.messages.size());
+            }
+        }
+    }
+
+    @Test
     public void newGrenadePairingRemovesThatPlayersPreviousPairing() throws Exception {
         Object player = client(1, 1);
         Globals.getInstance().mGrenadePairings[2] = 1;

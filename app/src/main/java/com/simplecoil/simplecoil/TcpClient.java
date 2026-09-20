@@ -584,8 +584,8 @@ public class TcpClient extends Service {
                 JSONArray grenadePairings = game.getJSONArray(TcpServer.JSON_GRENADE_PAIRINGS);
                 for (int x = 0; x < grenadePairings.length(); x++) {
                     JSONObject grenadePairing = grenadePairings.getJSONObject(x);
-                    int grenadeID = grenadePairing.getInt(TcpServer.JSON_PAIRED_GRENADE_ID);
-                    int playerID = grenadePairing.getInt(TcpServer.JSON_PLAYERID);
+                    int grenadeID = TcpJson.getInt(grenadePairing, TcpServer.JSON_PAIRED_GRENADE_ID);
+                    int playerID = TcpJson.getInt(grenadePairing, TcpServer.JSON_PLAYERID);
                     if (!Globals.isValidGrenadeID(grenadeID) || !Globals.isValidPlayerID(playerID) || playerID <= 0)
                         throw new JSONException("Invalid grenade pairing snapshot");
                     pairings[grenadeID] = playerID;
@@ -610,7 +610,7 @@ public class TcpClient extends Service {
                         && game.getBoolean(TcpServer.JSON_GPSFULLUPDATE);
                 for (int x = 0; x < updates.length(); x++) {
                     JSONObject update = updates.getJSONObject(x);
-                    int rawPlayerID = update.getInt(TcpServer.JSON_PLAYERID);
+                    int rawPlayerID = TcpJson.getInt(update, TcpServer.JSON_PLAYERID);
                     if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0)
                         throw new JSONException("Invalid GPS player ID " + rawPlayerID);
                     byte playerID = (byte) rawPlayerID;
@@ -623,7 +623,7 @@ public class TcpClient extends Service {
                         gps.longitude = longitude;
                         gps.latitude = latitude;
                         // Refresh team membership too: the host may have changed game modes.
-                        gps.team = update.getInt(TcpServer.JSON_TEAM);
+                        gps.team = TcpJson.getInt(update, TcpServer.JSON_TEAM);
                         gps.hasUpdate = true; // Anything that the server sends us is considered an update
                         locations.put(playerID, gps);
                     }
@@ -659,19 +659,19 @@ public class TcpClient extends Service {
                 allowPlayerSettings = game.getBoolean(TcpServer.JSON_ALLOWPLAYERSETTINGS);
                 for (int x = 0; x < settings.length(); x++) {
                     JSONObject setting = settings.getJSONObject(x);
-                    int rawPlayerID = setting.getInt(TcpServer.JSON_PLAYERID);
-                    int health = setting.getInt(TcpServer.JSON_HEALTH);
-                    int reloadShots = setting.getInt(TcpServer.JSON_RELOAD_SHOTS);
-                    long reloadTime = setting.getLong(TcpServer.JSON_RELOAD_TIME);
+                    int rawPlayerID = TcpJson.getInt(setting, TcpServer.JSON_PLAYERID);
+                    int health = TcpJson.getInt(setting, TcpServer.JSON_HEALTH);
+                    int reloadShots = TcpJson.getInt(setting, TcpServer.JSON_RELOAD_SHOTS);
+                    long reloadTime = TcpJson.getLong(setting, TcpServer.JSON_RELOAD_TIME);
                     boolean reloadOnEmpty = setting.getBoolean(TcpServer.JSON_RELOAD_ON_EMPTY);
-                    long spawnTime = setting.getLong(TcpServer.JSON_SPAWN_TIME);
-                    int damage = setting.getInt(TcpServer.JSON_DAMAGE);
+                    long spawnTime = TcpJson.getLong(setting, TcpServer.JSON_SPAWN_TIME);
+                    int damage = TcpJson.getInt(setting, TcpServer.JSON_DAMAGE);
                     boolean overrideLives = setting.has(TcpServer.JSON_LIVESLIMIT);
-                    int lives = overrideLives ? setting.getInt(TcpServer.JSON_LIVESLIMIT) : 0;
+                    int lives = overrideLives ? TcpJson.getInt(setting, TcpServer.JSON_LIVESLIMIT) : 0;
                     boolean allowSingle = setting.getBoolean(TcpServer.JSON_SHOT_MODE_SINGLE);
                     boolean allowBurst = setting.getBoolean(TcpServer.JSON_SHOT_MODE_BURST3);
                     boolean allowAuto = setting.getBoolean(TcpServer.JSON_SHOT_MODE_AUTO);
-                    int firingMode = setting.getInt(TcpServer.JSON_FIRING_MODE);
+                    int firingMode = TcpJson.getInt(setting, TcpServer.JSON_FIRING_MODE);
                     if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0
                             || !Globals.isValidPlayerSettings(health, reloadShots, reloadTime, spawnTime,
                             damage, lives, allowSingle, allowBurst, allowAuto, firingMode)) {
@@ -704,7 +704,7 @@ public class TcpClient extends Service {
                 JSONArray players = game.getJSONArray(TcpServer.JSON_PLAYERS);
                 for (int x = 0; x < players.length(); x++) {
                     JSONObject player = players.getJSONObject(x);
-                    int rawPlayerID = player.getInt(TcpServer.JSON_PLAYERID);
+                    int rawPlayerID = TcpJson.getInt(player, TcpServer.JSON_PLAYERID);
                     if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID <= 0)
                         throw new JSONException("Invalid roster player ID " + rawPlayerID);
                     byte playerID = (byte) rawPlayerID;
@@ -736,7 +736,7 @@ public class TcpClient extends Service {
                 int scoreLimit = globals.mScoreLimit;
                 JSONObject limits = game.getJSONObject(TcpServer.JSON_LIMITS);
                 if (limits.has(TcpServer.JSON_TIMELIMIT)) {
-                    int value = limits.getInt(TcpServer.JSON_TIMELIMIT);
+                    int value = TcpJson.getInt(limits, TcpServer.JSON_TIMELIMIT);
                     if (value > 0 && Globals.isValidGameLimit(value)) {
                         gameLimit |= Globals.GAME_LIMIT_TIME;
                         timeLimit = value;
@@ -745,7 +745,7 @@ public class TcpClient extends Service {
                     }
                 }
                 if (limits.has(TcpServer.JSON_LIVESLIMIT)) {
-                    int value = limits.getInt(TcpServer.JSON_LIVESLIMIT);
+                    int value = TcpJson.getInt(limits, TcpServer.JSON_LIVESLIMIT);
                     if (value > 0 && Globals.isValidGameLimit(value)) {
                         gameLimit |= Globals.GAME_LIMIT_LIVES;
                         livesLimit = value;
@@ -754,7 +754,7 @@ public class TcpClient extends Service {
                     }
                 }
                 if (limits.has(TcpServer.JSON_SCORELIMIT)) {
-                    int value = limits.getInt(TcpServer.JSON_SCORELIMIT);
+                    int value = TcpJson.getInt(limits, TcpServer.JSON_SCORELIMIT);
                     if (value > 0 && Globals.isValidGameLimit(value)) {
                         gameLimit |= Globals.GAME_LIMIT_SCORE;
                         scoreLimit = value;
@@ -762,7 +762,7 @@ public class TcpClient extends Service {
                         Log.w(TAG, "Ignoring invalid score limit from server: " + value);
                     }
                 }
-                int gameMode = game.getInt(TcpServer.JSON_GAMEMODE);
+                int gameMode = TcpJson.getInt(game, TcpServer.JSON_GAMEMODE);
                 if (!Globals.isValidGameMode(gameMode)) {
                     Log.w(TAG, "Ignoring invalid game mode from server: " + gameMode);
                     gameMode = globals.mGameMode;
@@ -770,7 +770,7 @@ public class TcpClient extends Service {
                 boolean useGPS = game.has(TcpServer.JSON_USEGPS);
                 int gpsMode = globals.mGPSMode;
                 if (useGPS) {
-                    int value = game.getInt(TcpServer.JSON_USEGPS);
+                    int value = TcpJson.getInt(game, TcpServer.JSON_USEGPS);
                     if (Globals.isValidGPSMode(value) && value != Globals.GPS_DISABLED) {
                         gpsMode = value;
                     } else {
@@ -783,12 +783,12 @@ public class TcpClient extends Service {
                 if (game.has(TcpServer.JSON_PLAYERGAMEUPDATE)) {
                     intent.putExtra(NetMsg.INTENT_HASGAMEUPDATE, true);
                     JSONObject playerGameUpdate = game.getJSONObject(TcpServer.JSON_PLAYERGAMEUPDATE);
-                    intent.putExtra(NetMsg.INTENT_SCORE, playerGameUpdate.getInt(TcpServer.JSON_PLAYERPOINTS));
-                    intent.putExtra(NetMsg.INTENT_ELIMINATIONS, playerGameUpdate.getInt(TcpServer.JSON_PLAYERELIMINATED));
+                    intent.putExtra(NetMsg.INTENT_SCORE, TcpJson.getInt(playerGameUpdate, TcpServer.JSON_PLAYERPOINTS));
+                    intent.putExtra(NetMsg.INTENT_ELIMINATIONS, TcpJson.getInt(playerGameUpdate, TcpServer.JSON_PLAYERELIMINATED));
                     if (playerGameUpdate.has(TcpServer.JSON_TEAMPOINTS))
-                        intent.putExtra(NetMsg.INTENT_TEAMSCORE, playerGameUpdate.getInt(TcpServer.JSON_TEAMPOINTS));
+                        intent.putExtra(NetMsg.INTENT_TEAMSCORE, TcpJson.getInt(playerGameUpdate, TcpServer.JSON_TEAMPOINTS));
                     if (playerGameUpdate.has(TcpServer.JSON_TIMEREMAINING)) {
-                        long timeRemaining = playerGameUpdate.getLong(TcpServer.JSON_TIMEREMAINING);
+                        long timeRemaining = TcpJson.getLong(playerGameUpdate, TcpServer.JSON_TIMEREMAINING);
                         long maxGameTimeSeconds = (long) Globals.MAX_GAME_LIMIT * 60 + Globals.MAX_RESPAWN_TIME_SECONDS;
                         if (timeRemaining >= 0 && timeRemaining <= maxGameTimeSeconds)
                             intent.putExtra(NetMsg.INTENT_TIMEREMAINING, timeRemaining);
@@ -798,7 +798,7 @@ public class TcpClient extends Service {
                 }
                 boolean dedicatedServer = game.has(TcpServer.JSON_DEDICATED) && game.getBoolean(TcpServer.JSON_DEDICATED);
                 if (dedicatedServer) {
-                    int gameState = game.getInt(TcpServer.JSON_GAMESTATE);
+                    int gameState = TcpJson.getInt(game, TcpServer.JSON_GAMESTATE);
                     if (gameState >= Globals.GAME_STATE_NONE && gameState <= Globals.GAME_STATE_ELIMINATED)
                         intent.putExtra(NetMsg.INTENT_GAMESTATE, gameState);
                     else

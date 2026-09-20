@@ -141,6 +141,76 @@ public class TcpJsonRegressionTest {
         fail("Player name editor was not found");
     }
 
+    @Test
+    public void integerReadsPreserveBothSignedIntBoundaries() throws Exception {
+        for (int value : new int[]{Integer.MIN_VALUE, Integer.MAX_VALUE, -1, 0, 1}) {
+            JSONObject json = TcpJson.parseObject(new JSONObject().put("value", value).toString());
+            assertEquals(value, TcpJson.getInt(json, "value"));
+            assertEquals(value, TcpJson.getLong(json, "value"));
+        }
+    }
+
+    @Test
+    public void integerReadsRejectValuesThatWouldWrapIntoRange() throws Exception {
+        for (long value : new long[]{(long) Integer.MIN_VALUE - 1, (long) Integer.MAX_VALUE + 1,
+                4294967297L, -4294967295L, Long.MIN_VALUE, Long.MAX_VALUE}) {
+            JSONObject json = TcpJson.parseObject(new JSONObject().put("value", value).toString());
+            assertIntegerReadRejected(json, false);
+        }
+    }
+
+    @Test
+    public void longReadsPreserveValuesBeyondDoublePrecision() throws Exception {
+        for (long value : new long[]{Long.MIN_VALUE, Long.MIN_VALUE + 1, Long.MAX_VALUE,
+                Long.MAX_VALUE - 1, 9007199254740993L, -9007199254740993L}) {
+            JSONObject json = TcpJson.parseObject(new JSONObject().put("value", value).toString());
+            assertEquals(value, TcpJson.getLong(json, "value"));
+        }
+    }
+
+    @Test
+    public void longReadsRejectOverflowInsteadOfSaturating() throws Exception {
+        for (String value : new String[]{"9223372036854775808", "-9223372036854775809", "1e100"}) {
+            JSONObject json = TcpJson.parseObject("{\"value\":" + value + "}");
+            assertIntegerReadRejected(json, true);
+        }
+    }
+
+    @Test
+    public void integerFieldsRejectFractionalAndFloatingPointEncodings() throws Exception {
+        for (String value : new String[]{"1.75", "-0.5", "1.00000000000000001", "1.0", "1e0"}) {
+            JSONObject json = TcpJson.parseObject("{\"value\":" + value + "}");
+            assertIntegerReadRejected(json, false);
+            assertIntegerReadRejected(json, true);
+        }
+    }
+
+    @Test
+    public void integerFieldsDoNotCoerceStringsBooleansNullOrContainers() throws Exception {
+        for (Object value : new Object[]{"1", "-5", "1.75", "1e2", "NaN", "Infinity",
+                true, false, JSONObject.NULL, new JSONObject(), new JSONArray()}) {
+            JSONObject json = TcpJson.parseObject(new JSONObject().put("value", value).toString());
+            assertIntegerReadRejected(json, false);
+            assertIntegerReadRejected(json, true);
+        }
+    }
+
+    @Test
+    public void missingIntegerFieldsRaiseCheckedParseErrors() throws Exception {
+        assertIntegerReadRejected(new JSONObject(), false);
+        assertIntegerReadRejected(new JSONObject(), true);
+    }
+
+    private static void assertIntegerReadRejected(JSONObject json, boolean readLong) throws Exception {
+        try {
+            if (readLong) TcpJson.getLong(json, "value");
+            else TcpJson.getInt(json, "value");
+            fail("Invalid integer field was accepted");
+        } catch (JSONException expected) {
+            // Callers already handle checked parse failures without changing game state.
+        }
+    }
+
     private static void assertRejected(String message) throws Exception {
         try {
             TcpJson.parseObject(message);

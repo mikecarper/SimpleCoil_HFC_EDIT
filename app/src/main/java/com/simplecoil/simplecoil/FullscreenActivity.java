@@ -3114,20 +3114,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 for (int x = 0; x < players.length(); x++) {
                     JSONObject player = players.getJSONObject(x);
                     PlayerDisplayData playerData = new PlayerDisplayData();
-                    int rawPlayerID = player.getInt(TcpServer.JSON_PLAYERID);
+                    int rawPlayerID = TcpJson.getInt(player, TcpServer.JSON_PLAYERID);
                     if (!Globals.isValidPlayerID(rawPlayerID) || rawPlayerID >= playerDisplayData.length) {
                         Log.w(TAG, "Ignoring player data for invalid player ID " + rawPlayerID);
                         continue;
                     }
                     playerData.playerID = (byte) rawPlayerID;
                     playerData.playerName = TcpJson.getPlayerName(player, TcpServer.JSON_PLAYERNAME);
-                    playerData.points = player.getInt(TcpServer.JSON_PLAYERPOINTS);
+                    playerData.points = TcpJson.getInt(player, TcpServer.JSON_PLAYERPOINTS);
                     if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                         int team = Globals.getInstance().calcNetworkTeam(playerData.playerID);
                         if (team >= 1 && team <= teamPoints.length)
                             teamPoints[team - 1] += playerData.points;
                     }
-                    playerData.eliminated = player.getInt(TcpServer.JSON_PLAYERELIMINATED);
+                    playerData.eliminated = TcpJson.getInt(player, TcpServer.JSON_PLAYERELIMINATED);
                     Globals.PlayerSettings playerSettings = Globals.getInstance().mPlayerSettings.get(playerData.playerID);
                     if (playerSettings == null) {
                         playerData.overrideLives = false;

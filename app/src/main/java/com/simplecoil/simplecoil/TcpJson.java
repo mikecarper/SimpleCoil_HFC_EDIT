@@ -75,4 +75,21 @@ final class TcpJson {
             throw new JSONException("Invalid player name");
         return (String) value;
     }
+
+    static int getInt(JSONObject object, String key) throws JSONException {
+        long value = getLong(object, key);
+        if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE)
+            throw new JSONException("Network integer is out of range: " + key);
+        return (int) value;
+    }
+
+    static long getLong(JSONObject object, String key) throws JSONException {
+        Object value = object.get(key);
+        // Integer protocol fields are emitted as JSON integer literals. Android's
+        // getters also accept strings and doubles, truncating fractions or wrapping
+        // oversized integers before the caller's ID/settings validation can run.
+        if (!(value instanceof Integer) && !(value instanceof Long))
+            throw new JSONException("Expected a network integer: " + key);
+        return ((Number) value).longValue();
+    }
 }
