@@ -65,6 +65,7 @@ public class TcpServerRegressionTest {
         globals.mGameMode = Globals.GAME_MODE_FFA;
         globals.mGameLimit = Globals.GAME_LIMIT_NONE;
         globals.mOnlyServerSettings = false;
+        globals.mTournamentMode = false;
         clearPlayerMaps();
     }
 
@@ -75,6 +76,7 @@ public class TcpServerRegressionTest {
             invoke(client, "close", new Class<?>[0]);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
+        Globals.getInstance().mTournamentMode = false;
         System.arraycopy(originalPairings, 0, Globals.getInstance().mGrenadePairings, 0, originalPairings.length);
         clearPlayerMaps();
     }
@@ -968,6 +970,44 @@ public class TcpServerRegressionTest {
         processMessage(sender, NetMsg.NETMSG_LEAVE);
         assertFalse(clients.containsKey(1));
         assertEquals(0, server.endRequests);
+    }
+
+    @Test
+    public void voluntaryQuitDoesNotEndTheRemainingFfaRound() throws Exception {
+        Object quitter = client(1, 1);
+        client(2, 11);
+
+        processMessage(quitter, NetMsg.NETMSG_QUIT);
+
+        assertFalse(clients.containsKey(1));
+        assertEquals("A voluntary quit ended the remaining player's round", 0, server.endRequests);
+        assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+    }
+
+    @Test
+    public void tournamentClientCannotEndTheHostRound() throws Exception {
+        Globals.getInstance().mTournamentMode = true;
+        Object clientRequestingEnd = client(1, 1);
+        client(2, 11);
+
+        processMessage(clientRequestingEnd, NetMsg.NETMSG_ENDGAME);
+
+        assertFalse(clients.containsKey(1));
+        assertEquals("A tournament client ended the host's round", 0, server.endRequests);
+        assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+    }
+
+    @Test
+    public void tournamentClientLeaveCannotEndTheHostRound() throws Exception {
+        Globals.getInstance().mTournamentMode = true;
+        Object leavingClient = client(1, 1);
+        client(2, 11);
+
+        processMessage(leavingClient, NetMsg.NETMSG_LEAVE);
+
+        assertFalse(clients.containsKey(1));
+        assertEquals("A tournament client leave ended the host's round", 0, server.endRequests);
+        assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
     }
 
     @Test

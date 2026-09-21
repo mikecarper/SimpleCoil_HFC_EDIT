@@ -45,6 +45,7 @@ import java.net.Socket;
 import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -101,6 +102,17 @@ public class TcpClient extends Service {
     private Intent mPendingStartIntent;
     private Intent mPendingGameStartEvent;
     private static final long CLOCK_REFRESH_MS = 30000;
+    // Once a shared countdown has been announced, take one inexpensive probe
+    // per second.  The probe only improves an already-good NTP estimate; it
+    // never delays the countdown or floods the dedicated host with a new
+    // five-sample burst.
+    private static final long COUNTDOWN_CLOCK_REFRESH_MS = 1000;
+    private static final long START_CLOCK_ADJUSTMENT_THRESHOLD_MS = 50;
+    private long mActiveHostStartAt = -1;
+    private long mActiveStartDuration;
+    private long mActiveLocalStartAt = -1;
+    private long mActiveStartRound;
+    private String mActiveStartToken;
 
     private volatile DataOutputStream out = null;
     private Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
@@ -304,7 +316,7 @@ public class TcpClient extends Service {
         try {
             writer.writeUTF(message);
             writer.flush();
-            if (!message.equals(TCP_CLIENT_PONG))
+            if (BuildConfig.DEBUG && !message.equals(TCP_CLIENT_PONG))
                 Log.i(TAG, "sent: " + message);
             return true;
         } catch (IOException e) {
@@ -330,10 +342,34 @@ public class TcpClient extends Service {
         mPendingStartInfo = null;
         mPendingStartIntent = null;
         mPendingGameStartEvent = null;
+        clearActiveStartLocked();
         mPongQueued = false;
     }
 
     public synchronized boolean isClockSynchronized() { return mClockSynchronized; }
+
+    private void clearActiveStartLocked() {
+        mActiveHostStartAt = -1;
+        mActiveStartDuration = 0;
+        mActiveLocalStartAt = -1;
+        mActiveStartRound = 0;
+        mActiveStartToken = null;
+    }
+
+    /**
+     * The initial five-sample exchange establishes the start deadline.  While
+     * that deadline is still in the future, small follow-up probes can replace
+     * it only with a materially better clock estimate.  Once the deadline has
+     * passed, changing it would make an already-started round jump backwards.
+     */
+    private boolean hasActiveStartCountdownLocked(long now) {
+        if (mActiveHostStartAt < 0 || mActiveLocalStartAt < 0)
+            return false;
+        if (now < mActiveLocalStartAt)
+            return true;
+        clearActiveStartLocked();
+        return false;
+    }
 
     private synchronized void requestClockSync() {
         if (mDestroyed || !keepListening || out == null || sendExecutor.isShutdown() || mClockRequestQueued)
@@ -342,9 +378,17 @@ public class TcpClient extends Service {
         if (mPendingClockRequest >= 0 && now - mPendingClockRequest < GameClock.MAX_ROUND_TRIP_MS)
             return;
         if (mGameClock.samples() >= GameClock.SAMPLES_PER_SYNC) {
-            if (now - mLastClockSync < CLOCK_REFRESH_MS)
+            boolean countdownActive = hasActiveStartCountdownLocked(now);
+            long refreshInterval = countdownActive ? COUNTDOWN_CLOCK_REFRESH_MS : CLOCK_REFRESH_MS;
+            if (now - mLastClockSync < refreshInterval)
                 return;
-            mGameClock.beginSampling();
+            // The initial synchronization and ordinary background refreshes
+            // use a fresh five-sample batch.  A running countdown uses one
+            // probe against the current best sample instead, which lets a
+            // better low-latency exchange refine the deadline without making
+            // every phone repeatedly enter a high-rate sampling burst.
+            if (!countdownActive)
+                mGameClock.beginSampling();
         }
         final DataOutputStream writer = out;
         final long generation = mSessionGeneration;
@@ -375,24 +419,36 @@ public class TcpClient extends Service {
         long hostReceived = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_RECEIVE);
         long hostSent = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_SEND);
         boolean ready;
+        boolean announceReady = false;
         synchronized (this) {
             if (!isCurrentSession(generation) || sentAt != mPendingClockRequest || sentAt < 0)
                 return;
             mPendingClockRequest = -1;
-            if (!mGameClock.record(sentAt, hostReceived, hostSent, receivedAt))
+            if (!mGameClock.record(sentAt, hostReceived, hostSent, receivedAt)) {
+                // A follow-up probe can be rejected for excessive delay.  Keep
+                // the last good estimate, but do not immediately retry in a
+                // tight loop while a busy Wi-Fi link is recovering.
+                if (mClockSynchronized)
+                    mLastClockSync = receivedAt;
                 return;
+            }
             ready = mGameClock.samples() >= GameClock.SAMPLES_PER_SYNC;
             if (ready) {
+                announceReady = !mClockSynchronized;
                 mClockSynchronized = true;
                 mLastClockSync = receivedAt;
-                sendPriorityTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
-                        + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+                if (announceReady) {
+                    sendPriorityTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                            + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+                }
             }
         }
-        if (ready)
+        if (ready) {
             publishPendingStart(generation);
-        else
+            publishClockAdjustedStart(generation);
+        } else {
             requestClockSync();
+        }
     }
 
     private static JSONObject readStartInfo(JSONObject message) throws JSONException {
@@ -433,7 +489,8 @@ public class TcpClient extends Service {
     private synchronized void publishPendingStart(long generation) throws JSONException {
         if (!isCurrentSession(generation) || !mClockSynchronized || mPendingStartInfo == null)
             return;
-        long startAt = mGameClock.toLocalTime(TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GAMESTART));
+        long hostStartAt = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GAMESTART);
+        long startAt = mGameClock.toLocalTime(hostStartAt);
         long duration = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GAMEDURATION);
         long roundID = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_ROUND_ID);
         Object roundTokenValue = mPendingStartInfo.get(TcpServer.JSON_ROUND_TOKEN);
@@ -448,9 +505,23 @@ public class TcpClient extends Service {
             throw new JSONException("Synchronized start is too far in the future");
         mLastStartRound = roundID;
         if (duration > 0 && startAt + duration <= now) {
-            finishServerSession(NetMsg.NETMSG_ENDGAME);
+            // A start plan may reach a paused client after its timed round has
+            // already expired. An active TCP session must retire normally; the
+            // parser is also used before a worker has been started, where
+            // finishServerSession intentionally ignores inactive sessions.
+            // In that latter case still tell the UI not to start a fresh
+            // countdown from a finished round.
+            if (keepListening)
+                finishServerSession(NetMsg.NETMSG_ENDGAME);
+            else
+                broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_ENDGAME));
             return;
         }
+        mActiveHostStartAt = hostStartAt;
+        mActiveStartDuration = duration;
+        mActiveLocalStartAt = startAt;
+        mActiveStartRound = roundID;
+        mActiveStartToken = roundToken;
         intent.putExtra(NetMsg.INTENT_START_AT, startAt)
                 .putExtra(NetMsg.INTENT_END_AT, duration == 0 ? 0 : startAt + duration)
                 .putExtra(NetMsg.INTENT_ROUND_ID, roundID)
@@ -463,6 +534,38 @@ public class TcpClient extends Service {
         // even if the activity is paused, and retain the start until it resumes.
         if (!mIsDedicatedServer)
             keepListening = false;
+    }
+
+    /**
+     * Broadcast a local-only adjustment for a start that the activity is
+     * already counting down to.  The host deadline itself remains unchanged;
+     * only this phone's conversion from the host monotonic clock is refined.
+     */
+    private synchronized void publishClockAdjustedStart(long generation) {
+        if (!isCurrentSession(generation) || !mClockSynchronized
+                || mActiveHostStartAt < 0 || mActiveStartToken == null)
+            return;
+        long now = SystemClock.elapsedRealtime();
+        if (!hasActiveStartCountdownLocked(now))
+            return;
+        final long adjustedStartAt;
+        try {
+            adjustedStartAt = mGameClock.toLocalTime(mActiveHostStartAt);
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        if (Math.abs(adjustedStartAt - mActiveLocalStartAt) < START_CLOCK_ADJUSTMENT_THRESHOLD_MS)
+            return;
+        long adjustedEndAt = mActiveStartDuration == 0 ? 0 : adjustedStartAt + mActiveStartDuration;
+        Intent adjustment = new Intent(NetMsg.NETMSG_STARTGAME)
+                .putExtra(NetMsg.INTENT_START_TIME_ADJUSTMENT, true)
+                .putExtra(NetMsg.INTENT_START_AT, adjustedStartAt)
+                .putExtra(NetMsg.INTENT_END_AT, adjustedEndAt)
+                .putExtra(NetMsg.INTENT_ROUND_ID, mActiveStartRound)
+                .putExtra(NetMsg.INTENT_ROUND_TOKEN, mActiveStartToken)
+                .putExtra(NetMsg.INTENT_PEER_GAME, !mIsDedicatedServer);
+        mActiveLocalStartAt = adjustedStartAt;
+        broadcastIfCurrentSession(generation, adjustment);
     }
 
     public synchronized Intent consumePendingGameStart(long eventId) {
@@ -568,6 +671,7 @@ public class TcpClient extends Service {
                 // Discovery may find another host while this session is reconnecting.
                 // Pending events belong only to the server selected at explicit start.
                 s.connect(new InetSocketAddress(serverAddress, TcpServer.TCP_SERVER_PORT), CONNECTION_TIMEOUT_MS);
+                s.setTcpNoDelay(true);
                 is = s.getInputStream();
                 in = new DataInputStream(is);
                 TcpMessageReader messageReader = new TcpMessageReader();
@@ -598,7 +702,8 @@ public class TcpClient extends Service {
                         if (message.equals(TcpServer.TCP_SERVER_PING))
                             sendPong();
                         else {
-                            Log.i(TAG, "received: '" + message + "'");
+                            if (BuildConfig.DEBUG)
+                                Log.i(TAG, "received: '" + message + "'");
                             if (message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON)) {
                                 message = message.substring(TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length());
                                 parseGameInfo(message);
@@ -828,6 +933,42 @@ public class TcpClient extends Service {
         sendPlayerGrenade(false);
     }
 
+    /**
+     * Report a confirmed blaster shot to a dedicated host's optional live
+     * dashboard. This is intentionally non-persistent: a delayed shot from a
+     * prior life or round must never inflate the next round's accuracy.
+     */
+    public void reportHostedShots(int count) {
+        if (!mIsDedicatedServer || count < 1 || count > Globals.MAX_RELOAD_COUNT)
+            return;
+        try {
+            JSONObject telemetry = new JSONObject();
+            telemetry.put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_SHOT);
+            telemetry.put(TcpServer.JSON_TELEMETRY_COUNT, count);
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry.toString());
+        } catch (JSONException e) {
+            Log.w(TAG, "Unable to encode hosted shot telemetry", e);
+        }
+    }
+
+    /**
+     * The receiving phone is the one that can verify an IR hit. Reporting the
+     * attacker's ID here lets a laptop host draw an accurate shooter-to-target
+     * trace and count hits without trusting a self-reported kill.
+     */
+    public void reportHostedHit(int attackerID) {
+        if (!mIsDedicatedServer || attackerID <= 0 || !Globals.isValidPlayerID(attackerID))
+            return;
+        try {
+            JSONObject telemetry = new JSONObject();
+            telemetry.put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_HIT);
+            telemetry.put(TcpServer.JSON_TELEMETRY_ATTACKER, attackerID);
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry.toString());
+        } catch (JSONException e) {
+            Log.w(TAG, "Unable to encode hosted hit telemetry", e);
+        }
+    }
+
     private void sendPlayerGrenade(boolean priority) {
         try {
             JSONObject playerGrenade = new JSONObject();
@@ -871,6 +1012,15 @@ public class TcpClient extends Service {
         }
     }
 
+    /** Leave a dedicated game without requesting that the host end its round. */
+    public void quitGame() {
+        if (keepListening) {
+            String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_QUIT;
+            sendPriorityTCPMessage(message);
+            stopTcpClient();
+        }
+    }
+
     private void sleep(long millis) {
         try {
             Thread.sleep(millis);
@@ -883,6 +1033,12 @@ public class TcpClient extends Service {
     private void waitBeforeReconnect() {
         if (keepListening)
             sleep(RECONNECT_RETRY_DELAY_MS);
+    }
+
+    private static boolean isSameGPSData(Globals.GPSData current, Globals.GPSData incoming) {
+        return current != null && current.team == incoming.team
+                && Double.compare(current.longitude, incoming.longitude) == 0
+                && Double.compare(current.latitude, incoming.latitude) == 0;
     }
 
     private void parseGameInfo(String message) {
@@ -974,9 +1130,30 @@ public class TcpClient extends Service {
                     synchronized (this) {
                         if (!isCurrentSession(generation))
                             return;
-                        if (fullUpdate)
-                            Globals.getInstance().mGPSData.clear();
-                        Globals.getInstance().mGPSData.putAll(locations);
+                        Map<Byte, Globals.GPSData> currentLocations = Globals.getInstance().mGPSData;
+                        if (currentLocations == null) {
+                            currentLocations = new HashMap<>();
+                            Globals.getInstance().mGPSData = currentLocations;
+                        }
+                        if (fullUpdate) {
+                            // Reconcile rather than clear-and-recreate unchanged entries.  That
+                            // lets the map retain its native marker objects during the periodic
+                            // full snapshot, while still removing players absent from it.
+                            Iterator<Map.Entry<Byte, Globals.GPSData>> existing
+                                    = currentLocations.entrySet().iterator();
+                            while (existing.hasNext()) {
+                                if (!locations.containsKey(existing.next().getKey()))
+                                    existing.remove();
+                            }
+                        }
+                        for (Map.Entry<Byte, Globals.GPSData> entry : locations.entrySet()) {
+                            Globals.GPSData current = currentLocations.get(entry.getKey());
+                            if (!isSameGPSData(current, entry.getValue())) {
+                                currentLocations.put(entry.getKey(), entry.getValue());
+                            }
+                            // If the previous event is still waiting for the UI, preserve its
+                            // update marker; otherwise identical data needs no map rebuild.
+                        }
                     }
                 } finally {
                     Globals.getInstance().mGPSDataSemaphore.release();
@@ -1011,6 +1188,11 @@ public class TcpClient extends Service {
             }
             Map<Byte, Globals.PlayerSettings> settingsUpdate = null;
             boolean allowPlayerSettings = false;
+            final boolean tournamentModeSpecified = game.has(TcpServer.JSON_TOURNAMENT_MODE);
+            final boolean tournamentMode = tournamentModeSpecified
+                    && TcpJson.getBoolean(game, TcpServer.JSON_TOURNAMENT_MODE);
+            final Boolean onlyServerSettingsUpdate = game.has(TcpServer.JSON_ONLY_SERVER_SETTINGS)
+                    ? TcpJson.getBoolean(game, TcpServer.JSON_ONLY_SERVER_SETTINGS) : null;
             if (game.has(TcpServer.JSON_PLAYERSETTINGS)) {
                 JSONArray settings = game.getJSONArray(TcpServer.JSON_PLAYERSETTINGS);
                 if (settings.length() > Globals.MAX_PLAYER_ID)
@@ -1144,7 +1326,18 @@ public class TcpClient extends Service {
                         useGPS = false;
                     }
                 }
-                boolean onlyServerSettings = game.getBoolean(TcpServer.JSON_ONLY_SERVER_SETTINGS);
+                if (onlyServerSettingsUpdate == null)
+                    throw new JSONException("Missing server settings policy");
+                boolean onlyServerSettings = onlyServerSettingsUpdate;
+                if (tournamentMode) {
+                    if (gameMode != Globals.GAME_MODE_2TEAMS)
+                        throw new JSONException("Tournament mode must use two teams");
+                    // These rules are deliberately enforced at both ends.  A future server
+                    // change cannot accidentally advertise a tournament while permitting a
+                    // player-specific auto/burst profile.
+                    onlyServerSettings = true;
+                    allowPlayerSettings = false;
+                }
                 Intent intent = new Intent(NetMsg.NETMSG_LISTPLAYERS);
                 if (game.has(TcpServer.JSON_PLAYERGAMEUPDATE)) {
                     intent.putExtra(NetMsg.INTENT_HASGAMEUPDATE, true);
@@ -1195,6 +1388,9 @@ public class TcpClient extends Service {
                                 synchronized (this) {
                                     if (!isCurrentSession(generation))
                                         return;
+                                    globals.mTournamentMode = tournamentMode;
+                                    if (tournamentMode)
+                                        globals.applyTournamentRules();
                                     if (settingsUpdate != null)
                                         applyPlayerSettingsLocked(settingsUpdate, allowPlayerSettings);
                                     globals.mTeamIPMap.clear();
@@ -1234,6 +1430,19 @@ public class TcpClient extends Service {
                     synchronized (this) {
                         if (!isCurrentSession(generation))
                             return;
+                        if (tournamentModeSpecified) {
+                            Globals.getInstance().mTournamentMode = tournamentMode;
+                            if (tournamentMode) {
+                                Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
+                                Globals.getInstance().mOnlyServerSettings = true;
+                                Globals.getInstance().applyTournamentRules();
+                                allowPlayerSettings = false;
+                            } else if (onlyServerSettingsUpdate != null) {
+                                Globals.getInstance().mOnlyServerSettings = onlyServerSettingsUpdate;
+                            }
+                        } else if (onlyServerSettingsUpdate != null) {
+                            Globals.getInstance().mOnlyServerSettings = onlyServerSettingsUpdate;
+                        }
                         applyPlayerSettingsLocked(settingsUpdate, allowPlayerSettings);
                     }
                 } finally {
@@ -1261,6 +1470,12 @@ public class TcpClient extends Service {
         // new game when the same player ID is reused.
         globals.mPlayerSettings.clear();
         globals.mPlayerSettings.putAll(settings);
+        if (globals.mTournamentMode) {
+            for (Globals.PlayerSettings playerSettings : globals.mPlayerSettings.values())
+                Globals.applyTournamentRules(playerSettings);
+            globals.applyTournamentRules();
+            return;
+        }
         Globals.PlayerSettings local = settings.get(globals.mPlayerID);
         if (local != null) {
             globals.mFullHealth = local.health;
@@ -1298,7 +1513,6 @@ public class TcpClient extends Service {
             final String action = intent.getAction();
             if (action == null)
                 return;
-            Log.e(TAG, action);
             if (NetMsg.NETMSG_GPSLOCUPDATE.equals(action)) {
                 double longitude = intent.getDoubleExtra(NetMsg.INTENT_LONGITUDE, Double.NaN);
                 double latitude = intent.getDoubleExtra(NetMsg.INTENT_LATITUDE, Double.NaN);

@@ -1,6 +1,4 @@
 <resources>
-    <string name="app_name">SimpleCoil Edited by Marius</string>
-
     //placeholder strings
     <string name="integer" translatable="false">%d</string>
     //weapon connect state strings
@@ -76,8 +74,18 @@
     <string name="respawn_qr_invalid">This is not a respawn QR code.</string>
     <string name="respawn_qr_wrong_team">That respawn QR belongs to another team.</string>
     <string name="respawn_qr_request_sent">Respawn requested.</string>
-    <string name="error_camera_permission_required">Camera permission is required to scan a respawn QR code.</string>
-    <string name="error_camera_unavailable">This device has no available camera for respawn QR scanning.</string>
+    <string name="respawn_qr_voice_prompt">Go back to base and scan respawn code.</string>
+    <string name="team_qr_scan_button">SCAN TEAM QR</string>
+    <string name="team_qr_scanner_prompt">Scan a TEAM respawn QR code to choose your team</string>
+    <string name="team_qr_cancel_button">CANCEL</string>
+    <string name="team_qr_assigned">Joined Team %1$d as Player %2$d.</string>
+    <string name="team_qr_unavailable_team">This game does not have Team %1$d.</string>
+    <string name="team_qr_no_available_player">That team has no free player IDs.</string>
+    <string name="combat_feedback_hit">HIT</string>
+    <string name="combat_feedback_already_dead">ALREADY\nDEAD</string>
+    <string name="enemy_destroyed_voice_prompt">Enemy Destroyed</string>
+    <string name="error_camera_permission_required">Camera permission is required to scan a QR code.</string>
+    <string name="error_camera_unavailable">This device has no available camera for QR scanning.</string>
     //Ble Strings
     <string name="ble_not_supported">BLE is not supported</string>
     <string name="error_bluetooth_not_supported">Bluetooth not supported.</string>
@@ -89,6 +97,12 @@
     <string name="error_udp_version">Network client version mismatch. Please update the app!</string>
     <string name="error_no_wifi">Wi-Fi must be connected!</string>
     <string name="error_join">Unable to find server lobby!</string>
+    <string name="game_invite_title">Join game?</string>
+    <string name="game_invite_message">A nearby host started a game. Joining automatically in %1$d seconds.</string>
+    <string name="game_invite_join_now">Join now</string>
+    <string name="game_invite_decline">Don’t join</string>
+    <string name="game_invite_select_team">Select a team before accepting a game invitation.</string>
+    <string name="game_invite_joining">Joining game&#8230;</string>
     <string name="error_host_start">Unable to start server lobby!</string>
     <string name="error_server_cancel">Server was canceled!</string>
     <string name="error_limit_too_high">Limit is too high!</string>
@@ -97,6 +111,10 @@
 
     <string name="end_game_dialog_title">End Game?</string>
     <string name="end_game_dialog_message">Are you sure you want to stop playing?</string>
+    <string name="quit_game_button">Quit Game</string>
+    <string name="quit_game_button_countdown">Quit Game (%1$d)</string>
+    <string name="quit_game_dialog_title">Quit Game?</string>
+    <string name="quit_game_dialog_message">Leave this game without ending it for everyone else?</string>
     <string name="yes">Yes</string>
     <string name="no">No</string>
     <string name="ok">OK</string>
@@ -158,6 +176,9 @@
     <string name="dedicated_game_waiting">Waiting to Start</string>
     <string name="dedicated_allow_join">Allow players to join after game has started?</string>
     <string name="dedicated_server_settings_only">Only allow server settings?</string>
+    <string name="dedicated_tournament_mode">Tournament rules: 2 teams, standard single-shot</string>
+    <string name="game_mode_tournament_2teams">Tournament &#8212; 2 Teams</string>
+    <string name="tournament_rules_locked">Tournament rules are locked for this match.</string>
     <string name="game_master_respawn_button">GAME MASTER RESPAWN</string>
     <string name="game_master_respawn_title">Game Master Respawn</string>
     <string name="game_master_no_players_waiting">No players are waiting to respawn.</string>

@@ -107,6 +107,27 @@ public class GameStartSyncRegressionTest {
         assertEquals(startAt + 60000, client.events.get(0).getLongExtra(NetMsg.INTENT_END_AT, 0));
     }
 
+    @Test public void countdownProbeRefinesAnAlreadyPublishedDeadline() throws Exception {
+        synchronize();
+        long deadline = SystemClock.elapsedRealtime() + 10000;
+        parse(plan(1, deadline, 60000));
+        assertEquals(1, client.events.size());
+
+        Field clockField = TcpClient.class.getDeclaredField("mGameClock");
+        clockField.setAccessible(true);
+        ((GameClock) clockField.get(client)).beginSampling();
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC; i++)
+            sample(OFFSET + 120);
+
+        assertEquals(2, client.events.size());
+        Intent adjustment = client.events.get(1);
+        assertEquals(NetMsg.NETMSG_STARTGAME, adjustment.getAction());
+        assertTrue(adjustment.getBooleanExtra(NetMsg.INTENT_START_TIME_ADJUSTMENT, false));
+        assertEquals(deadline - 120, adjustment.getLongExtra(NetMsg.INTENT_START_AT, 0));
+        assertEquals(deadline - 120 + 60000,
+                adjustment.getLongExtra(NetMsg.INTENT_END_AT, 0));
+    }
+
     @Test public void malformedAndExcessivelyFuturePlansAreIgnored() throws Exception {
         synchronize();
         long now = SystemClock.elapsedRealtime();

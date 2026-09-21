@@ -57,6 +57,9 @@ public class DedicatedServerRegressionTest {
     private long originalTimeRemaining;
     private boolean originalUseGPS;
     private boolean originalOnlyServerSettings;
+    private boolean originalAllowPlayerSettings;
+    private boolean originalTournamentMode;
+    private int originalGameMode;
 
     @Before
     public void setUp() {
@@ -74,6 +77,9 @@ public class DedicatedServerRegressionTest {
         originalTimeRemaining = globals.mServerGameTimeRemaining;
         originalUseGPS = globals.mUseGPS;
         originalOnlyServerSettings = globals.mOnlyServerSettings;
+        originalAllowPlayerSettings = globals.mAllowPlayerSettings;
+        originalTournamentMode = globals.mTournamentMode;
+        originalGameMode = globals.mGameMode;
         // Dedicated hosting temporarily owns player ID zero. Use a non-zero
         // selection to verify that closing the host restores the player screen.
         globals.mPlayerID = 7;
@@ -81,6 +87,8 @@ public class DedicatedServerRegressionTest {
         globals.mServerGameTimeRemaining = 0;
         globals.mUseGPS = false;
         globals.mOnlyServerSettings = true;
+        globals.mAllowPlayerSettings = true;
+        globals.mTournamentMode = false;
         scenario = ActivityScenario.launch(DedicatedServerActivity.class);
         scenario.onActivity(current -> {
             activity = current;
@@ -139,6 +147,9 @@ public class DedicatedServerRegressionTest {
         globals.mServerGameTimeRemaining = originalTimeRemaining;
         globals.mUseGPS = originalUseGPS;
         globals.mOnlyServerSettings = originalOnlyServerSettings;
+        globals.mAllowPlayerSettings = originalAllowPlayerSettings;
+        globals.mTournamentMode = originalTournamentMode;
+        globals.mGameMode = originalGameMode;
     }
 
     @Test
@@ -163,6 +174,29 @@ public class DedicatedServerRegressionTest {
             assertTrue(Globals.getInstance().mOnlyServerSettings);
             assertTrue(control.isChecked());
             assertEquals(2, tcp.gameInfoUpdates);
+        });
+    }
+
+    @Test
+    public void tournamentSwitchLocksTwoTeamsAndRestoresTheHostPolicyWhenTurnedOff() {
+        scenario.onActivity(current -> {
+            Switch tournament = current.findViewById(R.id.tournament_mode_switch);
+            Switch serverOnly = current.findViewById(R.id.only_server_settings_switch);
+            tournament.performClick();
+
+            assertTrue(Globals.getInstance().mTournamentMode);
+            assertEquals(Globals.GAME_MODE_2TEAMS, Globals.getInstance().mGameMode);
+            assertFalse(Globals.getInstance().mAllowPlayerSettings);
+            assertTrue(Globals.getInstance().mOnlyServerSettings);
+            assertFalse("Tournament rules must prevent a later settings-policy edit", serverOnly.isEnabled());
+            assertEquals(current.getString(R.string.game_mode_tournament_2teams),
+                    ((Button) current.findViewById(R.id.game_mode_toggle_button)).getText().toString());
+
+            tournament.performClick();
+            assertFalse(Globals.getInstance().mTournamentMode);
+            assertTrue(Globals.getInstance().mAllowPlayerSettings);
+            assertTrue(Globals.getInstance().mOnlyServerSettings);
+            assertTrue(serverOnly.isEnabled());
         });
     }
 
@@ -292,6 +326,20 @@ public class DedicatedServerRegressionTest {
             assertFalse(button(R.id.start_game_button).isEnabled());
             assertTrue(button(R.id.end_game_button).isEnabled());
             assertNotNull(get("mSpawnTimer"));
+        });
+    }
+
+    @Test
+    public void confirmedRoundStartInvitesNearbyIdlePhones() {
+        scenario.onActivity(current -> {
+            String roundToken = "01234567-89ab-cdef-0123-456789abcdef";
+            Intent start = new Intent(NetMsg.NETMSG_STARTGAME)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
+            ((BroadcastReceiver) get("mServerUpdateReceiver")).onReceive(activity, start);
+
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(1, udp.gameInvites);
+            assertEquals(roundToken, udp.lastInviteRoundToken);
         });
     }
 
@@ -966,10 +1014,17 @@ public class DedicatedServerRegressionTest {
         int listenerStarts;
         int listenerStops;
         int joinSettingChanges;
+        int gameInvites;
         boolean allowJoin;
+        String lastInviteRoundToken;
 
         @Override public void createServer() { listenerStarts++; }
         @Override void stopListen() { listenerStops++; }
         @Override public void allowJoin(boolean value) { joinSettingChanges++; allowJoin = value; }
+        @Override public boolean inviteNearbyPlayers(String roundToken) {
+            gameInvites++;
+            lastInviteRoundToken = roundToken;
+            return true;
+        }
     }
 }

@@ -345,6 +345,12 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         mApplyAllSwitch = view.findViewById(R.id.apply_to_all_switch);
         View.OnClickListener saveSettings =
                 button -> {
+                    if (Globals.getInstance().mTournamentMode) {
+                        Toast.makeText(getContext(), R.string.tournament_rules_locked,
+                                Toast.LENGTH_SHORT).show();
+                        dismiss();
+                        return;
+                    }
                     if (!mShotModeSingle.isChecked() && !mShotModeBurst3.isChecked() && !mShotModeAuto.isChecked()) {
                         Toast.makeText(getContext(), getContext().getString(R.string.player_settings_shot_mode_error), Toast.LENGTH_SHORT).show();
                         return;

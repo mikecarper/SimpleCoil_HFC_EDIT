@@ -459,6 +459,17 @@
             android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
 
         <Button
+            android:id="@+id/team_qr_scan_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_toEndOf="@id/use_network_button"
+            android:layout_alignBaseline="@id/use_network_button"
+            android:layout_marginStart="5dp"
+            android:text="@string/team_qr_scan_button"
+            android:visibility="gone" />
+
+        <Button
             android:id="@+id/firing_mode_button"
             style="@style/Widget.AppCompat.Button.Colored"
             android:layout_width="wrap_content"
@@ -629,6 +640,36 @@
 
     </LinearLayout>
     </ScrollView>
+
+    <!-- This stays above gameplay but below the QR scanner. It deliberately
+         does not consume input, so a hit flash never blocks a player action. -->
+    <View
+        android:id="@+id/incoming_hit_flash_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#B34A0000"
+        android:clickable="false"
+        android:focusable="false"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/hit_confirmation_tv"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:clickable="false"
+        android:focusable="false"
+        android:gravity="center"
+        android:paddingStart="24dp"
+        android:paddingEnd="24dp"
+        android:shadowColor="#FF000000"
+        android:shadowDx="3"
+        android:shadowDy="3"
+        android:shadowRadius="4"
+        android:textColor="#FFFFFFFF"
+        android:textSize="88sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
 
     <FrameLayout
         android:id="@+id/respawn_qr_scanner_overlay"

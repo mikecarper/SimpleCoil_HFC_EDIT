@@ -37,6 +37,7 @@ public class TcpServerSessionRegressionTest {
     private RecordingServer server;
     private Socket peer;
     private boolean originalUseGPS;
+    private int originalGPSMode;
     private int originalGameState;
     private int originalGrenadePairing;
 
@@ -45,9 +46,11 @@ public class TcpServerSessionRegressionTest {
         server = createServer();
         Globals globals = Globals.getInstance();
         originalUseGPS = globals.mUseGPS;
+        originalGPSMode = globals.mGPSMode;
         originalGameState = globals.mGameState;
         originalGrenadePairing = globals.mGrenadePairings[1];
         globals.mUseGPS = false;
+        globals.mGPSMode = Globals.GPS_ALL;
         globals.mGameState = Globals.GAME_STATE_NONE;
     }
 
@@ -59,6 +62,7 @@ public class TcpServerSessionRegressionTest {
         assertTrue("Server workers did not stop", awaitStopped(server, 3000));
         Globals globals = Globals.getInstance();
         globals.mUseGPS = originalUseGPS;
+        globals.mGPSMode = originalGPSMode;
         globals.mGameState = originalGameState;
         globals.mGrenadePairings[1] = originalGrenadePairing;
         Globals.getmGPSDataSemaphore();
@@ -491,6 +495,8 @@ public class TcpServerSessionRegressionTest {
             Globals.getInstance().mUseGPS = true;
             Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
             Globals.GPSData location = new Globals.GPSData();
+            location.longitude = 10;
+            location.latitude = 20;
             location.team = 1; // Player 6's old team in a two-team lobby.
             location.hasUpdate = true;
             Globals.getInstance().mGPSData.put((byte) 6, location);

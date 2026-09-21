@@ -41,6 +41,8 @@ public class TcpServerSettingsRegressionTest {
     private Map<Byte, Globals.PlayerSettings> originalSettings;
     private boolean originalAllowSettings;
     private boolean originalServerOnly;
+    private boolean originalTournamentMode;
+    private int originalGameMode;
     private final List<Thread> workers = new ArrayList<>();
     private final List<Throwable> failures = new CopyOnWriteArrayList<>();
 
@@ -49,10 +51,13 @@ public class TcpServerSettingsRegressionTest {
         Globals globals = Globals.getInstance();
         originalAllowSettings = globals.mAllowPlayerSettings;
         originalServerOnly = globals.mOnlyServerSettings;
+        originalTournamentMode = globals.mTournamentMode;
+        originalGameMode = globals.mGameMode;
         originalSettings = globals.mPlayerSettings;
         originalSettingsLock = globals.mPlayerSettingsSemaphore;
         globals.mAllowPlayerSettings = true;
         globals.mOnlyServerSettings = false;
+        globals.mTournamentMode = false;
         globals.mPlayerSettings = new HashMap<>();
         globals.mPlayerSettings.put((byte) 1, new Globals.PlayerSettings());
         settingsLock = new WaitingSemaphore();
@@ -80,6 +85,8 @@ public class TcpServerSettingsRegressionTest {
         globals.mPlayerSettingsSemaphore = originalSettingsLock;
         globals.mAllowPlayerSettings = originalAllowSettings;
         globals.mOnlyServerSettings = originalServerOnly;
+        globals.mTournamentMode = originalTournamentMode;
+        globals.mGameMode = originalGameMode;
         for (Thread worker : workers) assertFalse("Settings worker survived cleanup", worker.isAlive());
         assertTrue("Settings worker failed: " + failures, failures.isEmpty());
     }
@@ -245,6 +252,42 @@ public class TcpServerSettingsRegressionTest {
             assertTrue(globals.mPlayerSettings.containsKey((byte) 1));
             globals.mPlayerSettings.clear();
         }
+    }
+
+    @Test
+    public void tournamentRulesNormalizeEveryPlayerToTheSingleShotProfile() throws Exception {
+        Globals globals = Globals.getInstance();
+        Globals.PlayerSettings first = globals.mPlayerSettings.get((byte) 1);
+        first.health = 77;
+        first.shots = (byte) 200;
+        first.reloadTime = 1200;
+        first.damage = -8;
+        first.allowShotModeSingle = false;
+        first.allowShotModeBurst3 = true;
+        first.allowShotModeAuto = true;
+        Globals.PlayerSettings second = new Globals.PlayerSettings();
+        second.health = 99;
+        second.allowShotModeSingle = false;
+        second.allowShotModeAuto = true;
+        globals.mPlayerSettings.put((byte) 2, second);
+
+        server.setTournamentMode(true);
+
+        assertTrue(globals.mTournamentMode);
+        assertEquals(Globals.GAME_MODE_2TEAMS, globals.mGameMode);
+        assertFalse(globals.mAllowPlayerSettings);
+        assertTrue(globals.mOnlyServerSettings);
+        for (Globals.PlayerSettings settings : globals.mPlayerSettings.values()) {
+            assertEquals(Globals.MAX_HEALTH, settings.health);
+            assertEquals(Globals.RELOAD_COUNT, settings.shots);
+            assertEquals(Globals.RELOAD_TIME_MILLISECONDS, settings.reloadTime);
+            assertEquals(Globals.DAMAGE_PER_HIT, settings.damage);
+            assertTrue(settings.allowShotModeSingle);
+            assertFalse(settings.allowShotModeBurst3);
+            assertFalse(settings.allowShotModeAuto);
+        }
+        assertTrue(lastUpdate().getBoolean(TcpServer.JSON_TOURNAMENT_MODE));
+        assertFalse(lastUpdate().getBoolean(TcpServer.JSON_ALLOWPLAYERSETTINGS));
     }
 
     @Test

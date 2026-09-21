@@ -1,0 +1,6 @@
+# Copy this file to release.properties, then fill in the real values locally.
+# release.properties and all common keystore file extensions are gitignored.
+releaseStoreFile=/absolute/path/to/simplecoil-release.jks
+releaseStorePassword=choose-a-strong-secret
+releaseKeyAlias=simplecoil-release
+releaseKeyPassword=choose-a-strong-secret

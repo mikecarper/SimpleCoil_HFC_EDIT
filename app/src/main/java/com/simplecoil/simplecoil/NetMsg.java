@@ -26,6 +26,10 @@ public class NetMsg {
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
     public static final String NETMSG_HIT = "HIT";
     public static final String NETMSG_OUT = "OUT";
+    // A downed player sends this direct acknowledgement when another player
+    // hits them before they have respawned. It is feedback only; it cannot
+    // change score, health, or round state.
+    public static final String NETMSG_ALREADYDEAD = "ALREADYDEAD";
     public static final String NETMSG_ELIMINATED = "ELIMINATED";
     // Dedicated hosts authorize checkpoint and Game Master respawns.  Keeping
     // the approval on the host prevents a phone from reviving itself without a
@@ -34,6 +38,9 @@ public class NetMsg {
     public static final String NETMSG_RESPAWNGRANTED = "RESPAWNGRANTED";
     public static final String NETMSG_RESPAWNCOMPLETE = "RESPAWNCOMPLETE";
     public static final String NETMSG_LEAVE = "LEAVE";
+    // A player may voluntarily leave a running dedicated game without asking
+    // the host to declare the remaining players' round over.
+    public static final String NETMSG_QUIT = "QUIT";
     public static final String NETMSG_STARTGAME = "STARTGAME";
     public static final String NETMSG_CLOCKSYNCWAITING = "CLOCKSYNCWAITING";
     public static final String NETMSG_ENDGAME = "ENDGAME";
@@ -50,6 +57,11 @@ public class NetMsg {
     // A host appends ":<player ID>" to SERVERREPLY only when it moved a
     // conflicting joining player to an available slot on the same team.
     public static final String NETMSG_SERVERREPLY_ASSIGNMENT_PREFIX = NETMSG_SERVERREPLY + ":";
+    // A dedicated host broadcasts this when a round is committed.  Idle phones
+    // can offer to join the running game without first opening the network
+    // menu.  The payload is GAMEINVITE:<network version>:<round token>.
+    public static final String NETMSG_GAMEINVITE = "GAMEINVITE";
+    public static final String NETMSG_GAMEINVITE_PREFIX = NETMSG_GAMEINVITE + ":";
     public static final String NETMSG_GPSLOCUPDATE = "GPSLOCUPDATE";
     public static final String NETMSG_GPSDATAUPDATE = "GPSDATAUPDATE";
     public static final String NETMSG_GPSSETTING = "GPSSETTING";
@@ -86,6 +98,9 @@ public class NetMsg {
     public static final String INTENT_END_AT = "END_AT_ELAPSED";
     public static final String INTENT_ROUND_ID = "ROUND_ID";
     public static final String INTENT_ROUND_TOKEN = "ROUND_TOKEN";
+    // A TcpClient-only refinement of an already delivered synchronized start.
+    // It is never sent over UDP or accepted as a new round-start request.
+    public static final String INTENT_START_TIME_ADJUSTMENT = "START_TIME_ADJUSTMENT";
     // Internal synchronized-start metadata. Peer rounds need their token in
     // the UDP service before a paused activity can process the start itself.
     public static final String INTENT_PEER_GAME = "PEER_GAME";

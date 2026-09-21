@@ -35,7 +35,8 @@ alter the next round's score, roster, grenade pairing, or end state.
 ## Player capacity and hosting
 
 The game supports up to 20 players. A separate dedicated-host phone may be used,
-for a maximum of 21 phones total.
+for a maximum of 21 phones total. Alternatively, a JDK 17 laptop can run the
+included dedicated host, so no phone is consumed as the host.
 
 | Mode | Player IDs |
 | --- | --- |
@@ -50,6 +51,31 @@ rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and
 clears the roster;
 players must join again before the next round.
+
+## Laptop-hosted games and live displays
+
+The repository includes a dependency-free Java 17 laptop host at
+[`laptop-host/`](laptop-host/). It is protocol-compatible with the Android
+dedicated host and provides a local two-window dashboard:
+
+- A tactical GPS map for the two teams, including movement trails, position
+  snapshots, and laser lines for verified hits and eliminations. It also has
+  Game Master Respawn buttons for players currently waiting to return.
+- A leaderboard with KILLS, HITS, SHOTS, and live accuracy.
+
+Run it on the same Wi-Fi network as the phones:
+
+```bash
+./laptop-host/run.sh
+```
+
+Use the printed laptop IP in the app's **Join Game** flow, then open the local
+dashboard's **map** and **leaderboard** display windows. GPS updates are
+change-driven and forwarded at up to four times per second in hosted games.
+The laptop host broadcasts the same nearby-game invitation as a phone host,
+so idle phones can offer to join automatically. See
+[the laptop-host guide](laptop-host/README.md) for ports, firewall guidance,
+display security, and options.
 
 ## Checkpoint and Game Master respawns
 
@@ -83,8 +109,31 @@ Install JDK 17 and Android SDK Platform 34, then set `JAVA_HOME` and
 ./gradlew assembleDebug
 ```
 
+The launcher name defaults to `Dean's 11th Birthday Blaster Bash`. Override it
+for a particular build with the `appName` Gradle property:
+
+```bash
+./gradlew assembleDebug -PappName="Your Event Name"
+```
+
 The debug APK is written to
 `app/build/outputs/apk/debug/app-debug.apk`.
+
+## Release signing
+
+Release APKs must be signed with a keystore that is backed up securely; the
+same signing key is required for every future update. Copy
+[`release.properties.example`](release.properties.example) to the ignored
+`release.properties` file, fill in the keystore details, then build:
+
+```bash
+./gradlew assembleRelease
+```
+
+You may instead provide `releaseStoreFile`, `releaseStorePassword`,
+`releaseKeyAlias`, and `releaseKeyPassword` as Gradle `-P` properties. Do not
+commit the keystore or credentials. The signed APK is written to
+`app/build/outputs/apk/release/app-release.apk`.
 
 Run the local verification gate with:
 

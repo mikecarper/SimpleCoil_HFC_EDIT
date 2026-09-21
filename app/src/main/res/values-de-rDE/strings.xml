@@ -42,6 +42,16 @@
     <string name="respawn_qr_scan_button">TEAM-%1$d-WIEDEREINSTIEG QR SCANNEN</string>
     <string name="respawn_qr_scanner_prompt">Scanne den TEAM-%1$d-Wiedereinstieg-QR-Code</string>
     <string name="respawn_qr_wait_button">AUF WIEDEREINSTIEG WARTEN</string>
+    <string name="respawn_qr_voice_prompt">Gehe zurück zur Basis und scanne den Wiedereinstiegscode.</string>
+    <string name="team_qr_scan_button">TEAM-QR-CODE SCANNEN</string>
+    <string name="team_qr_scanner_prompt">Scanne einen TEAM-QR-Code, um dein Team zu wählen</string>
+    <string name="team_qr_cancel_button">ABBRECHEN</string>
+    <string name="team_qr_assigned">Du bist Team %1$d als Spieler %2$d beigetreten.</string>
+    <string name="team_qr_unavailable_team">Dieses Spiel hat kein Team %1$d.</string>
+    <string name="team_qr_no_available_player">Dieses Team hat keine freien Spieler-IDs.</string>
+    <string name="combat_feedback_hit">TREFFER</string>
+    <string name="combat_feedback_already_dead">BEREITS\nAUSGESCHIEDEN</string>
+    <string name="enemy_destroyed_voice_prompt">Feind zerstört</string>
     <string name="respawn_qr_invalid">Dies ist kein Wiedereinstieg-QR-Code.</string>
     <string name="respawn_qr_wrong_team">Dieser Wiedereinstieg-QR-Code gehört zu einem anderen Team.</string>
     <string name="respawn_qr_request_sent">Wiedereinstieg angefordert.</string>
@@ -55,6 +65,12 @@
     <string name="error_udp_version">Netzwerk Client Version unterschied. Update die APP!</string>
     <string name="error_no_wifi">WLAN muss verbunden sein</string>
     <string name="error_join">Server lobby nicht gefunden!</string>
+    <string name="game_invite_title">Spiel beitreten?</string>
+    <string name="game_invite_message">Ein Host in der Nähe hat ein Spiel gestartet. Automatischer Beitritt in %1$d Sekunden.</string>
+    <string name="game_invite_join_now">Jetzt beitreten</string>
+    <string name="game_invite_decline">Nicht beitreten</string>
+    <string name="game_invite_select_team">Wähle vor dem Beitritt zu einer Spieleinladung ein Team aus.</string>
+    <string name="game_invite_joining">Spiel wird beigetreten&#8230;</string>
     <string name="error_host_start">Server-Lobby konnte nicht gestartet werden!</string>
     <string name="error_server_cancel">Server wurde abgebrochen!</string>
     <string name="error_limit_too_high">Limit ist zu hoch !</string>
@@ -62,6 +78,10 @@
     <string name="dialog_out_of_lives">Keine Leben mehr!</string>
     <string name="end_game_dialog_title">Spiel Beenden ?</string>
     <string name="end_game_dialog_message">Bist du dir sicher das du aufhören möchtest ?</string>
+    <string name="quit_game_button">Spiel verlassen</string>
+    <string name="quit_game_button_countdown">Spiel verlassen (%1$d)</string>
+    <string name="quit_game_dialog_title">Spiel verlassen?</string>
+    <string name="quit_game_dialog_message">Dieses Spiel verlassen, ohne es für alle anderen zu beenden?</string>
     <string name="yes">Ja</string>
     <string name="no">Nein</string>
     <string name="ok">OK</string>
@@ -110,6 +130,9 @@
     <string name="dedicated_game_waiting">Warte auf Start</string>
     <string name="dedicated_allow_join">Erlaube Spieler dem spiel nach beginn beizutreten</string>
     <string name="dedicated_server_settings_only">Erlaube nur Server einstellungen ?</string>
+    <string name="dedicated_tournament_mode">Turnierregeln: 2 Teams, Standard-Einzelschuss</string>
+    <string name="game_mode_tournament_2teams">Turnier &#8212; 2 Teams</string>
+    <string name="tournament_rules_locked">Die Turnierregeln sind für dieses Spiel gesperrt.</string>
     <string name="game_master_respawn_button">SPIELLEITER-WIEDEREINSTIEG</string>
     <string name="game_master_respawn_title">Spielleiter-Wiedereinstieg</string>
     <string name="game_master_no_players_waiting">Keine Spieler warten auf den Wiedereinstieg.</string>
@@ -150,7 +173,6 @@
     <string name="serverip">Bedient auf 999.999.999</string>
     <string name="server_status_serving_on">Bedient auf %1$s</string>
     <string name="error_location_permission_required">Erlaubnis erforderlich für Böluetooth Suche</string>
-    <string name="app_name">SimpleCoil Editiert von Marius</string>
     <string name="scrollview_info">Dies ist eine modifizierte Version der Original Simplecoil App.\n\n
         Diese App ist kostenlos. Diese App kommt ohne Garantie und schadet evtl den Geräten.\n\n
         Diese App ist für die Nutzung von RECOIL Blastern von Goliath Toys entwickelt wurden.\n\n

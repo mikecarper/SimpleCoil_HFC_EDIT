@@ -8,3 +8,7 @@
 /build
 /captures
 .externalNativeBuild
+/laptop-host/out/
+release.properties
+*.jks
+*.keystore

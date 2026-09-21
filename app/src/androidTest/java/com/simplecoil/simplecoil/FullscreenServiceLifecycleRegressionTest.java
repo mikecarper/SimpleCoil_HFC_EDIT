@@ -368,7 +368,12 @@ public class FullscreenServiceLifecycleRegressionTest {
         }
     }
 
-    private static final class RecordingUDPService extends UDPListenerService { }
+    private static final class RecordingUDPService extends UDPListenerService {
+        @Override
+        public void startGameInviteListener() {
+            // Lifecycle tests use a detached service double, not a real UDP socket.
+        }
+    }
 
     private static final class RecordingTcpClient extends TcpClient {
         int playerNameChangeCount;

@@ -44,13 +44,14 @@ public class TcpGameInfoRegressionTest {
     private boolean originalUseGPS;
     private int originalGPSMode;
     private boolean originalOnlyServerSettings;
+    private boolean originalTournamentMode;
     private int[] originalPairings;
     private InetAddress originalPeer;
     private Map<Byte, Globals.PlayerSettings> originalSettings;
     private Map<String, Object> originalLocalSettings;
     private Map<String, Object> baselineLocalSettings;
     private Globals.PlayerSettings baselineSettings;
-    private static final String[] LOCAL_SETTINGS = {"mFullHealth", "mFullReload", "mReloadTime",
+    private static final String[] LOCAL_SETTINGS = {"mFullHealth", "mFullShields", "mFullReload", "mReloadTime",
             "mReloadOnEmpty", "mRespawnTime", "mDamage", "mOverrideLives", "mOverrideLivesVal",
             "mAllowSingleShotMode", "mAllowBurst3ShotMode", "mAllowAutoShotMode",
             "mCurrentFiringMode", "mAllowPlayerSettings"};
@@ -68,6 +69,7 @@ public class TcpGameInfoRegressionTest {
         originalUseGPS = globals.mUseGPS;
         originalGPSMode = globals.mGPSMode;
         originalOnlyServerSettings = globals.mOnlyServerSettings;
+        originalTournamentMode = globals.mTournamentMode;
         originalPairings = globals.mGrenadePairings.clone();
         originalLocalSettings = localSettings();
         Globals.getmPlayerSettingsSemaphore();
@@ -82,6 +84,7 @@ public class TcpGameInfoRegressionTest {
         globals.mFullHealth = 20;
         globals.mFullReload = 30;
         globals.mAllowPlayerSettings = true;
+        globals.mTournamentMode = false;
         baselineLocalSettings = localSettings();
         globals.mPlayerID = 1;
         globals.mGameMode = Globals.GAME_MODE_2TEAMS;
@@ -109,6 +112,7 @@ public class TcpGameInfoRegressionTest {
         globals.mUseGPS = originalUseGPS;
         globals.mGPSMode = originalGPSMode;
         globals.mOnlyServerSettings = originalOnlyServerSettings;
+        globals.mTournamentMode = originalTournamentMode;
         System.arraycopy(originalPairings, 0, globals.mGrenadePairings, 0, originalPairings.length);
         Globals.getmPlayerSettingsSemaphore();
         try {
@@ -129,6 +133,31 @@ public class TcpGameInfoRegressionTest {
     @Test
     public void deeplyNestedObjectsCannotCrashClientParsing() throws Exception {
         assertDeepMessageIgnored(false);
+    }
+
+    @Test
+    public void tournamentRosterPinsTheLocalPhoneToTheStandardSingleShotProfile() throws Exception {
+        parse(roster(new JSONArray().put(player(1)))
+                .put(TcpServer.JSON_TOURNAMENT_MODE, true)
+                .put(TcpServer.JSON_PLAYERSETTINGS, new JSONArray().put(settings(1)))
+                .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, true));
+
+        assertTrue(globals.mTournamentMode);
+        assertEquals(Globals.GAME_MODE_2TEAMS, globals.mGameMode);
+        assertTrue(globals.mOnlyServerSettings);
+        assertFalse(globals.mAllowPlayerSettings);
+        assertEquals(Globals.MAX_HEALTH, globals.mFullHealth);
+        assertEquals(Globals.MAX_SHIELDS, globals.mFullShields);
+        assertEquals(Globals.RELOAD_COUNT, globals.mFullReload);
+        assertEquals(Globals.RELOAD_TIME_MILLISECONDS, globals.mReloadTime);
+        assertEquals(Globals.DAMAGE_PER_HIT, globals.mDamage);
+        assertTrue(globals.mAllowSingleShotMode);
+        assertFalse(globals.mAllowBurst3ShotMode);
+        assertFalse(globals.mAllowAutoShotMode);
+        Globals.PlayerSettings local = globals.mPlayerSettings.get((byte) 1);
+        assertTrue(local.allowShotModeSingle);
+        assertFalse(local.allowShotModeBurst3);
+        assertFalse(local.allowShotModeAuto);
     }
 
     private void assertDeepMessageIgnored(boolean arrays) throws Exception {
@@ -865,6 +894,17 @@ public class TcpGameInfoRegressionTest {
         parse(gpsUpdate(true));
         assertTrue(globals.mGPSData.isEmpty());
         assertEquals(2, client.events.size());
+    }
+
+    @Test
+    public void unchangedFullGpsSnapshotRetainsTheCachedLocationForTheMap() throws Exception {
+        Globals.GPSData original = putGPS(5, 1);
+        original.longitude = 10.0;
+        original.latitude = 20.0;
+        parse(gpsUpdate(true, gps(5, 1)));
+        assertSame(original, globals.mGPSData.get((byte) 5));
+        assertFalse(original.hasUpdate);
+        assertTrue(client.events.get(0).getBooleanExtra(NetMsg.INTENT_FULLUPDATE, false));
     }
 
     private Globals.GPSData putGPS(int id, int team) {

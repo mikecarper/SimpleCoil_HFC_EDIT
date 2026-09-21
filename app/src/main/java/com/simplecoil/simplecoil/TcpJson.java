@@ -96,4 +96,13 @@ final class TcpJson {
             throw new JSONException("Expected a network integer: " + key);
         return ((Number) value).longValue();
     }
+
+    static boolean getBoolean(JSONObject object, String key) throws JSONException {
+        Object value = object.get(key);
+        // JSONObject#getBoolean accepts string values such as "true".  Protocol flags must
+        // remain actual JSON booleans so a malformed peer cannot quietly change game rules.
+        if (!(value instanceof Boolean))
+            throw new JSONException("Expected a network boolean: " + key);
+        return (Boolean) value;
+    }
 }

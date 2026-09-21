@@ -993,6 +993,21 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void sharedStartKeepsEnoughTimeForTheFullVoiceCountdown() throws Exception {
+        long originalRespawnTime = Globals.getInstance().mRespawnTime;
+        try {
+            Globals.getInstance().mRespawnTime = 1;
+            long beforeStart = SystemClock.elapsedRealtime();
+            dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+            JSONObject start = readJson(sockets.get(0));
+            assertTrue(start.getLong(TcpServer.JSON_GAMESTART) >= beforeStart
+                    + Globals.RESPAWN_TIME_SECONDS * 1000);
+        } finally {
+            Globals.getInstance().mRespawnTime = originalRespawnTime;
+        }
+    }
+
+    @Test
     public void failedStartWritesDoNotPublishAStartConfirmation() throws Exception {
         set(clients.get(1), "out", new DataOutputStream(new OutputStream() {
             @Override public void write(int value) throws IOException { throw new IOException("Disconnected"); }

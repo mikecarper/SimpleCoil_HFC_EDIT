@@ -21,11 +21,14 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import java.net.InetAddress;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
@@ -184,6 +187,63 @@ public class GameplayRegressionTest {
             assertEquals("Ending a peer game left its TCP host running", 1, calls[0]);
             assertEquals(false, get(activity, "mIsServer"));
             assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
+    public void invitedPlayerQuitsWithoutBroadcastingEndGame() {
+        scenario.onActivity(activity -> {
+            int[] quits = new int[1];
+            set(activity, "mTcpClient", new TcpClient() {
+                @Override public boolean isDedicatedServer() { return true; }
+                @Override public void quitGame() { quits[0]++; }
+                @Override public void stopTcpClient() { }
+            });
+            set(activity, "mJoinedFromGameInvite", true);
+            set(activity, "mReady", true);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+
+            invoke(activity, "quitGame");
+
+            assertEquals(1, quits[0]);
+            assertEquals("An invited player ended the shared game", 0, udp.endRequests);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertEquals(false, get(activity, "mJoinedFromGameInvite"));
+        });
+    }
+
+    @Test
+    public void tournamentPlayerQuitControlExpiresAfterThirtySeconds() {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = true;
+            Globals.getInstance().mTournamentMode = true;
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+
+            invoke(activity, "startPlayerQuitWindow");
+
+            assertEquals(true, get(activity, "mPlayerQuitWindowOpen"));
+            assertEquals(View.VISIBLE, activity.findViewById(R.id.end_network_game_button)
+                    .getVisibility());
+            CountDownTimer timer = (CountDownTimer) get(activity, "mQuitGameTimer");
+            timer.onFinish();
+            assertEquals(false, get(activity, "mPlayerQuitWindowOpen"));
+            assertEquals(View.GONE, activity.findViewById(R.id.end_network_game_button)
+                    .getVisibility());
+        });
+    }
+
+    @Test
+    public void lateInvitedPlayerDoesNotReceiveANewQuitWindow() {
+        scenario.onActivity(activity -> {
+            set(activity, "mJoinedFromGameInvite", true);
+            set(activity, "mHasSynchronizedStart", true);
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() - 30_001);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+
+            invoke(activity, "startPlayerQuitWindow");
+
+            assertEquals(false, get(activity, "mPlayerQuitWindowOpen"));
+            assertNull(get(activity, "mQuitGameTimer"));
         });
     }
 
@@ -453,6 +513,54 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void incomingHitFlashesTheFullScreenDarkRed() {
+        scenario.onActivity(activity -> {
+            telemetry(activity, 11, 1, 0, 0);
+
+            assertEquals("A confirmed incoming hit must flash the whole background", View.VISIBLE,
+                    ((View) get(activity, "mIncomingHitFlashView")).getVisibility());
+        });
+    }
+
+    @Test
+    public void confirmedHitShowsLargeHitFeedback() {
+        scenario.onActivity(activity -> {
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+
+            TextView feedback = (TextView) get(activity, "mHitConfirmationTV");
+            assertEquals(View.VISIBLE, feedback.getVisibility());
+            assertEquals(activity.getString(R.string.combat_feedback_hit), feedback.getText().toString());
+        });
+    }
+
+    @Test
+    public void deadTargetAcknowledgementShowsAlreadyDeadFeedback() {
+        scenario.onActivity(activity -> {
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ALREADYDEAD));
+
+            TextView feedback = (TextView) get(activity, "mHitConfirmationTV");
+            assertEquals(View.VISIBLE, feedback.getVisibility());
+            assertEquals(activity.getString(R.string.combat_feedback_already_dead),
+                    feedback.getText().toString());
+        });
+    }
+
+    @Test
+    public void eliminatedPlayerAcknowledgesNewEnemyShotWithoutTakingAnotherHit() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+            int originalHealth = (int) get(activity, "mHealth");
+            int originalHitsTaken = (int) get(activity, "mHitsTaken");
+
+            telemetry(activity, 11, 1, 0, 0);
+
+            assertEquals(Collections.singletonList(NetMsg.NETMSG_ALREADYDEAD + ":11"), udp.messages);
+            assertEquals(originalHealth, get(activity, "mHealth"));
+            assertEquals(originalHitsTaken, get(activity, "mHitsTaken"));
+        });
+    }
+
+    @Test
     public void nextRoundCanShowHitConfirmationBeforeThePreviousCleanupDeadline() {
         scenario.onActivity(activity -> {
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
@@ -482,6 +590,11 @@ public class GameplayRegressionTest {
             CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
             spawn.cancel();
             spawn.onFinish();
+
+            // The offline start is only used to avoid requiring a peer round
+            // nonce here. Restore the network damage table before verifying
+            // that the old shot ID no longer suppresses a real hit.
+            set(activity, "mUseNetwork", true);
 
             telemetry(activity, 11, 1, 0, 0);
             assertEquals("A reused weapon shot ID was filtered as a prior round's hit", 15,
@@ -852,7 +965,8 @@ public class GameplayRegressionTest {
             changeLifeOverride(activity, 3);
             assertLifeCount(activity, 0);
             assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
-            assertEquals(Collections.singletonList(NetMsg.NETMSG_LEAVE + ":all"), udp.messages);
+            assertEquals(1, udp.peerLeaveAnnouncements);
+            assertTrue(udp.messages.isEmpty());
             assertEquals(0, udp.endRequests);
         });
     }
@@ -1332,17 +1446,38 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void laterRespawnKeepsPersonalDelayAndCannotResetRoundTimer() {
+    public void initialCountdownTracksOnlyItsOwnClockAdjustment() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() + 10000;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+
+            long adjustedDeadline = deadline - 250;
+            receiveNetwork(activity, synchronizedStart(adjustedDeadline, adjustedDeadline + 60000)
+                    .putExtra(NetMsg.INTENT_START_TIME_ADJUSTMENT, true));
+            assertSame(timer, get(activity, "mSpawnTimer"));
+            assertEquals(adjustedDeadline, get(activity, "mSynchronizedStartAt"));
+            assertEquals(adjustedDeadline + 60000, get(activity, "mSynchronizedEndAt"));
+
+            receiveNetwork(activity, synchronizedStart(deadline - 500, deadline + 59500)
+                    .putExtra(NetMsg.INTENT_ROUND_ID, 2L)
+                    .putExtra(NetMsg.INTENT_START_TIME_ADJUSTMENT, true));
+            assertEquals(adjustedDeadline, get(activity, "mSynchronizedStartAt"));
+        });
+    }
+
+    @Test
+    public void laterTeamRespawnUsesCheckpointWaitAndCannotResetRoundTimer() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);
             long deadline = SystemClock.elapsedRealtime() - 1000;
             receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
             assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
             Object roundTimer = get(activity, "mGameCountdownTimer");
-            Globals.getInstance().mRespawnTime = 90;
             invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Hit");
             assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
-            assertTrue(((TextView) get(activity, "mSpawnInTV")).getText().toString().contains("90"));
+            assertTrue(((TextView) get(activity, "mSpawnInTV")).getText().toString().contains("03:00"));
             assertSame(roundTimer, get(activity, "mGameCountdownTimer"));
         });
     }
@@ -1693,6 +1828,63 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void teamQrAssignmentUsesRespawnCodeAndSkipsAnOccupiedPlayerId() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mGameState = Globals.GAME_STATE_NONE;
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            globals.mPlayerID = 0;
+            set(activity, "mReady", false);
+            set(activity, "mIsServer", false);
+            invoke(activity, "setTeam");
+            assertEquals("A fresh blaster needs the QR team-selection option", View.VISIBLE,
+                    ((View) get(activity, "mTeamQrScanButton")).getVisibility());
+
+            Map<Byte, InetAddress> originalEndpoints;
+            Globals.getmTeamIPMapSemaphore();
+            try {
+                originalEndpoints = new HashMap<>(globals.mTeamIPMap);
+                globals.mTeamIPMap.clear();
+                globals.mTeamIPMap.put((byte) 11, InetAddress.getLoopbackAddress());
+            } finally {
+                globals.mTeamIPMapSemaphore.release();
+            }
+            try {
+                invoke(activity, "assignTeamFromQrCode", new Class<?>[]{String.class},
+                        "TEAM 2 RESPAWN");
+                assertEquals("The scanned team did not skip its occupied player ID", 12,
+                        globals.mPlayerID);
+                assertEquals(2, globals.calcNetworkTeam(globals.mPlayerID));
+                assertEquals(View.VISIBLE, ((View) get(activity, "mTeamQrScanButton")).getVisibility());
+                assertEquals(12, bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
+            } finally {
+                Globals.getmTeamIPMapSemaphore();
+                try {
+                    globals.mTeamIPMap.clear();
+                    globals.mTeamIPMap.putAll(originalEndpoints);
+                } finally {
+                    globals.mTeamIPMapSemaphore.release();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void teamQrAssignmentRejectsCodesForUnavailableTeams() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mGameState = Globals.GAME_STATE_NONE;
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            globals.mPlayerID = 1;
+            set(activity, "mReady", false);
+            set(activity, "mIsServer", false);
+            invoke(activity, "assignTeamFromQrCode", new Class<?>[]{String.class},
+                    "SIMPLECOIL:RESPAWN:3");
+            assertEquals("A two-team game accepted Team 3", 1, globals.mPlayerID);
+        });
+    }
+
+    @Test
     public void grenadeDamageStillUsesThePairedOwnersSettings() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
@@ -1994,6 +2186,11 @@ public class GameplayRegressionTest {
         @Override
         public void announcePeerLeave() {
             peerLeaveAnnouncements++;
+        }
+
+        @Override
+        public void startGameInviteListener() {
+            // This detached fake deliberately has no Android service context or socket.
         }
 
         @Override

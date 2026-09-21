@@ -32,6 +32,21 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
     private final Activity context;
     private final boolean isClient;
 
+    private static final class ViewHolder {
+        final TextView playerID;
+        final TextView playerName;
+        final TextView playerPoints;
+        final TextView playerEliminated;
+        final ImageView networkStatus;
+
+        ViewHolder(View row, boolean isClient) {
+            playerID = row.findViewById(R.id.player_id_tv);
+            playerName = row.findViewById(R.id.player_name_tv);
+            playerPoints = row.findViewById(R.id.player_points_tv);
+            playerEliminated = row.findViewById(R.id.player_eliminated_tv);
+            networkStatus = isClient ? null : row.findViewById(R.id.network_status_iv);
+        }
+    }
 
     public PlayerDisplayDataListAdapter(Activity context,
                                         PlayerDisplayData[] data, boolean isClient) {
@@ -52,16 +67,21 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
     @Override
     public View getView(int position, View view, ViewGroup parent) {
         Resources res = context.getResources();
-        LayoutInflater inflater = context.getLayoutInflater();
-        View rowView;
-        if (isClient)
-            rowView = inflater.inflate(R.layout.player_display_data_client, parent, false);
-        else
-            rowView = inflater.inflate(R.layout.player_display_data, parent, false);
-        TextView playerIDTV = rowView.findViewById(R.id.player_id_tv);
-        TextView playerNameTV = rowView.findViewById(R.id.player_name_tv);
-        TextView playerPointsTV = rowView.findViewById(R.id.player_points_tv);
-        TextView playerEliminatedTV = rowView.findViewById(R.id.player_eliminated_tv);
+        View rowView = view;
+        ViewHolder holder;
+        if (rowView == null) {
+            LayoutInflater inflater = context.getLayoutInflater();
+            rowView = inflater.inflate(isClient ? R.layout.player_display_data_client
+                    : R.layout.player_display_data, parent, false);
+            holder = new ViewHolder(rowView, isClient);
+            rowView.setTag(holder);
+        } else {
+            holder = (ViewHolder) rowView.getTag();
+        }
+        TextView playerIDTV = holder.playerID;
+        TextView playerNameTV = holder.playerName;
+        TextView playerPointsTV = holder.playerPoints;
+        TextView playerEliminatedTV = holder.playerEliminated;
         if (position == 0) {
             playerIDTV.setText(R.string.player_list_id_label);
             playerNameTV.setText(R.string.player_list_name_label);
@@ -70,12 +90,21 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
                 playerEliminatedTV.setText(R.string.game_limit_lives);
             else
                 playerEliminatedTV.setText(R.string.player_list_eliminated_label);
+            if (holder.networkStatus != null)
+                holder.networkStatus.setVisibility(View.GONE);
             return rowView;
         }
         PlayerDisplayData player = getItem(position);
         if (position > Globals.MAX_PLAYER_ID) {
             if (player != null && player.playerName != null)
                 playerIDTV.setText(player.playerName);
+            else
+                playerIDTV.setText("");
+            playerNameTV.setText("");
+            playerPointsTV.setText("");
+            playerEliminatedTV.setText("");
+            if (holder.networkStatus != null)
+                holder.networkStatus.setVisibility(View.GONE);
             return rowView;
         }
         switch (Globals.getInstance().mGameMode) {
@@ -104,10 +133,8 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
             playerNameTV.setText(R.string.player_name_not_connected);
             playerPointsTV.setText("");
             playerEliminatedTV.setText("");
-            if (!isClient) {
-                ImageView networkStatus = rowView.findViewById(R.id.network_status_iv);
-                networkStatus.setVisibility(View.GONE);
-            }
+            if (holder.networkStatus != null)
+                holder.networkStatus.setVisibility(View.GONE);
             return rowView;
         }
         playerNameTV.setText(player.playerName);
@@ -123,13 +150,12 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
             else
                 playerEliminatedTV.setText("" + player.eliminated);
         }
-        if (!isClient) {
-            ImageView networkStatus = rowView.findViewById(R.id.network_status_iv);
-            networkStatus.setVisibility(View.VISIBLE);
+        if (holder.networkStatus != null) {
+            holder.networkStatus.setVisibility(View.VISIBLE);
             if (player.isConnected)
-                networkStatus.setImageResource(R.drawable.ic_network_connected_24dp);
+                holder.networkStatus.setImageResource(R.drawable.ic_network_connected_24dp);
             else
-                networkStatus.setImageResource(R.drawable.ic_network_disconnected_24dp);
+                holder.networkStatus.setImageResource(R.drawable.ic_network_disconnected_24dp);
         }
         return rowView;
     }

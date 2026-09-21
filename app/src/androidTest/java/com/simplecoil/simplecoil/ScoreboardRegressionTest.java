@@ -7,6 +7,7 @@ import android.view.ContextThemeWrapper;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.TextView;
 
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -187,6 +188,31 @@ public class ScoreboardRegressionTest {
         });
     }
 
+    @Test
+    public void recycledHostRowsDoNotLeakNetworkIconsOrPlayerTextIntoHeadersAndTotals() {
+        onMain(() -> {
+            PlayerDisplayData[] rows = new PlayerDisplayData[Globals.MAX_PLAYER_ID + 2];
+            rows[1] = player("Connected", 3);
+            rows[1].isConnected = true;
+            rows[Globals.MAX_PLAYER_ID + 1] = player("Team 1: 3, Team 2: 0", 0);
+            PlayerDisplayDataListAdapter adapter = new PlayerDisplayDataListAdapter(activity, rows, false);
+
+            View playerRow = adapter.getView(1, null, parent);
+            assertEquals(View.VISIBLE, networkStatus(playerRow).getVisibility());
+            View header = adapter.getView(0, playerRow, parent);
+            assertSame(playerRow, header);
+            assertEquals(View.GONE, networkStatus(header).getVisibility());
+
+            View anotherPlayerRow = adapter.getView(1, null, parent);
+            View footer = adapter.getView(Globals.MAX_PLAYER_ID + 1, anotherPlayerRow, parent);
+            assertEquals("Team 1: 3, Team 2: 0", text(footer, R.id.player_id_tv));
+            assertEquals("", text(footer, R.id.player_name_tv));
+            assertEquals("", text(footer, R.id.player_points_tv));
+            assertEquals("", text(footer, R.id.player_eliminated_tv));
+            assertEquals(View.GONE, networkStatus(footer).getVisibility());
+        });
+    }
+
     private void assertLivesTextForBothLayouts(PlayerDisplayData player, String expected) {
         for (boolean isClient : new boolean[]{false, true})
             assertEquals(expected, text(adapter(player, isClient).getView(1, null, parent), R.id.player_eliminated_tv));
@@ -206,6 +232,10 @@ public class ScoreboardRegressionTest {
 
     private static String text(View row, int id) {
         return ((TextView) row.findViewById(id)).getText().toString();
+    }
+
+    private static ImageView networkStatus(View row) {
+        return row.findViewById(R.id.network_status_iv);
     }
 
     private static void onMain(Runnable action) {

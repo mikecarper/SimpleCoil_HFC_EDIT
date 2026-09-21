@@ -10,18 +10,28 @@ final class GameClock {
     static final long MAX_TIMESTAMP = Long.MAX_VALUE / 4;
     private long offset;
     private long bestRoundTrip = Long.MAX_VALUE;
+    private long candidateOffset;
+    private long candidateRoundTrip = Long.MAX_VALUE;
     private int samples;
     private boolean hasEstimate;
+    private boolean sampling;
+
+    GameClock() {
+        beginSampling();
+    }
 
     void reset() {
         offset = 0;
         hasEstimate = false;
+        bestRoundTrip = Long.MAX_VALUE;
         beginSampling();
     }
 
     void beginSampling() {
         samples = 0;
-        bestRoundTrip = Long.MAX_VALUE;
+        candidateOffset = 0;
+        candidateRoundTrip = Long.MAX_VALUE;
+        sampling = true;
     }
 
     boolean record(long clientSend, long hostReceive, long hostSend, long clientReceive) {
@@ -32,13 +42,36 @@ final class GameClock {
         long roundTrip = (clientReceive - clientSend) - (hostSend - hostReceive);
         if (roundTrip < 0 || roundTrip > MAX_SAMPLE_DELAY_MS)
             return false;
-        // Select the least-delayed exchange to reduce asymmetric queueing error.
-        if (roundTrip < bestRoundTrip) {
-            offset = ((hostReceive - clientSend) + (hostSend - clientReceive)) / 2;
+        long measuredOffset = ((hostReceive - clientSend) + (hostSend - clientReceive)) / 2;
+        if (sampling) {
+            // Select the least-delayed exchange to reduce asymmetric queueing
+            // error.  A refresh is collected separately from the currently
+            // committed estimate so one mediocre first reply cannot make an
+            // already-scheduled game jump before the full batch completes.
+            if (roundTrip < candidateRoundTrip) {
+                candidateOffset = measuredOffset;
+                candidateRoundTrip = roundTrip;
+            }
+            samples++;
+            if (!hasEstimate) {
+                // A caller may inspect an initial estimate before all samples
+                // arrive, but TcpClient does not publish a round until five do.
+                offset = candidateOffset;
+                bestRoundTrip = candidateRoundTrip;
+                hasEstimate = true;
+            }
+            if (samples >= SAMPLES_PER_SYNC) {
+                offset = candidateOffset;
+                bestRoundTrip = candidateRoundTrip;
+                sampling = false;
+            }
+        } else if (roundTrip < bestRoundTrip) {
+            // During a live countdown use only a strictly better one-shot
+            // probe.  This makes refinements stable and keeps the host load
+            // bounded to one request per phone per second.
+            offset = measuredOffset;
             bestRoundTrip = roundTrip;
-            hasEstimate = true;
         }
-        samples++;
         return true;
     }
 

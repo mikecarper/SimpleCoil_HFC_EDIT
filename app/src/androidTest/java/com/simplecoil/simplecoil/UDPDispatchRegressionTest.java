@@ -196,9 +196,26 @@ public class UDPDispatchRegressionTest {
         throw new AssertionError("UDP sender did not wait for the held send lock");
     }
 
-    private static void await(Thread sender) throws Exception {
-        sender.join(2000);
-        assertFalse("UDP sender did not drain", sender.isAlive());
+    private void await(Thread sender) throws Exception {
+        // The production sender intentionally keeps one worker alive between
+        // combat bursts.  Waiting for the thread to terminate would turn that
+        // performance property into a test failure; instead wait until its
+        // bounded queue and active task have both drained. onDestroy() is
+        // still verified in tearDown(), where the worker must terminate.
+        ThreadPoolExecutor executor = sendExecutor();
+        long deadline = SystemClock.elapsedRealtime() + 2000;
+        do {
+            if (executor.getActiveCount() == 0 && executor.getQueue().isEmpty())
+                return;
+            Thread.sleep(10);
+        } while (SystemClock.elapsedRealtime() < deadline);
+        fail("UDP sender did not drain");
+    }
+
+    private ThreadPoolExecutor sendExecutor() throws Exception {
+        Field field = UDPListenerService.class.getDeclaredField("mSendExecutor");
+        field.setAccessible(true);
+        return (ThreadPoolExecutor) field.get(service);
     }
 
     private static DatagramSocket peer(String address) throws Exception {
@@ -252,6 +269,7 @@ public class UDPDispatchRegressionTest {
 
     private static final class RecordingService extends UDPListenerService {
         @Override public void startListenForUDPMessage() { }
+        @Override public void startGameInviteListener() { }
         @Override public void sendBroadcast(Intent intent) { }
     }
 }

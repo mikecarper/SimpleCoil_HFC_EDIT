@@ -62,6 +62,11 @@ public class MapFragment extends GlobeMapFragment {
 
     private static final int TWO_MINUTES = 1000 * 60 * 2;
     private static final int REQUEST_LOCATION_PERMISSION = 1;
+    // Hosted games use the GPS stream for a live operator display.  Request a
+    // quick fix while still discarding sub-meter receiver jitter; providers are
+    // free to deliver more slowly when their hardware or power policy requires it.
+    private static final long LOCATION_UPDATE_INTERVAL_MS = 250;
+    private static final float LOCATION_UPDATE_MIN_DISTANCE_METERS = 0.5f;
 
     private LocationListener mLocationListener = null;
     private boolean mResumed;
@@ -69,6 +74,7 @@ public class MapFragment extends GlobeMapFragment {
 
     private double mLongitude = 0;
     private double mLatitude = 0;
+    private Location mLastBroadcastLocation;
 
     private void sendLocation(Location location) {
         sendLocation(location, false);
@@ -81,10 +87,17 @@ public class MapFragment extends GlobeMapFragment {
     private void sendLocation(Location location, boolean force) {
         Context activity = getActivity();
         if (!isValidLocation(location) || activity == null) return;
-        if (!force && location.getLatitude() == mLatitude && location.getLongitude() == mLongitude)
-            return;
+        if (!force && mLastBroadcastLocation != null) {
+            if (location.getLatitude() == mLatitude && location.getLongitude() == mLongitude)
+                return;
+            // Providers can report slightly different fixes for a stationary phone.  Avoid
+            // turning that noise into a full team-map update while retaining meaningful motion.
+            if (location.distanceTo(mLastBroadcastLocation) < LOCATION_UPDATE_MIN_DISTANCE_METERS)
+                return;
+        }
         mLongitude = location.getLongitude();
         mLatitude = location.getLatitude();
+        mLastBroadcastLocation = new Location(location);
         Intent intent = new Intent(NetMsg.NETMSG_GPSLOCUPDATE);
         intent.putExtra(NetMsg.INTENT_LATITUDE, mLatitude);
         intent.putExtra(NetMsg.INTENT_LONGITUDE, mLongitude);
@@ -128,13 +141,12 @@ public class MapFragment extends GlobeMapFragment {
         public void onLocationChanged(Location loc) {
             if (mLocationListener != this || !isGPSActive() || !isValidLocation(loc))
                 return;
-            String longitude = "Longitude: " + loc.getLongitude();
-            Log.v(TAG, longitude);
-            String latitude = "Latitude: " + loc.getLatitude();
-            Log.v(TAG, latitude);
-            makeUseOfNewLocation(loc);
-
-            insertYourMarker();
+            if (BuildConfig.DEBUG)
+                Log.v(TAG, "Location: " + loc.getLongitude() + "," + loc.getLatitude());
+            // Recreating a Maply marker for every raw provider callback is expensive.  A marker
+            // only changes when the new fix wins the quality check below.
+            if (makeUseOfNewLocation(loc))
+                insertYourMarker();
         }
 
         @Override
@@ -152,12 +164,14 @@ public class MapFragment extends GlobeMapFragment {
      *
      * @param location The possible new location.
      */
-    void makeUseOfNewLocation(Location location) {
+    boolean makeUseOfNewLocation(Location location) {
         if ( isBetterLocation(location, currentBestLocation) ) {
             // Providers expose mutable Location objects; keep our own accepted snapshot.
             currentBestLocation = new Location(location);
             sendLocation(currentBestLocation);
+            return true;
         }
+        return false;
     }
 
     /** Determines whether one location reading is better than the current location fix
@@ -271,9 +285,8 @@ public class MapFragment extends GlobeMapFragment {
                 if (!isGPSActive())
                     return;
                 if (intent.getBooleanExtra(NetMsg.INTENT_FULLUPDATE, false))
-                    refreshPlayerMarkers();
-                else
-                    insertPlayerMarkers(false);
+                    removeMissingPlayerMarkers();
+                insertPlayerMarkers(false);
             } else if (action.equals(NetMsg.NETMSG_LISTPLAYERS) || action.equals(NetMsg.NETMSG_GPSSETTING)) {
                 enableGPS(Globals.getInstance().mUseGPS);
             }
@@ -305,11 +318,17 @@ public class MapFragment extends GlobeMapFragment {
                 }
                 mLongitude = 0;
                 mLatitude = 0;
-                mLocationListener = new MyLocationListener();
-                try {
-                    mLocationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 500, 1, mLocationListener);
-                } catch (SecurityException | IllegalArgumentException e) {
-                    Log.w(TAG, "Unable to register for location updates", e);
+                mLastBroadcastLocation = null;
+                LocationListener listener = new MyLocationListener();
+                // Set it before requesting updates. Some providers can deliver
+                // a cached fix as soon as registration returns.
+                mLocationListener = listener;
+                // GPS is the preferred source for a field map, while the network provider can
+                // supply a useful first fix before GPS has locked.  Register independently so a
+                // missing network provider never disables GPS tracking (or vice versa).
+                boolean gpsRegistered = registerLocationProvider(listener, LocationManager.GPS_PROVIDER);
+                boolean networkRegistered = registerLocationProvider(listener, LocationManager.NETWORK_PROVIDER);
+                if (!gpsRegistered && !networkRegistered) {
                     mLocationListener = null;
                     return;
                 }
@@ -334,6 +353,18 @@ public class MapFragment extends GlobeMapFragment {
                     }
                 }
             }
+        }
+    }
+
+    /** Register one provider without allowing an unavailable optional provider to stop tracking. */
+    private boolean registerLocationProvider(LocationListener listener, String provider) {
+        try {
+            mLocationManager.requestLocationUpdates(provider, LOCATION_UPDATE_INTERVAL_MS,
+                    LOCATION_UPDATE_MIN_DISTANCE_METERS, listener);
+            return true;
+        } catch (SecurityException | IllegalArgumentException e) {
+            Log.w(TAG, "Unable to register location provider: " + provider, e);
+            return false;
         }
     }
 
@@ -504,6 +535,30 @@ public class MapFragment extends GlobeMapFragment {
         if (mPlayerMarkers[playerID] != null)
             mapControl.removeObject(mPlayerMarkers[playerID], MaplyBaseController.ThreadMode.ThreadCurrent);
         mPlayerMarkers[playerID] = null;
+    }
+
+    /** Remove markers for players omitted by a full server snapshot without rebuilding unchanged ones. */
+    private void removeMissingPlayerMarkers() {
+        if (mPlayerMarkers == null)
+            return;
+        boolean[] present = new boolean[mPlayerMarkers.length];
+        Globals.getmGPSDataSemaphore();
+        try {
+            Map<Byte, Globals.GPSData> locations = Globals.getInstance().mGPSData;
+            if (locations != null) {
+                for (Byte id : locations.keySet()) {
+                    if (id != null && Globals.isValidPlayerID(id) && id > 0 && id < present.length)
+                        present[id] = true;
+                }
+            }
+        } finally {
+            Globals.getInstance().mGPSDataSemaphore.release();
+        }
+        int localPlayerID = Globals.getInstance().mPlayerID;
+        for (int playerID = 1; playerID < mPlayerMarkers.length; playerID++) {
+            if (playerID != localPlayerID && !present[playerID])
+                removePlayerMarker(playerID);
+        }
     }
 
     private void removeAllPlayerMarkers() {

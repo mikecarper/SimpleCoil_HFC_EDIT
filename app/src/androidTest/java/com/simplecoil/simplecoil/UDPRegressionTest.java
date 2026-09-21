@@ -45,6 +45,7 @@ public class UDPRegressionTest {
     private int originalGameMode;
     private byte originalPlayerID;
     private InetAddress originalServer;
+    private boolean originalTournamentMode;
 
     @Before
     public void setUp() throws Exception {
@@ -58,10 +59,12 @@ public class UDPRegressionTest {
         originalGameMode = globals.mGameMode;
         originalPlayerID = globals.mPlayerID;
         originalServer = globals.mServerIP;
+        originalTournamentMode = globals.mTournamentMode;
         globals.mGameState = Globals.GAME_STATE_RUNNING;
         globals.mGameMode = Globals.GAME_MODE_2TEAMS;
         globals.mPlayerID = 1;
         globals.mServerIP = null;
+        globals.mTournamentMode = false;
         clearPlayers();
     }
 
@@ -79,6 +82,7 @@ public class UDPRegressionTest {
         globals.mGameMode = originalGameMode;
         globals.mPlayerID = originalPlayerID;
         globals.mServerIP = originalServer;
+        globals.mTournamentMode = originalTournamentMode;
         clearPlayers();
     }
 
@@ -135,6 +139,16 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void tournamentRejectsBareUdpEndGameFromAKnownPlayer() throws Exception {
+        Globals.getInstance().mTournamentMode = true;
+        register(enemy, 11);
+
+        receive(enemy, NetMsg.NETMSG_ENDGAME);
+
+        assertTrue("A tournament player ended the host through UDP", service.events.isEmpty());
+    }
+
+    @Test
     public void peerEndGameIsBoundToTheCurrentRoundToken() throws Exception {
         final String firstRound = "11111111-1111-1111-1111-111111111111";
         final String secondRound = "22222222-2222-2222-2222-222222222222";
@@ -160,6 +174,22 @@ public class UDPRegressionTest {
         receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + secondRound);
         assertTrue("A previous round's ENDGAME ended the replacement round", service.events.isEmpty());
         receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + firstRound);
+        assertEquals(NetMsg.NETMSG_ENDGAME, service.events.get(0).getAction());
+    }
+
+    @Test
+    public void tournamentPeerEndGameMustComeFromTheHostEndpoint() throws Exception {
+        Globals.getInstance().mTournamentMode = true;
+        Globals.getInstance().mServerIP = teammate;
+        register(teammate, 2);
+        register(enemy, 11);
+        service.startGame(true, PEER_ROUND_TOKEN);
+
+        receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
+        assertTrue("A tournament peer ended the host's round", service.events.isEmpty());
+
+        receive(teammate, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
+        assertEquals(1, service.events.size());
         assertEquals(NetMsg.NETMSG_ENDGAME, service.events.get(0).getAction());
     }
 
@@ -238,6 +268,7 @@ public class UDPRegressionTest {
     public void fixedCommandsRejectTrailingGarbageWithoutRemovingPlayer() throws Exception {
         register(teammate, 2);
         String[] commands = {NetMsg.NETMSG_SHOTFIRED, NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT,
+                NetMsg.NETMSG_ALREADYDEAD,
                 NetMsg.NETMSG_ELIMINATED, NetMsg.NETMSG_LEAVE, NetMsg.NETMSG_ENDGAME,
                 NetMsg.NETMSG_TEAMELIMINATED, NetMsg.NETMSG_SAMETEAM, NetMsg.NETMSG_ERROR};
         for (String command : commands) receive(teammate, command + "garbage");
@@ -303,6 +334,63 @@ public class UDPRegressionTest {
         assertEquals(3, reply.getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
         assertEquals(teammate, Globals.getInstance().mServerIP);
         assertFalse(flag("mScanRunning"));
+    }
+
+    @Test
+    public void passiveListenerForwardsOnlyAValidGameInvitation() throws Exception {
+        set(service, "mPassiveInviteListener", true);
+        receive(teammate, NetMsg.NETMSG_GAMEINVITE_PREFIX + NetMsg.NETWORK_VERSION + ":"
+                + PEER_ROUND_TOKEN);
+
+        assertEquals(1, service.events.size());
+        Intent invite = service.events.get(0);
+        assertEquals(NetMsg.NETMSG_GAMEINVITE, invite.getAction());
+        assertEquals(teammate.getHostAddress(),
+                invite.getStringExtra(UDPListenerService.INTENT_SERVERIP));
+        assertEquals(PEER_ROUND_TOKEN,
+                invite.getStringExtra(UDPListenerService.INTENT_GAME_INVITE_TOKEN));
+
+        service.events.clear();
+        receive(enemy, NetMsg.NETMSG_GAMEINVITE_PREFIX + "99:" + PEER_ROUND_TOKEN);
+        receive(enemy, NetMsg.NETMSG_GAMEINVITE_PREFIX + NetMsg.NETWORK_VERSION + ":not-a-token");
+        assertTrue("Malformed or incompatible invitations reached the UI", service.events.isEmpty());
+    }
+
+    @Test
+    public void activeNetworkSessionIgnoresGameInvitations() throws Exception {
+        receive(teammate, NetMsg.NETMSG_GAMEINVITE_PREFIX + NetMsg.NETWORK_VERSION + ":"
+                + PEER_ROUND_TOKEN);
+        assertTrue("A lobby or game session was replaced by an unsolicited invite", service.events.isEmpty());
+    }
+
+    @Test
+    public void invitedJoinReusesThePassiveListenerInsteadOfReportingFailure() throws Exception {
+        set(service, "mPassiveInviteListener", true);
+        set(service, "doneListening", false);
+        set(service, "keepListening", true);
+
+        assertTrue(service.joinGameInvite(teammate));
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        assertTrue(flag("mScanRunning"));
+        assertFalse(flag("mPassiveInviteListener"));
+        assertEquals(1, service.listenerStarts);
+        assertTrue("Accepting an invite emitted a spurious join failure", service.events.isEmpty());
+    }
+
+    @Test
+    public void hostInvitationTemporarilyAllowsLateDiscovery() throws Exception {
+        set(service, "keepListening", true);
+        set(service, "mBroadcastAddress", teammate);
+        set(service, "mIsListService", false);
+
+        assertTrue(service.inviteNearbyPlayers(PEER_ROUND_TOKEN));
+        assertTrue(flag("mIsListService"));
+        assertTrue(flag("mInviteTemporarilyAllowsJoin"));
+
+        service.allowJoin(true);
+        assertTrue(flag("mIsListService"));
+        assertFalse("An explicit host policy must supersede the invitation timer",
+                flag("mInviteTemporarilyAllowsJoin"));
     }
 
     @Test
@@ -569,11 +657,12 @@ public class UDPRegressionTest {
     }
 
     @Test
-    public void validHitOutAndEliminationKeepTheirPlayerIds() throws Exception {
+    public void validCombatFeedbackEventsKeepTheirPlayerIds() throws Exception {
         register(enemy, 11);
-        String[] commands = {NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT, NetMsg.NETMSG_ELIMINATED};
+        String[] commands = {NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT, NetMsg.NETMSG_ALREADYDEAD,
+                NetMsg.NETMSG_ELIMINATED};
         for (String command : commands) receive(enemy, command);
-        assertEquals(3, service.events.size());
+        assertEquals(commands.length, service.events.size());
         for (int index = 0; index < commands.length; index++) {
             assertEquals(commands[index], service.events.get(index).getAction());
             assertEquals(11, service.events.get(index).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));

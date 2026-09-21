@@ -217,6 +217,18 @@ public class MapRegressionTest {
     }
 
     @Test
+    public void unchangedFullRefreshKeepsExistingNativeMarkers() {
+        scenario.onActivity(current -> {
+            showPlayers();
+            ComponentObject teammate = marker(2);
+            ComponentObject enemy = marker(11);
+            receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE).putExtra(NetMsg.INTENT_FULLUPDATE, true));
+            assertSame(teammate, marker(2));
+            assertSame(enemy, marker(11));
+        });
+    }
+
+    @Test
     public void disablingGpsRemovesMarkersWithoutALocationSubscription() {
         scenario.onActivity(current -> {
             showPlayers();

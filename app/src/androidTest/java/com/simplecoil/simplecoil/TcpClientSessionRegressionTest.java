@@ -432,6 +432,16 @@ public class TcpClientSessionRegressionTest {
     }
 
     private void expectGrenadePairing(int expected) throws Exception {
+        // Registration republishes both the player's saved settings and their
+        // grenade pairing. Assert the settings frame explicitly rather than
+        // treating it as a malformed grenade report.
+        String settingsMessage = received.readUTF();
+        assertTrue(settingsMessage.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
+        JSONObject settings = new JSONObject(settingsMessage.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                + TcpServer.TCPPREFIX_JSON.length()));
+        assertTrue(settings.getBoolean(TcpServer.JSON_PLAYERSETTINGS));
+        assertEquals(Globals.getInstance().mPlayerID, settings.getInt(TcpServer.JSON_PLAYERID));
+
         String message = received.readUTF();
         assertTrue(message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
         JSONObject pairing = new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length()

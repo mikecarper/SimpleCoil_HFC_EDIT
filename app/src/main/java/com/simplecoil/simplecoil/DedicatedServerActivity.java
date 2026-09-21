@@ -79,6 +79,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private TextView mGameStatusTV = null;
     private Switch mAllowJoinSwitch = null;
     private Switch mOnlyServerSettingsSwitch = null;
+    private Switch mTournamentModeSwitch = null;
     private ListView mPlayerDisplayList = null;
 
     private CountDownTimer mGameCountdownTimer = null;
@@ -90,6 +91,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private long mPreviousGameTimeRemaining;
     private boolean mPreviousUseGPS;
     private boolean mPreviousOnlyServerSettings;
+    private boolean mPreviousAllowPlayerSettings;
+    private boolean mPreviousTournamentMode;
+    private boolean mTournamentPolicySaved;
+    private boolean mTournamentPreviousAllowPlayerSettings;
+    private boolean mTournamentPreviousOnlyServerSettings;
     private InetAddress mPreviousServerIP;
     private boolean mPreviousAppStateRestored;
 
@@ -250,6 +256,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mPreviousGameTimeRemaining = globals.mServerGameTimeRemaining;
         mPreviousUseGPS = globals.mUseGPS;
         mPreviousOnlyServerSettings = globals.mOnlyServerSettings;
+        mPreviousAllowPlayerSettings = globals.mAllowPlayerSettings;
+        mPreviousTournamentMode = globals.mTournamentMode;
         mPreviousServerIP = globals.mServerIP;
         globals.mPlayerID = 0;
         globals.mGameState = Globals.GAME_STATE_NONE;
@@ -342,10 +350,20 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mOnlyServerSettingsSwitch = findViewById(R.id.only_server_settings_switch);
         mOnlyServerSettingsSwitch.setChecked(Globals.getInstance().mOnlyServerSettings);
         mOnlyServerSettingsSwitch.setOnClickListener((v -> {
+            if (Globals.getInstance().mTournamentMode) {
+                mOnlyServerSettingsSwitch.setChecked(true);
+                return;
+            }
             Globals.getInstance().mOnlyServerSettings = mOnlyServerSettingsSwitch.isChecked();
             if (mTcpServer != null)
                 mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
         }));
+        mTournamentModeSwitch = findViewById(R.id.tournament_mode_switch);
+        mTournamentModeSwitch.setChecked(globals.mTournamentMode);
+        mTournamentModeSwitch.setOnClickListener(v ->
+                setTournamentMode(mTournamentModeSwitch.isChecked()));
+        if (globals.mTournamentMode)
+            setTournamentMode(true);
         try {
             // Display app version
             PackageInfo pInfo = this.getPackageManager().getPackageInfo(getPackageName(), 0);
@@ -363,6 +381,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mPlayerDisplayList.setOnItemClickListener((parent, view, position, id) -> {
             if (position == 0 || position > Globals.MAX_PLAYER_ID)
                 return;
+            if (Globals.getInstance().mTournamentMode) {
+                Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
             PlayerSettingsAlertDialog dialog = new PlayerSettingsAlertDialog(DedicatedServerActivity.this);
             dialog.setServer((byte)position, mTcpServer);
             dialog.show();
@@ -424,6 +447,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         globals.mServerGameTimeRemaining = mPreviousGameTimeRemaining;
         globals.mUseGPS = mPreviousUseGPS;
         globals.mOnlyServerSettings = mPreviousOnlyServerSettings;
+        globals.mAllowPlayerSettings = mPreviousAllowPlayerSettings;
+        globals.mTournamentMode = mPreviousTournamentMode;
         globals.mServerIP = mPreviousServerIP;
     }
 
@@ -433,10 +458,66 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         editor.apply();
     }
 
+    /** Toggle the fixed, server-authoritative two-team tournament ruleset. */
+    private void setTournamentMode(boolean enabled) {
+        Globals globals = Globals.getInstance();
+        if (enabled && globals.mGameState != Globals.GAME_STATE_NONE) {
+            Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                    Toast.LENGTH_SHORT).show();
+            if (mTournamentModeSwitch != null)
+                mTournamentModeSwitch.setChecked(globals.mTournamentMode);
+            return;
+        }
+        if (enabled) {
+            if (!globals.mTournamentMode || !mTournamentPolicySaved) {
+                mTournamentPreviousAllowPlayerSettings = globals.mAllowPlayerSettings;
+                mTournamentPreviousOnlyServerSettings = globals.mOnlyServerSettings;
+                mTournamentPolicySaved = true;
+            }
+            globals.mTournamentMode = true;
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            globals.mAllowPlayerSettings = false;
+            globals.mOnlyServerSettings = true;
+            if (mGameModeButton != null)
+                mGameModeButton.setText(R.string.game_mode_tournament_2teams);
+            if (mTournamentModeSwitch != null)
+                mTournamentModeSwitch.setChecked(true);
+            if (mOnlyServerSettingsSwitch != null) {
+                mOnlyServerSettingsSwitch.setChecked(true);
+                mOnlyServerSettingsSwitch.setEnabled(false);
+            }
+            if (mTcpServer != null)
+                mTcpServer.setTournamentMode(true);
+        } else {
+            globals.mTournamentMode = false;
+            if (mTournamentPolicySaved) {
+                globals.mAllowPlayerSettings = mTournamentPreviousAllowPlayerSettings;
+                globals.mOnlyServerSettings = mTournamentPreviousOnlyServerSettings;
+                mTournamentPolicySaved = false;
+            }
+            if (mGameModeButton != null)
+                mGameModeButton.setText(R.string.game_mode_2teams);
+            if (mTournamentModeSwitch != null)
+                mTournamentModeSwitch.setChecked(false);
+            if (mOnlyServerSettingsSwitch != null) {
+                mOnlyServerSettingsSwitch.setEnabled(true);
+                mOnlyServerSettingsSwitch.setChecked(globals.mOnlyServerSettings);
+            }
+            if (mTcpServer != null)
+                mTcpServer.setTournamentMode(false);
+        }
+        // Tournament is always two teams, so GPS teammate visibility remains meaningful.
+        savePreference(FullscreenActivity.PREF_GAME_MODE, globals.mGameMode);
+        setGPSMode(globals.mGPSMode);
+        getPlayerDisplayData();
+    }
+
     @Override
     public boolean onMenuItemClick(MenuItem item) {
         int id = item.getItemId();
         if (id == R.id.game_mode_2teams_item) {
+            if (Globals.getInstance().mTournamentMode)
+                setTournamentMode(false);
             Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
             mGameModeButton.setText(R.string.game_mode_2teams);
             savePreference(FullscreenActivity.PREF_GAME_MODE, Globals.getInstance().mGameMode);
@@ -444,6 +525,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             getPlayerDisplayData();
             return true;
         } else if (id == R.id.game_mode_4teams_item) {
+            if (Globals.getInstance().mTournamentMode)
+                setTournamentMode(false);
             Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
             mGameModeButton.setText(R.string.game_mode_4teams);
             savePreference(FullscreenActivity.PREF_GAME_MODE, Globals.getInstance().mGameMode);
@@ -451,6 +534,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             getPlayerDisplayData();
             return true;
         } else if (id == R.id.game_mode_ffa_item) {
+            if (Globals.getInstance().mTournamentMode)
+                setTournamentMode(false);
             Globals.getInstance().mGameMode = Globals.GAME_MODE_FFA;
             mGameModeButton.setText(R.string.game_mode_ffa);
             savePreference(FullscreenActivity.PREF_GAME_MODE, Globals.getInstance().mGameMode);
@@ -480,8 +565,12 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mGPSModeButton.setText(R.string.gps_mode_disabled);
         } else {
             Globals.getInstance().mUseGPS = true;
-            if (mTcpServer != null)
+            if (mTcpServer != null) {
                 mTcpServer.sendGPSData();
+                // A visibility-mode change needs a complete replacement table so clients drop
+                // markers that are no longer eligible for them.
+                mTcpServer.requestGPSRefresh();
+            }
             if (mode == Globals.GPS_TEAMMATE)
                 mGPSModeButton.setText(R.string.gps_mode_teammate);
             else
@@ -658,11 +747,17 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                         ? mRoundStartAt + Globals.getInstance().mTimeLimit * 60000L : 0;
         mStartGameButton.setEnabled(false);
         mGameModeButton.setEnabled(false);
+        if (mTournamentModeSwitch != null)
+            mTournamentModeSwitch.setEnabled(false);
         mGameLimitButton.setEnabled(false);
         mGPSModeButton.setEnabled(false);
         mGameStatusTV.setText(R.string.dedicated_game_running);
-        if (mUDPListenerService != null)
+        if (mUDPListenerService != null) {
             mUDPListenerService.allowJoin(mAllowJoinSwitch.isChecked());
+            String roundToken = start.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+            if (TcpServer.isValidRoundToken(roundToken))
+                mUDPListenerService.inviteNearbyPlayers(roundToken);
+        }
         mEndGameButton.setEnabled(true);
         updateGameMasterRespawnButton();
         if (mRoundEndAt > 0) {
@@ -712,6 +807,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, 0));
         mStartGameButton.setEnabled(true);
         mGameModeButton.setEnabled(true);
+        if (mTournamentModeSwitch != null)
+            mTournamentModeSwitch.setEnabled(true);
         mGameLimitButton.setEnabled(true);
         mGPSModeButton.setEnabled(true);
         mGameStatusTV.setText(R.string.dedicated_game_waiting);
@@ -750,7 +847,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             } else if (NetMsg.NETMSG_FAILEDTOJOIN.equals(action)) {
                 if (mUdpServerStarting)
                     failDedicatedHostStartup();
-            } else if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)) {
+            } else if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)
+                    || NetMsg.NETMSG_QUIT.equals(action)) {
                 mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount() - 1));
                 if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE && NetMsg.NETMSG_LEAVE.equals(action) && Globals.getPlayerCount() <= 1)
                     endGame(); // Everyone else is out so game is over - this only works in FFA because we don't keep track of who and how many people are on each team
@@ -807,6 +905,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         final IntentFilter intentFilter = new IntentFilter();
         intentFilter.addAction(NetMsg.NETMSG_JOIN);
         intentFilter.addAction(NetMsg.NETMSG_LEAVE);
+        intentFilter.addAction(NetMsg.NETMSG_QUIT);
         intentFilter.addAction(NetMsg.NETMSG_STARTGAME);
         intentFilter.addAction(NetMsg.NETMSG_ENDGAME);
         intentFilter.addAction(NetMsg.NETMSG_ERROR);

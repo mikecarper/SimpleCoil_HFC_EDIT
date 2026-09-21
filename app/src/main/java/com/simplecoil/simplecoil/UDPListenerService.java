@@ -63,6 +63,13 @@ public class UDPListenerService extends Service {
     private static final int RECEIVE_BUFFER_SIZE = 500;
 
     private volatile DatagramSocket mSocket;
+    // Outbound events use one socket for the lifetime of the service.  Creating a fresh UDP
+    // socket for every recipient burns file descriptors and kernel work during a firefight.
+    // Access is serialized by mSendLock.
+    // Volatile lets destruction close an in-flight socket without waiting for a
+    // sender that is blocked on mSendLock. DatagramSocket.close() is safe from
+    // another thread and unblocks a concurrent send.
+    private volatile DatagramSocket mSendSocket;
 
     WifiManager wm = null;
     WifiManager.MulticastLock multicastLock = null;
@@ -71,14 +78,21 @@ public class UDPListenerService extends Service {
     private InetAddress mBroadcastAddress = null;
 
     private static final long LISTENER_START_TIMEOUT_MS = 5000;
+    // An invite waits ten seconds on the receiving phone before it joins. Keep
+    // discovery open long enough for that choice and the UDP/TCP hand-off.
+    private static final long GAME_INVITE_JOIN_WINDOW_MS = 20_000;
+    private static final int GAME_INVITE_BROADCAST_REPETITIONS = 3;
+    private static final long INVITE_LISTENER_RETRY_MS = 100;
     // Combat messages can arrive much faster than a congested Wi-Fi link can
     // transmit them. Keep the sender bounded so a stalled socket cannot create
     // an unbounded number of Java threads or queued packet snapshots.
     static final int MAX_PENDING_DATAGRAM_SENDS = 64;
-    private static final long SEND_THREAD_KEEP_ALIVE_MS = 100;
     private final Object mSendLock = new Object();
-    private final ThreadPoolExecutor mSendExecutor = new ThreadPoolExecutor(0, 1,
-            SEND_THREAD_KEEP_ALIVE_MS, TimeUnit.MILLISECONDS,
+    // Retain one worker once it has been used.  Combat bursts commonly arrive more than
+    // 100 ms apart, so allowing the old core-zero executor to time out recreated a thread for
+    // nearly every burst.
+    private final ThreadPoolExecutor mSendExecutor = new ThreadPoolExecutor(1, 1,
+            0L, TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<>(MAX_PENDING_DATAGRAM_SENDS),
             runnable -> new Thread(runnable, "SimpleCoil UDP send"),
             new ThreadPoolExecutor.DiscardOldestPolicy());
@@ -86,7 +100,7 @@ public class UDPListenerService extends Service {
     // new thread for every tap, while retaining the most recent address request.
     static final int MAX_PENDING_SERVER_LOOKUPS = 1;
     private final ThreadPoolExecutor mLookupExecutor = new ThreadPoolExecutor(0, 1,
-            SEND_THREAD_KEEP_ALIVE_MS, TimeUnit.MILLISECONDS,
+            100, TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<>(MAX_PENDING_SERVER_LOOKUPS),
             runnable -> new Thread(runnable, "SimpleCoil UDP lookup"),
             new ThreadPoolExecutor.DiscardOldestPolicy());
@@ -140,6 +154,16 @@ public class UDPListenerService extends Service {
     private volatile boolean mScanRunning = false;
     private final Object mListenerStateLock = new Object();
     private boolean mDestroyed;
+    // Idle player screens keep a lightweight listener for GAMEINVITE packets.
+    // It is deliberately separate from a real discovery scan: an invite must
+    // never make a phone look as though it has joined a lobby already.
+    private volatile boolean mPassiveInviteListener;
+    private boolean mInviteListenerRequested;
+    private Runnable mInviteListenerRetry;
+    // A host can temporarily reopen discovery for an invitation without
+    // overriding an operator's persistent "allow late joins" choice.
+    private long mInviteWindowGeneration;
+    private boolean mInviteTemporarilyAllowsJoin;
     // Queued sends may drain after stopListen(), but not into a replacement lobby.
     // Separate from discovery's generation, which changes on a successful reply.
     private long mSendGeneration;
@@ -162,6 +186,8 @@ public class UDPListenerService extends Service {
 
     public static final String INTENT_PLAYERID = "playerid";
     public static final String INTENT_MESSAGE = "message";
+    public static final String INTENT_SERVERIP = "serverip";
+    public static final String INTENT_GAME_INVITE_TOKEN = "gameinvitetoken";
 
     private void listenForMessage(InetAddress ip, Integer port, Integer timeout) throws Exception {
         byte[] recvBuf = new byte[RECEIVE_BUFFER_SIZE];
@@ -175,7 +201,8 @@ public class UDPListenerService extends Service {
             }
             socket.setSoTimeout(timeout);
             DatagramPacket packet = new DatagramPacket(recvBuf, recvBuf.length);
-            Log.d(TAG, "Waiting for UDP messages on " + ip.toString() + ":" + port);
+            if (BuildConfig.DEBUG)
+                Log.d(TAG, "Waiting for UDP messages on " + ip + ":" + port);
             synchronized (mListenerStateLock) {
                 if (!keepListening || mDestroyed)
                     return;
@@ -240,7 +267,17 @@ public class UDPListenerService extends Service {
         }
         if (message.startsWith(NetMsg.MESSAGE_PREFIX)) {
             message = message.substring(NetMsg.MESSAGE_PREFIX.length());
-            if (message.equals(NetMsg.NETMSG_SHOTFIRED)) {
+            if (message.startsWith(NetMsg.NETMSG_GAMEINVITE_PREFIX)) {
+                String roundToken = parseGameInviteToken(message);
+                // Only the listener started by an idle player screen accepts
+                // invitations. A player already in a lobby or round must not
+                // be pulled into an unrelated host by a broadcast packet.
+                if (roundToken != null && mPassiveInviteListener) {
+                    intent = new Intent(NetMsg.NETMSG_GAMEINVITE)
+                            .putExtra(INTENT_SERVERIP, ip.getHostAddress())
+                            .putExtra(INTENT_GAME_INVITE_TOKEN, roundToken);
+                }
+            } else if (message.equals(NetMsg.NETMSG_SHOTFIRED)) {
                 if (getPlayerID(ip) == null)
                     return;
                 // someone else fired a shot
@@ -250,16 +287,30 @@ public class UDPListenerService extends Service {
                 intent = new Intent(NetMsg.NETMSG_HIT);
                 Byte id = getPlayerID(ip);
                 if (id == null) {
-                    Log.e(TAG, "Unknown IP " + ip.toString());
+                    if (BuildConfig.DEBUG)
+                        Log.d(TAG, "Ignoring HIT from unknown IP " + ip);
                     return;
                 }
                 intent.putExtra(INTENT_PLAYERID, id);
             } else if (message.equals(NetMsg.NETMSG_OUT)) {
-                // hitting a player that's already out
+                // You landed the final hit that put a player out.
                 intent = new Intent(NetMsg.NETMSG_OUT);
                 Byte id = getPlayerID(ip);
                 if (id == null) {
-                    Log.e(TAG, "Unknown IP " + ip.toString());
+                    if (BuildConfig.DEBUG)
+                        Log.d(TAG, "Ignoring OUT from unknown IP " + ip);
+                    return;
+                }
+                intent.putExtra(INTENT_PLAYERID, id);
+            } else if (message.equals(NetMsg.NETMSG_ALREADYDEAD)) {
+                // A known player is currently eliminated, so this shot cannot
+                // earn another hit or point. Surface that acknowledgement to
+                // the shooter without changing game state.
+                intent = new Intent(NetMsg.NETMSG_ALREADYDEAD);
+                Byte id = getPlayerID(ip);
+                if (id == null) {
+                    if (BuildConfig.DEBUG)
+                        Log.d(TAG, "Ignoring ALREADYDEAD from unknown IP " + ip);
                     return;
                 }
                 intent.putExtra(INTENT_PLAYERID, id);
@@ -275,7 +326,8 @@ public class UDPListenerService extends Service {
                 intent = new Intent(NetMsg.NETMSG_ELIMINATED);
                 Byte id = getPlayerID(ip);
                 if (id == null) {
-                    Log.e(TAG, "Unknown IP " + ip.toString());
+                    if (BuildConfig.DEBUG)
+                        Log.d(TAG, "Ignoring elimination from unknown IP " + ip);
                     return;
                 }
                 intent.putExtra(INTENT_PLAYERID, id);
@@ -323,7 +375,8 @@ public class UDPListenerService extends Service {
                 // Discovery only proves that a peer can receive UDP. TCP registration
                 // owns roster membership and endpoints. Recording a JOIN here leaves
                 // ghosts when its sender never completes the TCP handshake.
-                Log.d(TAG, "UDP discovery from player " + assignedPlayerID + " at " + ip.toString());
+                if (BuildConfig.DEBUG)
+                    Log.d(TAG, "UDP discovery from player " + assignedPlayerID + " at " + ip);
                 String reply = NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY;
                 if (assignedPlayerID != playerID)
                     reply += ":" + assignedPlayerID;
@@ -362,7 +415,10 @@ public class UDPListenerService extends Service {
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
                 // Protocol 14 peer games bind ENDGAME to the current round nonce.
                 // Keep the old fixed form only for TCP-authoritative games.
-                if (mPeerGame)
+                // Tournament termination is host-authoritative. Dedicated hosts
+                // end clients through TCP, so a player must never be able to
+                // terminate that round with a forged UDP datagram.
+                if (mPeerGame || Globals.getInstance().mTournamentMode)
                     return;
                 if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                         || (getPlayerID(ip) == null && !ip.equals(Globals.getInstance().mServerIP)))
@@ -394,6 +450,21 @@ public class UDPListenerService extends Service {
         }
         if (intent != null)
             sendBroadcast(intent);
+    }
+
+    /** Returns a validated invite round token, or {@code null} for an untrusted packet. */
+    private static String parseGameInviteToken(String message) {
+        if (message == null || !message.startsWith(NetMsg.NETMSG_GAMEINVITE_PREFIX))
+            return null;
+        String payload = message.substring(NetMsg.NETMSG_GAMEINVITE_PREFIX.length());
+        int separator = payload.indexOf(':');
+        if (separator != NetMsg.NETWORK_VERSION.length()
+                || separator != payload.lastIndexOf(':'))
+            return null;
+        if (!NetMsg.NETWORK_VERSION.equals(payload.substring(0, separator)))
+            return null;
+        String roundToken = payload.substring(separator + 1);
+        return TcpServer.isValidRoundToken(roundToken) ? roundToken : null;
     }
 
     /**
@@ -492,6 +563,13 @@ public class UDPListenerService extends Service {
     /** Accept an ENDGAME only from a current peer and only for this exact round. */
     private void processPeerEndGame(InetAddress ip, String roundToken) {
         if (!TcpServer.isValidRoundToken(roundToken))
+            return;
+        // Tournament peer rounds still use UDP for low-latency gameplay, but
+        // only the host endpoint may terminate the shared match. The round
+        // nonce prevents stale packets; it is not an authority credential
+        // because every player receives it in the synchronized start.
+        if (Globals.getInstance().mTournamentMode
+                && !ip.equals(Globals.getInstance().mServerIP))
             return;
         final Intent intent;
         final boolean deliverNow;
@@ -1010,6 +1088,82 @@ public class UDPListenerService extends Service {
 
     private volatile Thread mUDPMessageThread;
 
+    /**
+     * Listen for a committed dedicated-game invitation while this phone is
+     * otherwise idle. The socket is reused in-place when the player accepts,
+     * avoiding a close/rebind race on Android 5.1-era Wi-Fi stacks.
+     */
+    public void startGameInviteListener() {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed)
+                return;
+            mInviteListenerRequested = true;
+            startGameInviteListenerLocked();
+        }
+    }
+
+    // Caller holds mListenerStateLock.
+    private void startGameInviteListenerLocked() {
+        // A host, an actual scan, or a joined client already owns this socket.
+        // Do not replace any of those sessions with the passive listener.
+        if (mDestroyed || mIsListService || mScanRunning || mPeerGame
+                || (keepListening && !mPassiveInviteListener)) {
+            cancelInviteListenerRequestLocked();
+            return;
+        }
+        if (mPassiveInviteListener && !doneListening) {
+            cancelInviteListenerRequestLocked();
+            return;
+        }
+        if (!doneListening) {
+            scheduleInviteListenerRetryLocked();
+            return;
+        }
+        cancelInviteListenerRequestLocked();
+        mPassiveInviteListener = true;
+        mMyIP = null;
+        mReadyToScan = 0;
+        startListenForUDPMessage();
+    }
+
+    // Caller holds mListenerStateLock.
+    private void scheduleInviteListenerRetryLocked() {
+        if (mInviteListenerRetry != null)
+            return;
+        final Runnable retry = new Runnable() {
+            @Override public void run() {
+                synchronized (mListenerStateLock) {
+                    if (mInviteListenerRetry != this)
+                        return;
+                    mInviteListenerRetry = null;
+                    if (mInviteListenerRequested)
+                        startGameInviteListenerLocked();
+                }
+            }
+        };
+        mInviteListenerRetry = retry;
+        mMainHandler.postDelayed(retry, INVITE_LISTENER_RETRY_MS);
+    }
+
+    // Caller holds mListenerStateLock.
+    private void cancelInviteListenerRequestLocked() {
+        mInviteListenerRequested = false;
+        if (mInviteListenerRetry != null) {
+            mMainHandler.removeCallbacks(mInviteListenerRetry);
+            mInviteListenerRetry = null;
+        }
+    }
+
+    // Caller holds mListenerStateLock. A real join/create can reuse the
+    // passive listener without reporting a false "could not find lobby".
+    private boolean canReusePassiveInviteListenerLocked() {
+        if (!mPassiveInviteListener || doneListening || mIsListService || mScanRunning)
+            return false;
+        mPassiveInviteListener = false;
+        cancelInviteListenerRequestLocked();
+        return true;
+    }
+
     public void startListenForUDPMessage() {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
@@ -1022,7 +1176,7 @@ public class UDPListenerService extends Service {
             // Set this before starting the thread so a fast second Join/Create request cannot
             // start another listener while the first one is still binding its socket.
             doneListening = false;
-            if (mIsListService) {
+            if (mIsListService || mPassiveInviteListener) {
                 if (wm == null)
                     wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
                 if (wm == null) {
@@ -1110,7 +1264,7 @@ public class UDPListenerService extends Service {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
                 return;
-            if (!doneListening) {
+            if (!doneListening && !canReusePassiveInviteListenerLocked()) {
                 Log.e(TAG, "Listening is still in progress");
                 // A new host request supersedes an unfinished discovery scan.
                 // Leaving the old scan alive lets a late SERVERREPLY join the
@@ -1119,6 +1273,10 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
+            cancelInviteListenerRequestLocked();
+            mPassiveInviteListener = false;
+            mInviteTemporarilyAllowsJoin = false;
+            mInviteWindowGeneration++;
             mBroadcastAddress = getBroadcastAddress();
             if (mBroadcastAddress == null) {
                 Log.e(TAG, "Failed to get broadcast IP address");
@@ -1192,7 +1350,7 @@ public class UDPListenerService extends Service {
             // even when Wi-Fi has already lost its DHCP lease. Otherwise a
             // late reply can attach this player to the abandoned server after
             // the new request has reported failure.
-            if (!doneListening) {
+            if (!doneListening && !mPassiveInviteListener) {
                 Log.e(TAG, "Listening is still in progress");
                 stopListen();
                 sendFailedJoin();
@@ -1221,7 +1379,7 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
-            if (!doneListening) {
+            if (!doneListening && !mPassiveInviteListener) {
                 // This request replaces the in-flight discovery. Leaving it
                 // active after reporting failure lets a late reply join the
                 // server the player just abandoned.
@@ -1271,6 +1429,25 @@ public class UDPListenerService extends Service {
         joinServer(serverIP, LISTEN_PORT);
     }
 
+    /**
+     * Join the host that sent a validated GAMEINVITE. This accepts the passive
+     * listener as a reusable socket, rather than treating it as an abandoned
+     * manual discovery request and displaying a false failure.
+     */
+    public boolean joinGameInvite(InetAddress serverIP) {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || serverIP == null) {
+                return false;
+            }
+            if (!doneListening && !mPassiveInviteListener) {
+                Log.w(TAG, "Ignoring a stale game invitation while another network session is active");
+                return false;
+            }
+            joinServer(serverIP, LISTEN_PORT);
+            return mScanRunning;
+        }
+    }
+
     public void joinServer(InetAddress serverIP, Integer port) {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
@@ -1280,7 +1457,7 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
-            if (!doneListening) {
+            if (!doneListening && !canReusePassiveInviteListenerLocked()) {
                 Log.e(TAG, "Listening is still in progress");
                 // This request replaces the in-flight discovery. Leaving it
                 // active after reporting failure lets a late reply join the
@@ -1289,6 +1466,10 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
+            cancelInviteListenerRequestLocked();
+            mPassiveInviteListener = false;
+            mInviteTemporarilyAllowsJoin = false;
+            mInviteWindowGeneration++;
             mSendGeneration++;
             endScanningLocked();
             mPeerGame = false;
@@ -1415,13 +1596,15 @@ public class UDPListenerService extends Service {
                                long generation) {
         if (recipients.isEmpty() || !isCurrentSend(generation))
             return;
+        final byte[] payload = message.getBytes(StandardCharsets.UTF_8);
         Runnable sendTask = () -> {
             synchronized (mSendLock) {
+                DatagramPacket packet = new DatagramPacket(payload, payload.length);
                 for (int repeat = 0; repeat < repeatCount; repeat++) {
                     for (InetAddress ip : recipients) {
                         if (!isCurrentSend(generation) || Thread.currentThread().isInterrupted())
                             return;
-                        sendDatagram(message, ip, port);
+                        sendDatagram(packet, ip, port);
                     }
                     if (repeat + 1 < repeatCount) {
                         try {
@@ -1443,28 +1626,67 @@ public class UDPListenerService extends Service {
         }
     }
 
-    private void sendDatagram(String message, InetAddress ip, int port) {
-        DatagramSocket udpSocket = null;
+    private DatagramSocket getSendSocketLocked() throws SocketException {
+        if (mSendSocket == null || mSendSocket.isClosed()) {
+            mSendSocket = new DatagramSocket();
+            mSendSocket.setBroadcast(true);
+        }
+        return mSendSocket;
+    }
+
+    private void closeSendSocketLocked() {
+        if (mSendSocket != null)
+            mSendSocket.close();
+        mSendSocket = null;
+    }
+
+    private void closeSendSocket() {
+        synchronized (mSendLock) {
+            closeSendSocketLocked();
+        }
+    }
+
+    /**
+     * Service destruction must not wait for a sender that is waiting on
+     * mSendLock. In particular, Android can call onDestroy on the main thread
+     * while a game event is queued from another thread. The executor has
+     * already been stopped and mDestroyed prevents queued work from opening a
+     * replacement socket, so closing the current DatagramSocket directly is
+     * both safe and prompt.
+     */
+    private void closeSendSocketDuringDestroy() {
+        DatagramSocket socket = mSendSocket;
+        mSendSocket = null;
+        if (socket != null)
+            socket.close();
+    }
+
+    // Called with mSendLock held.  A packet object and socket are shared by the serial sender;
+    // only the destination changes between recipients.
+    private void sendDatagram(DatagramPacket packet, InetAddress ip, int port) {
         try {
-            Log.d(TAG, "sending '" + message + "' to " + ip.toString() + ":" + port);
-            udpSocket = new DatagramSocket(0); // system will assign any unused port for sending
-            byte[] buf = message.getBytes(StandardCharsets.UTF_8);
-            DatagramPacket packet = new DatagramPacket(buf, buf.length, ip, port);
-            udpSocket.send(packet);
+            if (BuildConfig.DEBUG)
+                Log.d(TAG, "sending UDP packet to " + ip + ":" + port);
+            packet.setAddress(ip);
+            packet.setPort(port);
+            getSendSocketLocked().send(packet);
         } catch (SocketException e) {
+            closeSendSocketLocked();
             Log.e(TAG, "Socket Error:", e);
         } catch (IOException e) {
+            closeSendSocketLocked();
             Intent intent = new Intent(NetMsg.NETMSG_ERROR);
             intent.putExtra(INTENT_MESSAGE, e.getLocalizedMessage());
             sendBroadcast(intent);
-        } finally {
-            if (udpSocket != null)
-                udpSocket.close();
         }
     }
 
     void stopListen() {
         synchronized (mListenerStateLock) {
+            cancelInviteListenerRequestLocked();
+            mPassiveInviteListener = false;
+            mInviteTemporarilyAllowsJoin = false;
+            mInviteWindowGeneration++;
             endScanningLocked();
             mIsListService = false;
             mPeerGame = false;
@@ -1502,6 +1724,7 @@ public class UDPListenerService extends Service {
         }
         mSendExecutor.shutdownNow();
         mLookupExecutor.shutdownNow();
+        closeSendSocketDuringDestroy();
         if (mPeerStartReceiverRegistered) {
             mPeerStartReceiverRegistered = false;
             try {
@@ -1560,6 +1783,10 @@ public class UDPListenerService extends Service {
             return;
         }
         synchronized (mListenerStateLock) {
+            cancelInviteListenerRequestLocked();
+            mPassiveInviteListener = false;
+            mInviteTemporarilyAllowsJoin = false;
+            mInviteWindowGeneration++;
             mIsListService = false; // There is no list service while the game is running
             clearJoinAssignments();
             boolean peerRoundChanged = mPeerGame != peerGame
@@ -1599,7 +1826,60 @@ public class UDPListenerService extends Service {
         sendUDPMessageAllRepeat(message, 3);
     }
 
-    public void allowJoin(boolean allowed) { mIsListService = allowed;}
+    /**
+     * Broadcast a current dedicated round to phones listening on the local
+     * Wi-Fi network. While the prompt is counting down on those phones, keep
+     * discovery open so their normal JOIN/TCP registration can complete.
+     */
+    public boolean inviteNearbyPlayers(String roundToken) {
+        if (!TcpServer.isValidRoundToken(roundToken)) {
+            Log.w(TAG, "Refusing to broadcast a game invitation without a valid round token");
+            return false;
+        }
+        final InetAddress broadcastAddress;
+        final long sendGeneration;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || mPeerGame || !keepListening)
+                return false;
+            if (mBroadcastAddress == null)
+                mBroadcastAddress = getBroadcastAddress();
+            if (mBroadcastAddress == null)
+                return false;
+            broadcastAddress = mBroadcastAddress;
+            final long inviteGeneration = ++mInviteWindowGeneration;
+            mInviteTemporarilyAllowsJoin = !mIsListService;
+            if (mInviteTemporarilyAllowsJoin)
+                mIsListService = true;
+            mMainHandler.postDelayed(() -> closeGameInviteWindow(inviteGeneration),
+                    GAME_INVITE_JOIN_WINDOW_MS);
+            sendGeneration = mSendGeneration;
+        }
+        sendDatagrams(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_GAMEINVITE_PREFIX
+                        + NetMsg.NETWORK_VERSION + ":" + roundToken,
+                Collections.singletonList(broadcastAddress), LISTEN_PORT,
+                GAME_INVITE_BROADCAST_REPETITIONS, sendGeneration);
+        return true;
+    }
+
+    private void closeGameInviteWindow(long inviteGeneration) {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || inviteGeneration != mInviteWindowGeneration
+                    || !mInviteTemporarilyAllowsJoin)
+                return;
+            mInviteTemporarilyAllowsJoin = false;
+            mIsListService = false;
+            clearJoinAssignments();
+        }
+    }
+
+    /** An explicit host policy change always supersedes an invitation timeout. */
+    public void allowJoin(boolean allowed) {
+        synchronized (mListenerStateLock) {
+            mInviteWindowGeneration++;
+            mInviteTemporarilyAllowsJoin = false;
+            mIsListService = allowed;
+        }
+    }
 
     private void sleep(long millis) {
         try {

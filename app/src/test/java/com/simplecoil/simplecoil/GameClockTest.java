@@ -65,13 +65,16 @@ public class GameClockTest {
         assertTrue(latest - earliest < 1000);
     }
 
-    @Test public void refreshKeepsPreviousEstimateUntilANewSampleArrives() {
+    @Test public void refreshKeepsPreviousEstimateUntilAFullNewBatchArrives() {
         GameClock clock = new GameClock();
         clock.record(1000, 6010, 6010, 1020);
         clock.beginSampling();
         assertEquals(0, clock.samples());
         assertEquals(2000, clock.toLocalTime(7000));
         clock.record(2000, 7020, 7020, 2020);
+        assertEquals(2000, clock.toLocalTime(7000));
+        for (int index = 1; index < GameClock.SAMPLES_PER_SYNC; index++)
+            clock.record(3000 + index, 8020 + index, 8020 + index, 3020 + index);
         assertEquals(1990, clock.toLocalTime(7000));
     }
 

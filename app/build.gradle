@@ -1,7 +1,47 @@
 apply plugin: 'com.android.application'
 
+// Pass -PappName="Your Event Name" to customize the launcher label at build time.
+def appDisplayName = providers.gradleProperty('appName')
+        .getOrElse("Dean's 11th Birthday Blaster Bash")
+
+// Keep release signing credentials outside version control. Command-line -P properties
+// take precedence over an ignored release.properties file in the project root.
+def releaseProperties = new Properties()
+def releasePropertiesFile = rootProject.file('release.properties')
+if (releasePropertiesFile.isFile()) {
+    releasePropertiesFile.withInputStream { releaseProperties.load(it) }
+}
+def releaseProperty = { String name ->
+    project.findProperty(name) ?: releaseProperties.getProperty(name)
+}
+def releaseStoreFilePath = releaseProperty('releaseStoreFile')
+def releaseStorePassword = releaseProperty('releaseStorePassword')
+def releaseKeyAlias = releaseProperty('releaseKeyAlias')
+def releaseKeyPassword = releaseProperty('releaseKeyPassword')
+def releaseSigningConfigured = [releaseStoreFilePath, releaseStorePassword,
+        releaseKeyAlias, releaseKeyPassword].every { it != null && !it.trim().isEmpty() }
+
+if ([releaseStoreFilePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+        .any { it != null && !it.trim().isEmpty() } && !releaseSigningConfigured) {
+    throw new GradleException('Release signing needs releaseStoreFile, releaseStorePassword, '
+            + 'releaseKeyAlias, and releaseKeyPassword.')
+}
+if (releaseSigningConfigured && !rootProject.file(releaseStoreFilePath).isFile()) {
+    throw new GradleException("Release keystore not found: ${releaseStoreFilePath}")
+}
+
 android {
     compileSdk 34
+    signingConfigs {
+        release {
+            if (releaseSigningConfigured) {
+                storeFile rootProject.file(releaseStoreFilePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
     defaultConfig {
         applicationId "com.simplecoil.simplecoil"
         minSdkVersion 21
@@ -9,11 +49,14 @@ android {
         versionCode 15
         versionName "1.14"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders = [appName: appDisplayName]
     }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (releaseSigningConfigured)
+                signingConfig signingConfigs.release
         }
     }
     lint {

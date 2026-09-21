@@ -77,6 +77,12 @@ public class Globals {
     public volatile boolean mOverrideLives = false;
     public volatile int mOverrideLivesVal = 0;
     public volatile boolean mAllowPlayerSettings = true;
+    /**
+     * A dedicated-host tournament is deliberately a fixed, reproducible ruleset.  It is
+     * separate from the normal game-mode value because the existing team calculations still
+     * operate on the ordinary two-team mode.
+     */
+    public volatile boolean mTournamentMode = false;
     public volatile boolean mReloadOnEmpty = false; // Primarily intended for instagib
     // This is local phone feedback, not a weapon setting that a server can impose.
     // Keep the historical default off until the player explicitly enables it.
@@ -191,6 +197,44 @@ public class Globals {
                 && lives >= 0 && lives <= MAX_CONFIGURED_HEALTH
                 && (allowSingle || allowBurst || allowAuto)
                 && isValidFiringMode(firingMode);
+    }
+
+    /** Apply the common tournament profile to one network player record. */
+    public static void applyTournamentRules(PlayerSettings settings) {
+        if (settings == null)
+            return;
+        settings.health = MAX_HEALTH;
+        settings.shots = RELOAD_COUNT;
+        settings.reloadTime = RELOAD_TIME_MILLISECONDS;
+        settings.reloadOnEmpty = false;
+        settings.spawnTime = RESPAWN_TIME_SECONDS;
+        settings.damage = DAMAGE_PER_HIT;
+        settings.overrideLives = false;
+        settings.lives = 0;
+        // Tournament matches are deliberately single-shot only.  Keep this in the profile,
+        // rather than relying on the client UI, so a reconnect cannot restore auto or burst.
+        settings.allowShotModeSingle = true;
+        settings.allowShotModeBurst3 = false;
+        settings.allowShotModeAuto = false;
+        settings.firingMode = FIRING_MODE_OUTDOOR_NO_CONE;
+    }
+
+    /** Apply the common tournament profile to the local phone and weapon configuration. */
+    public void applyTournamentRules() {
+        mFullHealth = MAX_HEALTH;
+        mFullShields = MAX_SHIELDS;
+        mFullReload = RELOAD_COUNT;
+        mReloadTime = RELOAD_TIME_MILLISECONDS;
+        mReloadOnEmpty = false;
+        mRespawnTime = RESPAWN_TIME_SECONDS;
+        mDamage = DAMAGE_PER_HIT;
+        mOverrideLives = false;
+        mOverrideLivesVal = 0;
+        mAllowSingleShotMode = true;
+        mAllowBurst3ShotMode = false;
+        mAllowAutoShotMode = false;
+        mCurrentFiringMode = FIRING_MODE_OUTDOOR_NO_CONE;
+        mAllowPlayerSettings = false;
     }
 
     public volatile byte mPlayerID = 0;
