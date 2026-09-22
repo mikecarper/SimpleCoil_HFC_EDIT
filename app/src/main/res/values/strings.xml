@@ -17,6 +17,12 @@
     <string name="connect_status_scanning">Scanning&#8230;</string>
     <string name="connect_status_connecting">Connecting&#8230;</string>
     <string name="connect_status_communicating">Communicating&#8230;</string>
+    <string name="weapon_pairing_title">Choose Your Weapon</string>
+    <string name="weapon_pairing_message">%1$d compatible weapons are nearby. Hold the trigger on the weapon you want to use, then tap Detect Trigger.</string>
+    <string name="weapon_pairing_detect_trigger">Detect Trigger</string>
+    <string name="weapon_pairing_checking">Hold the trigger on %1$s&#8230;</string>
+    <string name="weapon_pairing_not_detected">No held trigger was detected. Keep holding the trigger and try again.</string>
+    <string name="weapon_pairing_selected">Weapon selected</string>
     //Game strings
     <string name="start_game_button">Start</string>
     <string name="end_game_button">End</string>

@@ -98,6 +98,7 @@ import org.json.JSONObject;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -231,6 +232,27 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private volatile boolean mConnected = false;
     private boolean mCommunicating = false; // Used to make sure that we start receiving telemetry data after initial connection
     private String mDeviceAddress = ""; // MAC address of the tagger
+    // A first-time scan must not connect to whichever nearby blaster happens to
+    // advertise first. Collect viable SRG1 devices briefly, then use a held
+    // trigger notification to identify the player's gun if there is a choice.
+    private static final long NEW_WEAPON_DISCOVERY_WINDOW_MS = 3_000L;
+    private static final long NEW_WEAPON_TRIGGER_PROBE_TIMEOUT_MS = 6_000L;
+    private final Handler mWeaponPairingHandler = new Handler(Looper.getMainLooper());
+    private final ArrayList<WeaponCandidate> mNewWeaponCandidates = new ArrayList<>();
+    private Runnable mNewWeaponDiscoveryRunnable;
+    private Runnable mTriggerProbeConnectRunnable;
+    private Runnable mTriggerProbeTimeoutRunnable;
+    private boolean mCollectingNewWeaponCandidates;
+    private boolean mTriggerPairingActive;
+    private int mTriggerProbeIndex = -1;
+    private String mTriggerProbeAddress;
+    // The Connect Weapon action intentionally clears mDeviceAddress before a
+    // first-time scan. Keep the previous saved address separately so a
+    // cancelled or unsuccessful chooser cannot make a nearby, unselected gun
+    // become the next automatic reconnect target.
+    private String mPreviousWeaponAddress = "";
+    private AlertDialog mWeaponPairingDialog;
+    private BluetoothGattCharacteristic mIdCharacteristic;
     private static byte mLastTeam = 0;
     private int mHitsTaken = 0; // total hits taken regardless of lives
     private static int mHealth = Globals.MAX_HEALTH;
@@ -258,6 +280,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static class LastHitData {
         int playerID;
         byte shotID;
+    }
+
+    private static final class WeaponCandidate {
+        final String address;
+        final String name;
+
+        WeaponCandidate(String address, String name) {
+            this.address = address;
+            this.name = name == null || name.trim().isEmpty() ? "SRG1" : name.trim();
+        }
     }
 
     private final LastHitData mLastHitData1 = new LastHitData();
@@ -362,6 +394,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     public final static int RECOIL_POWER_BIT = 0x10;
 
     private static final byte WEAPON_PROFILE = (byte)0x00;
+
+    // Keep game phones focused on the match. IMMERSIVE_STICKY makes a swipe
+    // reveal Android's system controls only temporarily; it is intentionally
+    // not a kiosk lock, so the player can still leave through Android when
+    // necessary.
+    private static final int GAME_LOCK_SYSTEM_UI_FLAGS = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            | View.SYSTEM_UI_FLAG_FULLSCREEN
+            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
 
     // Field games normally use the Recoil hub. Keep networking ready by
     // default; a player can still explicitly disable it for a local game.
@@ -527,9 +570,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     handleDisconnect();
                     return;
                 }
-                SharedPreferences.Editor editor = sharedPreferences.edit();
-                editor.putString(PREF_DEVICE_ADDRESS, mDeviceAddress);
-                editor.apply();
+                // Probe connections in the multi-gun chooser are deliberately
+                // temporary. Do not replace the saved blaster until its held
+                // trigger identifies it as the player's selection.
+                if (!mTriggerPairingActive) {
+                    SharedPreferences.Editor editor = sharedPreferences.edit();
+                    editor.putString(PREF_DEVICE_ADDRESS, mDeviceAddress);
+                    editor.apply();
+                }
             }
 
             @Override
@@ -1956,10 +2004,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         resetRoundTelemetryState();
         clearCombatFeedback();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        getWindow().getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION // hide nav bar
-                        //| View.SYSTEM_UI_FLAG_FULLSCREEN // hide status bar
-                        | View.SYSTEM_UI_FLAG_IMMERSIVE);
+        enableGameLock();
         mScore = 0;
         mScoreTV.setText("0");
         mTeamScore = 0;
@@ -2166,6 +2211,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return mPlayerQuitWindowOpen && mPlayerQuitWindowEndsAt > SystemClock.elapsedRealtime();
     }
 
+    private void enableGameLock() {
+        if (isFinishing() || isDestroyed())
+            return;
+        getWindow().getDecorView().setSystemUiVisibility(GAME_LOCK_SYSTEM_UI_FLAGS);
+    }
+
+    private void disableGameLock() {
+        if (!isFinishing() && !isDestroyed())
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+    }
+
     private void endGame() {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         updateTeamAssignmentScanButton();
@@ -2206,7 +2262,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         hideWeaponDisconnect();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+        disableGameLock();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
             mSpawnTimer = null;
@@ -3036,6 +3092,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     protected void onResume() {
         super.onResume();
         mActivityResumed = true;
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            enableGameLock();
         if (mRecoilWifiAutoJoiner != null)
             mRecoilWifiAutoJoiner.start();
         ContextCompat.registerReceiver(this, mGattUpdateReceiver, makeGattUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
@@ -3072,9 +3130,26 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     @Override
+    public void onWindowFocusChanged(boolean hasWindowFocus) {
+        super.onWindowFocusChanged(hasWindowFocus);
+        // A system dialog or an accidental swipe can make the bars visible.
+        // Reassert sticky mode as soon as this active game regains focus.
+        if (hasWindowFocus && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            enableGameLock();
+    }
+
+    @Override
     protected void onPause() {
         if (mGameInviteDialog != null)
             dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
+        // Trigger identification relies on receiver-delivered BLE telemetry.
+        // Do not leave a half-finished probe alive while the activity is in
+        // the background, where it could later be mistaken for a real gun.
+        if (mCollectingNewWeaponCandidates || mTriggerPairingActive
+                || mWeaponPairingDialog != null) {
+            cancelNewWeaponPairing();
+            returnFromNewWeaponPairing();
+        }
         mActivityResumed = false;
         if (mRecoilWifiAutoJoiner != null)
             mRecoilWifiAutoJoiner.stop();
@@ -3105,6 +3180,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     protected void onDestroy() {
         if (mGameInviteDialog != null)
             dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
+        cancelNewWeaponPairing();
         clearCombatFeedback();
         resetTeamRespawnQrState();
         hideWeaponDisconnect();
@@ -3121,10 +3197,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mGameCountdownTimer.cancel();
             mGameCountdownTimer = null;
         }
-        if (mConnectFailTimer != null) {
-            mConnectFailTimer.cancel();
-            mConnectFailTimer = null;
-        }
+        stopConnectFailTest();
         cancelShieldRegeneration();
         resetBluetoothServices();
         unbindUDPService();
@@ -3170,6 +3243,262 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         FragmentTransaction fragmentTransaction = mFragmentMgr.beginTransaction();
         fragmentTransaction.remove(mapFragment);
         fragmentTransaction.commit();
+    }
+
+    private void beginNewWeaponDiscovery() {
+        mPreviousWeaponAddress = sharedPreferences == null ? ""
+                : normalizeBluetoothAddress(readStringPreference(sharedPreferences,
+                PREF_DEVICE_ADDRESS, ""));
+        mCollectingNewWeaponCandidates = true;
+        mNewWeaponCandidates.clear();
+        scheduleNewWeaponDiscoveryFinish();
+    }
+
+    private void scheduleNewWeaponDiscoveryFinish() {
+        if (mNewWeaponDiscoveryRunnable != null)
+            mWeaponPairingHandler.removeCallbacks(mNewWeaponDiscoveryRunnable);
+        mNewWeaponDiscoveryRunnable = () -> {
+            mNewWeaponDiscoveryRunnable = null;
+            finishNewWeaponDiscovery();
+        };
+        mWeaponPairingHandler.postDelayed(mNewWeaponDiscoveryRunnable, NEW_WEAPON_DISCOVERY_WINDOW_MS);
+    }
+
+    private void finishNewWeaponDiscovery() {
+        if (!mCollectingNewWeaponCandidates || isFinishing() || isDestroyed())
+            return;
+        if (mNewWeaponCandidates.isEmpty()) {
+            // Keep looking until the existing connection timeout. BLE scan
+            // callbacks can be delayed for a recently powered-on blaster.
+            scheduleNewWeaponDiscoveryFinish();
+            return;
+        }
+        mCollectingNewWeaponCandidates = false;
+        stopBLEScan();
+        // A player needs time to read the chooser and hold a trigger. The
+        // scan timeout is only for finding a first viable blaster; each probe
+        // has its own timeout below.
+        stopConnectFailTest();
+        if (mNewWeaponCandidates.size() == 1) {
+            connectToWeaponCandidate(mNewWeaponCandidates.get(0));
+        } else {
+            showMultipleWeaponPairingDialog();
+        }
+    }
+
+    private void addNewWeaponCandidate(String address, String name) {
+        if (!mCollectingNewWeaponCandidates || address == null)
+            return;
+        for (WeaponCandidate candidate : mNewWeaponCandidates) {
+            if (address.equals(candidate.address))
+                return;
+        }
+        mNewWeaponCandidates.add(new WeaponCandidate(address, name));
+    }
+
+    private void showMultipleWeaponPairingDialog() {
+        if (isFinishing() || isDestroyed() || mNewWeaponCandidates.size() < 2)
+            return;
+        if (mWeaponPairingDialog != null)
+            mWeaponPairingDialog.dismiss();
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.weapon_pairing_title)
+                .setMessage(getString(R.string.weapon_pairing_message, mNewWeaponCandidates.size()))
+                .setPositiveButton(R.string.weapon_pairing_detect_trigger, null)
+                .setNegativeButton(android.R.string.cancel,
+                        (ignored, which) -> abandonNewWeaponPairing())
+                .create();
+        mWeaponPairingDialog = dialog;
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(view -> {
+                    if (mWeaponPairingDialog != dialog)
+                        return;
+                    dialog.dismiss();
+                    beginTriggerWeaponPairing();
+                }));
+        dialog.setOnDismissListener(ignored -> {
+            if (mWeaponPairingDialog == dialog)
+                mWeaponPairingDialog = null;
+        });
+        dialog.setOnCancelListener(ignored -> abandonNewWeaponPairing());
+        dialog.show();
+    }
+
+    private void beginTriggerWeaponPairing() {
+        if (mNewWeaponCandidates.size() < 2)
+            return;
+        mTriggerPairingActive = true;
+        mTriggerProbeIndex = -1;
+        mTriggerProbeAddress = null;
+        probeNextWeaponTrigger();
+    }
+
+    private void probeNextWeaponTrigger() {
+        if (!mTriggerPairingActive)
+            return;
+        cancelTriggerProbeCallbacks();
+        // Closing first makes each GATT service/discovery cycle belong to only
+        // one candidate. BluetoothLeService invalidates late callbacks on close.
+        resetBluetoothServices();
+        mTriggerProbeIndex++;
+        if (mTriggerProbeIndex >= mNewWeaponCandidates.size()) {
+            mTriggerPairingActive = false;
+            mTriggerProbeAddress = null;
+            showTriggerNotDetectedDialog();
+            return;
+        }
+        WeaponCandidate candidate = mNewWeaponCandidates.get(mTriggerProbeIndex);
+        mTriggerProbeAddress = candidate.address;
+        mDeviceAddress = candidate.address;
+        TextView connectStatusTV = findViewById(R.id.connect_status_tv);
+        if (connectStatusTV != null)
+            connectStatusTV.setText(getString(R.string.weapon_pairing_checking, candidate.name));
+        final String candidateAddress = candidate.address;
+        mTriggerProbeConnectRunnable = () -> {
+            mTriggerProbeConnectRunnable = null;
+            if (!mTriggerPairingActive || !candidateAddress.equals(mTriggerProbeAddress))
+                return;
+            setupBLEServiceConnection();
+            mTriggerProbeTimeoutRunnable = () -> {
+                if (mTriggerPairingActive && candidateAddress.equals(mTriggerProbeAddress))
+                    probeNextWeaponTrigger();
+            };
+            mWeaponPairingHandler.postDelayed(mTriggerProbeTimeoutRunnable,
+                    NEW_WEAPON_TRIGGER_PROBE_TIMEOUT_MS);
+        };
+        mWeaponPairingHandler.postDelayed(mTriggerProbeConnectRunnable, 250L);
+    }
+
+    private void cancelTriggerProbeCallbacks() {
+        if (mTriggerProbeConnectRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mTriggerProbeConnectRunnable);
+            mTriggerProbeConnectRunnable = null;
+        }
+        cancelTriggerProbeTimeout();
+    }
+
+    private void cancelTriggerProbeTimeout() {
+        if (mTriggerProbeTimeoutRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mTriggerProbeTimeoutRunnable);
+            mTriggerProbeTimeoutRunnable = null;
+        }
+    }
+
+    private void showTriggerNotDetectedDialog() {
+        if (isFinishing() || isDestroyed())
+            return;
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.weapon_pairing_title)
+                .setMessage(R.string.weapon_pairing_not_detected)
+                .setPositiveButton(R.string.weapon_pairing_detect_trigger, null)
+                .setNegativeButton(android.R.string.cancel,
+                        (ignored, which) -> abandonNewWeaponPairing())
+                .create();
+        mWeaponPairingDialog = dialog;
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(view -> {
+                    if (mWeaponPairingDialog != dialog)
+                        return;
+                    dialog.dismiss();
+                    beginTriggerWeaponPairing();
+                }));
+        dialog.setOnDismissListener(ignored -> {
+            if (mWeaponPairingDialog == dialog)
+                mWeaponPairingDialog = null;
+        });
+        dialog.setOnCancelListener(ignored -> abandonNewWeaponPairing());
+        dialog.show();
+    }
+
+    private void connectToWeaponCandidate(WeaponCandidate candidate) {
+        if (candidate == null)
+            return;
+        mDeviceAddress = candidate.address;
+        TextView connectStatusTV = findViewById(R.id.connect_status_tv);
+        if (connectStatusTV != null)
+            connectStatusTV.setText(R.string.connect_status_connecting);
+        setupBLEServiceConnection();
+        // Discovery deliberately pauses for three seconds before a lone
+        // candidate is selected, so give its actual GATT connection a full
+        // connection window instead of counting that discovery time against it.
+        startConnectFailTest();
+    }
+
+    private void completeTriggerWeaponPairing(byte[] telemetry) {
+        if (!mTriggerPairingActive)
+            return;
+        mTriggerPairingActive = false;
+        mTriggerProbeAddress = null;
+        cancelTriggerProbeCallbacks();
+        mNewWeaponCandidates.clear();
+        mPreviousWeaponAddress = "";
+        if (sharedPreferences != null)
+            sharedPreferences.edit().putString(PREF_DEVICE_ADDRESS, mDeviceAddress).apply();
+        Toast.makeText(getApplicationContext(), R.string.weapon_pairing_selected, Toast.LENGTH_SHORT).show();
+        if (mBluetoothLeService != null && mIdCharacteristic != null)
+            mBluetoothLeService.readCharacteristic(mIdCharacteristic);
+        playSound(R.raw.spawn);
+        // Reprocess this packet with the normal game path so the connected
+        // weapon immediately receives its settings and the play screen opens.
+        processTelemetryData(telemetry);
+    }
+
+    private void cancelNewWeaponPairing() {
+        boolean pairingWasActive = mCollectingNewWeaponCandidates || mTriggerPairingActive
+                || mWeaponPairingDialog != null || !mNewWeaponCandidates.isEmpty();
+        mCollectingNewWeaponCandidates = false;
+        mTriggerPairingActive = false;
+        mTriggerProbeAddress = null;
+        mTriggerProbeIndex = -1;
+        if (mNewWeaponDiscoveryRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mNewWeaponDiscoveryRunnable);
+            mNewWeaponDiscoveryRunnable = null;
+        }
+        cancelTriggerProbeCallbacks();
+        mNewWeaponCandidates.clear();
+        if (mWeaponPairingDialog != null) {
+            AlertDialog dialog = mWeaponPairingDialog;
+            mWeaponPairingDialog = null;
+            dialog.dismiss();
+        }
+        if (pairingWasActive)
+            mDeviceAddress = mPreviousWeaponAddress;
+        mPreviousWeaponAddress = "";
+    }
+
+    private void abandonNewWeaponPairing() {
+        // The dialog may already be in Android's dismissal path. Clear our
+        // reference first so cancellation does not try to dismiss it again.
+        mWeaponPairingDialog = null;
+        cancelNewWeaponPairing();
+        returnFromNewWeaponPairing();
+    }
+
+    private void returnFromNewWeaponPairing() {
+        stopConnectFailTest();
+        stopBLEScan();
+        resetBluetoothServices();
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+            handleDisconnect();
+            return;
+        }
+        showConnectLayout();
+        if (mConnectButton != null)
+            mConnectButton.setEnabled(true);
+        if (mReconnectButton != null)
+            mReconnectButton.setEnabled(true);
+        if (mDedicatedServerButton != null)
+            mDedicatedServerButton.setEnabled(true);
+        if (mQRConnectButton != null)
+            mQRConnectButton.setEnabled(true);
+        TextView connectStatusTV = findViewById(R.id.connect_status_tv);
+        if (connectStatusTV != null)
+            connectStatusTV.setText(R.string.connect_status_not_connected);
+    }
+
+    static boolean isTriggerHeld(byte[] telemetry) {
+        return telemetry != null && telemetry.length > RECOIL_OFFSET_BUTTONS
+                && ((telemetry[RECOIL_OFFSET_BUTTONS] & RECOIL_TRIGGER_BIT) != 0);
     }
 
     private ScanCallback mLeScanCallback;
@@ -3222,7 +3551,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 boolean hasSavedDevice = mDeviceAddress != null && !mDeviceAddress.isEmpty();
                 boolean isMatchingDevice = hasSavedDevice && mDeviceAddress.equals(deviceAddress);
                 boolean isAutoDetectedDevice = !hasSavedDevice && deviceName != null && deviceName.startsWith("SRG1");
-                if (isAutoDetectedDevice || isMatchingDevice) {
+                if (isAutoDetectedDevice) {
+                    addNewWeaponCandidate(deviceAddress, deviceName);
+                    return false;
+                }
+                if (isMatchingDevice) {
                     Log.d(TAG, "Connecting to " + deviceName + " '" + deviceAddress + "'");
                     TextView connectStatusTV = findViewById(R.id.connect_status_tv);
                     if (connectStatusTV != null) {
@@ -3395,6 +3728,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Log.d(TAG, "starting to scan");
         // Give each scan its own callback identity. Android can deliver callbacks
         // from the old scan after stopScan() or after a new scan has started.
+        if (mDeviceAddress == null || mDeviceAddress.isEmpty())
+            beginNewWeaponDiscovery();
+        else
+            cancelNewWeaponPairing();
         mLeScanCallback = createLEScanCallback();
         mScanning = true;
         try {
@@ -3441,6 +3778,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mConnectFailTimer.start();
     }
 
+    private void stopConnectFailTest() {
+        if (mConnectFailTimer != null) {
+            mConnectFailTimer.cancel();
+            mConnectFailTimer = null;
+        }
+    }
+
     @SuppressLint("MissingPermission") // Permission is checked before scanning begins.
     private void stopBLEScan() {
         ScanCallback callback = mLeScanCallback;
@@ -3470,6 +3814,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mTelemetryCharacteristic = null;
         mCommandCharacteristic = null;
         mConfigCharacteristic = null;
+        mIdCharacteristic = null;
         if (mBluetoothLeService != null)
             mBluetoothLeService.close();
         if (mBLEServiceBound) {
@@ -3495,10 +3840,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void handleDisconnect() {
-        if (mConnectFailTimer != null) {
-            mConnectFailTimer.cancel();
-            mConnectFailTimer = null;
+        if (mTriggerPairingActive) {
+            probeNextWeaponTrigger();
+            return;
         }
+        if (mCollectingNewWeaponCandidates || mWeaponPairingDialog != null)
+            cancelNewWeaponPairing();
+        stopConnectFailTest();
         stopBLEScan();
         // Release the old binding before scanning again. Otherwise finding the
         // blaster calls setupBLEServiceConnection(), which skips an existing binding.
@@ -3571,7 +3919,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mCommunicating = false; // When we receive the first packet, we'll switch layouts
                 startConnectionTest();
             } else if (BluetoothLeService.ACTION_GATT_DISCONNECTED.equals(action)) {
-                handleDisconnect();
+                if (mTriggerPairingActive)
+                    probeNextWeaponTrigger();
+                else
+                    handleDisconnect();
             } else if (BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED.equals(action)) {
                 // Show all the supported services and characteristics on the user interface.
                 //displayGattServices(mBluetoothLeService.getSupportedGattServices());
@@ -3601,9 +3952,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         }
                         mCommandCharacteristic = gattService.getCharacteristic(UUID.fromString(GattAttributes.RECOIL_COMMAND_UUID));
                         mConfigCharacteristic = gattService.getCharacteristic(UUID.fromString(GattAttributes.RECOIL_CONFIG_UUID));
-                        BluetoothGattCharacteristic idCharacteristic = gattService.getCharacteristic(UUID.fromString(GattAttributes.RECOIL_ID_UUID));
-                        if (idCharacteristic != null) {
-                            bluetoothLeService.readCharacteristic(idCharacteristic); // to get the blaster type, rifle or pistol
+                        mIdCharacteristic = gattService.getCharacteristic(UUID.fromString(GattAttributes.RECOIL_ID_UUID));
+                        if (mTriggerPairingActive) {
+                            // Notifications are all a probe needs. Avoid changing
+                            // settings or announcing the type of an unselected gun.
+                            return;
+                        }
+                        if (mIdCharacteristic != null) {
+                            bluetoothLeService.readCharacteristic(mIdCharacteristic); // to get the blaster type, rifle or pistol
                         } else {
                             Log.d(TAG, "failed to find ID characteristic");
                         }
@@ -4061,6 +4417,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mTelemetryCharacteristic == null)
             return;
         if (data != null && data.length > RECOIL_OFFSET_SHOTS_REMAINING) {
+            if (mTriggerPairingActive) {
+                // This is a level bit, so holding the trigger before this GATT
+                // connection finishes is still detected; a counter-only test
+                // could miss that first press.
+                mConnectionTest = true;
+                if (isTriggerHeld(data))
+                    completeTriggerWeaponPairing(data);
+                return;
+            }
             byte player_id = data[RECOIL_OFFSET_TEAM];
             byte shotsRemaining = data[RECOIL_OFFSET_SHOTS_REMAINING];
             //byte status = data[RECOIL_OFFSET_STATUS];
