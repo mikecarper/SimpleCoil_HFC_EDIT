@@ -1,6 +1,3 @@
 <resources>
-    <!-- The portrait lobby has controls and HUD data below the health bars.
-         Reserve measured content height so they scroll instead of overlapping. -->
-    <dimen name="play_layout_min_height">800dp</dimen>
     <dimen name="fab_margin">16dp</dimen>
 </resources>
