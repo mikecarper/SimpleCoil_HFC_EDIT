@@ -3,7 +3,10 @@ package com.simplecoil.simplecoil;
 import org.junit.Test;
 
 import java.net.InetAddress;
+import java.util.HashMap;
+import java.util.Map;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 
@@ -45,6 +48,50 @@ public class GlobalsTest {
             globals.mTimeLimit = timeLimit;
             globals.mLivesLimit = livesLimit;
             globals.mScoreLimit = scoreLimit;
+        }
+    }
+
+    @Test public void teamRosterCountsIncludeTheHostAndAllConnectedPeers() {
+        Globals globals = Globals.getInstance();
+        int originalGameMode = globals.mGameMode;
+        byte originalPlayerID = globals.mPlayerID;
+        Map<Byte, InetAddress> originalRoster;
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            originalRoster = new HashMap<>(globals.mTeamIPMap);
+            globals.mTeamIPMap.clear();
+            globals.mGameMode = Globals.GAME_MODE_4TEAMS;
+            globals.mPlayerID = 1;
+            globals.mTeamIPMap.put((byte) 6, InetAddress.getLoopbackAddress());
+            globals.mTeamIPMap.put((byte) 12, InetAddress.getLoopbackAddress());
+            globals.mTeamIPMap.put((byte) 20, InetAddress.getLoopbackAddress());
+        } finally {
+            globals.mTeamIPMapSemaphore.release();
+        }
+        try {
+            assertArrayEquals(new int[]{1, 1, 1, 1}, globals.getNetworkTeamPlayerCounts());
+
+            Globals.getmTeamIPMapSemaphore();
+            try {
+                globals.mTeamIPMap.clear();
+                globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+                globals.mTeamIPMap.put((byte) 2, InetAddress.getLoopbackAddress());
+                globals.mTeamIPMap.put((byte) 11, InetAddress.getLoopbackAddress());
+                globals.mTeamIPMap.put((byte) 20, InetAddress.getLoopbackAddress());
+            } finally {
+                globals.mTeamIPMapSemaphore.release();
+            }
+            assertArrayEquals(new int[]{2, 2}, globals.getNetworkTeamPlayerCounts());
+        } finally {
+            Globals.getmTeamIPMapSemaphore();
+            try {
+                globals.mTeamIPMap.clear();
+                globals.mTeamIPMap.putAll(originalRoster);
+                globals.mGameMode = originalGameMode;
+                globals.mPlayerID = originalPlayerID;
+            } finally {
+                globals.mTeamIPMapSemaphore.release();
+            }
         }
     }
 

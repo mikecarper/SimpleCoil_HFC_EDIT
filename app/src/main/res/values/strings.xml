@@ -150,6 +150,9 @@
     <string name="scan_started_toast">Player scan started!</string>
     <string name="network_player_1count">1 Player</string>
     <string name="network_player_count">%1$d Players</string>
+    <string name="team_player_count_label">Players by Team</string>
+    <string name="team_player_count_2">T1: %1$d  |  T2: %2$d</string>
+    <string name="team_player_count_4">T1: %1$d  |  T2: %2$d  |  T3: %3$d  |  T4: %4$d</string>
     <string name="not_enough_players_toast">Not enough players!</string>
     <string name="network_team">Player %1$d</string>
     <string name="player_name">Player Name:</string>

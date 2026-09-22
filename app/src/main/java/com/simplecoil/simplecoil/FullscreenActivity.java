@@ -119,6 +119,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final int REQUEST_ENABLE_BT = 1;
     private static final int REQUEST_QR_SCAN = 2;
     private static final int REQUEST_CODE_QR_CAMERA_PERMISSION = 1024;
+    private static final float GAME_MODE_TEXT_SIZE_SP = 22f;
+    private static final float TEAM_ROSTER_TEXT_SIZE_SP = 13f;
 
     // For testing and debugging network only -- dumps you straight to the play game layout and allows you to switch teams without connecting a blaster
     private static final boolean TEST_NETWORK = false;
@@ -1273,7 +1275,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     }
                     if (Globals.getPlayerCount() <= 1) {
                         Toast.makeText(getApplicationContext(), getString(R.string.not_enough_players_toast), Toast.LENGTH_SHORT).show();
-                        mNetworkPlayerCountTV.setText(R.string.network_player_1count);
+                        updateNetworkRosterDisplay();
                         return;
                     }
                     if (mIsServer ? !mTcpServer.arePlayerClocksSynchronized() : !mTcpClient.isClockSynchronized()) {
@@ -1409,6 +1411,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         mGameModeLabelTV = findViewById(R.id.game_mode_label_tv);
         mGameModeTV = findViewById(R.id.game_mode_tv);
+        updateGameModeDisplay();
         mScoreLabelTV = findViewById(R.id.score_label_tv);
         mScoreTV = findViewById(R.id.score_tv);
         mTeamScoreLabelTV = findViewById(R.id.team_score_label_tv);
@@ -1589,17 +1592,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 return true;
             }else if (id == R.id.game_mode_2teams_item) {
                     Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
-                    mGameModeTV.setText(R.string.game_mode_2teams);
+                    updateGameModeDisplay();
                     setTeam();
                     return true;
             }else if (id ==R.id.game_mode_4teams_item) {
                     Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
-                    mGameModeTV.setText(R.string.game_mode_4teams);
+                    updateGameModeDisplay();
                     setTeam();
                     return true;
             }else if (id == R.id.game_mode_ffa_item) {
                     Globals.getInstance().mGameMode = Globals.GAME_MODE_FFA;
-                    mGameModeTV.setText(R.string.game_mode_ffa);
+                    updateGameModeDisplay();
                     setTeam();
                     return true;
             }else {
@@ -1851,6 +1854,59 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             finishOutOfLives();
     }
 
+    /** Keeps the compact hosting roster in the bottom-center HUD up to date. */
+    private void updateNetworkRosterDisplay() {
+        if (mNetworkPlayerCountTV != null) {
+            int playerCount = Globals.getPlayerCount();
+            if (playerCount == 1)
+                mNetworkPlayerCountTV.setText(R.string.network_player_1count);
+            else
+                mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, playerCount));
+            mNetworkPlayerCountTV.setVisibility(View.VISIBLE);
+        }
+        updateGameModeDisplay();
+    }
+
+    /**
+     * A peer host needs the game roster at a glance.  The bottom-center slot is
+     * between the local deaths and kills counters, so it can show every team
+     * without displacing either counter.  Clients retain the normal game-mode
+     * display there.
+     */
+    private void updateGameModeDisplay() {
+        if (mGameModeTV == null || mGameModeLabelTV == null)
+            return;
+
+        Globals globals = Globals.getInstance();
+        if (mUseNetwork && mIsServer
+                && (globals.mGameMode == Globals.GAME_MODE_2TEAMS
+                || globals.mGameMode == Globals.GAME_MODE_4TEAMS)) {
+            int[] teamCounts = globals.getNetworkTeamPlayerCounts();
+            mGameModeLabelTV.setText(R.string.team_player_count_label);
+            mGameModeTV.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEAM_ROSTER_TEXT_SIZE_SP);
+            if (teamCounts.length == 4) {
+                mGameModeTV.setText(getString(R.string.team_player_count_4, teamCounts[0],
+                        teamCounts[1], teamCounts[2], teamCounts[3]));
+            } else {
+                mGameModeTV.setText(getString(R.string.team_player_count_2, teamCounts[0],
+                        teamCounts[1]));
+            }
+            return;
+        }
+
+        mGameModeLabelTV.setText(R.string.game_mode_label);
+        mGameModeTV.setTextSize(TypedValue.COMPLEX_UNIT_SP, GAME_MODE_TEXT_SIZE_SP);
+        if (globals.mTournamentMode) {
+            mGameModeTV.setText(R.string.game_mode_tournament_2teams);
+        } else if (globals.mGameMode == Globals.GAME_MODE_2TEAMS) {
+            mGameModeTV.setText(R.string.game_mode_2teams);
+        } else if (globals.mGameMode == Globals.GAME_MODE_4TEAMS) {
+            mGameModeTV.setText(R.string.game_mode_4teams);
+        } else {
+            mGameModeTV.setText(R.string.game_mode_ffa);
+        }
+    }
+
     private void setReady() { setReady(true); }
 
     private void setReady(boolean sendPlayerLeft) {
@@ -1894,6 +1950,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mPlayerDataButton.setVisibility(View.GONE);
             startGameInviteListening();
         }
+        updateGameModeDisplay();
         updateTeamAssignmentScanButton();
         Intent intent = new Intent(NetMsg.NETMSG_GPSSETTING);
         sendBroadcast(intent);
@@ -5065,24 +5122,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 checkPeerScoreLimit();
             } else if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)
                     || NetMsg.NETMSG_QUIT.equals(action)) {
-                mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount()));
-                mNetworkPlayerCountTV.setVisibility(View.VISIBLE);
+                updateNetworkRosterDisplay();
                 if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE && NetMsg.NETMSG_LEAVE.equals(action) && Globals.getPlayerCount() <= 1)
                     endGame(); // Everyone else is out so game is over - this only works in FFA because we don't keep track of who and how many people are on each team
             } else if (NetMsg.NETMSG_LISTPLAYERS.equals(action)) {
                 if (mReady) {
                     endUDPScanning();
-                    mNetworkPlayerCountTV.setText(getString(R.string.network_player_count, Globals.getPlayerCount()));
-                    mNetworkPlayerCountTV.setVisibility(View.VISIBLE);
-                    if (Globals.getInstance().mTournamentMode) {
-                        mGameModeTV.setText(R.string.game_mode_tournament_2teams);
-                    } else if (Globals.getInstance().mGameMode == Globals.GAME_MODE_2TEAMS) {
-                        mGameModeTV.setText(R.string.game_mode_2teams);
-                    } else if (Globals.getInstance().mGameMode == Globals.GAME_MODE_4TEAMS) {
-                        mGameModeTV.setText(R.string.game_mode_4teams);
-                    } else {
-                        mGameModeTV.setText(R.string.game_mode_ffa);
-                    }
+                    updateNetworkRosterDisplay();
                     setTeam();
                     if (!mIsServer && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
                         setGameLimit();
@@ -5254,6 +5300,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mReady = true;
                 mIsServer = true;
                 setReady();
+                updateNetworkRosterDisplay();
                 if (mUDPListenerService != null)
                     mUDPListenerService.inviteNearbyLobbyPlayers();
                 if (Globals.getInstance().mServerIP != null) {
@@ -5503,8 +5550,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             Globals.getInstance().applyTournamentRules();
             mCurrentShotMode = Globals.SHOT_MODE_SINGLE;
             setRecoil(true);
-            if (mGameModeTV != null)
-                mGameModeTV.setText(R.string.game_mode_tournament_2teams);
+            updateGameModeDisplay();
         }
         mHealthLabelTV.setText(getString(R.string.health_label, Globals.getInstance().mFullHealth));
         mShotsRemainingLabelTV.setText(getString(R.string.shots_remaining_label,

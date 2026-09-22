@@ -476,6 +476,45 @@ public class Globals {
         return ret + 1; // All other players plus ourself
     }
 
+    /**
+     * Returns the connected-player roster grouped by the current team mode.
+     * The local player is deliberately counted separately because peer hosts do
+     * not store themselves in {@link #mTeamIPMap}.
+     */
+    public int[] getNetworkTeamPlayerCounts() {
+        int teamCount;
+        if (mGameMode == GAME_MODE_2TEAMS) {
+            teamCount = 2;
+        } else if (mGameMode == GAME_MODE_4TEAMS) {
+            teamCount = 4;
+        } else {
+            return new int[0];
+        }
+
+        int[] counts = new int[teamCount];
+        addPlayerToTeamCount(counts, mPlayerID);
+        getmTeamIPMapSemaphore();
+        try {
+            if (mTeamIPMap != null) {
+                for (Byte playerID : mTeamIPMap.keySet()) {
+                    if (playerID != null && playerID != mPlayerID)
+                        addPlayerToTeamCount(counts, playerID);
+                }
+            }
+        } finally {
+            mTeamIPMapSemaphore.release();
+        }
+        return counts;
+    }
+
+    private void addPlayerToTeamCount(int[] counts, byte playerID) {
+        if (playerID <= 0 || !isValidPlayerID(playerID))
+            return;
+        int team = calcNetworkTeam(playerID);
+        if (team >= 1 && team <= counts.length)
+            counts[team - 1]++;
+    }
+
     public static class GPSData {
         double latitude = 0;
         double longitude = 0;
