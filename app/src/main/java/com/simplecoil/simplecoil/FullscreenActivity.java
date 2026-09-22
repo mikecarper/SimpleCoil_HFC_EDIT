@@ -646,6 +646,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     // Peer hosts must not announce a lobby until their TCP listener has bound.
     private boolean mPeerHostCreationPending;
     private boolean mPeerUdpServerStarting;
+    // A standalone laptop has announced that it is replacing this idle peer
+    // lobby. SERVERREPLY completes UDP discovery before TCP is restarted.
+    private boolean mLobbyTakeoverPending;
 
     private void startPeerUdpServerIfTcpReady() {
         if (!mPeerHostCreationPending || mPeerUdpServerStarting || mTcpServer == null
@@ -866,6 +869,72 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         dialog.setOnCancelListener(ignored -> dismissGameInvite(dialog, inviteID, true));
         dialog.show();
         startGameInviteCountdown(dialog, invitedServer, inviteID);
+    }
+
+    /** Immediately join a nearby peer lobby announced while this player is idle. */
+    private void joinNearbyLobby(Intent invite) {
+        if (invite == null || !mActivityResumed || mReady || mIsServer
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            return;
+        String serverAddress = invite.getStringExtra(UDPListenerService.INTENT_SERVERIP);
+        if (serverAddress == null || serverAddress.trim().isEmpty()
+                || Globals.getInstance().mPlayerID <= 0
+                || !Globals.isValidPlayerID(Globals.getInstance().mPlayerID)
+                || !isWifiConnected() || !networkServicesReady())
+            return;
+        final InetAddress host;
+        try {
+            host = InetAddress.getByName(serverAddress.trim());
+        } catch (UnknownHostException | SecurityException e) {
+            Log.w(TAG, "Ignoring invalid nearby lobby host", e);
+            return;
+        }
+        mUseNetwork = true;
+        mUseNetworkingButton.setText(R.string.network_menu_button);
+        displayAllNetworkingOptions(true);
+        mReady = true;
+        setReady();
+        if (!mUDPListenerService.joinLobbyInvite(host)) {
+            mReady = false;
+            setReady(false);
+            return;
+        }
+        setNetworkMenu(NETWORK_TYPE_JOINING);
+    }
+
+    /** Move an idle phone-hosted lobby to the standalone host that announced it. */
+    private void joinLobbyTakeover(Intent takeover) {
+        if (takeover == null || !mActivityResumed || !mUseNetwork || !mReady
+                || mLobbyTakeoverPending || isDedicatedServerConnection()
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                || !networkServicesReady() || !isWifiConnected())
+            return;
+        String serverAddress = takeover.getStringExtra(UDPListenerService.INTENT_SERVERIP);
+        if (serverAddress == null || serverAddress.trim().isEmpty())
+            return;
+        final InetAddress host;
+        try {
+            host = InetAddress.getByName(serverAddress.trim());
+        } catch (UnknownHostException | SecurityException e) {
+            Log.w(TAG, "Ignoring invalid takeover host", e);
+            return;
+        }
+        // Do not broadcast SERVERCANCEL: all players are already migrating to
+        // the laptop. Closing the peer listener releases its port and TCP
+        // clients without resetting their UDP handoff state.
+        mPeerHostCreationPending = false;
+        mPeerUdpServerStarting = false;
+        if (mIsServer && mTcpServer != null)
+            mTcpServer.stopTcpServer();
+        mIsServer = false;
+        mLobbyTakeoverPending = mUDPListenerService.joinServerAfterHostTakeover(host);
+        if (!mLobbyTakeoverPending) {
+            mReady = false;
+            setReady(false);
+            return;
+        }
+        setReady();
+        setNetworkMenu(NETWORK_TYPE_JOINING);
     }
 
     private void startGameInviteCountdown(AlertDialog dialog, String serverAddress, String inviteID) {
@@ -1715,6 +1784,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mGameLimitButton.setVisibility(View.GONE);
         } else {
             mJoinedFromGameInvite = false;
+            mLobbyTakeoverPending = false;
             cancelPlayerQuitWindow();
             Globals.getInstance().mOnlyServerSettings = false;
             // Tournament rules belong to the server session, not this phone's next local game.
@@ -4810,6 +4880,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 showGameInvite(intent);
                 return;
             }
+            if (NetMsg.NETMSG_LOBBYINVITE.equals(action)) {
+                joinNearbyLobby(intent);
+                return;
+            }
+            if (NetMsg.NETMSG_HOSTTAKEOVER.equals(action)) {
+                joinLobbyTakeover(intent);
+                return;
+            }
             if (NetMsg.NETMSG_STARTGAME.equals(action)
                     && intent.getBooleanExtra(NetMsg.INTENT_START_TIME_ADJUSTMENT, false)) {
                 applySynchronizedStartAdjustment(intent);
@@ -5067,6 +5145,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 boolean failedPeerHostCreation = mPeerHostCreationPending;
                 mPeerHostCreationPending = false;
                 mPeerUdpServerStarting = false;
+                mLobbyTakeoverPending = false;
                 // Only the peer-host flow owns a provisional TCP listener. A
                 // normal failed join must not tear down an unrelated listener.
                 if (failedPeerHostCreation && mTcpServer != null)
@@ -5106,6 +5185,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mReady = true;
                 mIsServer = true;
                 setReady();
+                if (mUDPListenerService != null)
+                    mUDPListenerService.inviteNearbyLobbyPlayers();
                 if (Globals.getInstance().mServerIP != null) {
                     String ip = Globals.getInstance().mServerIP.toString();
                     if (ip.startsWith("/"))
@@ -5125,8 +5206,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             } else if (NetMsg.NETMSG_SERVERREPLY.equals(action)) {
                 applyServerAssignedPlayerID(intent.getByteExtra(UDPListenerService.INTENT_PLAYERID,
                         (byte) 0));
-                if (mTcpClient != null)
-                    mTcpClient.startTcpClient();
+                if (mTcpClient != null) {
+                    if (mLobbyTakeoverPending) {
+                        mLobbyTakeoverPending = false;
+                        mTcpClient.restartAfterHostTakeover();
+                    } else {
+                        mTcpClient.startTcpClient();
+                    }
+                }
             } else if (NetMsg.NETMSG_NETWORKCONNECTED.equals(action)) {
                 mNetworkStatusIV.setImageResource(R.drawable.ic_network_connected_24dp);
             } else if (NetMsg.NETMSG_NETWORKDISCONNECTED.equals(action)) {
@@ -5177,6 +5264,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         intentFilter.addAction(NetMsg.NETMSG_LISTPLAYERS);
         intentFilter.addAction(NetMsg.NETMSG_PLAYERDATAUPDATE);
         intentFilter.addAction(NetMsg.NETMSG_GAMEINVITE);
+        intentFilter.addAction(NetMsg.NETMSG_LOBBYINVITE);
+        intentFilter.addAction(NetMsg.NETMSG_HOSTTAKEOVER);
         intentFilter.addAction(NetMsg.NETMSG_STARTGAME);
         intentFilter.addAction(NetMsg.NETMSG_CLOCKSYNCWAITING);
         intentFilter.addAction(NetMsg.NETMSG_ENDGAME);

@@ -277,6 +277,23 @@ public class UDPListenerService extends Service {
                             .putExtra(INTENT_SERVERIP, ip.getHostAddress())
                             .putExtra(INTENT_GAME_INVITE_TOKEN, roundToken);
                 }
+            } else if (isVersionedAnnouncement(message, NetMsg.NETMSG_LOBBYINVITE_PREFIX)) {
+                // This is intentionally limited to the idle listener. A phone
+                // that is already in a lobby must not be pulled into another
+                // nearby peer host just because it hears a broadcast.
+                if (mPassiveInviteListener) {
+                    intent = new Intent(NetMsg.NETMSG_LOBBYINVITE)
+                            .putExtra(INTENT_SERVERIP, ip.getHostAddress());
+                }
+            } else if (isVersionedAnnouncement(message, NetMsg.NETMSG_HOSTTAKEOVER_PREFIX)) {
+                // A takeover is different from a lobby invitation: existing
+                // lobby clients and the phone host itself must see it. The
+                // activity verifies that the local game is still idle before
+                // switching to the announcing standalone server.
+                if (!mPeerGame && keepListening) {
+                    intent = new Intent(NetMsg.NETMSG_HOSTTAKEOVER)
+                            .putExtra(INTENT_SERVERIP, ip.getHostAddress());
+                }
             } else if (message.equals(NetMsg.NETMSG_SHOTFIRED)) {
                 if (getPlayerID(ip) == null)
                     return;
@@ -465,6 +482,11 @@ public class UDPListenerService extends Service {
             return null;
         String roundToken = payload.substring(separator + 1);
         return TcpServer.isValidRoundToken(roundToken) ? roundToken : null;
+    }
+
+    private static boolean isVersionedAnnouncement(String message, String prefix) {
+        return message != null && prefix != null
+                && message.equals(prefix + NetMsg.NETWORK_VERSION);
     }
 
     /**
@@ -1457,6 +1479,69 @@ public class UDPListenerService extends Service {
         }
     }
 
+    /** Join a newly-created nearby peer lobby from the reusable idle listener. */
+    public boolean joinLobbyInvite(InetAddress serverIP) {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || serverIP == null)
+                return false;
+            if (!doneListening && !mPassiveInviteListener) {
+                Log.w(TAG, "Ignoring a lobby invitation while another network session is active");
+                return false;
+            }
+            joinServer(serverIP, LISTEN_PORT);
+            return mScanRunning;
+        }
+    }
+
+    /**
+     * Move an idle lobby to a standalone host. Unlike an ordinary invitation,
+     * this is allowed to reuse an active host/client listener in-place, so the
+     * handoff does not create a close/rebind race on older Wi-Fi stacks.
+     */
+    public boolean joinServerAfterHostTakeover(InetAddress serverIP) {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || serverIP == null || mPeerGame)
+                return false;
+            final boolean reusingActiveListener = !doneListening && isListenerReadyLocked();
+            if (!doneListening && !reusingActiveListener) {
+                Log.w(TAG, "Ignoring host takeover while UDP listener is not ready");
+                return false;
+            }
+            cancelInviteListenerRequestLocked();
+            mPassiveInviteListener = false;
+            mInviteTemporarilyAllowsJoin = false;
+            mInviteWindowGeneration++;
+            mSendGeneration++;
+            endScanningLocked();
+            mPeerGame = false;
+            mPeerRoundToken = null;
+            mPendingPeerRoundToken = null;
+            mPendingPeerEndGame = null;
+            resetPeerGameSequences();
+            // The replacement TCP host owns a new roster. Drop the old peer
+            // snapshot immediately so its players cannot appear during the
+            // short UDP/TCP handoff window.
+            Globals.getmIPTeamMapSemaphore();
+            Globals.getInstance().mIPTeamMap.clear();
+            Globals.getInstance().mIPTeamMapSemaphore.release();
+            Globals.getmTeamIPMapSemaphore();
+            Globals.getInstance().mTeamIPMap.clear();
+            Globals.getInstance().mTeamIPMapSemaphore.release();
+            clearJoinAssignments();
+            keepListening = true;
+            mIsListService = false;
+            mScanRunning = true;
+            mJoinAddress = serverIP;
+            mBroadcastScan = false;
+            mMyIP = null;
+            if (!reusingActiveListener)
+                mReadyToScan = 0;
+            startListenForUDPMessage();
+            joinFailCheck(serverIP, LISTEN_PORT);
+            return true;
+        }
+    }
+
     public void joinServer(InetAddress serverIP, Integer port) {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
@@ -1871,6 +1956,27 @@ public class UDPListenerService extends Service {
         }
         sendDatagrams(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_GAMEINVITE_PREFIX
                         + NetMsg.NETWORK_VERSION + ":" + roundToken,
+                Collections.singletonList(broadcastAddress), LISTEN_PORT,
+                GAME_INVITE_BROADCAST_REPETITIONS, sendGeneration);
+        return true;
+    }
+
+    /** Broadcast a newly-created peer lobby to idle phones on this Wi-Fi. */
+    public boolean inviteNearbyLobbyPlayers() {
+        final InetAddress broadcastAddress;
+        final long sendGeneration;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || mPeerGame || !mIsListService || !keepListening)
+                return false;
+            if (mBroadcastAddress == null)
+                mBroadcastAddress = getBroadcastAddress();
+            if (mBroadcastAddress == null)
+                return false;
+            broadcastAddress = mBroadcastAddress;
+            sendGeneration = mSendGeneration;
+        }
+        sendDatagrams(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_LOBBYINVITE_PREFIX
+                        + NetMsg.NETWORK_VERSION,
                 Collections.singletonList(broadcastAddress), LISTEN_PORT,
                 GAME_INVITE_BROADCAST_REPETITIONS, sendGeneration);
         return true;

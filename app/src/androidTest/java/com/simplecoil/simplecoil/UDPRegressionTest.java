@@ -364,6 +364,39 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void passiveListenerForwardsOnlyACompatibleLobbyInvitation() throws Exception {
+        set(service, "mPassiveInviteListener", true);
+        receive(teammate, NetMsg.NETMSG_LOBBYINVITE_PREFIX + NetMsg.NETWORK_VERSION);
+
+        assertEquals(1, service.events.size());
+        Intent invite = service.events.get(0);
+        assertEquals(NetMsg.NETMSG_LOBBYINVITE, invite.getAction());
+        assertEquals(teammate.getHostAddress(),
+                invite.getStringExtra(UDPListenerService.INTENT_SERVERIP));
+
+        service.events.clear();
+        receive(enemy, NetMsg.NETMSG_LOBBYINVITE_PREFIX + "99");
+        assertTrue("An incompatible lobby invitation reached the UI", service.events.isEmpty());
+    }
+
+    @Test
+    public void idleLobbyForwardsTakeoverButPeerRoundDoesNot() throws Exception {
+        set(service, "keepListening", true);
+        receive(teammate, NetMsg.NETMSG_HOSTTAKEOVER_PREFIX + NetMsg.NETWORK_VERSION);
+
+        assertEquals(1, service.events.size());
+        Intent takeover = service.events.get(0);
+        assertEquals(NetMsg.NETMSG_HOSTTAKEOVER, takeover.getAction());
+        assertEquals(teammate.getHostAddress(),
+                takeover.getStringExtra(UDPListenerService.INTENT_SERVERIP));
+
+        service.events.clear();
+        set(service, "mPeerGame", true);
+        receive(enemy, NetMsg.NETMSG_HOSTTAKEOVER_PREFIX + NetMsg.NETWORK_VERSION);
+        assertTrue("A takeover packet affected a running peer game", service.events.isEmpty());
+    }
+
+    @Test
     public void invitedJoinReusesThePassiveListenerInsteadOfReportingFailure() throws Exception {
         set(service, "mPassiveInviteListener", true);
         set(service, "doneListening", false);

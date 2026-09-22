@@ -22,6 +22,17 @@ The launcher prints each usable laptop IPv4 address. On every phone, use
 lobby connection happen automatically. Allow the laptop through its firewall
 on TCP port `17510` and UDP port `17500` if prompted.
 
+To replace a lobby that was created on a phone, start the laptop host with
+`--takeover` before the game starts. Updated phones in that idle lobby
+automatically reconnect to the laptop, which then becomes the game authority:
+
+```bash
+./laptop-host/run.sh --takeover
+```
+
+The laptop's selected rules become authoritative. A takeover deliberately does
+not interrupt or move an in-progress round; end that game first.
+
 The launcher opens a local landing page at `http://127.0.0.1:17511/`. Use its
 buttons to open the two independent display windows:
 
@@ -45,6 +56,7 @@ because the local dashboard intentionally has no login prompt.
 ./laptop-host/run.sh --teams 2 --duration-minutes 20 --score-limit 50
 ./laptop-host/run.sh --tournament
 ./laptop-host/run.sh --no-late-join --no-browser
+./laptop-host/run.sh --takeover
 ```
 
 Run `./laptop-host/run.sh --help` for every option. Keep the default TCP and

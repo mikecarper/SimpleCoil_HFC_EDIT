@@ -65,6 +65,15 @@ public class NetMsg {
     // menu.  The payload is GAMEINVITE:<network version>:<round token>.
     public static final String NETMSG_GAMEINVITE = "GAMEINVITE";
     public static final String NETMSG_GAMEINVITE_PREFIX = NETMSG_GAMEINVITE + ":";
+    // A peer host broadcasts this after its TCP and UDP listeners are both
+    // ready. Idle players on the same Wi-Fi can join the newly-created lobby
+    // without opening the network menu. Payload: LOBBYINVITE:<network version>.
+    public static final String NETMSG_LOBBYINVITE = "LOBBYINVITE";
+    public static final String NETMSG_LOBBYINVITE_PREFIX = NETMSG_LOBBYINVITE + ":";
+    // A standalone host broadcasts this only when explicitly asked to replace
+    // an idle phone-hosted lobby. Payload: HOSTTAKEOVER:<network version>.
+    public static final String NETMSG_HOSTTAKEOVER = "HOSTTAKEOVER";
+    public static final String NETMSG_HOSTTAKEOVER_PREFIX = NETMSG_HOSTTAKEOVER + ":";
     public static final String NETMSG_GPSLOCUPDATE = "GPSLOCUPDATE";
     public static final String NETMSG_GPSDATAUPDATE = "GPSDATAUPDATE";
     public static final String NETMSG_GPSSETTING = "GPSSETTING";

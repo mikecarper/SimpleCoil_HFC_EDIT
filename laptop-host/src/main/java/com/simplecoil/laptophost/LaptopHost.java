@@ -111,6 +111,7 @@ public final class LaptopHost {
     private static final String MSG_VERSION_ERROR = "VERSIONERROR";
     private static final String MSG_SERVER_REPLY = "SERVERREPLY";
     private static final String MSG_SAME_TEAM = "SAMETEAM";
+    private static final String MSG_HOST_TAKEOVER = "HOSTTAKEOVER";
 
     private final HostConfig config;
     private final long clockOriginNanos = System.nanoTime();
@@ -219,6 +220,8 @@ public final class LaptopHost {
                 GPS_PUBLISH_INTERVAL_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(this::advanceRoundClock, 100, 100, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(this::disconnectUnresponsiveClients, 5, 5, TimeUnit.SECONDS);
+        if (config.takeover)
+            scheduler.scheduleAtFixedRate(this::broadcastHostTakeover, 0, 1, TimeUnit.SECONDS);
     }
 
     private void stop() {
@@ -412,6 +415,27 @@ public final class LaptopHost {
                 // available even when a network blocks broadcast traffic.
             }
         });
+    }
+
+    /**
+     * Announce an explicitly requested pre-game takeover. Repeating the packet
+     * makes a one-off Android multicast loss harmless while keeping the signal
+     * local to the connected Wi-Fi networks.
+     */
+    private void broadcastHostTakeover() {
+        if (stopping)
+            return;
+        String announcement = MESSAGE_PREFIX + MSG_HOST_TAKEOVER + ":" + NETWORK_VERSION;
+        byte[] payload = announcement.getBytes(StandardCharsets.UTF_8);
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.setBroadcast(true);
+            for (InetAddress address : broadcastAddresses()) {
+                DatagramPacket packet = new DatagramPacket(payload, payload.length, address, config.udpPort);
+                socket.send(packet);
+            }
+        } catch (IOException ignored) {
+            // A host can still be joined manually if this Wi-Fi blocks broadcast.
+        }
     }
 
     private void handleFrame(ClientConnection client, String frame) {
@@ -1877,6 +1901,7 @@ public final class LaptopHost {
         boolean onlyServerSettings;
         boolean tournament;
         boolean allowLateJoin = true;
+        boolean takeover;
         int startDelaySeconds = 10;
         int durationMinutes;
         int scoreLimit;
@@ -1904,6 +1929,10 @@ public final class LaptopHost {
                 }
                 if ("--no-late-join".equals(argument)) {
                     config.allowLateJoin = false;
+                    continue;
+                }
+                if ("--takeover".equals(argument)) {
+                    config.takeover = true;
                     continue;
                 }
                 if (index + 1 >= args.length)
@@ -1988,6 +2017,7 @@ public final class LaptopHost {
                     + "  --dashboard-port PORT       Local dashboard (default: 17511)\n"
                     + "  --dashboard-bind ADDRESS    Defaults to 127.0.0.1\n"
                     + "  --no-late-join              Reject joins after the start\n"
+                    + "  --takeover                  Replace an idle phone-hosted lobby on this Wi-Fi\n"
                     + "  --no-browser                Do not open the dashboard automatically";
         }
     }

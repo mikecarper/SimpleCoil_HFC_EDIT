@@ -88,6 +88,10 @@ public class TcpClient extends Service {
     private volatile boolean mIsDedicatedServer = false;
     private boolean mDestroyed;
     private long mSessionGeneration;
+    // A takeover receives the new UDP endpoint before it is safe to start a
+    // second TCP reader. Let the retiring reader finish, then open one fresh
+    // session to the replacement host.
+    private boolean mRestartAfterHostTakeover;
     private boolean mReceiverRegistered;
     private Socket mActiveSocket;
     private Thread mClientThread;
@@ -642,11 +646,16 @@ public class TcpClient extends Service {
                 finishServerSession(NetMsg.NETMSG_SERVERCANCEL);
             }
         } finally {
+            final boolean restart;
             synchronized (this) {
                 keepListening = false;
                 isListening = false;
                 mClientThread = null;
+                restart = mRestartAfterHostTakeover && !mDestroyed;
+                mRestartAfterHostTakeover = false;
             }
+            if (restart)
+                startTcpClient();
         }
     }
 
@@ -1013,6 +1022,7 @@ public class TcpClient extends Service {
         synchronized (this) {
             mSessionGeneration++;
             keepListening = false;
+            mRestartAfterHostTakeover = false;
             // A later lobby can be peer-hosted. Do not let a prior dedicated
             // roster influence its score, grenade, or leave routing.
             mIsDedicatedServer = false;
@@ -1025,6 +1035,39 @@ public class TcpClient extends Service {
         try { if (connectingSocket != null) connectingSocket.close(); } catch (IOException e) { /* ignored */ }
         if (connectingThread != null)
             connectingThread.interrupt();
+    }
+
+    /**
+     * Retire the current TCP session and connect to the current
+     * {@link Globals#mServerIP} once its reader has completely stopped. This
+     * is used by an explicit pre-game host takeover, where immediately starting
+     * a second reader can otherwise leave the old session owning the client.
+     */
+    public void restartAfterHostTakeover() {
+        final Socket socket;
+        final Thread clientThread;
+        final boolean startImmediately;
+        synchronized (this) {
+            if (mDestroyed || sendExecutor.isShutdown())
+                return;
+            mSessionGeneration++;
+            keepListening = false;
+            mIsDedicatedServer = false;
+            resetClockSyncLocked();
+            out = null;
+            messageQueue = new ConcurrentLinkedQueue<>();
+            mPersistentDrainRequested = false;
+            mPendingTerminalEvent = null;
+            socket = mActiveSocket;
+            clientThread = mClientThread;
+            startImmediately = !isListening;
+            mRestartAfterHostTakeover = !startImmediately;
+        }
+        try { if (socket != null) socket.close(); } catch (IOException e) { /* ignored */ }
+        if (clientThread != null)
+            clientThread.interrupt();
+        if (startImmediately)
+            startTcpClient();
     }
 
     public void leaveServer() {
