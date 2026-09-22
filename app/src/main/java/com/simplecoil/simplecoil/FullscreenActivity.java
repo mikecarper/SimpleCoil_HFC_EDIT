@@ -2024,15 +2024,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUseNetwork) {
             displayInGameNetworkingOptions();
             cancelPlayerQuitWindow();
-            if (isPlayerQuitOnlyGame()) {
-                // A player can opt out only after the synchronized round has
-                // actually begun; finishSpawn opens the 30-second grace window.
-                mEndNetworkGameButton.setText(R.string.quit_game_button);
-                mEndNetworkGameButton.setVisibility(View.GONE);
-            } else {
-                mEndNetworkGameButton.setText(R.string.end_game_button);
-                mEndNetworkGameButton.setVisibility(View.VISIBLE);
-            }
+            updateInGameEndControl();
             // Install the UI-side token immediately before changing the
             // listener's round. This keeps the two checks adjacent while
             // still allowing the first accepted current-round event through.
@@ -2149,6 +2141,26 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     /** True when this phone may leave itself but must never end the shared round. */
     private boolean isPlayerQuitOnlyGame() {
         return mUseNetwork && !mIsServer && (mJoinedFromGameInvite || isTournamentClient());
+    }
+
+    /**
+     * A tournament participant may only leave their own game, but its host
+     * retains the authoritative End Game control. Keep that distinction here
+     * rather than allowing a later UI refresh to turn a host into a Quit-only
+     * player.
+     */
+    private void updateInGameEndControl() {
+        if (mEndNetworkGameButton == null)
+            return;
+        if (isPlayerQuitOnlyGame()) {
+            // A player can opt out only after the synchronized round has
+            // actually begun; finishSpawn opens the 30-second grace window.
+            mEndNetworkGameButton.setText(R.string.quit_game_button);
+            mEndNetworkGameButton.setVisibility(View.GONE);
+            return;
+        }
+        mEndNetworkGameButton.setText(R.string.end_game_button);
+        mEndNetworkGameButton.setVisibility(View.VISIBLE);
     }
 
     private void startPlayerQuitWindow() {

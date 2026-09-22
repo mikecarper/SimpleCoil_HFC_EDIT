@@ -233,6 +233,21 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void tournamentHostKeepsEndGameControl() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mTournamentMode = true;
+            set(activity, "mIsServer", true);
+            activity.findViewById(R.id.end_network_game_button).setVisibility(View.GONE);
+
+            invoke(activity, "updateInGameEndControl");
+
+            TextView endControl = activity.findViewById(R.id.end_network_game_button);
+            assertEquals(View.VISIBLE, endControl.getVisibility());
+            assertEquals(activity.getString(R.string.end_game_button), endControl.getText().toString());
+        });
+    }
+
+    @Test
     public void lateInvitedPlayerDoesNotReceiveANewQuitWindow() {
         scenario.onActivity(activity -> {
             set(activity, "mJoinedFromGameInvite", true);

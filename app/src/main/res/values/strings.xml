@@ -25,7 +25,7 @@
     <string name="weapon_pairing_selected">Weapon selected</string>
     //Game strings
     <string name="start_game_button">Start</string>
-    <string name="end_game_button">End</string>
+    <string name="end_game_button">End Game</string>
     //Team strings
     <string name="team_label">TEAM</string>
     <string name="team_number_label">TEAM %1$d</string>
