@@ -368,11 +368,14 @@ public class UDPRegressionTest {
         set(service, "mPassiveInviteListener", true);
         set(service, "doneListening", false);
         set(service, "keepListening", true);
+        set(service, "mReadyToScan", 1);
 
         assertTrue(service.joinGameInvite(teammate));
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
         assertTrue(flag("mScanRunning"));
         assertFalse(flag("mPassiveInviteListener"));
+        assertEquals("Promoting a passive listener must retain its bound-socket readiness", 1,
+                ((Integer) get(service, "mReadyToScan")).intValue());
         assertEquals(1, service.listenerStarts);
         assertTrue("Accepting an invite emitted a spurious join failure", service.events.isEmpty());
     }

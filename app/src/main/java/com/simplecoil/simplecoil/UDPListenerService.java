@@ -1264,7 +1264,15 @@ public class UDPListenerService extends Service {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
                 return;
-            if (!doneListening && !canReusePassiveInviteListenerLocked()) {
+            // The idle invite listener owns the same UDP socket that a new
+            // lobby needs.  Keep its ready state when promoting it to a host:
+            // clearing mReadyToScan below while startListenForUDPMessage()
+            // correctly declines to start a second thread left the socket
+            // usable but permanently marked "not ready".  That made every
+            // host creation from an idle player time out after five seconds.
+            final boolean reusingPassiveInviteListener = !doneListening
+                    && canReusePassiveInviteListenerLocked();
+            if (!doneListening && !reusingPassiveInviteListener) {
                 Log.e(TAG, "Listening is still in progress");
                 // A new host request supersedes an unfinished discovery scan.
                 // Leaving the old scan alive lets a late SERVERREPLY join the
@@ -1301,7 +1309,8 @@ public class UDPListenerService extends Service {
             mIsListService = true;
             mScanRunning = false;
             mMyIP = null;
-            mReadyToScan = 0;
+            if (!reusingPassiveInviteListener)
+                mReadyToScan = 0;
             startListenForUDPMessage();
             final long generation = mJoinGeneration;
             new Thread(() -> finishServerCreation(generation), "SimpleCoil UDP server startup").start();
@@ -1457,7 +1466,12 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
-            if (!doneListening && !canReusePassiveInviteListenerLocked()) {
+            // Preserve the readiness of a socket reused from the passive
+            // invitation listener. See createServer() for why resetting it
+            // before startListenForUDPMessage() is a stale-state bug.
+            final boolean reusingPassiveInviteListener = !doneListening
+                    && canReusePassiveInviteListenerLocked();
+            if (!doneListening && !reusingPassiveInviteListener) {
                 Log.e(TAG, "Listening is still in progress");
                 // This request replaces the in-flight discovery. Leaving it
                 // active after reporting failure lets a late reply join the
@@ -1490,7 +1504,8 @@ public class UDPListenerService extends Service {
             mJoinAddress = serverIP;
             mBroadcastScan = serverIP.equals(mBroadcastAddress);
             mMyIP = null;
-            mReadyToScan = 0;
+            if (!reusingPassiveInviteListener)
+                mReadyToScan = 0;
             startListenForUDPMessage();
             joinFailCheck(serverIP, port);
         }
