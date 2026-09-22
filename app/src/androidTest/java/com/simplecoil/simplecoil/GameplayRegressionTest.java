@@ -304,6 +304,29 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void startCreatesPeerLobbyBeforeTryingToStartANetworkRound() {
+        scenario.onActivity(activity -> {
+            int[] listenerStarts = new int[1];
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override void startTcpServer() { listenerStarts[0]++; }
+                @Override boolean isTcpServerReady() { return false; }
+            });
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            Globals.getInstance().mPlayerID = 1;
+            set(activity, "mUseNetwork", true);
+            set(activity, "mReady", false);
+            set(activity, "mIsServer", false);
+
+            activity.findViewById(R.id.start_game_button).performClick();
+
+            assertEquals(1, listenerStarts[0]);
+            assertEquals(true, get(activity, "mPeerHostCreationPending"));
+            assertEquals("Start advertised a lobby before its TCP listener was ready", 0,
+                    udp.serverCreates);
+        });
+    }
+
+    @Test
     public void failedPlayerDiscoveryDoesNotCancelAnUnrelatedTcpListener() {
         scenario.onActivity(activity -> {
             int[] calls = new int[1];

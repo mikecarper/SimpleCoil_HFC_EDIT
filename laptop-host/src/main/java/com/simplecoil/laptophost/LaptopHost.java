@@ -1903,7 +1903,7 @@ public final class LaptopHost {
         boolean allowLateJoin = true;
         boolean takeover;
         int startDelaySeconds = 10;
-        int durationMinutes;
+        int durationMinutes = 5;
         int scoreLimit;
         int livesLimit;
         boolean noBrowser;
@@ -2007,7 +2007,7 @@ public final class LaptopHost {
             return "Usage: java --add-modules jdk.httpserver -cp out com.simplecoil.laptophost.LaptopHost [options]\n"
                     + "  --teams 2|4|ffa             Team layout (default: 2)\n"
                     + "  --tournament                Fixed two-team single-shot rules\n"
-                    + "  --duration-minutes 0..100   0 means unlimited\n"
+                    + "  --duration-minutes 0..100   0 means unlimited (default: 5)\n"
                     + "  --score-limit 0..100        0 means unlimited\n"
                     + "  --lives-limit 0..100        0 means unlimited\n"
                     + "  --gps all|team              Phone GPS visibility (default: team)\n"

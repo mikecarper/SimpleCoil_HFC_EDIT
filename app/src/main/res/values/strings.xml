@@ -18,10 +18,8 @@
     <string name="connect_status_connecting">Connecting&#8230;</string>
     <string name="connect_status_communicating">Communicating&#8230;</string>
     <string name="weapon_pairing_title">Choose Your Weapon</string>
-    <string name="weapon_pairing_message">%1$d compatible weapons are nearby. Hold the trigger on the weapon you want to use, then tap Detect Trigger.</string>
-    <string name="weapon_pairing_detect_trigger">Detect Trigger</string>
+    <string name="weapon_pairing_message">%1$d compatible weapons are nearby. Hold the trigger on the weapon you want to use. Detecting&#8230;</string>
     <string name="weapon_pairing_checking">Hold the trigger on %1$s&#8230;</string>
-    <string name="weapon_pairing_not_detected">No held trigger was detected. Keep holding the trigger and try again.</string>
     <string name="weapon_pairing_selected">Weapon selected</string>
     //Game strings
     <string name="start_game_button">Start</string>
@@ -102,6 +100,8 @@
     <string name="player_id_reassigned">Player ID changed to %1$d to avoid a conflict.</string>
     <string name="error_udp_version">Network client version mismatch. Please update the app!</string>
     <string name="error_no_wifi">Wi-Fi must be connected!</string>
+    <string name="wifi_connecting_recoil">Searching for and connecting to Recoil Wi-Fi&#8230;</string>
+    <string name="error_recoil_wifi_not_found">No Recoil Wi-Fi network was found. Turn on the game hub or connect to Wi-Fi, then try again.</string>
     <string name="error_join">Unable to find server lobby!</string>
     <string name="game_invite_title">Join game?</string>
     <string name="game_invite_message">A nearby host started a game. Joining automatically in %1$d seconds.</string>

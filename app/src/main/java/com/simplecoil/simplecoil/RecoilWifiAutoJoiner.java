@@ -93,6 +93,19 @@ final class RecoilWifiAutoJoiner {
         scheduleRetry(0L);
     }
 
+    /**
+     * Give an explicit Network Options tap priority over the normal background retry cadence.
+     * On Android 5.1 this may enable Wi-Fi, use already-visible scan results immediately, and
+     * request a fresh scan whose result broadcasts are handled by this same joiner.
+     */
+    void scanAndJoinNow() {
+        start();
+        if (mWifiManager == null)
+            return;
+        mHandler.removeCallbacks(mRetryRunnable);
+        attemptAutoJoin(true);
+    }
+
     void stop() {
         mStarted = false;
         mHandler.removeCallbacks(mRetryRunnable);
@@ -116,11 +129,25 @@ final class RecoilWifiAutoJoiner {
 
     @SuppressLint("MissingPermission")
     private void attemptAutoJoin() {
+        attemptAutoJoin(false);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void attemptAutoJoin(boolean userInitiated) {
         if (!mStarted || mWifiManager == null)
             return;
         try {
             if (!mWifiManager.isWifiEnabled()) {
-                Log.d(TAG, "Wi-Fi is disabled; waiting for the user to enable it");
+                if (userInitiated) {
+                    boolean enabled = mWifiManager.setWifiEnabled(true);
+                    Log.i(TAG, "Requested Wi-Fi enable for Recoil network (enabled=" + enabled + ")");
+                    if (enabled)
+                        // The Wi-Fi-state broadcast normally arrives first;
+                        // keep a delayed fallback in case it does not.
+                        scheduleRetry(SCAN_RETRY_MS);
+                } else {
+                    Log.d(TAG, "Wi-Fi is disabled; waiting for the user to enable it");
+                }
                 return;
             }
             if (isRecoilSsid(currentSsid())) {
@@ -128,9 +155,9 @@ final class RecoilWifiAutoJoiner {
                 return;
             }
 
-            ScanResult candidate = findBestEligibleNetwork(mWifiManager.getScanResults());
+            ScanResult candidate = findBestConnectableNetwork(mWifiManager.getScanResults());
             if (candidate != null)
-                requestConnection(candidate);
+                requestConnection(candidate, userInitiated);
 
             // Scan results may be stale when a hub was just switched on.  Keep looking until
             // association succeeds, but do not scan continuously once connected.
@@ -146,15 +173,23 @@ final class RecoilWifiAutoJoiner {
     }
 
     @SuppressLint("MissingPermission")
-    private void requestConnection(ScanResult candidate) {
+    private void requestConnection(ScanResult candidate, boolean force) {
         long now = System.currentTimeMillis();
-        if (sameAccessPoint(candidate, mLastRequestedSsid, mLastRequestedBssid)
+        if (!force && sameAccessPoint(candidate, mLastRequestedSsid, mLastRequestedBssid)
                 && now - mLastRequestAt < CONNECT_RETRY_MS) {
             return;
         }
 
-        int networkId = findSavedOpenNetworkId(candidate.SSID);
+        boolean openNetwork = isOpenNetwork(candidate.capabilities);
+        // A protected Recoil network is safe to join only when Android already has its
+        // credentials. Never create or overwrite a protected configuration from an SSID alone.
+        int networkId = findSavedNetworkId(candidate.SSID, openNetwork);
         if (networkId == -1) {
+            if (!openNetwork) {
+                Log.w(TAG, "Recoil hub needs saved Wi-Fi credentials: "
+                        + printableSsid(candidate.SSID));
+                return;
+            }
             WifiConfiguration configuration = new WifiConfiguration();
             configuration.SSID = quoteSsid(candidate.SSID);
             configuration.allowedKeyManagement.clear();
@@ -176,17 +211,34 @@ final class RecoilWifiAutoJoiner {
     }
 
     @SuppressLint("MissingPermission")
-    private int findSavedOpenNetworkId(String ssid) {
+    private int findSavedNetworkId(String ssid, boolean requireOpenConfiguration) {
         List<WifiConfiguration> configurations = mWifiManager.getConfiguredNetworks();
         if (configurations == null)
             return -1;
         for (WifiConfiguration configuration : configurations) {
             if (configuration != null && isSameSsid(configuration.SSID, ssid)
-                    && isOpenConfiguration(configuration)) {
+                    && (!requireOpenConfiguration || isOpenConfiguration(configuration))) {
                 return configuration.networkId;
             }
         }
         return -1;
+    }
+
+    @SuppressLint("MissingPermission")
+    private ScanResult findBestConnectableNetwork(List<ScanResult> scanResults) {
+        if (scanResults == null)
+            return null;
+        ScanResult best = null;
+        for (ScanResult result : scanResults) {
+            if (result == null || !isRecoilSsid(result.SSID))
+                continue;
+            boolean openNetwork = isOpenNetwork(result.capabilities);
+            if (!openNetwork && findSavedNetworkId(result.SSID, false) == -1)
+                continue;
+            if (best == null || result.level > best.level)
+                best = result;
+        }
+        return best;
     }
 
     @SuppressLint("MissingPermission")

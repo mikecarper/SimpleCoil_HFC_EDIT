@@ -218,6 +218,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean mRespawnQrOpenWhenResumed;
     private boolean mTeamAssignmentQrOpenWhenResumed;
     private RecoilWifiAutoJoiner mRecoilWifiAutoJoiner;
+    private static final long NETWORK_OPTIONS_WIFI_WAIT_MS = 10_000L;
+    // Checking Android's already-known connection state is cheap; run this
+    // once a second while the player explicitly waits for Network Options.
+    // Fresh radio scans remain rate-limited by RecoilWifiAutoJoiner.
+    private static final long NETWORK_OPTIONS_WIFI_POLL_MS = 1_000L;
+    private final Handler mNetworkOptionsHandler = new Handler(Looper.getMainLooper());
+    private Runnable mNetworkOptionsWifiWaitRunnable;
+    private long mNetworkOptionsWifiWaitUntil;
 
     private BluetoothLeScanner mBluetoothLeScanner;
     private BluetoothLeService mBluetoothLeService;
@@ -238,11 +246,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     // trigger notification to identify the player's gun if there is a choice.
     private static final long NEW_WEAPON_DISCOVERY_WINDOW_MS = 3_000L;
     private static final long NEW_WEAPON_TRIGGER_PROBE_TIMEOUT_MS = 6_000L;
+    private static final long NEW_WEAPON_TRIGGER_RETRY_DELAY_MS = 500L;
     private final Handler mWeaponPairingHandler = new Handler(Looper.getMainLooper());
     private final ArrayList<WeaponCandidate> mNewWeaponCandidates = new ArrayList<>();
     private Runnable mNewWeaponDiscoveryRunnable;
     private Runnable mTriggerProbeConnectRunnable;
     private Runnable mTriggerProbeTimeoutRunnable;
+    private Runnable mTriggerProbeRetryRunnable;
     private boolean mCollectingNewWeaponCandidates;
     private boolean mTriggerPairingActive;
     private int mTriggerProbeIndex = -1;
@@ -482,6 +492,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     public static final String PREF_LIMIT_LIVES = "LivesLimit";
     public static final String PREF_LIMIT_SCORE = "ScoreLimit";
     public static final String PREF_DEVICE_ADDRESS = "DeviceAddress";
+    // New installs begin with a bounded round; players can still select
+    // Unlimited from the Game Limit menu.
+    static final int DEFAULT_TIME_LIMIT_MINUTES = 5;
 
     private static void discardMalformedPreference(SharedPreferences preferences, String key,
                                                    ClassCastException exception) {
@@ -658,6 +671,21 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mUDPListenerService.createServer();
     }
 
+    /** Start a peer lobby once; TCP must be ready before UDP advertises it. */
+    private void createPeerLobbyIfNeeded() {
+        if (!networkServicesReady()) {
+            Log.w(TAG, "Ignoring lobby creation before network services are ready");
+            return;
+        }
+        if (mReady || mPeerHostCreationPending || mPeerUdpServerStarting)
+            return;
+        mPeerHostCreationPending = true;
+        mPeerUdpServerStarting = false;
+        mTcpServer.startTcpServer();
+        startPeerUdpServerIfTcpReady();
+        setNetworkMenu(NETWORK_TYPE_JOINING);
+    }
+
     private void setupTcpClientServiceConnection() {
         if (mTcpClientServiceBound) return;
         mTcpClientServiceConnection = createTcpClientServiceConnection();
@@ -817,6 +845,80 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         ConnectivityManager manager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         NetworkInfo wifi = manager == null ? null : manager.getNetworkInfo(ConnectivityManager.TYPE_WIFI);
         return wifi != null && wifi.isConnected();
+    }
+
+    /**
+     * A Network Options tap is an explicit request to join a field hub. Start
+     * a fresh Recoil scan/association, then open the normal menu as soon as
+     * Android reports Wi-Fi connected instead of requiring another tap.
+     */
+    private void requestNetworkOptions() {
+        if (isWifiConnected()) {
+            cancelNetworkOptionsWifiWait();
+            showNetworkOptionsPopup();
+            return;
+        }
+        if (mRecoilWifiAutoJoiner != null)
+            mRecoilWifiAutoJoiner.scanAndJoinNow();
+        Toast.makeText(getApplicationContext(), R.string.wifi_connecting_recoil,
+                Toast.LENGTH_SHORT).show();
+        updateTeamAssignmentScanButton();
+        waitForRecoilWifiThenOpenNetworkOptions();
+    }
+
+    private void waitForRecoilWifiThenOpenNetworkOptions() {
+        cancelNetworkOptionsWifiWait();
+        mNetworkOptionsWifiWaitUntil = SystemClock.elapsedRealtime() + NETWORK_OPTIONS_WIFI_WAIT_MS;
+        mNetworkOptionsWifiWaitRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (mNetworkOptionsWifiWaitRunnable != this)
+                    return;
+                if (!mActivityResumed || isFinishing() || isDestroyed()) {
+                    cancelNetworkOptionsWifiWait();
+                    return;
+                }
+                if (isWifiConnected()) {
+                    cancelNetworkOptionsWifiWait();
+                    showNetworkOptionsPopup();
+                    return;
+                }
+                if (SystemClock.elapsedRealtime() >= mNetworkOptionsWifiWaitUntil) {
+                    cancelNetworkOptionsWifiWait();
+                    Toast.makeText(getApplicationContext(), R.string.error_recoil_wifi_not_found,
+                            Toast.LENGTH_LONG).show();
+                    return;
+                }
+                mNetworkOptionsHandler.postDelayed(this, NETWORK_OPTIONS_WIFI_POLL_MS);
+            }
+        };
+        mNetworkOptionsHandler.post(mNetworkOptionsWifiWaitRunnable);
+    }
+
+    private void cancelNetworkOptionsWifiWait() {
+        if (mNetworkOptionsWifiWaitRunnable != null) {
+            mNetworkOptionsHandler.removeCallbacks(mNetworkOptionsWifiWaitRunnable);
+            mNetworkOptionsWifiWaitRunnable = null;
+        }
+        mNetworkOptionsWifiWaitUntil = 0;
+    }
+
+    private void showNetworkOptionsPopup() {
+        if (!isWifiConnected() || mUseNetworkingButton == null)
+            return;
+        if (mNetworkPopup == null) {
+            mNetworkPopup = new PopupMenu(this, mUseNetworkingButton);
+            mNetworkPopup.setOnMenuItemClickListener(this);
+            setNetworkMenu(NETWORK_TYPE_ENABLED);
+        }
+        if (!mUseNetwork) {
+            mUseNetwork = true;
+            mUseNetworkingButton.setText(R.string.network_menu_button);
+            displayAllNetworkingOptions(true);
+            setNetworkMenu(NETWORK_TYPE_ENABLED);
+        }
+        mNetworkPopup.show();
+        setTeam();
     }
 
     private void showGameInvite(Intent invite) {
@@ -1162,6 +1264,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         Log.w(TAG, "Ignoring start-game request before network services are ready");
                         return;
                     }
+                    // In network mode, Start is also the fast path to host a
+                    // lobby. Once peers have joined, the same button starts
+                    // the synchronized round as usual.
+                    if (!mReady) {
+                        createPeerLobbyIfNeeded();
+                        return;
+                    }
                     if (Globals.getPlayerCount() <= 1) {
                         Toast.makeText(getApplicationContext(), getString(R.string.not_enough_players_toast), Toast.LENGTH_SHORT).show();
                         mNetworkPlayerCountTV.setText(R.string.network_player_1count);
@@ -1264,7 +1373,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         int savedGameMode = readIntPreference(sharedPreferences, PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS);
         Globals.getInstance().mGameMode = Globals.isValidGameMode(savedGameMode) ? savedGameMode : Globals.GAME_MODE_2TEAMS;
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
-        int savedTimeLimit = readIntPreference(sharedPreferences, PREF_LIMIT_TIME, 0);
+        int savedTimeLimit = readIntPreference(sharedPreferences, PREF_LIMIT_TIME,
+                DEFAULT_TIME_LIMIT_MINUTES);
         Globals.getInstance().mTimeLimit = Globals.isValidGameLimit(savedTimeLimit) ? savedTimeLimit : 0;
         if (Globals.getInstance().mTimeLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_TIME;
@@ -1295,31 +1405,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mNetworkPlayerCountTV = findViewById(R.id.player_count_tv);
         mUseNetworkingButton = findViewById(R.id.use_network_button);
         if (mUseNetworkingButton != null) {
-            mUseNetworkingButton.setOnClickListener((v -> {
-                ConnectivityManager connManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-                NetworkInfo mWifi = connManager == null ? null : connManager.getNetworkInfo(ConnectivityManager.TYPE_WIFI);
-                if (mWifi == null || !mWifi.isConnected()) {
-                    Toast.makeText(getApplicationContext(), getString(R.string.error_no_wifi), Toast.LENGTH_SHORT).show();
-                    // Keep the default network mode selected while an access
-                    // point is still associating. The next tap can discover
-                    // the lobby without making the player re-enable it.
-                    updateTeamAssignmentScanButton();
-                    return;
-                }
-                if (mNetworkPopup == null) {
-                    mNetworkPopup = new PopupMenu(FullscreenActivity.this, v);
-                    mNetworkPopup.setOnMenuItemClickListener(FullscreenActivity.this);
-                    setNetworkMenu(NETWORK_TYPE_ENABLED);
-                }
-                if (!mUseNetwork) {
-                    mUseNetwork = true;
-                    mUseNetworkingButton.setText(R.string.network_menu_button);
-                    displayAllNetworkingOptions(true);
-                    setNetworkMenu(NETWORK_TYPE_ENABLED);
-                }
-                mNetworkPopup.show();
-                setTeam();
-            }));
+            mUseNetworkingButton.setOnClickListener(v -> requestNetworkOptions());
         }
         mGameModeLabelTV = findViewById(R.id.game_mode_label_tv);
         mGameModeTV = findViewById(R.id.game_mode_tv);
@@ -1432,12 +1518,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         Toast.makeText(getApplicationContext(), getString(R.string.error_select_team), Toast.LENGTH_SHORT).show();
                         return true;
                     }
-                    if (!networkServicesReady()) return true;
-                    mPeerHostCreationPending = true;
-                    mPeerUdpServerStarting = false;
-                    mTcpServer.startTcpServer();
-                    startPeerUdpServerIfTcpReady();
-                    setNetworkMenu(NETWORK_TYPE_JOINING);
+                    createPeerLobbyIfNeeded();
                     return true;
             }else if (id == R.id.player_name_item) {
                     requestPlayerName();
@@ -3226,6 +3307,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     protected void onPause() {
         if (mGameInviteDialog != null)
             dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
+        cancelNetworkOptionsWifiWait();
         // Trigger identification relies on receiver-delivered BLE telemetry.
         // Do not leave a half-finished probe alive while the activity is in
         // the background, where it could later be mistaken for a real gun.
@@ -3264,6 +3346,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     protected void onDestroy() {
         if (mGameInviteDialog != null)
             dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
+        cancelNetworkOptionsWifiWait();
         cancelNewWeaponPairing();
         clearCombatFeedback();
         resetTeamRespawnQrState();
@@ -3388,24 +3471,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(R.string.weapon_pairing_title)
                 .setMessage(getString(R.string.weapon_pairing_message, mNewWeaponCandidates.size()))
-                .setPositiveButton(R.string.weapon_pairing_detect_trigger, null)
                 .setNegativeButton(android.R.string.cancel,
                         (ignored, which) -> abandonNewWeaponPairing())
                 .create();
         mWeaponPairingDialog = dialog;
-        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
-                .setOnClickListener(view -> {
-                    if (mWeaponPairingDialog != dialog)
-                        return;
-                    dialog.dismiss();
-                    beginTriggerWeaponPairing();
-                }));
         dialog.setOnDismissListener(ignored -> {
             if (mWeaponPairingDialog == dialog)
                 mWeaponPairingDialog = null;
         });
         dialog.setOnCancelListener(ignored -> abandonNewWeaponPairing());
         dialog.show();
+        beginTriggerWeaponPairing();
     }
 
     private void beginTriggerWeaponPairing() {
@@ -3426,9 +3502,19 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         resetBluetoothServices();
         mTriggerProbeIndex++;
         if (mTriggerProbeIndex >= mNewWeaponCandidates.size()) {
-            mTriggerPairingActive = false;
+            // Keep listening until the player either holds a trigger during
+            // that gun's probe window or chooses Cancel. This avoids making
+            // them start the entire discovery flow again just because the
+            // trigger was held a moment too late.
+            mTriggerProbeIndex = -1;
             mTriggerProbeAddress = null;
-            showTriggerNotDetectedDialog();
+            mTriggerProbeRetryRunnable = () -> {
+                mTriggerProbeRetryRunnable = null;
+                if (mTriggerPairingActive)
+                    probeNextWeaponTrigger();
+            };
+            mWeaponPairingHandler.postDelayed(mTriggerProbeRetryRunnable,
+                    NEW_WEAPON_TRIGGER_RETRY_DELAY_MS);
             return;
         }
         WeaponCandidate candidate = mNewWeaponCandidates.get(mTriggerProbeIndex);
@@ -3458,6 +3544,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mWeaponPairingHandler.removeCallbacks(mTriggerProbeConnectRunnable);
             mTriggerProbeConnectRunnable = null;
         }
+        if (mTriggerProbeRetryRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mTriggerProbeRetryRunnable);
+            mTriggerProbeRetryRunnable = null;
+        }
         cancelTriggerProbeTimeout();
     }
 
@@ -3466,32 +3556,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mWeaponPairingHandler.removeCallbacks(mTriggerProbeTimeoutRunnable);
             mTriggerProbeTimeoutRunnable = null;
         }
-    }
-
-    private void showTriggerNotDetectedDialog() {
-        if (isFinishing() || isDestroyed())
-            return;
-        final AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle(R.string.weapon_pairing_title)
-                .setMessage(R.string.weapon_pairing_not_detected)
-                .setPositiveButton(R.string.weapon_pairing_detect_trigger, null)
-                .setNegativeButton(android.R.string.cancel,
-                        (ignored, which) -> abandonNewWeaponPairing())
-                .create();
-        mWeaponPairingDialog = dialog;
-        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
-                .setOnClickListener(view -> {
-                    if (mWeaponPairingDialog != dialog)
-                        return;
-                    dialog.dismiss();
-                    beginTriggerWeaponPairing();
-                }));
-        dialog.setOnDismissListener(ignored -> {
-            if (mWeaponPairingDialog == dialog)
-                mWeaponPairingDialog = null;
-        });
-        dialog.setOnCancelListener(ignored -> abandonNewWeaponPairing());
-        dialog.show();
     }
 
     private void connectToWeaponCandidate(WeaponCandidate candidate) {
@@ -3516,6 +3580,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         cancelTriggerProbeCallbacks();
         mNewWeaponCandidates.clear();
         mPreviousWeaponAddress = "";
+        if (mWeaponPairingDialog != null) {
+            AlertDialog dialog = mWeaponPairingDialog;
+            mWeaponPairingDialog = null;
+            dialog.dismiss();
+        }
         if (sharedPreferences != null)
             sharedPreferences.edit().putString(PREF_DEVICE_ADDRESS, mDeviceAddress).apply();
         Toast.makeText(getApplicationContext(), R.string.weapon_pairing_selected, Toast.LENGTH_SHORT).show();

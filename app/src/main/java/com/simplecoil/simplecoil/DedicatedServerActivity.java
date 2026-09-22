@@ -325,7 +325,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mGameModeButton.setText(R.string.game_mode_ffa);
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
         int savedTimeLimit = FullscreenActivity.readIntPreference(sharedPreferences,
-                FullscreenActivity.PREF_LIMIT_TIME, 0);
+                FullscreenActivity.PREF_LIMIT_TIME, FullscreenActivity.DEFAULT_TIME_LIMIT_MINUTES);
         Globals.getInstance().mTimeLimit = Globals.isValidGameLimit(savedTimeLimit) ? savedTimeLimit : 0;
         if (Globals.getInstance().mTimeLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_TIME;

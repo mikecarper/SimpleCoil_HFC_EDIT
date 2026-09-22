@@ -8,6 +8,10 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 
 public class GlobalsTest {
+    @Test public void defaultGameLengthIsFiveMinutes() {
+        assertEquals(5, FullscreenActivity.DEFAULT_TIME_LIMIT_MINUTES);
+    }
+
     @Test public void wifiIpv4UsesAndroidLittleEndianOctets() {
         InetAddress address = Globals.fromWifiIPv4Address(0x2A01A8C0);
         assertEquals("192.168.1.42", address.getHostAddress());
