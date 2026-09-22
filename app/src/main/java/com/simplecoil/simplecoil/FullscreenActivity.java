@@ -363,7 +363,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private static final byte WEAPON_PROFILE = (byte)0x00;
 
-    private boolean mUseNetwork = false;
+    // Field games normally use the Recoil hub. Keep networking ready by
+    // default; a player can still explicitly disable it for a local game.
+    private boolean mUseNetwork = true;
     // An invitation joins a dedicated round as a player, never as a host. Its
     // in-game control must therefore leave the player session rather than
     // broadcasting an ENDGAME for everyone else.
@@ -1180,7 +1182,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 NetworkInfo mWifi = connManager == null ? null : connManager.getNetworkInfo(ConnectivityManager.TYPE_WIFI);
                 if (mWifi == null || !mWifi.isConnected()) {
                     Toast.makeText(getApplicationContext(), getString(R.string.error_no_wifi), Toast.LENGTH_SHORT).show();
-                    mUseNetwork = false;
+                    // Keep the default network mode selected while an access
+                    // point is still associating. The next tap can discover
+                    // the lobby without making the player re-enable it.
                     updateTeamAssignmentScanButton();
                     return;
                 }
@@ -1220,8 +1224,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mPlayerNameTV = findViewById(R.id.player_name_label_tv);
         if (mPlayerNameTV != null)
             mPlayerNameTV.setText(Globals.getInstance().mPlayerName);
-        displayAllNetworkingOptions(false);
+        displayAllNetworkingOptions(mUseNetwork);
         mUseNetworkingButton.setVisibility(View.VISIBLE);
+        if (mUseNetwork)
+            mUseNetworkingButton.setText(R.string.network_menu_button);
         setGameLimit();
         mPlayerDataButton = findViewById(R.id.player_data_button);
         if (mPlayerDataButton != null) {

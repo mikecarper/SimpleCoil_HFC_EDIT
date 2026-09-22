@@ -20,7 +20,10 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    public static final String NETWORK_VERSION = "14";
+    // Clock calibration now requires a longer, low-latency sample burst. Keep
+    // older clients out of a lobby rather than leaving them unable to satisfy
+    // the updated start barrier.
+    public static final String NETWORK_VERSION = "15";
 
     // Most of these messages are straightforward and contain no extra data.
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";

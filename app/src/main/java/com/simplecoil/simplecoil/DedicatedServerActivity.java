@@ -249,7 +249,9 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_dedicated_server);
-        this.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+        // A phone can be used as the dedicated host in the field. Keep its
+        // controls in the same tall orientation as the game client.
+        this.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         Globals globals = Globals.getInstance();
         mPreviousPlayerID = globals.mPlayerID;
         mPreviousGameState = globals.mGameState;
@@ -339,8 +341,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
         setGameLimit();
         int savedGPSMode = FullscreenActivity.readIntPreference(sharedPreferences, PREF_GPS_MODE,
-                Globals.GPS_ALL);
-        Globals.getInstance().mGPSMode = Globals.isValidGPSMode(savedGPSMode) ? savedGPSMode : Globals.GPS_ALL;
+                Globals.GPS_TEAMMATE);
+        Globals.getInstance().mGPSMode = Globals.isValidGPSMode(savedGPSMode) ? savedGPSMode : Globals.GPS_TEAMMATE;
         setGPSMode(Globals.getInstance().mGPSMode);
         mAllowJoinSwitch = findViewById(R.id.allow_join_switch);
         mAllowJoinSwitch.setOnClickListener((v -> {
@@ -558,7 +560,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
     private void setGPSMode(int mode) {
         if (!Globals.isValidGPSMode(mode))
-            mode = Globals.GPS_ALL;
+            mode = Globals.GPS_TEAMMATE;
         Globals.getInstance().mGPSMode = mode;
         if (mode == Globals.GPS_DISABLED || (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA && mode == Globals.GPS_TEAMMATE)) {
             Globals.getInstance().mUseGPS = false;

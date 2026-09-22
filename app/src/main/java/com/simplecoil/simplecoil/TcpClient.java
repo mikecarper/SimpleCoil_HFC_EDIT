@@ -105,9 +105,12 @@ public class TcpClient extends Service {
     // Once a shared countdown has been announced, take one inexpensive probe
     // per second.  The probe only improves an already-good NTP estimate; it
     // never delays the countdown or floods the dedicated host with a new
-    // five-sample burst.
+    // calibration burst.
     private static final long COUNTDOWN_CLOCK_REFRESH_MS = 1000;
     private static final long START_CLOCK_ADJUSTMENT_THRESHOLD_MS = 50;
+    // GPS time is optional and only refines an NTP-derived start when both
+    // estimates already agree within the game's one-second sync target.
+    private static final long GPS_START_REFINEMENT_LIMIT_MS = 1000;
     private long mActiveHostStartAt = -1;
     private long mActiveStartDuration;
     private long mActiveLocalStartAt = -1;
@@ -357,7 +360,7 @@ public class TcpClient extends Service {
     }
 
     /**
-     * The initial five-sample exchange establishes the start deadline.  While
+     * The initial calibration burst establishes the start deadline. While
      * that deadline is still in the future, small follow-up probes can replace
      * it only with a materially better clock estimate.  Once the deadline has
      * passed, changing it would make an already-started round jump backwards.
@@ -383,7 +386,7 @@ public class TcpClient extends Service {
             if (now - mLastClockSync < refreshInterval)
                 return;
             // The initial synchronization and ordinary background refreshes
-            // use a fresh five-sample batch.  A running countdown uses one
+            // use a fresh low-latency sample batch. A running countdown uses one
             // probe against the current best sample instead, which lets a
             // better low-latency exchange refine the deadline without making
             // every phone repeatedly enter a high-rate sampling burst.
@@ -405,6 +408,9 @@ public class TcpClient extends Service {
                 }
                 try {
                     JSONObject request = new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, sentAt);
+                    long gpsTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(sentAt, sentAt);
+                    if (GpsGameTime.isValidUtcTime(gpsTime))
+                        request.put(TcpServer.JSON_GPS_CLOCK, gpsTime);
                     writeMessage(writer, TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + request);
                 } catch (JSONException e) {
                     Log.w(TAG, "Unable to request clock synchronization", e);
@@ -459,11 +465,17 @@ public class TcpClient extends Service {
         String roundToken = (String) roundTokenValue;
         long startAt = TcpJson.getLong(message, TcpServer.JSON_GAMESTART);
         long duration = TcpJson.getLong(message, TcpServer.JSON_GAMEDURATION);
+        long gpsStartTime = GpsGameTime.INVALID_TIME;
+        if (message.has(TcpServer.JSON_GPS_START_TIME)) {
+            gpsStartTime = TcpJson.getLong(message, TcpServer.JSON_GPS_START_TIME);
+            if (!GpsGameTime.isValidUtcTime(gpsStartTime))
+                throw new JSONException("Invalid GPS synchronized start");
+        }
         if (roundID <= 0 || !GameClock.validTimestamp(roundID) || !GameClock.validTimestamp(startAt)
                 || duration < 0 || duration > Globals.MAX_GAME_LIMIT * 60000L
                 || !TcpServer.isValidRoundToken(roundToken))
             throw new JSONException("Invalid synchronized game start");
-        return TcpServer.createStartInfo(roundID, startAt, duration, roundToken);
+        return TcpServer.createStartInfo(roundID, startAt, duration, roundToken, gpsStartTime);
     }
 
     private void queueSynchronizedStart(long generation, JSONObject startInfo, Intent intent) throws JSONException {
@@ -491,6 +503,13 @@ public class TcpClient extends Service {
             return;
         long hostStartAt = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GAMESTART);
         long startAt = mGameClock.toLocalTime(hostStartAt);
+        if (mPendingStartInfo.has(TcpServer.JSON_GPS_START_TIME)) {
+            long gpsStartTime = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GPS_START_TIME);
+            long gpsStartAt = Globals.getInstance().mGpsGameTime.elapsedTimeForUtc(gpsStartTime,
+                    SystemClock.elapsedRealtime());
+            if (gpsStartAt >= 0 && Math.abs(gpsStartAt - startAt) <= GPS_START_REFINEMENT_LIMIT_MS)
+                startAt = gpsStartAt;
+        }
         long duration = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_GAMEDURATION);
         long roundID = TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_ROUND_ID);
         Object roundTokenValue = mPendingStartInfo.get(TcpServer.JSON_ROUND_TOKEN);
@@ -934,9 +953,9 @@ public class TcpClient extends Service {
     }
 
     /**
-     * Report a confirmed blaster shot to a dedicated host's optional live
-     * dashboard. This is intentionally non-persistent: a delayed shot from a
-     * prior life or round must never inflate the next round's accuracy.
+     * Report a confirmed blaster shot to the host's optional live dashboard.
+     * This is intentionally non-persistent: a delayed shot from a prior life
+     * or round must never inflate the next round's accuracy.
      */
     public void reportHostedShots(int count) {
         if (!mIsDedicatedServer || count < 1 || count > Globals.MAX_RELOAD_COUNT)
@@ -953,11 +972,15 @@ public class TcpClient extends Service {
 
     /**
      * The receiving phone is the one that can verify an IR hit. Reporting the
-     * attacker's ID here lets a laptop host draw an accurate shooter-to-target
-     * trace and count hits without trusting a self-reported kill.
+     * attacker's ID lets any host draw a verified trace, count a hit, and grant
+     * the two involved opponents a short-lived GPS reveal without trusting a
+     * self-reported miss or kill.
      */
     public void reportHostedHit(int attackerID) {
-        if (!mIsDedicatedServer || attackerID <= 0 || !Globals.isValidPlayerID(attackerID))
+        // The receiving blaster is the authoritative source of a hit in both
+        // phone-hosted and dedicated games.  A normal phone host uses this
+        // report for the short enemy-GPS reveal as well as the dashboard.
+        if (attackerID <= 0 || !Globals.isValidPlayerID(attackerID))
             return;
         try {
             JSONObject telemetry = new JSONObject();

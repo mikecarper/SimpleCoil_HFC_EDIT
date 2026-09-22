@@ -493,6 +493,73 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void confirmedEnemyHitCreatesTeamWideGpsRevealsWithoutExposingOtherEnemies() throws Exception {
+        Globals globals = Globals.getInstance();
+        int originalGameMode = globals.mGameMode;
+        int originalMode = globals.mGPSMode;
+        boolean originalUseGps = globals.mUseGPS;
+        try {
+            globals.mGameMode = Globals.GAME_MODE_4TEAMS;
+            globals.mGPSMode = Globals.GPS_TEAMMATE;
+            globals.mUseGPS = true;
+            Object target = client(1, 1);
+            client(2, 2);  // Target's teammate.
+            client(3, 6);  // Attacker.
+            client(4, 7);  // Attacker's teammate.
+            client(5, 11); // An uninvolved third-team player.
+
+            // The target phone reports an actual IR hit. A shot/miss frame never
+            // carries an attacker ID and therefore cannot open this reveal.
+            parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_HIT)
+                    .put(TcpServer.JSON_TELEMETRY_ATTACKER, 6));
+
+            @SuppressWarnings("unchecked")
+            Map<Byte, Map<Byte, Long>> reveals = (Map<Byte, Map<Byte, Long>>) get(server,
+                    "mEnemyGPSRevealUntil");
+            assertEquals(4, reveals.size());
+            assertTrue(reveals.get((byte) 1).containsKey((byte) 6));
+            assertTrue(reveals.get((byte) 2).containsKey((byte) 6));
+            assertTrue(reveals.get((byte) 6).containsKey((byte) 1));
+            assertTrue(reveals.get((byte) 7).containsKey((byte) 1));
+            assertFalse("A confirmed hit must not expose unrelated enemy teams", reveals.containsKey((byte) 11));
+        } finally {
+            globals.mGameMode = originalGameMode;
+            globals.mGPSMode = originalMode;
+            globals.mUseGPS = originalUseGps;
+        }
+    }
+
+    @Test
+    public void eliminatingEitherPlayerClearsTheirTemporaryEnemyGpsReveal() throws Exception {
+        Globals globals = Globals.getInstance();
+        int originalGameMode = globals.mGameMode;
+        int originalMode = globals.mGPSMode;
+        boolean originalUseGps = globals.mUseGPS;
+        try {
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            globals.mGPSMode = Globals.GPS_TEAMMATE;
+            globals.mUseGPS = true;
+            Object target = client(1, 1);
+            client(2, 11);
+            client(3, 2);
+            client(4, 12);
+            parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_HIT)
+                    .put(TcpServer.JSON_TELEMETRY_ATTACKER, 11));
+
+            eliminate(target, 11);
+
+            @SuppressWarnings("unchecked")
+            Map<Byte, Map<Byte, Long>> reveals = (Map<Byte, Map<Byte, Long>>) get(server,
+                    "mEnemyGPSRevealUntil");
+            assertTrue("A death must end both players' GPS reveal immediately", reveals.isEmpty());
+        } finally {
+            globals.mGameMode = originalGameMode;
+            globals.mGPSMode = originalMode;
+            globals.mUseGPS = originalUseGps;
+        }
+    }
+
+    @Test
     public void zeroCoordinatePlaceholderDoesNotMoveThePlayer() throws Exception {
         Object player = client(1, 6);
         parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 10.0)

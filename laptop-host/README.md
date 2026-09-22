@@ -4,7 +4,7 @@
 keeps the game authority and live display on a laptop; players still use the
 Android app and their BLE laser-tag hardware.
 
-It speaks the existing protocol-14 TCP lobby, clock synchronization, GPS,
+It speaks the existing protocol-15 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
 
@@ -25,7 +25,7 @@ on TCP port `17510` and UDP port `17500` if prompted.
 The launcher opens a local landing page at `http://127.0.0.1:17511/`. Use its
 buttons to open the two independent display windows:
 
-- **Tactical GPS Map** — all players are shown by team, with recent movement
+- **Tactical GPS Map** — the laptop game master sees all players by team, with recent movement
   trails and short laser lines for verified hits and eliminations. The laser
   endpoints are captured when the hit is confirmed, so a later GPS movement
   does not shift the trace. It also lists one **Game Master Respawn** button
@@ -59,6 +59,19 @@ produce a useful initial location while a phone is acquiring satellites. The
 app forwards meaningful movement to a hosted game immediately. The laptop
 forwards changed positions at up to four updates per second and sends periodic
 complete snapshots to correct stale markers.
+
+When a phone has a fresh GPS fix, SimpleCoil also uses its UTC timestamp as an
+optional refinement for the shared countdown. It does not change the phone's
+system clock; the existing monotonic round-trip clock sync remains the fallback
+and final guardrail when GPS time is missing or disagrees. Joining the lobby
+immediately starts a 12-probe calibration burst; only samples at or below 80 ms
+round trip are accepted, keeping network-path uncertainty below 50 ms.
+
+Phones see only their own team by default; the laptop's local game-master map
+still sees every player. A valid IR hit temporarily reveals the involved enemy
+to each participating player's whole team for up to ten seconds. The host ends
+that reveal immediately if either player is eliminated, and a miss does not
+reveal a location.
 
 Laser lines are based on a phone that actually received a valid IR hit; they
 are not guessed from proximity. The host records each endpoint's latest GPS

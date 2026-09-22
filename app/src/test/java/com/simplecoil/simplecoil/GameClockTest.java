@@ -41,28 +41,25 @@ public class GameClockTest {
         assertEquals(20, clock.toLocalTime(GameClock.MAX_TIMESTAMP));
     }
 
-    @Test public void rejectsSamplesTooUncertainForOneSecondGroupAlignment() {
+    @Test public void rejectsSamplesTooUncertainForSubFiftyMillisecondAlignment() {
         GameClock clock = new GameClock();
-        assertFalse(clock.record(1000, 2000, 2000, 1501));
+        assertFalse(clock.record(1000, 2000, 2000, 1081));
         assertEquals(0, clock.samples());
-        assertTrue(clock.record(1000, 2000, 2000, 1500));
+        assertTrue(clock.record(1000, 2000, 2000, 1080));
     }
 
-    @Test public void twentyDifferentClocksStayWithinOneSecondEvenWithAsymmetricDelay() {
-        long earliest = Long.MAX_VALUE;
-        long latest = Long.MIN_VALUE;
+    @Test public void everyAcceptedClockIsWithinFortyMillisecondsOfHostDespiteAsymmetricDelay() {
         for (int player = 0; player < 20; player++) {
             long actualOffset = player * 100000L;
-            long outbound = player * 25L;
-            long inbound = 500 - outbound;
+            long outbound = player * 4L;
+            long inbound = GameClock.MAX_SAMPLE_DELAY_MS - outbound;
             GameClock clock = new GameClock();
             assertTrue(clock.record(1000, 1000 + actualOffset + outbound,
                     1000 + actualOffset + outbound, 1000 + outbound + inbound));
             long translatedBackToHost = clock.toLocalTime(5000000) + actualOffset;
-            earliest = Math.min(earliest, translatedBackToHost);
-            latest = Math.max(latest, translatedBackToHost);
+            assertTrue(Math.abs(translatedBackToHost - 5000000)
+                    <= GameClock.MAX_SAMPLE_DELAY_MS / 2);
         }
-        assertTrue(latest - earliest < 1000);
     }
 
     @Test public void refreshKeepsPreviousEstimateUntilAFullNewBatchArrives() {

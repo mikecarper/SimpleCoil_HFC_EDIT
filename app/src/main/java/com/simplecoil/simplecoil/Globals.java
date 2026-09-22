@@ -31,6 +31,10 @@ import java.util.concurrent.Semaphore;
 
 public class Globals {
     private static Globals mInstance= null;
+    // GPS-derived UTC is intentionally kept separate from the device wall
+    // clock. Ordinary apps cannot set system time, and game timing uses the
+    // monotonic clock even when a phone's displayed time is wrong.
+    public final GpsGameTime mGpsGameTime = new GpsGameTime();
 
     /* Highest player ID allowed in the GUI, absolute max is 0x3F or 63. Player ID 0 can technically
     be used but would require code changes to the hit detection if you really need 64 players. */
@@ -147,7 +151,9 @@ public class Globals {
     public static final int GPS_DISABLED = 0;
     public static final int GPS_TEAMMATE = 1;
     public static final int GPS_ALL = 2;
-    public volatile int mGPSMode = GPS_ALL;
+    // Team games should not disclose the opposing team's positions by default.
+    // Hosts can still deliberately select GPS_ALL for a referee or training game.
+    public volatile int mGPSMode = GPS_TEAMMATE;
 
     public static boolean isValidGPSMode(int gpsMode) {
         return gpsMode == GPS_DISABLED || gpsMode == GPS_TEAMMATE || gpsMode == GPS_ALL;

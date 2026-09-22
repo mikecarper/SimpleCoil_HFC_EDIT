@@ -67,8 +67,8 @@ public class TcpServer extends Service {
     public static final int TCP_READ_WAIT_MS = 200;
     public static final int TCP_DEDICATED_READ_WAIT_MS = 100;
     static final int CLOCK_READ_WAIT_MS = 10;
-    // A valid NTP sample is capped at 500 ms, so one second is ample for the
-    // initial five-exchange burst.  Do not hold every socket in a 10 ms polling
+    // A valid NTP sample is capped at 80 ms, so one second is ample for the
+    // initial twelve-exchange burst. Do not hold every socket in a 10 ms polling
     // loop for the former five-second round-trip timeout after a single probe.
     private static final long CLOCK_SYNC_BURST_WINDOW_MS = 1000;
     // Every network snapshot is generated on a separate task so the caller
@@ -125,6 +125,10 @@ public class TcpServer extends Service {
     static final String JSON_CLOCK_RECEIVE = "clockreceive";
     static final String JSON_CLOCK_SEND = "clocksend";
     static final String JSON_CLOCK_READY = "clockready";
+    // Optional GPS UTC calibration. The host still owns the start deadline;
+    // this only gives clients with fresh GPS fixes a lower-jitter conversion.
+    static final String JSON_GPS_CLOCK = "gpsclock";
+    static final String JSON_GPS_START_TIME = "gpsstarttime";
     static final String JSON_GAMESTART = "gamestart";
     static final String JSON_GAMEDURATION = "gameduration";
     static final String JSON_ROUND_ID = "roundid";
@@ -185,6 +189,13 @@ public class TcpServer extends Service {
     // Explicitly leaving must not reset a player's score or spent lives in this round.
     private final Map<Byte, ScoreData> mDepartedScores = new ConcurrentHashMap<>();
     private volatile boolean mIsDedicated = false;
+    // A confirmed IR hit gives both involved teams a temporary view of the
+    // opposing participant. Keep this server-authoritative: receiving a GPS
+    // frame never lets a client decide that it is entitled to see an enemy.
+    // Both maps are guarded by mServerStateLock.
+    private static final long HIT_ENEMY_GPS_REVEAL_MS = 10_000L;
+    private final Map<Byte, Map<Byte, Long>> mEnemyGPSRevealUntil = new HashMap<>();
+    private final Set<Byte> mGPSVisibilityRefreshPlayers = new HashSet<>();
     private boolean mGPSRunning = false;
 
     // GPS snapshots are JSON-heavy and can fan out to every player.  Keep that work away from
@@ -509,6 +520,7 @@ public class TcpServer extends Service {
                 final long duration;
                 final long roundID;
                 final String roundToken;
+                final long gpsStartTime;
                 synchronized (mServerStateLock) {
                     if (!isClientTaskActive() || mEndingGame
                             || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
@@ -527,9 +539,11 @@ public class TcpServer extends Service {
                     roundID = ++mRoundSequence;
                     roundToken = createRoundToken();
                     mRoundToken = roundToken;
+                    gpsStartTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(startAt,
+                            SystemClock.elapsedRealtime());
                 }
                 String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON
-                        + createStartInfo(roundID, startAt, duration, roundToken);
+                        + createStartInfo(roundID, startAt, duration, roundToken, gpsStartTime);
                 boolean delivered = false;
                 for (ClientRecipient recipient : recipients) {
                     synchronized (mServerStateLock) {
@@ -698,11 +712,19 @@ public class TcpServer extends Service {
     }
 
     static JSONObject createStartInfo(long roundID, long startAt, long duration, String roundToken) {
+        return createStartInfo(roundID, startAt, duration, roundToken, GpsGameTime.INVALID_TIME);
+    }
+
+    static JSONObject createStartInfo(long roundID, long startAt, long duration, String roundToken,
+                                      long gpsStartTime) {
         if (!isValidRoundToken(roundToken))
             throw new IllegalArgumentException("Invalid round token");
         try {
-            return new JSONObject().put(JSON_ROUND_ID, roundID).put(JSON_ROUND_TOKEN, roundToken)
+            JSONObject start = new JSONObject().put(JSON_ROUND_ID, roundID).put(JSON_ROUND_TOKEN, roundToken)
                     .put(JSON_GAMESTART, startAt).put(JSON_GAMEDURATION, duration);
+            if (GpsGameTime.isValidUtcTime(gpsStartTime))
+                start.put(JSON_GPS_START_TIME, gpsStartTime);
+            return start;
         } catch (JSONException e) {
             throw new IllegalArgumentException("Invalid game start", e);
         }
@@ -753,6 +775,10 @@ public class TcpServer extends Service {
     }
 
     private void clearSharedRosterState() {
+        synchronized (mServerStateLock) {
+            mEnemyGPSRevealUntil.clear();
+            mGPSVisibilityRefreshPlayers.clear();
+        }
         Globals globals = Globals.getInstance();
         Globals.getmGPSDataSemaphore();
         try {
@@ -1004,12 +1030,18 @@ public class TcpServer extends Service {
         mGPSHandler = new Handler(mGPSWorkerThread.getLooper());
     }
 
-    /** Builds one GPS frame, optionally restricted to the requested recipient team. */
-    private String createGPSMessage(List<GPSUpdate> updates, boolean fullUpdate, int recipientTeam) {
+    /**
+     * Builds one GPS frame for a recipient. Team members are always eligible;
+     * enemy IDs are eligible only while a server-recorded, confirmed-hit reveal
+     * is active for that recipient's team.
+     */
+    private String createGPSMessage(List<GPSUpdate> updates, boolean fullUpdate, int recipientTeam,
+                                    Set<Byte> revealedEnemyIDs) {
         try {
             JSONArray players = new JSONArray();
             for (GPSUpdate update : updates) {
-                if (recipientTeam != SEND_ALL && update.team != recipientTeam)
+                if (recipientTeam != SEND_ALL && update.team != recipientTeam
+                        && (revealedEnemyIDs == null || !revealedEnemyIDs.contains(update.playerID)))
                     continue;
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERID, update.playerID);
@@ -1033,11 +1065,13 @@ public class TcpServer extends Service {
     }
 
     /**
-     * Team-only GPS used to broadcast every position and let clients hide enemies locally.
-     * Send each team only its own data instead, saving bandwidth and avoiding needless JSON/map
-     * work on up to twenty phones.
+     * Team GPS sends each phone its teammates and its team's short-lived confirmed-hit enemy
+     * reveal. The periodic full snapshot plus targeted visibility refreshes remove an enemy
+     * marker as soon as a reveal expires or either involved player dies.
      */
-    private void sendTeamGPSData(final List<GPSUpdate> updates, final boolean fullUpdate) {
+    private void sendTeamGPSData(final List<GPSUpdate> changedUpdates,
+                                 final List<GPSUpdate> fullSnapshot,
+                                 final boolean fullUpdate) {
         runClientTask(() -> {
             if (!Globals.getInstance().mUseGPS
                     || Globals.getInstance().mGPSMode != Globals.GPS_TEAMMATE)
@@ -1047,18 +1081,119 @@ public class TcpServer extends Service {
                 if (!recipient.isCurrent() || recipient.playerID <= 0
                         || !Globals.isValidPlayerID(recipient.playerID))
                     continue;
-                int team = recipient.team;
+                final Set<Byte> revealedEnemyIDs;
+                final boolean recipientFullUpdate;
+                synchronized (mServerStateLock) {
+                    Map<Byte, Long> reveals = mEnemyGPSRevealUntil.get(recipient.playerID);
+                    revealedEnemyIDs = reveals == null ? new HashSet<>()
+                            : new HashSet<>(reveals.keySet());
+                    recipientFullUpdate = fullUpdate
+                            || mGPSVisibilityRefreshPlayers.remove(recipient.playerID);
+                }
                 String message;
-                if (messages.containsKey(team)) {
-                    message = messages.get(team);
+                // The ordinary teammate-only case is identical for a team, so retain the
+                // compact one-frame-per-team behavior. A temporary enemy reveal is team-wide.
+                if (revealedEnemyIDs.isEmpty() && !recipientFullUpdate
+                        && messages.containsKey(recipient.team)) {
+                    message = messages.get(recipient.team);
                 } else {
-                    message = createGPSMessage(updates, fullUpdate, team);
-                    messages.put(team, message);
+                    List<GPSUpdate> updates = recipientFullUpdate ? fullSnapshot : changedUpdates;
+                    message = createGPSMessage(updates, recipientFullUpdate, recipient.team,
+                            revealedEnemyIDs);
+                    if (revealedEnemyIDs.isEmpty() && !recipientFullUpdate)
+                        messages.put(recipient.team, message);
                 }
                 if (message != null)
                     recipient.client.sendTCPMessage(message, false);
             }
         });
+    }
+
+    /** Caller holds mServerStateLock. */
+    private void grantEnemyGPSRevealLocked(byte firstPlayerID, byte secondPlayerID) {
+        if (Globals.getInstance().mGPSMode != Globals.GPS_TEAMMATE
+                || Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                || firstPlayerID <= 0 || secondPlayerID <= 0
+                || !Globals.isValidPlayerID(firstPlayerID) || !Globals.isValidPlayerID(secondPlayerID)
+                || Globals.getInstance().calcNetworkTeam(firstPlayerID)
+                == Globals.getInstance().calcNetworkTeam(secondPlayerID))
+            return;
+        long expiresAt = SystemClock.elapsedRealtime() + HIT_ENEMY_GPS_REVEAL_MS;
+        int firstTeam = Globals.getInstance().calcNetworkTeam(firstPlayerID);
+        int secondTeam = Globals.getInstance().calcNetworkTeam(secondPlayerID);
+        Map<Integer, ClientData> clients = mClientData;
+        if (clients == null)
+            return;
+        for (ClientData client : clients.values()) {
+            byte teammateID = client.mPlayerID;
+            if (teammateID <= 0 || !Globals.isValidPlayerID(teammateID))
+                continue;
+            int teammateTeam = Globals.getInstance().calcNetworkTeam(teammateID);
+            if (teammateTeam == firstTeam)
+                grantEnemyGPSRevealLocked(teammateID, secondPlayerID, expiresAt);
+            else if (teammateTeam == secondTeam)
+                grantEnemyGPSRevealLocked(teammateID, firstPlayerID, expiresAt);
+        }
+    }
+
+    /** Caller holds mServerStateLock. */
+    private void grantEnemyGPSRevealLocked(byte recipientID, byte enemyID, long expiresAt) {
+        Map<Byte, Long> reveals = mEnemyGPSRevealUntil.get(recipientID);
+        if (reveals == null) {
+            reveals = new HashMap<>();
+            mEnemyGPSRevealUntil.put(recipientID, reveals);
+        }
+        reveals.put(enemyID, expiresAt);
+        mGPSVisibilityRefreshPlayers.add(recipientID);
+    }
+
+    /** Caller holds mServerStateLock. */
+    private void expireEnemyGPSRevealsLocked(long now) {
+        Iterator<Map.Entry<Byte, Map<Byte, Long>>> recipients = mEnemyGPSRevealUntil.entrySet().iterator();
+        while (recipients.hasNext()) {
+            Map.Entry<Byte, Map<Byte, Long>> recipient = recipients.next();
+            Map<Byte, Long> reveals = recipient.getValue();
+            boolean changed = false;
+            Iterator<Map.Entry<Byte, Long>> enemies = reveals.entrySet().iterator();
+            while (enemies.hasNext()) {
+                Long expiresAt = enemies.next().getValue();
+                if (expiresAt == null || expiresAt <= now) {
+                    enemies.remove();
+                    changed = true;
+                }
+            }
+            if (changed)
+                mGPSVisibilityRefreshPlayers.add(recipient.getKey());
+            if (reveals.isEmpty())
+                recipients.remove();
+        }
+    }
+
+    /** Caller holds mServerStateLock. End a reveal immediately when either participant dies or leaves. */
+    private void clearEnemyGPSRevealsForPlayerLocked(byte playerID) {
+        boolean changed = false;
+        if (mEnemyGPSRevealUntil.remove(playerID) != null) {
+            mGPSVisibilityRefreshPlayers.add(playerID);
+            changed = true;
+        }
+        Iterator<Map.Entry<Byte, Map<Byte, Long>>> recipients = mEnemyGPSRevealUntil.entrySet().iterator();
+        while (recipients.hasNext()) {
+            Map.Entry<Byte, Map<Byte, Long>> recipient = recipients.next();
+            if (recipient.getValue().remove(playerID) != null) {
+                mGPSVisibilityRefreshPlayers.add(recipient.getKey());
+                changed = true;
+            }
+            if (recipient.getValue().isEmpty())
+                recipients.remove();
+        }
+        if (changed)
+            requestFullGPSUpdate();
+    }
+
+    private boolean hasPendingGPSVisibilityRefresh() {
+        synchronized (mServerStateLock) {
+            return !mGPSVisibilityRefreshPlayers.isEmpty();
+        }
     }
 
     public void sendGPSData() {
@@ -1082,6 +1217,9 @@ public class TcpServer extends Service {
                     }
 
                     final List<GPSUpdate> updates = new ArrayList<>();
+                    // A per-player visibility change needs a complete snapshot even between
+                    // normal five-second refreshes, so retain the valid stationary positions.
+                    final List<GPSUpdate> fullSnapshot = new ArrayList<>();
                     final int gpsMode;
                     Globals.getmGPSDataSemaphore();
                     try {
@@ -1091,6 +1229,7 @@ public class TcpServer extends Service {
                             if (!isCurrentGPSCallbackLocked(this))
                                 return;
                             gpsMode = Globals.getInstance().mGPSMode;
+                            expireEnemyGPSRevealsLocked(SystemClock.elapsedRealtime());
                             if (Globals.getInstance().mGPSData != null) {
                                 for (Map.Entry<Byte, Globals.GPSData> entry
                                         : Globals.getInstance().mGPSData.entrySet()) {
@@ -1098,15 +1237,17 @@ public class TcpServer extends Service {
                                     Globals.GPSData gps = entry.getValue();
                                     if (gps == null)
                                         continue;
-                                    if ((gps.hasUpdate || fullUpdate)
-                                            && playerID != null && playerID > 0
+                                    if (playerID != null && playerID > 0
                                             && Globals.isValidPlayerID(playerID)
                                             && Globals.isValidCoordinates(gps.longitude, gps.latitude)) {
                                         // A stationary player's cached entry can predate a
                                         // lobby game-mode change; use the current layout.
-                                        updates.add(new GPSUpdate(playerID,
+                                        GPSUpdate update = new GPSUpdate(playerID,
                                                 Globals.getInstance().calcNetworkTeam(playerID),
-                                                gps.longitude, gps.latitude));
+                                                gps.longitude, gps.latitude);
+                                        fullSnapshot.add(update);
+                                        if (gps.hasUpdate || fullUpdate)
+                                            updates.add(update);
                                     }
                                     // Invalid or stale entries must not make every periodic
                                     // tick reattempt the same unusable update.
@@ -1121,12 +1262,13 @@ public class TcpServer extends Service {
                     // JSON construction and network dispatch happen on the GPS worker.  A
                     // normal all-player update retains the existing broadcast path; team mode
                     // emits one compact frame per team instead.
-                    if (gpsMode != Globals.GPS_DISABLED && (!updates.isEmpty() || fullUpdate)) {
+                    if (gpsMode != Globals.GPS_DISABLED && (!updates.isEmpty() || fullUpdate
+                            || hasPendingGPSVisibilityRefresh())) {
                         if (gpsMode == Globals.GPS_TEAMMATE
                                 && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
-                            sendTeamGPSData(updates, fullUpdate);
+                            sendTeamGPSData(updates, fullSnapshot, fullUpdate);
                         } else {
-                            String message = createGPSMessage(updates, fullUpdate, SEND_ALL);
+                            String message = createGPSMessage(updates, fullUpdate, SEND_ALL, null);
                             if (message != null)
                                 sendTCPMessageAll(message, false);
                         }
@@ -1851,6 +1993,13 @@ public class TcpServer extends Service {
                                                         entry.getValue().eliminated + 1);
                                                 scoringPlayer.points = Math.min(Globals.MAX_SCOREBOARD_VALUE,
                                                         scoringPlayer.points + 1);
+                                                synchronized (mServerStateLock) {
+                                                    // Do not leak an opponent's last location into a
+                                                    // respawn: a death ends every reveal involving either
+                                                    // player without waiting for the normal 10-second expiry.
+                                                    clearEnemyGPSRevealsForPlayerLocked(entry.getValue().mPlayerID);
+                                                    clearEnemyGPSRevealsForPlayerLocked(id);
+                                                }
                                                 sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, true);
                                                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                                                     // Send a message to all teammates about the score increase
@@ -2011,7 +2160,11 @@ public class TcpServer extends Service {
                         long sentAt = TcpJson.getLong(player, JSON_CLOCK_REQUEST);
                         if (!GameClock.validTimestamp(sentAt))
                             return;
-                        // Only the initial five exchanges need fast polling.
+                        if (player.has(JSON_GPS_CLOCK)) {
+                            long gpsTime = TcpJson.getLong(player, JSON_GPS_CLOCK);
+                            Globals.getInstance().mGpsGameTime.recordNetworkGpsTime(gpsTime, receivedAt);
+                        }
+                        // Only the initial calibration exchanges need fast polling.
                         // Later countdown probes are deliberately lightweight
                         // and should not keep a 20-phone dedicated host busy.
                         if (client.clockSamples < GameClock.SAMPLES_PER_SYNC)
@@ -2020,6 +2173,10 @@ public class TcpServer extends Service {
                         JSONObject reply = new JSONObject().put(JSON_CLOCK_REQUEST, sentAt)
                                 .put(JSON_CLOCK_RECEIVE, receivedAt)
                                 .put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime());
+                        long gpsTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(
+                                SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime());
+                        if (GpsGameTime.isValidUtcTime(gpsTime))
+                            reply.put(JSON_GPS_CLOCK, gpsTime);
                         if (client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply))
                             client.clockSamples = Math.min(GameClock.SAMPLES_PER_SYNC,
                                     client.clockSamples + 1);
@@ -2038,7 +2195,7 @@ public class TcpServer extends Service {
                 // Telemetry is intentionally best-effort. It feeds hosted-game
                 // scoreboards and visualizers, but never decides who was killed
                 // or whether a respawn is allowed.
-                if (!mIsDedicated || client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)
+                if (client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)
                         || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
                         || !hasRoundStarted()) {
                     return;
@@ -2069,6 +2226,9 @@ public class TcpServer extends Service {
                             return;
                         }
                         attacker.hits = Math.min(Globals.MAX_SCOREBOARD_VALUE, attacker.hits + 1);
+                        synchronized (mServerStateLock) {
+                            grantEnemyGPSRevealLocked(attackerID, client.mPlayerID);
+                        }
                         sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                     }
                 } catch (JSONException e) {
@@ -2336,6 +2496,9 @@ public class TcpServer extends Service {
             if (mClientData.get(clientID) != client)
                 return;
             if (client.mPlayerID != 0) {
+                synchronized (mServerStateLock) {
+                    clearEnemyGPSRevealsForPlayerLocked(client.mPlayerID);
+                }
                 if (alwaysRemove || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
                     if (mIsDedicated && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
                         ScoreData score = getScore(client.mPlayerID);

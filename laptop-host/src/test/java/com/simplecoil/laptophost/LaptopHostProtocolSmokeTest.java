@@ -11,6 +11,7 @@ import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -21,8 +22,9 @@ public final class LaptopHostProtocolSmokeTest {
     private static final int TCP_PORT = 19_510;
     private static final int UDP_PORT = 19_500;
     private static final int DASHBOARD_PORT = 19_511;
-    private static final String JSON_PREFIX = "SimpleCoil:14JSON";
-    private static final String MESSAGE_PREFIX = "SimpleCoil:14MESG";
+    private static final String JSON_PREFIX = "SimpleCoil:15JSON";
+    private static final String MESSAGE_PREFIX = "SimpleCoil:15MESG";
+    private static final long GPS_UTC_BASE = 1_800_000_000_000L;
 
     public static void main(String[] args) throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
@@ -40,12 +42,18 @@ public final class LaptopHostProtocolSmokeTest {
             require(get("/leaderboard").contains("Leaderboard"), "leaderboard display was unavailable");
             verifyUdpDiscovery();
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
-                 FakePhone second = new FakePhone("127.0.0.2", 11, "Red")) {
+                 FakePhone blueTeammate = new FakePhone("127.0.0.5", 2, "Blue Two");
+                 FakePhone second = new FakePhone("127.0.0.2", 11, "Red");
+                 FakePhone redTeammate = new FakePhone("127.0.0.6", 12, "Red Two")) {
                 first.synchronizeClock();
+                blueTeammate.synchronizeClock();
                 second.synchronizeClock();
+                redTeammate.synchronizeClock();
                 first.send(JSON_PREFIX + "{\"gpslongitude\":-122.1,\"gpslatitude\":47.6}");
                 second.send(JSON_PREFIX + "{\"gpslongitude\":-122.2,\"gpslatitude\":47.7}");
                 require(post("/api/start").contains("\"ok\":true"), "host did not start the round");
+                require(first.readUntil(frame -> frame.contains("\"gpsstarttime\"")) != null,
+                        "GPS-calibrated start time was not delivered to the phone");
                 Thread.sleep(1_150);
                 require(get("/api/state").contains("\"state\":\"running\""),
                         "round did not leave the start countdown");
@@ -53,7 +61,17 @@ public final class LaptopHostProtocolSmokeTest {
                 verifyDirectLateJoinBlocked();
 
                 first.send(JSON_PREFIX + "{\"telemetry\":\"shot\",\"count\":3}");
+                require(!first.receivesFor(frame -> gpsFrameContainsPlayer(frame, 11), 600),
+                        "a shot/miss revealed an enemy GPS location");
                 second.send(JSON_PREFIX + "{\"telemetry\":\"hit\",\"attacker\":1}");
+                require(first.readUntil(frame -> gpsFrameContainsPlayer(frame, 11)) != null,
+                        "a confirmed hit did not reveal the targeted enemy to the shooter");
+                require(blueTeammate.readUntil(frame -> gpsFrameContainsPlayer(frame, 11)) != null,
+                        "a confirmed hit did not reveal the targeted enemy to the shooter's team");
+                require(second.readUntil(frame -> gpsFrameContainsPlayer(frame, 1)) != null,
+                        "a confirmed hit did not reveal the shooter to the target");
+                require(redTeammate.readUntil(frame -> gpsFrameContainsPlayer(frame, 1)) != null,
+                        "a confirmed hit did not reveal the shooter to the target's team");
                 second.send(MESSAGE_PREFIX + "ELIMINATED1");
                 String kill = first.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ELIMINATED11"));
                 require(kill != null, "scorer did not receive the authoritative kill frame");
@@ -96,7 +114,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.3", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN141".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN151".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -111,7 +129,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.4", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN142".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN152".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -164,6 +182,11 @@ public final class LaptopHostProtocolSmokeTest {
             throw new AssertionError(message);
     }
 
+    private static boolean gpsFrameContainsPlayer(String frame, int playerID) {
+        return frame.startsWith(JSON_PREFIX) && frame.contains("\"gpsupdate\"")
+                && frame.contains("\"playerID\":" + playerID);
+    }
+
     private static final class FakePhone implements AutoCloseable {
         private final Socket socket = new Socket();
         private final DataInputStream input;
@@ -180,9 +203,10 @@ public final class LaptopHostProtocolSmokeTest {
         }
 
         void synchronizeClock() throws IOException {
-            for (int sample = 0; sample < 5; sample++) {
+            for (int sample = 0; sample < 12; sample++) {
                 long stamp = System.nanoTime() / 1_000_000L;
-                send(JSON_PREFIX + "{\"clocksync\":" + stamp + "}");
+                send(JSON_PREFIX + "{\"clocksync\":" + stamp + ",\"gpsclock\":"
+                        + (GPS_UTC_BASE + stamp) + "}");
                 String reply = readUntil(frame -> frame.startsWith(JSON_PREFIX) && frame.contains("\"clockreceive\""));
                 require(reply != null, "clock sample was not answered");
             }
@@ -202,6 +226,27 @@ public final class LaptopHostProtocolSmokeTest {
                     return frame;
             }
             return null;
+        }
+
+        boolean receivesFor(Predicate<String> wanted, long durationMillis) throws IOException {
+            long deadline = System.nanoTime() + durationMillis * 1_000_000L;
+            int previousTimeout = socket.getSoTimeout();
+            try {
+                while (System.nanoTime() < deadline) {
+                    long remainingMillis = Math.max(1,
+                            (deadline - System.nanoTime() + 999_999L) / 1_000_000L);
+                    socket.setSoTimeout((int) Math.min(previousTimeout, remainingMillis));
+                    try {
+                        if (wanted.test(input.readUTF()))
+                            return true;
+                    } catch (SocketTimeoutException expected) {
+                        return false;
+                    }
+                }
+                return false;
+            } finally {
+                socket.setSoTimeout(previousTimeout);
+            }
         }
 
         @Override

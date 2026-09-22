@@ -44,10 +44,12 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -57,7 +59,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * A desktop dedicated host for SimpleCoil protocol 14.
+ * A desktop dedicated host for SimpleCoil protocol 15.
  *
  * <p>Phones still exchange latency-sensitive blaster events directly over UDP.
  * This process owns the lobby, NTP-style start deadline, score authority, GPS
@@ -65,11 +67,17 @@ import java.util.concurrent.atomic.AtomicInteger;
  * of the combat path means it remains useful with a full 20-player game.</p>
  */
 public final class LaptopHost {
-    private static final int NETWORK_VERSION = 14;
+    private static final int NETWORK_VERSION = 15;
     private static final String MESSAGE_PREFIX = "SimpleCoil:";
     private static final String TCP_PREFIX = MESSAGE_PREFIX + NETWORK_VERSION;
     private static final String TCP_JSON_PREFIX = TCP_PREFIX + "JSON";
     private static final String TCP_MESSAGE_PREFIX = TCP_PREFIX + "MESG";
+    private static final String JSON_GPS_CLOCK = "gpsclock";
+    private static final String JSON_GPS_START_TIME = "gpsstarttime";
+    // Must match the Android client's GameClock.SAMPLES_PER_SYNC. The client
+    // selects the lowest-delay measurement and rejects RTTs above 80 ms, which
+    // bounds its network timing uncertainty to less than 50 ms.
+    private static final int CLOCK_SAMPLES_REQUIRED = 12;
 
     private static final int MAX_PLAYERS = 20;
     private static final int MAX_GRENADE_IDS = 16;
@@ -78,6 +86,9 @@ public final class LaptopHost {
     private static final long GPS_PUBLISH_INTERVAL_MS = 250;
     private static final int GPS_FULL_UPDATE_EVERY_TICKS = 20;
     private static final long GPS_STALE_AFTER_MS = 15_000;
+    private static final long GPS_CLOCK_MAX_AGE_MS = 60_000;
+    private static final long EARLIEST_GPS_UTC_MS = 1_577_836_800_000L; // 2020-01-01
+    private static final long HIT_ENEMY_GPS_REVEAL_MS = 10_000;
     private static final long LASER_LIFETIME_MS = 1_500;
     private static final long JOIN_ASSIGNMENT_TIMEOUT_MS = 10_000;
     // Match the dedicated phone host's practical heartbeat window. A Wi-Fi
@@ -109,6 +120,11 @@ public final class LaptopHost {
     private final Map<InetAddress, PendingAssignment> pendingAssignments = new HashMap<>();
     private final Map<Integer, Integer> grenadeOwners = new HashMap<>();
     private final Deque<LaserEvent> lasers = new ArrayDeque<>();
+    // Recipient player ID -> the enemy player IDs that a confirmed IR hit may
+    // reveal. These maps are protected by stateLock. Every active teammate of
+    // each participant shares the reveal, but no other enemy is exposed.
+    private final Map<Integer, Map<Integer, Long>> enemyGpsRevealUntil = new HashMap<>();
+    private final Set<Integer> gpsVisibilityRefreshPlayers = new HashSet<>();
     private final AtomicInteger nextClientID = new AtomicInteger();
     private final ExecutorService clientExecutor = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "SimpleCoil laptop client");
@@ -139,6 +155,11 @@ public final class LaptopHost {
     private long roundStartAt;
     private long roundDuration;
     private long roundEndAt;
+    // A laptop normally has no GPS receiver. During clock sync a phone with a
+    // fresh GPS fix can provide an optional UTC reference for the shared start.
+    // The normal monotonic NTP exchange remains the required fallback.
+    private long gpsUtcAtReference = -1;
+    private long gpsElapsedAtReference = -1;
     private int gpsTick;
 
     private LaptopHost(HostConfig config) {
@@ -454,9 +475,17 @@ public final class LaptopHost {
             reply.put("clocksync", sentAt);
             reply.put("clockreceive", received);
             reply.put("clocksend", elapsedMillis());
-            client.clockSamples = Math.min(5, client.clockSamples + 1);
+            synchronized (stateLock) {
+                if (json.containsKey(JSON_GPS_CLOCK))
+                    recordGpsClockLocked(longValue(json.get(JSON_GPS_CLOCK), -1), received);
+                long gpsTime = gpsTimeAtElapsedLocked(elapsedMillis());
+                if (validGpsUtcTime(gpsTime))
+                    reply.put(JSON_GPS_CLOCK, gpsTime);
+                client.clockSamples = Math.min(CLOCK_SAMPLES_REQUIRED, client.clockSamples + 1);
+            }
             client.send(jsonFrame(reply));
-        } else if (Boolean.TRUE.equals(json.get("clockready")) && client.clockSamples >= 5) {
+        } else if (Boolean.TRUE.equals(json.get("clockready"))
+                && client.clockSamples >= CLOCK_SAMPLES_REQUIRED) {
             client.clockReady = true;
         }
     }
@@ -502,6 +531,7 @@ public final class LaptopHost {
                     return;
                 attacker.hits = addScore(attacker.hits, 1);
                 addLaserLocked(attacker, reporter, "hit");
+                grantEnemyGpsRevealLocked(attacker.id, reporter.id);
             }
         }
     }
@@ -694,6 +724,10 @@ public final class LaptopHost {
             victim.deaths = addScore(victim.deaths, 1);
             attacker.kills = addScore(attacker.kills, 1);
             addLaserLocked(attacker, victim, "kill");
+            // A death ends the short confirmed-hit map reveal immediately so
+            // a respawn cannot inherit an opponent's last known position.
+            clearEnemyGpsRevealsForPlayerLocked(victim.id);
+            clearEnemyGpsRevealsForPlayerLocked(attacker.id);
             scorerConnection = attacker.connection;
             if (config.gameMode != GameMode.FFA) {
                 scorerTeam = new ArrayList<>();
@@ -751,6 +785,9 @@ public final class LaptopHost {
             start.put("roundtoken", roundToken);
             start.put("gamestart", roundStartAt);
             start.put("gameduration", roundDuration);
+            long gpsStartTime = gpsTimeAtElapsedLocked(roundStartAt);
+            if (validGpsUtcTime(gpsStartTime))
+                start.put(JSON_GPS_START_TIME, gpsStartTime);
             startFrame = jsonFrame(start);
         }
         for (ClientConnection client : recipients)
@@ -828,10 +865,79 @@ public final class LaptopHost {
             client.close();
     }
 
+    /** Caller holds stateLock. */
+    private void grantEnemyGpsRevealLocked(int firstPlayerID, int secondPlayerID) {
+        if (config.gpsMode != GpsMode.TEAMMATE || config.gameMode == GameMode.FFA
+                || !areOpponents(firstPlayerID, secondPlayerID))
+            return;
+        long expiresAt = elapsedMillis() + HIT_ENEMY_GPS_REVEAL_MS;
+        grantEnemyGpsRevealLocked(firstPlayerID, secondPlayerID, expiresAt);
+        int firstTeam = teamFor(firstPlayerID);
+        int secondTeam = teamFor(secondPlayerID);
+        for (Player player : players.values()) {
+            if (!player.connected)
+                continue;
+            if (teamFor(player.id) == firstTeam)
+                grantEnemyGpsRevealLocked(player.id, secondPlayerID, expiresAt);
+            else if (teamFor(player.id) == secondTeam)
+                grantEnemyGpsRevealLocked(player.id, firstPlayerID, expiresAt);
+        }
+    }
+
+    /** Caller holds stateLock. */
+    private void grantEnemyGpsRevealLocked(int recipientID, int enemyID, long expiresAt) {
+        Map<Integer, Long> reveals = enemyGpsRevealUntil.get(recipientID);
+        if (reveals == null) {
+            reveals = new HashMap<>();
+            enemyGpsRevealUntil.put(recipientID, reveals);
+        }
+        reveals.put(enemyID, expiresAt);
+        gpsVisibilityRefreshPlayers.add(recipientID);
+    }
+
+    /** Caller holds stateLock. */
+    private void expireEnemyGpsRevealsLocked(long now) {
+        java.util.Iterator<Map.Entry<Integer, Map<Integer, Long>>> recipients
+                = enemyGpsRevealUntil.entrySet().iterator();
+        while (recipients.hasNext()) {
+            Map.Entry<Integer, Map<Integer, Long>> recipient = recipients.next();
+            boolean changed = false;
+            java.util.Iterator<Map.Entry<Integer, Long>> enemies = recipient.getValue().entrySet().iterator();
+            while (enemies.hasNext()) {
+                Long expiresAt = enemies.next().getValue();
+                if (expiresAt == null || expiresAt <= now) {
+                    enemies.remove();
+                    changed = true;
+                }
+            }
+            if (changed)
+                gpsVisibilityRefreshPlayers.add(recipient.getKey());
+            if (recipient.getValue().isEmpty())
+                recipients.remove();
+        }
+    }
+
+    /** Caller holds stateLock. */
+    private void clearEnemyGpsRevealsForPlayerLocked(int playerID) {
+        if (enemyGpsRevealUntil.remove(playerID) != null)
+            gpsVisibilityRefreshPlayers.add(playerID);
+        java.util.Iterator<Map.Entry<Integer, Map<Integer, Long>>> recipients
+                = enemyGpsRevealUntil.entrySet().iterator();
+        while (recipients.hasNext()) {
+            Map.Entry<Integer, Map<Integer, Long>> recipient = recipients.next();
+            if (recipient.getValue().remove(playerID) != null)
+                gpsVisibilityRefreshPlayers.add(recipient.getKey());
+            if (recipient.getValue().isEmpty())
+                recipients.remove();
+        }
+    }
+
     private void publishGps() {
-        List<Position> positions;
+        List<Position> changedPositions = new ArrayList<>();
+        List<Position> fullSnapshot = new ArrayList<>();
         List<ClientConnection> recipients;
         boolean fullUpdate;
+        boolean visibilityRefreshPending;
         synchronized (stateLock) {
             if (!config.useGps)
                 return;
@@ -839,29 +945,36 @@ public final class LaptopHost {
             if (fullUpdate)
                 gpsTick = 0;
             long now = elapsedMillis();
-            positions = new ArrayList<>();
+            expireEnemyGpsRevealsLocked(now);
             for (Player player : players.values()) {
                 if (!player.connected || !validCoordinates(player.longitude, player.latitude)
                         || now - player.lastGpsAt > GPS_STALE_AFTER_MS)
                     continue;
+                Position position = new Position(player.id, teamFor(player.id), player.longitude, player.latitude);
+                fullSnapshot.add(position);
                 if (player.gpsDirty || fullUpdate)
-                    positions.add(new Position(player.id, teamFor(player.id), player.longitude, player.latitude));
+                    changedPositions.add(position);
+                player.gpsDirty = false;
             }
-            if (positions.isEmpty() && !fullUpdate)
+            visibilityRefreshPending = !gpsVisibilityRefreshPlayers.isEmpty();
+            if (changedPositions.isEmpty() && !fullUpdate && !visibilityRefreshPending)
                 return;
-            for (Position position : positions) {
-                Player player = players.get(position.playerID);
-                if (player != null)
-                    player.gpsDirty = false;
-            }
             recipients = connectedClientsLocked();
         }
         for (ClientConnection client : recipients) {
             int recipientTeam = teamFor(client.playerID);
+            final Set<Integer> revealedEnemies;
+            final boolean recipientFullUpdate;
+            synchronized (stateLock) {
+                Map<Integer, Long> reveals = enemyGpsRevealUntil.get(client.playerID);
+                revealedEnemies = reveals == null ? Collections.emptySet() : new HashSet<>(reveals.keySet());
+                recipientFullUpdate = fullUpdate || gpsVisibilityRefreshPlayers.remove(client.playerID);
+            }
+            List<Position> source = recipientFullUpdate ? fullSnapshot : changedPositions;
             List<Object> updates = new ArrayList<>();
-            for (Position position : positions) {
+            for (Position position : source) {
                 if (config.gpsMode == GpsMode.TEAMMATE && config.gameMode != GameMode.FFA
-                        && position.team != recipientTeam)
+                        && position.team != recipientTeam && !revealedEnemies.contains(position.playerID))
                     continue;
                 Map<String, Object> update = new LinkedHashMap<>();
                 update.put("playerID", position.playerID);
@@ -870,11 +983,11 @@ public final class LaptopHost {
                 update.put("gpslatitude", position.latitude);
                 updates.add(update);
             }
-            if (updates.isEmpty() && !fullUpdate)
+            if (updates.isEmpty() && !recipientFullUpdate)
                 continue;
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("gpsupdate", updates);
-            if (fullUpdate)
+            if (recipientFullUpdate)
                 payload.put("gpsfullupdate", true);
             client.send(jsonFrame(payload));
         }
@@ -1091,6 +1204,8 @@ public final class LaptopHost {
         pendingAssignments.clear();
         grenadeOwners.clear();
         lasers.clear();
+        enemyGpsRevealUntil.clear();
+        gpsVisibilityRefreshPlayers.clear();
         roundState = RoundState.LOBBY;
         roundToken = null;
         roundStartAt = 0;
@@ -1107,6 +1222,7 @@ public final class LaptopHost {
                 player.connection = null;
                 player.connected = false;
                 player.awaitingRespawn = false;
+                clearEnemyGpsRevealsForPlayerLocked(player.id);
                 if (!isRoundActiveLocked() && roundState != RoundState.FINISHED) {
                     players.remove(player.id);
                     grenadeOwners.entrySet().removeIf(entry -> entry.getValue() == player.id);
@@ -1122,6 +1238,32 @@ public final class LaptopHost {
 
     private long elapsedMillis() {
         return (System.nanoTime() - clockOriginNanos) / 1_000_000L;
+    }
+
+    private static boolean validGpsUtcTime(long utcTime) {
+        return utcTime >= EARLIEST_GPS_UTC_MS && utcTime <= CLOCK_MAX_VALUE;
+    }
+
+    /** Caller holds stateLock. A phone reports its extrapolated current GPS UTC. */
+    private void recordGpsClockLocked(long utcTime, long elapsedNow) {
+        if (!validGpsUtcTime(utcTime) || elapsedNow < 0)
+            return;
+        gpsUtcAtReference = utcTime;
+        gpsElapsedAtReference = elapsedNow;
+    }
+
+    /** Caller holds stateLock. */
+    private long gpsTimeAtElapsedLocked(long elapsedTime) {
+        long now = elapsedMillis();
+        if (!validGpsUtcTime(gpsUtcAtReference) || gpsElapsedAtReference < 0
+                || now < gpsElapsedAtReference || now - gpsElapsedAtReference > GPS_CLOCK_MAX_AGE_MS)
+            return -1;
+        long delta = elapsedTime - gpsElapsedAtReference;
+        if ((delta > 0 && gpsUtcAtReference > Long.MAX_VALUE - delta)
+                || (delta < 0 && gpsUtcAtReference < Long.MIN_VALUE - delta))
+            return -1;
+        long utcTime = gpsUtcAtReference + delta;
+        return validGpsUtcTime(utcTime) ? utcTime : -1;
     }
 
     private int teamFor(int playerID) {
@@ -1728,7 +1870,9 @@ public final class LaptopHost {
         int dashboardPort = 17_511;
         String dashboardBind = "127.0.0.1";
         GameMode gameMode = GameMode.TWO_TEAMS;
-        GpsMode gpsMode = GpsMode.ALL;
+        // Phones see teammates by default. The laptop dashboard is a trusted
+        // game-master display and remains an all-player view.
+        GpsMode gpsMode = GpsMode.TEAMMATE;
         boolean useGps = true;
         boolean onlyServerSettings;
         boolean tournament;
@@ -1837,7 +1981,7 @@ public final class LaptopHost {
                     + "  --duration-minutes 0..100   0 means unlimited\n"
                     + "  --score-limit 0..100        0 means unlimited\n"
                     + "  --lives-limit 0..100        0 means unlimited\n"
-                    + "  --gps all|team              Phone GPS visibility (default: all)\n"
+                    + "  --gps all|team              Phone GPS visibility (default: team)\n"
                     + "  --start-delay 1..1000       Shared countdown seconds (default: 10)\n"
                     + "  --tcp-port PORT             Must remain 17510 for stock phones\n"
                     + "  --udp-port PORT             Must remain 17500 for stock phones\n"

@@ -32,6 +32,11 @@ if (releaseSigningConfigured && !rootProject.file(releaseStoreFilePath).isFile()
 
 android {
     compileSdk 34
+    compileOptions {
+        // The QR library uses Java 8 collection APIs (for example List.sort).
+        // Backport them so the stated Android 5.0 minimum remains real.
+        coreLibraryDesugaringEnabled true
+    }
     signingConfigs {
         release {
             if (releaseSigningConfigured) {
@@ -46,8 +51,8 @@ android {
         applicationId "com.simplecoil.simplecoil"
         minSdkVersion 21
         targetSdkVersion 29
-        versionCode 15
-        versionName "1.14"
+        versionCode 16
+        versionName "1.15"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders = [appName: appDisplayName]
     }
@@ -73,6 +78,7 @@ dependencies {
     implementation 'com.google.android.material:material:1.10.0'
     implementation 'androidx.annotation:annotation:1.7.0'
     implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.3'
     implementation(name: 'WhirlyGlobeMaply', ext: 'aar')
     // The bundled AAR has no dependency metadata and uses the OkHttp 2 API.
     implementation 'com.squareup.okhttp:okhttp:2.7.5'

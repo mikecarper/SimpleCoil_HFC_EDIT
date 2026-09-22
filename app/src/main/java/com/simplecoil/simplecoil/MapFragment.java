@@ -29,6 +29,7 @@ import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -82,6 +83,17 @@ public class MapFragment extends GlobeMapFragment {
 
     private static boolean isValidLocation(Location location) {
         return location != null && Globals.isValidCoordinates(location.getLongitude(), location.getLatitude());
+    }
+
+    /** Keep a fresh GPS UTC-to-monotonic mapping for the synchronized game start. */
+    private static void recordGpsGameTime(Location location) {
+        if (location == null || !LocationManager.GPS_PROVIDER.equals(location.getProvider()))
+            return;
+        long elapsedAtFix = location.getElapsedRealtimeNanos() / 1_000_000L;
+        if (elapsedAtFix <= 0)
+            return;
+        Globals.getInstance().mGpsGameTime.recordGpsFix(location.getTime(), elapsedAtFix,
+                SystemClock.elapsedRealtime());
     }
 
     private void sendLocation(Location location, boolean force) {
@@ -141,6 +153,7 @@ public class MapFragment extends GlobeMapFragment {
         public void onLocationChanged(Location loc) {
             if (mLocationListener != this || !isGPSActive() || !isValidLocation(loc))
                 return;
+            recordGpsGameTime(loc);
             if (BuildConfig.DEBUG)
                 Log.v(TAG, "Location: " + loc.getLongitude() + "," + loc.getLatitude());
             // Recreating a Maply marker for every raw provider callback is expensive.  A marker
@@ -333,6 +346,7 @@ public class MapFragment extends GlobeMapFragment {
                     return;
                 }
                 currentBestLocation = getLastBestLocation();
+                recordGpsGameTime(currentBestLocation);
                 insertYourMarker();
             }
             // Joining/rejoining or changing GPS settings may require republishing a stationary

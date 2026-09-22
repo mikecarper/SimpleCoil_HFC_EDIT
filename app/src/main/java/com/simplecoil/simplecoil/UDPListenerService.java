@@ -318,7 +318,7 @@ public class UDPListenerService extends Service {
                 processPeerElimination(ip,
                         message.substring(NetMsg.NETMSG_PEER_ELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_ELIMINATED)) {
-                // Protocol 14 peer games use round-scoped, sequenced elimination events. Keep
+                // Protocol 15 peer games use round-scoped, sequenced elimination events. Keep
                 // the old fixed form only for non-peer compatibility paths.
                 if (mPeerGame)
                     return;
@@ -413,7 +413,7 @@ public class UDPListenerService extends Service {
                 processPeerEndGame(ip,
                         message.substring(NetMsg.NETMSG_PEER_ENDGAME.length()));
             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
-                // Protocol 14 peer games bind ENDGAME to the current round nonce.
+                // Protocol 15 peer games bind ENDGAME to the current round nonce.
                 // Keep the old fixed form only for TCP-authoritative games.
                 // Tournament termination is host-authoritative. Dedicated hosts
                 // end clients through TCP, so a player must never be able to
@@ -436,7 +436,7 @@ public class UDPListenerService extends Service {
                         message.substring(NetMsg.NETMSG_PEER_TEAMELIMINATED.length()));
             } else if (message.equals(NetMsg.NETMSG_TEAMELIMINATED)) {
                 // A bare team score packet cannot distinguish a retransmit from
-                // a new kill, so it is not valid during a protocol 14 peer game.
+                // a new kill, so it is not valid during a protocol 15 peer game.
                 if (mPeerGame)
                     return;
                 Byte playerID = getPlayerID(ip);

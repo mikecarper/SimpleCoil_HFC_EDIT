@@ -18,14 +18,17 @@ Network games use TCP for the lobby and an NTP-style exchange of monotonic-clock
 timestamps to synchronize a start deadline. The app never changes a phone's
 system clock and does not use a public NTP server.
 
-- Each player completes five valid clock exchanges before a start is accepted.
-- Exchanges with a round-trip delay above 500 ms are discarded; the lowest-delay
-  valid sample is used to estimate clock offset.
+- Lobby join immediately begins a 12-exchange clock-calibration burst before a
+  start is accepted.
+- Exchanges with a round-trip delay above 80 ms are discarded; the lowest-delay
+  valid sample is used to estimate clock offset. That bounds the network-path
+  uncertainty of an accepted estimate to 40 ms relative to the host.
 - The host sends one shared start deadline and every phone shows a countdown to
   it. Timed games also use a shared end deadline.
-- The design target is alignment within one second on a healthy local network;
-  Wi-Fi congestion, device suspension, or poor signal can still affect it.
-- All participants must use network protocol 14 (this build). Older protocol
+- The network-offset target is below 50 ms on a healthy local network. Wi-Fi
+  congestion, device suspension, and normal UI scheduling can still affect the
+  moment a device visibly reacts.
+- All participants must use network protocol 15 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
 Peer-game UDP events are scoped to a per-round nonce, and retransmitted score
@@ -45,7 +48,7 @@ included dedicated host, so no phone is consumed as the host.
 | Free-for-all | 1-20 |
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-14 host automatically
+team before starting. If an ID conflicts, a protocol-15 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and

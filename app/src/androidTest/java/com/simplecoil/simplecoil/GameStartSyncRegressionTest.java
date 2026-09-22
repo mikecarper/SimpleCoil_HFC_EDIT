@@ -27,11 +27,11 @@ public class GameStartSyncRegressionTest {
         InstrumentationRegistry.getInstrumentation().runOnMainSync(client::onDestroy);
     }
 
-    @Test public void fiveSamplesAreRequiredBeforeStartIsPublished() throws Exception {
+    @Test public void fullClockSampleBurstIsRequiredBeforeStartIsPublished() throws Exception {
         long deadline = SystemClock.elapsedRealtime() + 10000;
         parse(plan(1, deadline, 60000));
         assertTrue(client.events.isEmpty());
-        for (int i = 0; i < 4; i++) sample(OFFSET);
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC - 1; i++) sample(OFFSET);
         assertFalse(client.isClockSynchronized());
         assertTrue(client.events.isEmpty());
         sample(OFFSET);
