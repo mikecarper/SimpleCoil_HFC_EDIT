@@ -39,6 +39,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.AnimationDrawable;
 import android.media.AudioAttributes;
+import android.media.AudioManager;
 import android.media.SoundPool;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
@@ -2003,6 +2004,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         resetRoundTelemetryState();
         clearCombatFeedback();
+        setGameVolumeToMaximum();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         enableGameLock();
         mScore = 0;
@@ -4120,6 +4122,21 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (soundID != 0)
                     mSoundIds.put(resource, soundID);
             }
+        }
+    }
+
+    /** Raise the media stream used by the game's effects and spoken countdown. */
+    private void setGameVolumeToMaximum() {
+        try {
+            AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            if (audioManager == null)
+                return;
+            int maximum = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            if (maximum > 0)
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maximum, 0);
+        } catch (RuntimeException e) {
+            // Audio controls must never prevent the round itself from starting.
+            Log.w(TAG, "Unable to raise game media volume", e);
         }
     }
 
