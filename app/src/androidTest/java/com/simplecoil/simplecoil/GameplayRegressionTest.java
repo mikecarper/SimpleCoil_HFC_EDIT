@@ -99,10 +99,10 @@ public class GameplayRegressionTest {
                 globals.mPlayerSettings.clear();
                 Globals.PlayerSettings first = new Globals.PlayerSettings();
                 first.damage = -5;
-                globals.mPlayerSettings.put((byte) 11, first);
+                globals.mPlayerSettings.put((byte) 17, first);
                 Globals.PlayerSettings second = new Globals.PlayerSettings();
                 second.damage = -7;
-                globals.mPlayerSettings.put((byte) 12, second);
+                globals.mPlayerSettings.put((byte) 18, second);
             } finally {
                 globals.mPlayerSettingsSemaphore.release();
             }
@@ -431,10 +431,10 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void sequencedPeerEliminationRelaysTheSameEventToTeammates() {
+    public void sequencedPeerEliminationUsesTheSharedStateWithoutUnicastFanout() {
         scenario.onActivity(activity -> {
             Intent event = new Intent(NetMsg.NETMSG_ELIMINATED)
-                    .putExtra(UDPListenerService.INTENT_PLAYERID, (byte) 11)
+                    .putExtra(UDPListenerService.INTENT_PLAYERID, (byte) 17)
                     .putExtra(NetMsg.INTENT_EVENT_SEQUENCE, 42L);
             // Android 5.1 can pause an ActivityScenario between setup and this
             // callback. Model a real, registered network receiver while the
@@ -444,10 +444,9 @@ public class GameplayRegressionTest {
                 set(activity, "mNetworkReceiverRegistered", true);
             try {
                 receiveNetwork(activity, event);
-                assertEquals(9, udp.peerTeamEliminationPublishes);
-                assertEquals(Byte.valueOf((byte) 11), udp.lastPeerTeamEliminatedPlayer);
-                assertEquals(42L, udp.lastPeerTeamEventSequence);
-                assertEquals(Byte.valueOf((byte) 10), udp.lastPeerTeamRecipient);
+                assertEquals(0, udp.peerTeamEliminationPublishes);
+                assertEquals(1, get(activity, "mScore"));
+                assertEquals(1, get(activity, "mTeamScore"));
             } finally {
                 if (!receiverRegistered)
                     set(activity, "mNetworkReceiverRegistered", false);
@@ -504,10 +503,10 @@ public class GameplayRegressionTest {
         scenario.onActivity(activity -> {
             set(activity, "mHitAnimation", null);
             set(activity, "mHealth", 6);
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
             assertEquals(1, get(activity, "mHealth"));
             assertEquals(View.VISIBLE, ((View) get(activity, "mHitIV")).getVisibility());
-            telemetry(activity, 12, 1, 0, 0);
+            telemetry(activity, 18, 1, 0, 0);
             assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
             assertEquals(View.VISIBLE, ((View) get(activity, "mEliminatedByTV")).getVisibility());
         });
@@ -524,8 +523,8 @@ public class GameplayRegressionTest {
         scenario.onActivity(activity -> {
             set(activity, "mHitAnimation", null);
             set(activity, "mHealth", 6);
-            telemetry(activity, 11, 1, 0, 0);
-            telemetry(activity, 12, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
+            telemetry(activity, 18, 1, 0, 0);
             assertNull("The killer name must not inherit the nonfatal hit's fade",
                     ((View) get(activity, "mEliminatedByTV")).getAnimation());
             assertNull(get(activity, "mHitAnimation"));
@@ -536,7 +535,7 @@ public class GameplayRegressionTest {
     public void endingRoundStopsIncomingAndOutgoingHitAnimations() {
         scenario.onActivity(activity -> {
             set(activity, "mHitAnimation", null);
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
             AnimationDrawable incoming = (AnimationDrawable) get(activity, "mHitAnimation");
             AnimationDrawable outgoing = (AnimationDrawable) get(activity, "mHitPlayerAnimation");
@@ -553,7 +552,7 @@ public class GameplayRegressionTest {
     @Test
     public void incomingHitFlashesTheFullScreenDarkRed() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
 
             assertEquals("A confirmed incoming hit must flash the whole background", View.VISIBLE,
                     ((View) get(activity, "mIncomingHitFlashView")).getVisibility());
@@ -590,9 +589,9 @@ public class GameplayRegressionTest {
             int originalHealth = (int) get(activity, "mHealth");
             int originalHitsTaken = (int) get(activity, "mHitsTaken");
 
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
 
-            assertEquals(Collections.singletonList(NetMsg.NETMSG_ALREADYDEAD + ":11"), udp.messages);
+            assertEquals(Collections.singletonList(NetMsg.NETMSG_ALREADYDEAD + ":17"), udp.messages);
             assertEquals(originalHealth, get(activity, "mHealth"));
             assertEquals(originalHitsTaken, get(activity, "mHitsTaken"));
         });
@@ -618,7 +617,7 @@ public class GameplayRegressionTest {
     @Test
     public void newRoundDoesNotReuseHitDeduplicationOrHitCounter() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
             assertEquals(15, get(activity, "mHealth"));
             assertEquals(1, get(activity, "mHitsTaken"));
 
@@ -634,7 +633,7 @@ public class GameplayRegressionTest {
             // that the old shot ID no longer suppresses a real hit.
             set(activity, "mUseNetwork", true);
 
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
             assertEquals("A reused weapon shot ID was filtered as a prior round's hit", 15,
                     get(activity, "mHealth"));
             assertEquals("The hit counter carried over from the prior round", 1,
@@ -671,7 +670,7 @@ public class GameplayRegressionTest {
     public void ordinaryHitFeedbackStillExpires() throws InterruptedException {
         scenario.onActivity(activity -> {
             set(activity, "mHitAnimation", null);
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
             assertEquals(View.VISIBLE, ((View) get(activity, "mHitIV")).getVisibility());
             assertEquals(View.VISIBLE, ((View) get(activity, "mHitPlayerIV")).getVisibility());
@@ -834,8 +833,8 @@ public class GameplayRegressionTest {
     @Test
     public void telemetryUsesEachBroadcastPacketEvenAfterCharacteristicChanges() {
         scenario.onActivity(activity -> {
-            byte[] first = telemetryPacket(11, 1, 0, 0);
-            byte[] second = telemetryPacket(11, 2, 0, 0);
+            byte[] first = telemetryPacket(17, 1, 0, 0);
+            byte[] second = telemetryPacket(17, 2, 0, 0);
             ((BluetoothGattCharacteristic) get(activity, "mTelemetryCharacteristic")).setValue(second);
             receiveTelemetry(activity, first);
             receiveTelemetry(activity, second);
@@ -1674,7 +1673,7 @@ public class GameplayRegressionTest {
     @Test
     public void hitInSecondSlotUsesConfiguredDamageOnce() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 0, 0, 11, 1);
+            telemetry(activity, 0, 0, 17, 1);
             assertEquals(15, get(activity, "mHealth"));
         });
     }
@@ -1682,7 +1681,7 @@ public class GameplayRegressionTest {
     @Test
     public void twoDifferentAttackersApplyTheirOwnDamageOnce() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 11, 1, 12, 1);
+            telemetry(activity, 17, 1, 18, 1);
             assertEquals(8, get(activity, "mHealth"));
         });
     }
@@ -1690,9 +1689,9 @@ public class GameplayRegressionTest {
     @Test
     public void repeatedShotInBothSlotsAndNextPacketCountsOnce() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 11, 1, 11, 1);
+            telemetry(activity, 17, 1, 17, 1);
             assertEquals(15, get(activity, "mHealth"));
-            telemetry(activity, 11, 1, 11, 1);
+            telemetry(activity, 17, 1, 17, 1);
             assertEquals(15, get(activity, "mHealth"));
             assertEquals(1, get(activity, "mHitsTaken"));
         });
@@ -1701,7 +1700,7 @@ public class GameplayRegressionTest {
     @Test
     public void differentShotsFromSameAttackerBothCount() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 11, 1, 11, 2);
+            telemetry(activity, 17, 1, 17, 2);
             assertEquals(10, get(activity, "mHealth"));
         });
     }
@@ -1709,7 +1708,7 @@ public class GameplayRegressionTest {
     @Test
     public void friendlyHitDoesNotAddDamageToEnemyHit() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 2, 1, 11, 1);
+            telemetry(activity, 2, 1, 17, 1);
             assertEquals(15, get(activity, "mHealth"));
         });
     }
@@ -1727,7 +1726,7 @@ public class GameplayRegressionTest {
                 set(activity, "mGattReceiverRegistered", true);
                 globals.mDamage = -5;
 
-                telemetry(activity, 11, 1, 0, 0);
+                telemetry(activity, 17, 1, 0, 0);
 
                 assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
                 assertEquals(1, get(activity, "mHitsTaken"));
@@ -1746,9 +1745,9 @@ public class GameplayRegressionTest {
             set(activity, "mHasLivesLimit", true);
             set(activity, "mEliminationCount", 1);
             set(activity, "mHealth", 5);
-            telemetry(activity, 11, 1, 0, 0);
+            telemetry(activity, 17, 1, 0, 0);
             assertEquals(1, udp.peerEliminationPublishes);
-            assertEquals(Byte.valueOf((byte) 11), udp.lastPeerEliminationRecipient);
+            assertEquals(Byte.valueOf((byte) 17), udp.lastPeerEliminationRecipient);
             assertEquals(1, udp.peerLeaveAnnouncements);
             assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
             assertNull(get(activity, "mSpawnTimer"));
@@ -1756,16 +1755,16 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void twentiethPlayerCanBeConfiguredOnTheBlasterAndScoreHits() {
+    public void thirtySecondPlayerCanBeConfiguredOnTheBlasterAndScoreHits() {
         scenario.onActivity(activity -> {
-            Globals.getInstance().mPlayerID = 20;
+            Globals.getInstance().mPlayerID = 32;
             Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
             invoke(activity, "setTeam");
-            assertEquals(20, bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
+            assertEquals(32, bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
             Globals.getInstance().mPlayerID = 1;
             Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
             set(activity, "mNetworkTeam", 1);
-            telemetry(activity, 20, 1, 0, 0);
+            telemetry(activity, 32, 1, 0, 0);
             assertEquals(19, get(activity, "mHealth"));
         });
     }
@@ -1777,7 +1776,7 @@ public class GameplayRegressionTest {
 
     @Test
     public void unsupportedBlasterStatusCannotReplaceTheSelectedPlayerId() {
-        assertInvalidTelemetryPlayerIdIgnored(21);
+        assertInvalidTelemetryPlayerIdIgnored(33);
     }
 
     @Test
@@ -1819,7 +1818,7 @@ public class GameplayRegressionTest {
             set(activity, "mEliminationCount", 1);
             byte[] packet = telemetryPacket(0, 0, 0, 0);
             packet[secondSlot ? FullscreenActivity.RECOIL_OFFSET_HIT_BY2
-                    : FullscreenActivity.RECOIL_OFFSET_HIT_BY1] = (byte) (21 << 2);
+                    : FullscreenActivity.RECOIL_OFFSET_HIT_BY1] = (byte) (33 << 2);
             receiveTelemetry(activity, packet);
             assertEquals("An unsupported attacker consumed our last life", 1, get(activity, "mHealth"));
             assertEquals(1, get(activity, "mEliminationCount"));
@@ -1833,7 +1832,7 @@ public class GameplayRegressionTest {
     @Test
     public void invalidHitSlotDoesNotHideAValidHitInTheSamePacket() {
         scenario.onActivity(activity -> {
-            telemetry(activity, 21, 1, 11, 1);
+            telemetry(activity, 33, 1, 17, 1);
             assertEquals(15, get(activity, "mHealth"));
             assertEquals(1, get(activity, "mHitsTaken"));
         });
@@ -1842,7 +1841,7 @@ public class GameplayRegressionTest {
     @Test
     public void reservedAndUnsignedHitSourcesCannotCauseDamage() {
         scenario.onActivity(activity -> {
-            for (int source : new int[]{1, 2, 3, 84, 127, 128, 164, 166, 168, 255}) {
+            for (int source : new int[]{1, 2, 3, 132, 133, 164, 166, 168, 255}) {
                 byte[] packet = telemetryPacket(0, 0, 0, 0);
                 packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY1] = (byte) source;
                 receiveTelemetry(activity, packet);
@@ -1854,13 +1853,13 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void validTwentiethPlayerStatusStillUpdatesTheDisplayedTeam() {
+    public void validThirtySecondPlayerStatusStillUpdatesTheDisplayedTeam() {
         scenario.onActivity(activity -> {
             byte[] packet = telemetryPacket(0, 0, 0, 0);
-            packet[FullscreenActivity.RECOIL_OFFSET_TEAM] = 20;
+            packet[FullscreenActivity.RECOIL_OFFSET_TEAM] = 32;
             receiveTelemetry(activity, packet);
-            assertEquals(20, Globals.getInstance().mPlayerID);
-            assertEquals((byte) 20, get(activity, "mLastTeam"));
+            assertEquals(32, Globals.getInstance().mPlayerID);
+            assertEquals((byte) 32, get(activity, "mLastTeam"));
             assertEquals(2, get(activity, "mNetworkTeam"));
         });
     }
@@ -1883,18 +1882,18 @@ public class GameplayRegressionTest {
             try {
                 originalEndpoints = new HashMap<>(globals.mTeamIPMap);
                 globals.mTeamIPMap.clear();
-                globals.mTeamIPMap.put((byte) 11, InetAddress.getLoopbackAddress());
+                globals.mTeamIPMap.put((byte) 17, InetAddress.getLoopbackAddress());
             } finally {
                 globals.mTeamIPMapSemaphore.release();
             }
             try {
                 invoke(activity, "assignTeamFromQrCode", new Class<?>[]{String.class},
                         "TEAM 2 RESPAWN");
-                assertEquals("The scanned team did not skip its occupied player ID", 12,
+                assertEquals("The scanned team did not skip its occupied player ID", 18,
                         globals.mPlayerID);
                 assertEquals(2, globals.calcNetworkTeam(globals.mPlayerID));
                 assertEquals(View.VISIBLE, ((View) get(activity, "mTeamQrScanButton")).getVisibility());
-                assertEquals(12, bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
+                assertEquals(18, bluetooth.writes.get(bluetooth.writes.size() - 1)[4]);
             } finally {
                 Globals.getmTeamIPMapSemaphore();
                 try {
@@ -1930,7 +1929,7 @@ public class GameplayRegressionTest {
             int previousOwner;
             try {
                 previousOwner = globals.mGrenadePairings[3];
-                globals.mGrenadePairings[3] = 11;
+                globals.mGrenadePairings[3] = 17;
             } finally { globals.mGrenadePairingsSemaphore.release(); }
             try {
                 receiveTelemetry(activity, grenadePacket(false, 0x31));
@@ -1979,13 +1978,13 @@ public class GameplayRegressionTest {
                 globals.mGrenadePairings[3] = Globals.INVALID_PLAYER_ID;
             } finally { globals.mGrenadePairingsSemaphore.release(); }
             try {
-                byte[] packet = telemetryPacket(11, 1, 0, 0);
+                byte[] packet = telemetryPacket(17, 1, 0, 0);
                 packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY2] = (byte) Globals.GRENADE_PLAYER_ID;
                 packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY2_SHOTID] = 0x31;
                 receiveTelemetry(activity, packet);
                 assertEquals("An unpaired grenade should still use default damage", 14,
                         get(activity, "mHealth"));
-                assertTrue(udp.messages.contains(NetMsg.NETMSG_HIT + ":11"));
+                assertTrue(udp.messages.contains(NetMsg.NETMSG_HIT + ":17"));
                 assertTrue("An unpaired grenade was credited to pseudo-player 41",
                         !udp.messages.contains(NetMsg.NETMSG_HIT + ":41"));
             } finally {
@@ -2004,7 +2003,7 @@ public class GameplayRegressionTest {
             int previousOwner;
             try {
                 previousOwner = globals.mGrenadePairings[3];
-                globals.mGrenadePairings[3] = 11;
+                globals.mGrenadePairings[3] = 17;
             } finally { globals.mGrenadePairingsSemaphore.release(); }
             try {
                 byte[] packet = grenadePacket(false, 0x31);

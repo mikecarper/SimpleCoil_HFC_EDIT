@@ -23,7 +23,8 @@ public class NetMsg {
     // Clock calibration now requires a longer, low-latency sample burst. Keep
     // older clients out of a lobby rather than leaving them unable to satisfy
     // the updated start barrier.
-    public static final String NETWORK_VERSION = "15";
+    public static final int NETWORK_VERSION_NUMBER = 18;
+    public static final String NETWORK_VERSION = "18";
 
     // Most of these messages are straightforward and contain no extra data.
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
@@ -56,6 +57,9 @@ public class NetMsg {
     public static final String NETMSG_TCPSERVERREADY = "TCPSERVERREADY";
     public static final String NETMSG_TCPSERVERFAILED = "TCPSERVERFAILED";
     public static final String NETMSG_TEAMELIMINATED = "TEAMELIMINATED";
+    // Internal app broadcast carrying an absolute team total reconstructed
+    // from peer state snapshots. It is not a text UDP wire message.
+    public static final String NETMSG_TEAMSCORESTATE = "TEAMSCORESTATE";
     public static final String NETMSG_SERVERREPLY = "SERVERREPLY";
     // A host appends ":<player ID>" to SERVERREPLY only when it moved a
     // conflicting joining player to an available slot on the same team.
@@ -82,6 +86,7 @@ public class NetMsg {
     public static final String NETMSG_NETWORKCONNECTED = "NETWORKCONNECTED";
     public static final String NETMSG_NETWORKDISCONNECTED = "NETWORKDISCONNECTED";
     public static final String NETMSG_PLAYERSETTINGSUPDATE = "PLAYERSETTINGSUPDATE";
+    public static final String NETMSG_BALANCEDLOBBY = "BALANCEDLOBBY";
     // Peer-hosted games close their TCP listener after the round starts. Every
     // state-changing peer UDP payload includes the synchronized round nonce, so
     // a delayed previous-round datagram cannot affect a later round.

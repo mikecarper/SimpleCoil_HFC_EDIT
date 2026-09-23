@@ -28,27 +28,61 @@ system clock and does not use a public NTP server.
 - The network-offset target is below 50 ms on a healthy local network. Wi-Fi
   congestion, device suspension, and normal UI scheduling can still affect the
   moment a device visibly reacts.
-- All participants must use network protocol 15 (this build). Older protocol
+- All participants must use network protocol 18 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
-Peer-game UDP events are scoped to a per-round nonce, and retransmitted score
-events are deduplicated. Delayed packets from an earlier round therefore cannot
-alter the next round's score, roster, grenade pairing, or end state.
+During a peer game, each phone sends one subnet-directed IPv4 broadcast instead
+of one unicast packet per player. The fixed 1,312-byte protocol-18 snapshot fits
+32 player records below the 1,472-byte UDP payload ceiling and avoids normal
+IPv4 fragmentation. Each record carries cumulative score/deaths, health,
+shield, shots, player state, grenade pairing, a deduplicated important event,
+and GPS rounded to 0.00001 degrees (about one metre). A one-second heartbeat
+repeats the complete state view so dropped datagrams repair themselves. Names,
+addresses, and other bulky mappings remain in TCP lobby setup. Android holds
+Wi-Fi performance and multicast locks only while gameplay is active.
 
 ## Player capacity and hosting
 
-The game supports up to 20 players. A separate dedicated-host phone may be used,
-for a maximum of 21 phones total. Alternatively, a JDK 17 laptop can run the
+The game supports up to 32 players. A separate dedicated-host phone may be used,
+for a maximum of 33 phones total. Alternatively, a JDK 17 laptop can run the
 included dedicated host, so no phone is consumed as the host.
 
-| Mode | Player IDs |
+| Locked tournament mode | Player IDs |
 | --- | --- |
-| Two teams | Team 1: 1-10; Team 2: 11-20 |
-| Four teams | Teams 1-4: 1-5, 6-10, 11-15, 16-20 |
-| Free-for-all | 1-20 |
+| Two teams | Team 1: 1-16; Team 2: 17-32 |
+| Boss Mode | Boss: Player 1; Hunters: Players 2-32 |
+
+Every game uses the same server-authoritative tournament profile: 5 health, 10 shields,
+30-shot magazines, a 1.5-second reload, one damage per hit, recoil enabled,
+and single-shot firing. Player and host controls cannot change those rules.
+
+Boss Mode is the alternate locked tournament variant. Player 1 is the boss;
+everyone else is a hunter. Hunters have 2 health, 3 shields, a 30-round
+magazine, no shield regeneration, and forced single-shot fire. The boss starts
+with 5 health and 10 shields, then gains 1 health and 2 shields per hunter. For
+example, against 10 hunters the boss has 15 health and 30 shields. The boss has
+120 rounds, starts each game in automatic, and may switch among single, burst,
+and automatic fire. The starting roster fixes boss strength for the round.
+
+Balanced Random is an optional two-team assignment method on the laptop host.
+Everyone joins the lobby, then the host presses **Start** to assign teams using
+the kills and deaths saved on each player's phone from previous network games.
+The team sizes differ by no more than two players. Player IDs no longer imply a
+team in this mode, and lobby joins can take any free ID; each phone displays its
+assigned team. With **QR Check-in**,
+every player, including a playing phone host, scans the printed Team 1 or Team 2
+respawn QR that matches their assignment. The shared 10-second countdown begins
+after the final check-in, or after a 90-second check-in timeout if someone has
+not scanned. Everyone keeps their assigned team when the timeout starts the game.
+**No QR** starts that countdown as soon as the teams are assigned. Names can be
+edited in the lobby; weapon and player rules remain locked. Clearing an app's data
+also clears that phone's past-match totals.
+
+While a QR check-in is pending, the phone repeats the assigned team number in
+its spoken scan reminder. Respawn QR reminders also say the player's team.
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-15 host automatically
+team before starting. If an ID conflicts, a protocol-18 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and

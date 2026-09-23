@@ -96,7 +96,7 @@ public class UDPRegressionTest {
 
     @Test
     public void opponentCannotAwardPointsToOurTeam() throws Exception {
-        register(enemy, 11);
+        register(enemy, 17);
         receive(enemy, NetMsg.NETMSG_TEAMELIMINATED);
         assertTrue(service.events.isEmpty());
     }
@@ -110,7 +110,7 @@ public class UDPRegressionTest {
 
     @Test
     public void teamMembershipUsesCurrentGameMode() throws Exception {
-        register(teammate, 6);
+        register(teammate, 9);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
         receive(teammate, NetMsg.NETMSG_TEAMELIMINATED);
         assertTrue(service.events.isEmpty());
@@ -129,7 +129,7 @@ public class UDPRegressionTest {
 
     @Test
     public void knownPeerAndCurrentServerCanStillEndGame() throws Exception {
-        register(enemy, 11);
+        register(enemy, 17);
         receive(enemy, NetMsg.NETMSG_ENDGAME);
         Globals.getInstance().mServerIP = stranger;
         receive(stranger, NetMsg.NETMSG_ENDGAME);
@@ -141,7 +141,7 @@ public class UDPRegressionTest {
     @Test
     public void tournamentRejectsBareUdpEndGameFromAKnownPlayer() throws Exception {
         Globals.getInstance().mTournamentMode = true;
-        register(enemy, 11);
+        register(enemy, 17);
 
         receive(enemy, NetMsg.NETMSG_ENDGAME);
 
@@ -152,7 +152,7 @@ public class UDPRegressionTest {
     public void peerEndGameIsBoundToTheCurrentRoundToken() throws Exception {
         final String firstRound = "11111111-1111-1111-1111-111111111111";
         final String secondRound = "22222222-2222-2222-2222-222222222222";
-        register(enemy, 11);
+        register(enemy, 17);
         service.startGame(true, secondRound);
 
         receive(enemy, NetMsg.NETMSG_ENDGAME);
@@ -161,8 +161,9 @@ public class UDPRegressionTest {
         assertTrue("A bare, stale, or malformed peer ENDGAME ended the round", service.events.isEmpty());
 
         service.endGame();
-        assertEquals(NetMsg.NETMSG_PEER_ENDGAME + secondRound, service.sentMessages.get(0));
-        assertEquals(3, (int) service.repeatCounts.get(0));
+        PeerStatePacket.Decoded sentEnd = service.peerPacket(0);
+        assertEquals(PeerStatePacket.EVENT_END_GAME, sentEnd.players[1].eventType);
+        assertEquals(3, (int) service.peerRepeatCounts.get(0));
 
         receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + secondRound);
         assertEquals(1, service.events.size());
@@ -182,7 +183,7 @@ public class UDPRegressionTest {
         Globals.getInstance().mTournamentMode = true;
         Globals.getInstance().mServerIP = teammate;
         register(teammate, 2);
-        register(enemy, 11);
+        register(enemy, 17);
         service.startGame(true, PEER_ROUND_TOKEN);
 
         receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
@@ -196,7 +197,7 @@ public class UDPRegressionTest {
     @Test
     public void peerEndGameIsRetainedUntilTheActivityCanConsumeIt() throws Exception {
         final String replacementRound = "77777777-7777-7777-7777-777777777777";
-        register(enemy, 11);
+        register(enemy, 17);
         service.startGame(true, PEER_ROUND_TOKEN);
 
         receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
@@ -215,7 +216,7 @@ public class UDPRegressionTest {
 
     @Test
     public void peerEndDuringPausedStartIsRetainedUntilTheRoundBecomesActive() throws Exception {
-        register(enemy, 11);
+        register(enemy, 17);
 
         // TcpClient broadcasts starts asynchronously. Exercise an ENDGAME that
         // arrives before UDPListenerService has handled that start broadcast.
@@ -233,7 +234,7 @@ public class UDPRegressionTest {
 
     @Test
     public void candidatePeerEndCannotCrossThroughADedicatedStart() throws Exception {
-        register(enemy, 11);
+        register(enemy, 17);
         receive(enemy, NetMsg.NETMSG_PEER_ENDGAME + PEER_ROUND_TOKEN);
 
         service.startGame(false, null);
@@ -247,14 +248,14 @@ public class UDPRegressionTest {
         final String oldRound = "33333333-3333-3333-3333-333333333333";
         final String currentRound = "44444444-4444-4444-4444-444444444444";
         register(teammate, 2);
-        register(enemy, 11);
+        register(enemy, 17);
         service.startGame(true, currentRound);
 
         receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + oldRound + ":1");
-        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + oldRound + ":11:1");
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + oldRound + ":17:1");
         receive(enemy, NetMsg.NETMSG_PEER_LEAVE + oldRound);
         assertTrue("A prior-round peer packet changed the current round", service.events.isEmpty());
-        assertEquals(Byte.valueOf((byte) 11), Globals.getInstance().mIPTeamMap.get(enemy));
+        assertEquals(Byte.valueOf((byte) 17), Globals.getInstance().mIPTeamMap.get(enemy));
 
         receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + currentRound + ":1");
         assertEquals(NetMsg.NETMSG_ELIMINATED, service.events.get(0).getAction());
@@ -511,17 +512,17 @@ public class UDPRegressionTest {
     @Test
     public void peerLeaveCannotOvertakeASequencedFinalScoreEvent() throws Exception {
         register(teammate, 2);
-        register(enemy, 11);
+        register(enemy, 17);
         startPeerGame();
 
         receive(enemy, NetMsg.NETMSG_PEER_LEAVE + PEER_ROUND_TOKEN);
         receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + PEER_ROUND_TOKEN + ":1");
         assertEquals(2, service.events.size());
         assertEquals(NetMsg.NETMSG_ELIMINATED, service.events.get(1).getAction());
-        assertEquals(11, service.events.get(1).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+        assertEquals(17, service.events.get(1).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
 
         receive(teammate, NetMsg.NETMSG_PEER_LEAVE + PEER_ROUND_TOKEN);
-        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":11:1");
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":17:1");
         assertEquals(4, service.events.size());
         assertEquals(NetMsg.NETMSG_TEAMELIMINATED, service.events.get(3).getAction());
     }
@@ -591,20 +592,20 @@ public class UDPRegressionTest {
             globals.mPairedGrenadeID = 3;
             service.publishPeerGrenadePairing();
             assertEquals(1, globals.mGrenadePairings[3]);
-            assertEquals(NetMsg.NETMSG_GRENADEPAIR + PEER_ROUND_TOKEN + ":1:3", service.sentMessages.get(0));
-            assertEquals(3, (int) service.repeatCounts.get(0));
+            assertEquals(3, service.peerPacket(0).players[1].grenadeID);
+            assertEquals(3, (int) service.peerRepeatCounts.get(0));
 
             globals.mPairedGrenadeID = 0;
             service.publishPeerGrenadePairing();
             assertEquals(Globals.INVALID_PLAYER_ID, globals.mGrenadePairings[3]);
-            assertEquals(NetMsg.NETMSG_GRENADEPAIR + PEER_ROUND_TOKEN + ":2:0", service.sentMessages.get(1));
-            assertEquals(3, (int) service.repeatCounts.get(1));
+            assertEquals(0, service.peerPacket(1).players[1].grenadeID);
+            assertEquals(3, (int) service.peerRepeatCounts.get(1));
 
             service.startGame(false);
             globals.mPairedGrenadeID = 4;
             service.publishPeerGrenadePairing();
             assertEquals("Dedicated games must retain TCP-authoritative pairings", 2,
-                    service.sentMessages.size());
+                    service.peerStatePackets.size());
             assertEquals(Globals.INVALID_PLAYER_ID, globals.mGrenadePairings[4]);
         } finally {
             globals.mPairedGrenadeID = originalPairedGrenade;
@@ -620,14 +621,14 @@ public class UDPRegressionTest {
 
     @Test
     public void peerEliminationEventsAreSequencedAndCannotAwardDuplicatePoints() throws Exception {
-        register(enemy, 11);
+        register(enemy, 17);
         register(teammate, 2);
         startPeerGame();
 
         receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + PEER_ROUND_TOKEN + ":1");
         assertEquals(1, service.events.size());
         assertEquals(NetMsg.NETMSG_ELIMINATED, service.events.get(0).getAction());
-        assertEquals(11, service.events.get(0).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+        assertEquals(17, service.events.get(0).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
         assertEquals(1L, service.events.get(0).getLongExtra(NetMsg.INTENT_EVENT_SEQUENCE, 0));
 
         receive(enemy, NetMsg.NETMSG_PEER_ELIMINATED + PEER_ROUND_TOKEN + ":1");
@@ -645,63 +646,59 @@ public class UDPRegressionTest {
     @Test
     public void peerTeamEliminationEventsAreSequencedAndValidateBothTeams() throws Exception {
         register(teammate, 2);
-        register(enemy, 11);
+        register(enemy, 17);
         startPeerGame();
 
-        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":11:1");
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":17:1");
         assertEquals(1, service.events.size());
         assertEquals(NetMsg.NETMSG_TEAMELIMINATED, service.events.get(0).getAction());
 
-        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":11:1");
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":17:1");
         receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":2:2");
         receive(enemy, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":2:1");
         assertEquals("Repeated or invalid team score relays changed the team score", 1,
                 service.events.size());
 
-        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":11:2");
+        receive(teammate, NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":17:2");
         assertEquals(2, service.events.size());
     }
 
     @Test
-    public void peerScorePublisherRetriesSequencedEventsAndLeaves() throws Exception {
+    public void peerPublisherBroadcastsSequencedStateAndLeaves() throws Exception {
         register(teammate, 2);
-        register(enemy, 11);
+        register(enemy, 17);
         startPeerGame();
 
-        service.publishPeerElimination((byte) 11);
-        assertEquals(1, service.directMessages.size());
-        assertEquals(NetMsg.NETMSG_PEER_ELIMINATED + PEER_ROUND_TOKEN + ":1", service.directMessages.get(0));
-        assertEquals(Byte.valueOf((byte) 11), service.directRecipients.get(0));
-        assertEquals(3, (int) service.directRepeatCounts.get(0));
+        service.publishPeerElimination((byte) 17);
+        assertEquals(1, service.peerStatePackets.size());
+        assertEquals(PeerStatePacket.EVENT_ELIMINATED, service.peerPacket(0).players[1].eventType);
+        assertEquals(17, service.peerPacket(0).players[1].eventTargetID);
+        assertEquals(3, (int) service.peerRepeatCounts.get(0));
 
-        service.publishPeerTeamElimination((byte) 11, 1, (byte) 2);
-        assertEquals(2, service.directMessages.size());
-        assertEquals(NetMsg.NETMSG_PEER_TEAMELIMINATED + PEER_ROUND_TOKEN + ":11:1", service.directMessages.get(1));
-        assertEquals(Byte.valueOf((byte) 2), service.directRecipients.get(1));
-        assertEquals(3, (int) service.directRepeatCounts.get(1));
+        service.publishPeerTeamElimination((byte) 17, 1, (byte) 2);
+        assertEquals(1, service.peerStatePackets.size());
 
         service.announcePeerLeave();
-        assertEquals(NetMsg.NETMSG_PEER_LEAVE + PEER_ROUND_TOKEN, service.sentMessages.get(0));
-        assertEquals(3, (int) service.repeatCounts.get(0));
+        assertEquals(PeerStatePacket.EVENT_LEAVE, service.peerPacket(1).players[1].eventType);
+        assertEquals(3, (int) service.peerRepeatCounts.get(1));
 
         service.startGame(false);
-        service.publishPeerElimination((byte) 11);
-        service.publishPeerTeamElimination((byte) 11, 2, (byte) 2);
+        service.publishPeerElimination((byte) 17);
+        service.publishPeerTeamElimination((byte) 17, 2, (byte) 2);
         service.announcePeerLeave();
-        assertEquals(2, service.directMessages.size());
-        assertEquals(1, service.sentMessages.size());
+        assertEquals(2, service.peerStatePackets.size());
     }
 
     @Test
     public void validCombatFeedbackEventsKeepTheirPlayerIds() throws Exception {
-        register(enemy, 11);
+        register(enemy, 17);
         String[] commands = {NetMsg.NETMSG_HIT, NetMsg.NETMSG_OUT, NetMsg.NETMSG_ALREADYDEAD,
                 NetMsg.NETMSG_ELIMINATED};
         for (String command : commands) receive(enemy, command);
         assertEquals(commands.length, service.events.size());
         for (int index = 0; index < commands.length; index++) {
             assertEquals(commands[index], service.events.get(index).getAction());
-            assertEquals(11, service.events.get(index).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
+            assertEquals(17, service.events.get(index).getByteExtra(UDPListenerService.INTENT_PLAYERID, (byte) 0));
         }
     }
 
@@ -1167,6 +1164,8 @@ public class UDPRegressionTest {
         final List<Integer> directRepeatCounts = new CopyOnWriteArrayList<>();
         final List<String> endpointMessages = new CopyOnWriteArrayList<>();
         final List<InetAddress> endpointRecipients = new CopyOnWriteArrayList<>();
+        final List<byte[]> peerStatePackets = new CopyOnWriteArrayList<>();
+        final List<Integer> peerRepeatCounts = new CopyOnWriteArrayList<>();
         boolean realListener;
         int listenerStarts;
         boolean blockFirstLookup;
@@ -1195,6 +1194,17 @@ public class UDPRegressionTest {
             endpointRecipients.add(address);
             if (realListener)
                 super.sendUDPMessage(message, address, port);
+        }
+        @Override void sendDatagrams(byte[] payload, List<InetAddress> recipients, int port,
+                                     int repeatCount, long generation) {
+            peerStatePackets.add(payload.clone());
+            peerRepeatCounts.add(repeatCount);
+        }
+        PeerStatePacket.Decoded peerPacket(int index) {
+            byte[] payload = peerStatePackets.get(index);
+            PeerStatePacket.Decoded decoded = PeerStatePacket.decode(payload, 0, payload.length);
+            assertNotNull(decoded);
+            return decoded;
         }
         @Override public void startListenForUDPMessage() {
             if (realListener) super.startListenForUDPMessage();

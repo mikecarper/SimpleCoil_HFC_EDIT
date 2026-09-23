@@ -8,7 +8,9 @@ import java.util.Map;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 public class GlobalsTest {
     @Test public void defaultGameLengthIsFiveMinutes() {
@@ -22,6 +24,52 @@ public class GlobalsTest {
 
     @Test public void wifiWithoutAnAddressDoesNotProduceAnyLocalAddress() {
         assertNull(Globals.fromWifiIPv4Address(0));
+    }
+
+    @Test public void tournamentProfileMakesEveryWeaponSingleShotAndIdentical() {
+        Globals.PlayerSettings settings = new Globals.PlayerSettings();
+        settings.health = 400;
+        settings.shots = 4;
+        settings.reloadTime = 9_000;
+        settings.reloadOnEmpty = true;
+        settings.damage = -20;
+        settings.allowShotModeSingle = false;
+        settings.allowShotModeBurst3 = true;
+        settings.allowShotModeAuto = true;
+        settings.firingMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
+
+        Globals.applyTournamentRules(settings);
+
+        assertTrue(Globals.TOURNAMENT_RULES_REQUIRED);
+        assertEquals(Globals.MAX_HEALTH, settings.health);
+        assertEquals(Globals.RELOAD_COUNT, settings.shots);
+        assertEquals(Globals.RELOAD_TIME_MILLISECONDS, settings.reloadTime);
+        assertFalse(settings.reloadOnEmpty);
+        assertEquals(Globals.DAMAGE_PER_HIT, settings.damage);
+        assertTrue(settings.allowShotModeSingle);
+        assertFalse(settings.allowShotModeBurst3);
+        assertFalse(settings.allowShotModeAuto);
+        assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE, settings.firingMode);
+    }
+
+    @Test public void bossProfileScalesAndUnlocksTheBossWeaponOnly() {
+        Globals.PlayerSettings boss = new Globals.PlayerSettings();
+        Globals.applyTournamentRules(boss);
+        Globals.applyBossHealth(boss, Globals.BOSS_PLAYER_ID, 10);
+        assertEquals(15, boss.health);
+        assertEquals(120, boss.shots & 0xff);
+        assertTrue(boss.allowShotModeSingle);
+        assertTrue(boss.allowShotModeBurst3);
+        assertTrue(boss.allowShotModeAuto);
+
+        Globals.PlayerSettings hunter = new Globals.PlayerSettings();
+        Globals.applyTournamentRules(hunter);
+        Globals.applyBossHealth(hunter, 2, 10);
+        assertEquals(2, hunter.health);
+        assertEquals(30, hunter.shots & 0xff);
+        assertTrue(hunter.allowShotModeSingle);
+        assertFalse(hunter.allowShotModeBurst3);
+        assertFalse(hunter.allowShotModeAuto);
     }
 
     @Test public void clearingLimitsRemovesAllActiveLimitValues() {
@@ -62,9 +110,9 @@ public class GlobalsTest {
             globals.mTeamIPMap.clear();
             globals.mGameMode = Globals.GAME_MODE_4TEAMS;
             globals.mPlayerID = 1;
-            globals.mTeamIPMap.put((byte) 6, InetAddress.getLoopbackAddress());
-            globals.mTeamIPMap.put((byte) 12, InetAddress.getLoopbackAddress());
-            globals.mTeamIPMap.put((byte) 20, InetAddress.getLoopbackAddress());
+            globals.mTeamIPMap.put((byte) 9, InetAddress.getLoopbackAddress());
+            globals.mTeamIPMap.put((byte) 17, InetAddress.getLoopbackAddress());
+            globals.mTeamIPMap.put((byte) 25, InetAddress.getLoopbackAddress());
         } finally {
             globals.mTeamIPMapSemaphore.release();
         }
@@ -76,8 +124,8 @@ public class GlobalsTest {
                 globals.mTeamIPMap.clear();
                 globals.mGameMode = Globals.GAME_MODE_2TEAMS;
                 globals.mTeamIPMap.put((byte) 2, InetAddress.getLoopbackAddress());
-                globals.mTeamIPMap.put((byte) 11, InetAddress.getLoopbackAddress());
-                globals.mTeamIPMap.put((byte) 20, InetAddress.getLoopbackAddress());
+                globals.mTeamIPMap.put((byte) 17, InetAddress.getLoopbackAddress());
+                globals.mTeamIPMap.put((byte) 32, InetAddress.getLoopbackAddress());
             } finally {
                 globals.mTeamIPMapSemaphore.release();
             }

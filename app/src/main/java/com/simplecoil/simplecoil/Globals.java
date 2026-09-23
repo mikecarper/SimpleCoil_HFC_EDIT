@@ -25,8 +25,10 @@ import java.net.NetworkInterface;
 import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Semaphore;
 
 public class Globals {
@@ -38,7 +40,7 @@ public class Globals {
 
     /* Highest player ID allowed in the GUI, absolute max is 0x3F or 63. Player ID 0 can technically
     be used but would require code changes to the hit detection if you really need 64 players. */
-    public static final byte MAX_PLAYER_ID = (byte) 20;
+    public static final byte MAX_PLAYER_ID = (byte) 32;
 
     // Scoreboards aggregate player scores into team totals. Keep each score below
     // a value whose sum remains representable for every supported player.
@@ -68,25 +70,34 @@ public class Globals {
     public static final long MIN_RELOAD_TIME_MILLISECONDS = 0;
     public static final long MAX_RELOAD_TIME_MILLISECONDS = 10000;
     public volatile long mReloadTime = RELOAD_TIME_MILLISECONDS;
-    public static final int MAX_HEALTH = 20; // Number of hits you can take before you are eliminated
+    public static final int MAX_HEALTH = 5; // Health hits after shields are depleted
     public static final int MIN_HEALTH = 1;
     public static final int MAX_CONFIGURED_HEALTH = 1000;
     public volatile int mFullHealth = MAX_HEALTH;
-    public static final int MAX_SHIELDS = 5;
+    public static final int MAX_SHIELDS = 10;
     public volatile int mFullShields = MAX_SHIELDS;
+    public static final byte BOSS_PLAYER_ID = 1;
+    public static final int BOSS_HUNTER_HEALTH = 2;
+    public static final int BOSS_HUNTER_SHIELDS = 3;
+    public static final int BOSS_BASE_HEALTH = 5;
+    public static final int BOSS_BASE_SHIELDS = 10;
+    public static final int BOSS_HEALTH_PER_HUNTER = 1;
+    public static final int BOSS_SHIELDS_PER_HUNTER = 2;
+    public static final byte BOSS_RELOAD_COUNT = 120;
     public static final int DAMAGE_PER_HIT = -1;
     public static final int MIN_DAMAGE_PER_HIT = -1000;
     public static final int MAX_DAMAGE_PER_HIT = -1;
     public volatile int mDamage = DAMAGE_PER_HIT;
     public volatile boolean mOverrideLives = false;
     public volatile int mOverrideLivesVal = 0;
-    public volatile boolean mAllowPlayerSettings = true;
+    public volatile boolean mAllowPlayerSettings = false;
     /**
-     * A dedicated-host tournament is deliberately a fixed, reproducible ruleset.  It is
-     * separate from the normal game-mode value because the existing team calculations still
-     * operate on the ordinary two-team mode.
+     * This build always runs the fixed two-team tournament ruleset.  Keeping the policy in the
+     * shared model (instead of relying only on disabled UI controls) prevents saved preferences,
+     * reconnects, or a stale network settings frame from restoring unequal weapon profiles.
      */
-    public volatile boolean mTournamentMode = false;
+    public static final boolean TOURNAMENT_RULES_REQUIRED = true;
+    public volatile boolean mTournamentMode = TOURNAMENT_RULES_REQUIRED;
     public volatile boolean mReloadOnEmpty = false; // Primarily intended for instagib
     // This is local phone feedback, not a weapon setting that a server can impose.
     // Keep the historical default off until the player explicitly enables it.
@@ -118,6 +129,27 @@ public class Globals {
     public static final int GAME_MODE_2TEAMS = 2;
     public static final int GAME_MODE_4TEAMS = 4;
     public volatile int mGameMode = GAME_MODE_2TEAMS;
+    /** Player 1 is the boss; every other valid player ID is on the hunter team. */
+    public volatile boolean mBossMode = false;
+    // -1 means derive the lobby preview from the currently visible roster.
+    // Once a host commits a round, the advertised value is retained so a
+    // disconnect cannot reduce the boss's maximum health or shields.
+    public volatile int mBossHunterCount = -1;
+    public volatile boolean mBalancedRandom = false;
+    public volatile boolean mBalancedRequireQr = true;
+    // Published as immutable snapshots so UDP and UI readers never see a partial assignment.
+    public volatile Map<Byte, Integer> mBalancedTeams = Collections.emptyMap();
+    public volatile Set<Byte> mBalancedCheckedIn = Collections.emptySet();
+
+    public void clearBalancedAssignments() {
+        mBalancedTeams = Collections.emptyMap();
+        mBalancedCheckedIn = Collections.emptySet();
+    }
+
+    public void setBalancedAssignments(Map<Byte, Integer> teams, Set<Byte> checkedIn) {
+        mBalancedTeams = Collections.unmodifiableMap(new HashMap<>(teams));
+        mBalancedCheckedIn = Collections.unmodifiableSet(new HashSet<>(checkedIn));
+    }
 
     public static boolean isValidGameMode(int gameMode) {
         return gameMode == GAME_MODE_FFA || gameMode == GAME_MODE_2TEAMS || gameMode == GAME_MODE_4TEAMS;
@@ -177,8 +209,8 @@ public class Globals {
     public static final int SHOT_MODE_SINGLE = 2;
     public static final int SHOT_MODE_BURST = 4;
     public volatile boolean mAllowSingleShotMode = true;
-    public volatile boolean mAllowBurst3ShotMode = true;
-    public volatile boolean mAllowAutoShotMode = true;
+    public volatile boolean mAllowBurst3ShotMode = false;
+    public volatile boolean mAllowAutoShotMode = false;
 
     public static final int FIRING_MODE_OUTDOOR_NO_CONE = 0;
     public static final int FIRING_MODE_OUTDOOR_WITH_CONE = 1;
@@ -225,11 +257,39 @@ public class Globals {
         settings.firingMode = FIRING_MODE_OUTDOOR_NO_CONE;
     }
 
+    /** Apply Boss Mode health to a server-owned player profile. */
+    public static void applyBossHealth(PlayerSettings settings, int playerID, int hunterCount) {
+        if (settings == null)
+            return;
+        settings.health = playerID == BOSS_PLAYER_ID
+                ? BOSS_BASE_HEALTH + Math.max(0, hunterCount) * BOSS_HEALTH_PER_HUNTER
+                : BOSS_HUNTER_HEALTH;
+        settings.shots = playerID == BOSS_PLAYER_ID ? BOSS_RELOAD_COUNT : RELOAD_COUNT;
+        settings.allowShotModeSingle = true;
+        settings.allowShotModeBurst3 = playerID == BOSS_PLAYER_ID;
+        settings.allowShotModeAuto = playerID == BOSS_PLAYER_ID;
+    }
+
     /** Apply the common tournament profile to the local phone and weapon configuration. */
     public void applyTournamentRules() {
-        mFullHealth = MAX_HEALTH;
-        mFullShields = MAX_SHIELDS;
-        mFullReload = RELOAD_COUNT;
+        mTournamentMode = true;
+        mGameMode = GAME_MODE_2TEAMS;
+        if (mBossMode) {
+            int hunterCount = mBossHunterCount >= 0 ? mBossHunterCount
+                    : Math.max(0, getPlayerCount() - 1);
+            if (mPlayerID == BOSS_PLAYER_ID) {
+                mFullHealth = BOSS_BASE_HEALTH + hunterCount * BOSS_HEALTH_PER_HUNTER;
+                mFullShields = BOSS_BASE_SHIELDS + hunterCount * BOSS_SHIELDS_PER_HUNTER;
+            } else {
+                mFullHealth = BOSS_HUNTER_HEALTH;
+                mFullShields = BOSS_HUNTER_SHIELDS;
+            }
+        } else {
+            mFullHealth = MAX_HEALTH;
+            mFullShields = MAX_SHIELDS;
+        }
+        boolean localBoss = mBossMode && mPlayerID == BOSS_PLAYER_ID;
+        mFullReload = localBoss ? BOSS_RELOAD_COUNT : RELOAD_COUNT;
         mReloadTime = RELOAD_TIME_MILLISECONDS;
         mReloadOnEmpty = false;
         mRespawnTime = RESPAWN_TIME_SECONDS;
@@ -237,10 +297,12 @@ public class Globals {
         mOverrideLives = false;
         mOverrideLivesVal = 0;
         mAllowSingleShotMode = true;
-        mAllowBurst3ShotMode = false;
-        mAllowAutoShotMode = false;
-        mCurrentFiringMode = FIRING_MODE_OUTDOOR_NO_CONE;
+        mAllowBurst3ShotMode = localBoss;
+        mAllowAutoShotMode = localBoss;
+        if (!localBoss || !isValidFiringMode(mCurrentFiringMode))
+            mCurrentFiringMode = FIRING_MODE_OUTDOOR_NO_CONE;
         mAllowPlayerSettings = false;
+        mOnlyServerSettings = true;
     }
 
     public volatile byte mPlayerID = 0;
@@ -266,7 +328,7 @@ public class Globals {
     public Semaphore mPlayerSettingsSemaphore;
     public Semaphore mGrenadePairingsSemaphore;
     public volatile boolean mUseGPS = false;
-    public volatile boolean mOnlyServerSettings = false;
+    public volatile boolean mOnlyServerSettings = true;
 
     public volatile long mServerGameTimeRemaining = 0; // in seconds
 
@@ -299,6 +361,13 @@ public class Globals {
         int team = 1;
         if (!isValidPlayerID(player_id))
             return INVALID_PLAYER_ID;
+        if (mBossMode)
+            return player_id == BOSS_PLAYER_ID ? 1 : 2;
+        if (mBalancedRandom && mGameMode == GAME_MODE_2TEAMS) {
+            Integer assigned = mBalancedTeams.get(player_id);
+            if (assigned != null)
+                return assigned;
+        }
         if (mGameMode == GAME_MODE_2TEAMS) {
             final int x = ((MAX_PLAYER_ID + 1) / 2);
             if (player_id > x)
@@ -596,8 +665,8 @@ public class Globals {
         boolean overrideLives = false;
         int lives = 0;
         boolean allowShotModeSingle = true;
-        boolean allowShotModeBurst3 = true;
-        boolean allowShotModeAuto = true;
+        boolean allowShotModeBurst3 = false;
+        boolean allowShotModeAuto = false;
         int firingMode = FIRING_MODE_OUTDOOR_NO_CONE;
         //TODO checks
      //   boolean allowVibratePhone = false;

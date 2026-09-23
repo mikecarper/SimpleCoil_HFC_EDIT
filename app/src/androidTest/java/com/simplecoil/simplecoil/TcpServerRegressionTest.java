@@ -421,9 +421,9 @@ public class TcpServerRegressionTest {
     @Test
     public void unregisteredConnectionCannotAwardEliminationPoints() throws Exception {
         Object sender = client(1, 0);
-        client(2, 11);
-        eliminate(sender, 11);
-        assertEquals(0, server.getScore((byte) 11).points);
+        client(2, 17);
+        eliminate(sender, 17);
+        assertEquals(0, server.getScore((byte) 17).points);
         assertEquals(0, get(sender, "eliminated"));
     }
 
@@ -431,19 +431,19 @@ public class TcpServerRegressionTest {
     public void eliminationReportsInLobbyDoNotChangeScores() throws Exception {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Object victim = client(1, 1);
-        client(2, 11);
-        eliminate(victim, 11);
-        assertEquals(0, server.getScore((byte) 11).points);
+        client(2, 17);
+        eliminate(victim, 17);
+        assertEquals(0, server.getScore((byte) 17).points);
         assertEquals(0, server.getScore((byte) 1).eliminated);
     }
 
     @Test
     public void eliminationReportsDuringSharedCountdownDoNotChangeScores() throws Exception {
         Object victim = client(1, 1);
-        client(2, 11);
+        client(2, 17);
         set(server, "mScheduledStart", android.os.SystemClock.elapsedRealtime() + 10000);
-        eliminate(victim, 11);
-        assertEquals(0, server.getScore((byte) 11).points);
+        eliminate(victim, 17);
+        assertEquals(0, server.getScore((byte) 17).points);
         assertEquals(0, server.getScore((byte) 1).eliminated);
     }
 
@@ -451,10 +451,10 @@ public class TcpServerRegressionTest {
     public void changingToFourTeamsRecognizesNewEnemies() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
         Object victim = client(1, 1);
-        client(2, 6);
+        client(2, 9);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
-        eliminate(victim, 6);
-        assertEquals(1, server.getScore((byte) 6).points);
+        eliminate(victim, 9);
+        assertEquals(1, server.getScore((byte) 9).points);
         assertEquals(1, server.getScore((byte) 1).eliminated);
     }
 
@@ -462,34 +462,34 @@ public class TcpServerRegressionTest {
     public void mergingTeamsRejectsPreviouslyHostileFriendlyFire() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
         Object victim = client(1, 1);
-        client(2, 6);
+        client(2, 9);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
-        eliminate(victim, 6);
-        assertEquals(0, server.getScore((byte) 6).points);
+        eliminate(victim, 9);
+        assertEquals(0, server.getScore((byte) 9).points);
         assertEquals(0, server.getScore((byte) 1).eliminated);
     }
 
     @Test
     public void repeatedEliminationsCannotOverflowTheScoreboard() throws Exception {
         Object victim = client(1, 1);
-        Object attacker = client(2, 11);
+        Object attacker = client(2, 17);
         set(victim, "eliminated", Globals.MAX_SCOREBOARD_VALUE);
         set(attacker, "points", Globals.MAX_SCOREBOARD_VALUE);
 
-        eliminate(victim, 11);
+        eliminate(victim, 17);
 
         assertEquals(Globals.MAX_SCOREBOARD_VALUE, server.getScore((byte) 1).eliminated);
-        assertEquals(Globals.MAX_SCOREBOARD_VALUE, server.getScore((byte) 11).points);
+        assertEquals(Globals.MAX_SCOREBOARD_VALUE, server.getScore((byte) 17).points);
     }
 
     @Test
     public void gpsTeamReflectsTheCurrentGameMode() throws Exception {
         Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
-        Object player = client(1, 6);
+        Object player = client(1, 9);
         Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
         parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 10.0)
                 .put(TcpServer.JSON_GPSLATITUDE, 20.0));
-        assertEquals(2, Globals.getInstance().mGPSData.get((byte) 6).team);
+        assertEquals(2, Globals.getInstance().mGPSData.get((byte) 9).team);
     }
 
     @Test
@@ -504,24 +504,24 @@ public class TcpServerRegressionTest {
             globals.mUseGPS = true;
             Object target = client(1, 1);
             client(2, 2);  // Target's teammate.
-            client(3, 6);  // Attacker.
-            client(4, 7);  // Attacker's teammate.
-            client(5, 11); // An uninvolved third-team player.
+            client(3, 9);  // Attacker.
+            client(4, 10); // Attacker's teammate.
+            client(5, 17); // An uninvolved third-team player.
 
             // The target phone reports an actual IR hit. A shot/miss frame never
             // carries an attacker ID and therefore cannot open this reveal.
             parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_HIT)
-                    .put(TcpServer.JSON_TELEMETRY_ATTACKER, 6));
+                    .put(TcpServer.JSON_TELEMETRY_ATTACKER, 9));
 
             @SuppressWarnings("unchecked")
             Map<Byte, Map<Byte, Long>> reveals = (Map<Byte, Map<Byte, Long>>) get(server,
                     "mEnemyGPSRevealUntil");
             assertEquals(4, reveals.size());
-            assertTrue(reveals.get((byte) 1).containsKey((byte) 6));
-            assertTrue(reveals.get((byte) 2).containsKey((byte) 6));
-            assertTrue(reveals.get((byte) 6).containsKey((byte) 1));
-            assertTrue(reveals.get((byte) 7).containsKey((byte) 1));
-            assertFalse("A confirmed hit must not expose unrelated enemy teams", reveals.containsKey((byte) 11));
+            assertTrue(reveals.get((byte) 1).containsKey((byte) 9));
+            assertTrue(reveals.get((byte) 2).containsKey((byte) 9));
+            assertTrue(reveals.get((byte) 9).containsKey((byte) 1));
+            assertTrue(reveals.get((byte) 10).containsKey((byte) 1));
+            assertFalse("A confirmed hit must not expose unrelated enemy teams", reveals.containsKey((byte) 17));
         } finally {
             globals.mGameMode = originalGameMode;
             globals.mGPSMode = originalMode;
@@ -540,13 +540,13 @@ public class TcpServerRegressionTest {
             globals.mGPSMode = Globals.GPS_TEAMMATE;
             globals.mUseGPS = true;
             Object target = client(1, 1);
-            client(2, 11);
+            client(2, 17);
             client(3, 2);
-            client(4, 12);
+            client(4, 18);
             parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_HIT)
-                    .put(TcpServer.JSON_TELEMETRY_ATTACKER, 11));
+                    .put(TcpServer.JSON_TELEMETRY_ATTACKER, 17));
 
-            eliminate(target, 11);
+            eliminate(target, 17);
 
             @SuppressWarnings("unchecked")
             Map<Byte, Map<Byte, Long>> reveals = (Map<Byte, Map<Byte, Long>>) get(server,
@@ -583,8 +583,8 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mScoreLimit = 1;
         Globals.getInstance().mOnlyServerSettings = true;
         Object victim = client(1, 1);
-        client(2, 11);
-        eliminate(victim, 11);
+        client(2, 17);
+        eliminate(victim, 17);
         assertEquals(1, server.endRequests);
     }
 
@@ -595,7 +595,7 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mScoreLimit = 3;
         Object attacker = client(1, 1);
         Object teammate = client(2, 2);
-        Object victim = client(3, 11);
+        Object victim = client(3, 17);
         set(attacker, "points", 1);
         set(teammate, "points", 1);
         eliminate(victim, 1);
@@ -608,7 +608,7 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_SCORE;
         Globals.getInstance().mScoreLimit = 3;
         client(1, 1);
-        Object victim = client(2, 11);
+        Object victim = client(2, 17);
         set(victim, "points", 20);
         eliminate(victim, 1);
         assertEquals(0, server.endRequests);
@@ -618,8 +618,8 @@ public class TcpServerRegressionTest {
     public void disabledScoreLimitDoesNotEndRound() throws Exception {
         Globals.getInstance().mScoreLimit = 1;
         Object victim = client(1, 1);
-        client(2, 11);
-        eliminate(victim, 11);
+        client(2, 17);
+        eliminate(victim, 17);
         assertEquals(0, server.endRequests);
     }
 
@@ -686,7 +686,7 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mScoreLimit = 3;
         client(1, 1);
         Object teammate = client(2, 2);
-        Object victim = client(3, 11);
+        Object victim = client(3, 17);
         set(teammate, "points", 2);
         remove(teammate, 2);
         eliminate(victim, 1);
@@ -956,7 +956,7 @@ public class TcpServerRegressionTest {
     public void partialFrameDoesNotReadUnavailableBytesOrBlockOtherPlayers() throws Exception {
         Object partialSender = client(1, 1);
         Object victim = client(2, 2);
-        client(3, 11);
+        client(3, 17);
         final int[] prematureReads = {0};
         InputStream fragment = new InputStream() {
             private boolean headerByteRead;
@@ -971,9 +971,9 @@ public class TcpServerRegressionTest {
             }
         };
         set(partialSender, "in", new DataInputStream(fragment));
-        eliminate(victim, 11);
+        eliminate(victim, 17);
         assertEquals(0, prematureReads[0]);
-        assertEquals(1, server.getScore((byte) 11).points);
+        assertEquals(1, server.getScore((byte) 17).points);
     }
 
     @Test

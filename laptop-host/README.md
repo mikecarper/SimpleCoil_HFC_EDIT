@@ -4,7 +4,7 @@
 keeps the game authority and live display on a laptop; players still use the
 Android app and their BLE laser-tag hardware.
 
-It speaks the existing protocol-15 TCP lobby, clock synchronization, GPS,
+It speaks the protocol-18 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
 
@@ -16,6 +16,22 @@ run this from the repository root:
 ```bash
 ./laptop-host/run.sh
 ```
+
+For Balanced Random teams, start the laptop with `--balanced-qr` to require
+each player to scan the assigned Team 1 or Team 2 QR, or `--balanced-no-qr` to
+start the 10-second countdown as soon as teams are assigned. The laptop uses
+the prior kills and deaths reported by each phone and keeps team sizes within
+two players. The dashboard Start button assigns teams; QR mode starts
+automatically after the last check-in. These options also work with `--takeover`.
+If a player does not scan, QR mode starts the same 10-second countdown after
+90 seconds; that player stays on their assigned team.
+
+For Boss Mode, run `./laptop-host/run.sh --boss`. Player 1 is the boss and all
+other player IDs are hunters. The roster freezes when the round starts. Hunters
+have 2 health, 3 shields, 30 rounds, and locked single-shot fire. The boss has
+5 health and 10 shields plus 1 health and 2 shields for every hunter, carries
+120 rounds, starts in automatic, and may switch between single, burst, and
+automatic fire. Shields do not regenerate in this mode.
 
 The launcher prints each usable laptop IPv4 address. On every phone, use
 **Join Game** and enter that address. The app's normal UDP join step and TCP
@@ -54,14 +70,15 @@ because the local dashboard intentionally has no login prompt.
 
 ```bash
 ./laptop-host/run.sh --teams 2 --duration-minutes 20 --score-limit 50
-./laptop-host/run.sh --tournament
 ./laptop-host/run.sh --no-late-join --no-browser
 ./laptop-host/run.sh --takeover
+./laptop-host/run.sh --boss
 ```
 
 Run `./laptop-host/run.sh --help` for every option. Keep the default TCP and
-UDP ports for stock SimpleCoil phones. Tournament mode locks the existing
-two-team, shared-health, single-shot ruleset.
+UDP ports for stock SimpleCoil phones. Tournament mode is always enabled and
+locks the two-team health, ammunition, reload, damage, recoil, and single-shot
+rules. `--tournament` remains accepted only for compatibility with old scripts.
 
 ## GPS and laser display
 

@@ -163,40 +163,34 @@ public class DedicatedServerRegressionTest {
     }
 
     @Test
-    public void retainedServerOnlyPolicyCanBeDisabledWithOneClickAndEnabledAgain() {
+    public void tournamentPolicyCannotBeDisabledFromHostControls() {
         scenario.onActivity(current -> {
             Switch control = current.findViewById(R.id.only_server_settings_switch);
             control.performClick();
-            assertFalse("One click should disable the retained policy", Globals.getInstance().mOnlyServerSettings);
-            assertFalse(control.isChecked());
-            assertEquals(1, tcp.gameInfoUpdates);
-            control.performClick();
             assertTrue(Globals.getInstance().mOnlyServerSettings);
             assertTrue(control.isChecked());
-            assertEquals(2, tcp.gameInfoUpdates);
+            assertFalse(control.isEnabled());
+            assertEquals(0, tcp.gameInfoUpdates);
         });
     }
 
     @Test
-    public void tournamentSwitchLocksTwoTeamsAndRestoresTheHostPolicyWhenTurnedOff() {
+    public void tournamentRulesAreEnabledAndCannotBeTurnedOff() {
         scenario.onActivity(current -> {
             Switch tournament = current.findViewById(R.id.tournament_mode_switch);
             Switch serverOnly = current.findViewById(R.id.only_server_settings_switch);
-            tournament.performClick();
 
             assertTrue(Globals.getInstance().mTournamentMode);
             assertEquals(Globals.GAME_MODE_2TEAMS, Globals.getInstance().mGameMode);
             assertFalse(Globals.getInstance().mAllowPlayerSettings);
             assertTrue(Globals.getInstance().mOnlyServerSettings);
             assertFalse("Tournament rules must prevent a later settings-policy edit", serverOnly.isEnabled());
+            assertFalse("Tournament mode itself must not be switchable", tournament.isEnabled());
+            assertTrue(tournament.isChecked());
             assertEquals(current.getString(R.string.game_mode_tournament_2teams),
                     ((Button) current.findViewById(R.id.game_mode_toggle_button)).getText().toString());
-
-            tournament.performClick();
-            assertFalse(Globals.getInstance().mTournamentMode);
-            assertTrue(Globals.getInstance().mAllowPlayerSettings);
-            assertTrue(Globals.getInstance().mOnlyServerSettings);
-            assertTrue(serverOnly.isEnabled());
+            assertTrue("The lobby must allow selecting the locked Boss variant",
+                    current.findViewById(R.id.game_mode_toggle_button).isEnabled());
         });
     }
 

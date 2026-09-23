@@ -45,9 +45,11 @@ import java.net.Socket;
 import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
@@ -898,11 +900,22 @@ public class TcpClient extends Service {
         }
     }
 
+    public void sendBalancedCheckIn() {
+        try {
+            JSONObject checkIn = new JSONObject().put(TcpServer.JSON_BALANCED_CHECKIN, true);
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + checkIn);
+        } catch (JSONException e) {
+            Log.w(TAG, "Unable to send balanced team check-in", e);
+        }
+    }
+
     private void sendPlayerInfo(boolean rejoin) {
         try {
             JSONObject playerInfo = new JSONObject();
             playerInfo.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
             playerInfo.put(TcpServer.JSON_PLAYERNAME, Globals.getInstance().mPlayerName);
+            playerInfo.put(TcpServer.JSON_PRIOR_KILLS, PlayerHistory.kills(this));
+            playerInfo.put(TcpServer.JSON_PRIOR_DEATHS, PlayerHistory.deaths(this));
             if (rejoin) {
                 Log.d(TAG, "Attempting to rejoin server");
                 playerInfo.put(TcpServer.JSON_REJOIN, true);
@@ -1255,8 +1268,16 @@ public class TcpClient extends Service {
             Map<Byte, Globals.PlayerSettings> settingsUpdate = null;
             boolean allowPlayerSettings = false;
             final boolean tournamentModeSpecified = game.has(TcpServer.JSON_TOURNAMENT_MODE);
-            final boolean tournamentMode = tournamentModeSpecified
+            final boolean advertisedTournamentMode = tournamentModeSpecified
                     && TcpJson.getBoolean(game, TcpServer.JSON_TOURNAMENT_MODE);
+            final boolean tournamentMode = Globals.TOURNAMENT_RULES_REQUIRED
+                    || advertisedTournamentMode;
+            if (Globals.TOURNAMENT_RULES_REQUIRED && !advertisedTournamentMode)
+                throw new JSONException("Server does not enforce the required tournament rules");
+            final boolean bossMode = game.has(TcpServer.JSON_BOSS_MODE)
+                    && TcpJson.getBoolean(game, TcpServer.JSON_BOSS_MODE);
+            if (bossMode && !tournamentMode)
+                throw new JSONException("Boss mode requires tournament weapon rules");
             final Boolean onlyServerSettingsUpdate = game.has(TcpServer.JSON_ONLY_SERVER_SETTINGS)
                     ? TcpJson.getBoolean(game, TcpServer.JSON_ONLY_SERVER_SETTINGS) : null;
             if (game.has(TcpServer.JSON_PLAYERSETTINGS)) {
@@ -1309,6 +1330,12 @@ public class TcpClient extends Service {
                 Map<Byte, InetAddress> teamIPs = new HashMap<>();
                 Map<InetAddress, Byte> ipTeams = new HashMap<>();
                 Map<Byte, String> playerNames = new HashMap<>();
+                Map<Byte, Integer> balancedTeams = new HashMap<>();
+                Set<Byte> balancedCheckedIn = new HashSet<>();
+                boolean balancedMode = game.has(TcpServer.JSON_BALANCED_MODE)
+                        && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_MODE);
+                boolean balancedQr = game.has(TcpServer.JSON_BALANCED_QR)
+                        && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_QR);
                 JSONArray players = game.getJSONArray(TcpServer.JSON_PLAYERS);
                 if (players.length() > Globals.MAX_PLAYER_ID)
                     throw new JSONException("Too many players in roster snapshot");
@@ -1322,6 +1349,14 @@ public class TcpClient extends Service {
                         throw new JSONException("Conflicting player roster snapshot");
                     seenPlayers[rawPlayerID] = true;
                     byte playerID = (byte) rawPlayerID;
+                    if (player.has(TcpServer.JSON_TEAM)) {
+                        int assignedTeam = TcpJson.getInt(player, TcpServer.JSON_TEAM);
+                        if (!balancedMode || assignedTeam < 1 || assignedTeam > 2)
+                            throw new JSONException("Invalid balanced team assignment");
+                        balancedTeams.put(playerID, assignedTeam);
+                        if (TcpJson.getBoolean(player, TcpServer.JSON_BALANCED_CHECKIN))
+                            balancedCheckedIn.add(playerID);
+                    }
                     if (playerID != Globals.getInstance().mPlayerID) {
                         InetAddress playerIP;
                         String ip = player.getString(TcpServer.JSON_PLAYERIP);
@@ -1381,6 +1416,12 @@ public class TcpClient extends Service {
                     Log.w(TAG, "Ignoring invalid game mode from server: " + gameMode);
                     gameMode = globals.mGameMode;
                 }
+                if (balancedMode && gameMode != Globals.GAME_MODE_2TEAMS)
+                    throw new JSONException("Balanced random requires two teams");
+                if (bossMode && balancedMode)
+                    throw new JSONException("Boss mode cannot use balanced team assignment");
+                if (!balancedTeams.isEmpty() && balancedTeams.size() != players.length())
+                    throw new JSONException("Incomplete balanced team assignment");
                 boolean useGPS = game.has(TcpServer.JSON_USEGPS);
                 int gpsMode = globals.mGPSMode;
                 if (useGPS) {
@@ -1455,8 +1496,8 @@ public class TcpClient extends Service {
                                     if (!isCurrentSession(generation))
                                         return;
                                     globals.mTournamentMode = tournamentMode;
-                                    if (tournamentMode)
-                                        globals.applyTournamentRules();
+                                    globals.mBossMode = bossMode;
+                                    globals.applyTournamentRules();
                                     if (settingsUpdate != null)
                                         applyPlayerSettingsLocked(settingsUpdate, allowPlayerSettings);
                                     globals.mTeamIPMap.clear();
@@ -1469,10 +1510,15 @@ public class TcpClient extends Service {
                                     globals.mTimeLimit = timeLimit;
                                     globals.mLivesLimit = livesLimit;
                                     globals.mScoreLimit = scoreLimit;
-                                    globals.mGameMode = gameMode;
+                                    globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+                                    globals.mBalancedRandom = balancedMode;
+                                    globals.mBalancedRequireQr = balancedQr;
+                                    globals.setBalancedAssignments(balancedTeams, balancedCheckedIn);
                                     globals.mUseGPS = useGPS;
                                     globals.mGPSMode = gpsMode;
                                     globals.mOnlyServerSettings = onlyServerSettings;
+                                    // Boss health and shields scale from this newly installed roster.
+                                    globals.applyTournamentRules();
                                     mIsDedicatedServer = dedicatedServer;
                                 }
                             } finally {
@@ -1498,16 +1544,13 @@ public class TcpClient extends Service {
                             return;
                         if (tournamentModeSpecified) {
                             Globals.getInstance().mTournamentMode = tournamentMode;
-                            if (tournamentMode) {
-                                Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
-                                Globals.getInstance().mOnlyServerSettings = true;
-                                Globals.getInstance().applyTournamentRules();
-                                allowPlayerSettings = false;
-                            } else if (onlyServerSettingsUpdate != null) {
-                                Globals.getInstance().mOnlyServerSettings = onlyServerSettingsUpdate;
-                            }
+                            Globals.getInstance().mBossMode = bossMode;
+                            Globals.getInstance().applyTournamentRules();
+                            allowPlayerSettings = false;
                         } else if (onlyServerSettingsUpdate != null) {
-                            Globals.getInstance().mOnlyServerSettings = onlyServerSettingsUpdate;
+                            Globals.getInstance().mBossMode = bossMode;
+                            Globals.getInstance().applyTournamentRules();
+                            allowPlayerSettings = false;
                         }
                         applyPlayerSettingsLocked(settingsUpdate, allowPlayerSettings);
                     }
@@ -1537,11 +1580,24 @@ public class TcpClient extends Service {
         globals.mPlayerSettings.clear();
         globals.mPlayerSettings.putAll(settings);
         if (globals.mTournamentMode) {
-            for (Globals.PlayerSettings playerSettings : globals.mPlayerSettings.values())
-                Globals.applyTournamentRules(playerSettings);
+            int bossHunterCount = -1;
+            if (globals.mBossMode) {
+                Globals.PlayerSettings boss = globals.mPlayerSettings.get(Globals.BOSS_PLAYER_ID);
+                if (boss != null)
+                    bossHunterCount = Math.max(0, Math.min(Globals.MAX_PLAYER_ID - 1,
+                            boss.health - Globals.BOSS_BASE_HEALTH));
+            }
+            globals.mBossHunterCount = bossHunterCount;
+            for (Map.Entry<Byte, Globals.PlayerSettings> entry : globals.mPlayerSettings.entrySet()) {
+                Globals.applyTournamentRules(entry.getValue());
+                if (globals.mBossMode)
+                    Globals.applyBossHealth(entry.getValue(), entry.getKey(),
+                            Math.max(0, bossHunterCount));
+            }
             globals.applyTournamentRules();
             return;
         }
+        globals.mBossHunterCount = -1;
         Globals.PlayerSettings local = settings.get(globals.mPlayerID);
         if (local != null) {
             globals.mFullHealth = local.health;
