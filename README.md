@@ -28,18 +28,32 @@ system clock and does not use a public NTP server.
 - The network-offset target is below 50 ms on a healthy local network. Wi-Fi
   congestion, device suspension, and normal UI scheduling can still affect the
   moment a device visibly reacts.
-- All participants must use network protocol 18 (this build). Older protocol
+- All participants must use network protocol 19 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
-During a peer game, each phone sends one subnet-directed IPv4 broadcast instead
-of one unicast packet per player. The fixed 1,312-byte protocol-18 snapshot fits
-32 player records below the 1,472-byte UDP payload ceiling and avoids normal
-IPv4 fragmentation. Each record carries cumulative score/deaths, health,
-shield, shots, player state, grenade pairing, a deduplicated important event,
-and GPS rounded to 0.00001 degrees (about one metre). A one-second heartbeat
-repeats the complete state view so dropped datagrams repair themselves. Names,
-addresses, and other bulky mappings remain in TCP lobby setup. Android holds
-Wi-Fi performance and multicast locks only while gameplay is active.
+During every network game, each phone sends one subnet-directed IPv4 state
+broadcast per second instead of one unicast packet per player. The fixed
+1,312-byte protocol-19 snapshot fits 32 player records below the 1,472-byte UDP
+payload ceiling and avoids normal IPv4 fragmentation. Each record carries
+cumulative score/deaths,
+health, shield, shots, player state, grenade pairing, a deduplicated important
+event, and GPS rounded to 0.00001 degrees (about one metre). Everyone caches
+the newer player rows they hear. The host still publishes an authoritative tick
+every second; after a missing tick's 20% grace window (200 ms), a phone fills
+only newer portions of that tick from its overheard cache. Late or stale data
+cannot roll state back. Names, addresses, and other bulky mappings remain in
+TCP lobby setup. Android holds Wi-Fi performance and multicast locks only while
+gameplay is active.
+
+Combat feedback does not wait for that one-second state cadence. `HIT`, `OUT`,
+`ALREADY DEAD`, and elimination use a 32-byte subnet broadcast that every phone
+can overhear. Only the addressed phone returns a 32-byte unicast ACK, avoiding
+an ACK storm with 32 players. If needed, retries at 20 ms and 60 ms are unicast
+only to that target and stop as soon as its ACK arrives, for a hard ceiling of
+three sends; duplicate events are ACKed but applied only once. Combat uses its
+own bounded sender so a hit cannot sit behind a full 32-phone authority
+fan-out. Untargeted shot feedback is sent once, while the cumulative one-second
+snapshots remain the final repair path for a completely missed combat burst.
 
 ## Player capacity and hosting
 
@@ -82,7 +96,7 @@ While a QR check-in is pending, the phone repeats the assigned team number in
 its spoken scan reminder. Respawn QR reminders also say the player's team.
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-18 host automatically
+team before starting. If an ID conflicts, a protocol-19 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and

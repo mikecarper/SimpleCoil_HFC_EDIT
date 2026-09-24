@@ -7,10 +7,13 @@ import android.content.BroadcastReceiver;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.widget.PopupMenu;
 import android.widget.TextView;
 
+import androidx.appcompat.app.AlertDialog;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.test.platform.app.InstrumentationRegistry;
 
 import org.junit.After;
 import org.junit.Before;
@@ -190,6 +193,78 @@ public class BluetoothLifecycleRegressionTest {
     }
 
     @Test
+    public void connectedBlasterPromptsForHeldTriggerIfTelemetryIsStillMissing() {
+        scenario.onActivity(current -> {
+            set("mGattReceiverRegistered", true);
+            ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(current,
+                    new Intent(BluetoothLeService.ACTION_GATT_CONNECTED));
+            Runnable hint = (Runnable) get("mWeaponSyncTriggerHintRunnable");
+            assertTrue(hint != null);
+            assertFalse((boolean) get("mCommunicating"));
+
+            hint.run(); // Simulate the two-second delayed callback.
+
+            assertEquals(current.getString(R.string.connect_status_hold_trigger),
+                    status().getText().toString());
+            assertTrue((boolean) get("mWeaponSyncTriggerHintShown"));
+            ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(current,
+                    new Intent(BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED));
+            assertEquals(current.getString(R.string.connect_status_hold_trigger),
+                    status().getText().toString());
+        });
+    }
+
+    @Test
+    public void telemetryBeforeTheDelayPreventsTheTriggerPrompt() {
+        scenario.onActivity(current -> {
+            set("mGattReceiverRegistered", true);
+            ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(current,
+                    new Intent(BluetoothLeService.ACTION_GATT_CONNECTED));
+            Runnable hint = (Runnable) get("mWeaponSyncTriggerHintRunnable");
+            set("mCommunicating", true);
+
+            hint.run();
+
+            assertEquals(current.getString(R.string.connect_status_communicating),
+                    status().getText().toString());
+            assertFalse((boolean) get("mWeaponSyncTriggerHintShown"));
+        });
+    }
+
+    @Test
+    public void startWizardAppearsOnlyOnceAfterWeaponIsCommunicating() {
+        scenario.onActivity(current -> {
+            set("mCommunicating", false);
+            invoke("maybeShowStartWizard");
+            assertNull(get("mStartWizardDialog"));
+
+            set("mCommunicating", true);
+            invoke("maybeShowStartWizard");
+            AlertDialog wizard = (AlertDialog) get("mStartWizardDialog");
+            assertTrue(wizard.isShowing());
+            assertEquals(2, wizard.getListView().getCount());
+            wizard.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+        });
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        scenario.onActivity(current -> {
+            invoke("maybeShowStartWizard");
+            assertNull(get("mStartWizardDialog"));
+        });
+    }
+
+    @Test
+    public void lobbyHostCanChangeModeButJoinedPlayerCannot() {
+        scenario.onActivity(current -> {
+            PopupMenu menu = new PopupMenu(current, current.findViewById(R.id.use_network_button));
+            set("mNetworkPopup", menu);
+            invokeNetworkMenu(4); // Hosting a lobby.
+            assertTrue(menu.getMenu().findItem(R.id.game_mode_item) != null);
+            invokeNetworkMenu(3); // Joined as a player.
+            assertNull(menu.getMenu().findItem(R.id.game_mode_item));
+        });
+    }
+
+    @Test
     public void destroyingActivityDismissesTheWeaponDisconnectDialog() {
         scenario.onActivity(current -> {
             invoke("showWeaponDisconnect");
@@ -304,6 +379,14 @@ public class BluetoothLifecycleRegressionTest {
             Method method = FullscreenActivity.class.getDeclaredMethod(name);
             method.setAccessible(true);
             return method.invoke(activity);
+        } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
+    }
+
+    private void invokeNetworkMenu(int state) {
+        try {
+            Method method = FullscreenActivity.class.getDeclaredMethod("setNetworkMenu", int.class);
+            method.setAccessible(true);
+            method.invoke(activity, state);
         } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
     }
 

@@ -37,6 +37,7 @@ import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.drawable.AnimationDrawable;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
@@ -99,11 +100,13 @@ import org.json.JSONObject;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -159,11 +162,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private TextView mEliminatedTV = null;
     private TextView mSpawnInTV = null;
     private TextView mEliminatedByTV = null;
-    private Button mRespawnQrScanButton = null;
     private View mRespawnQrScannerOverlay = null;
     private DecoratedBarcodeView mRespawnQrScanner = null;
     private TextView mRespawnQrScannerPrompt = null;
-    private Button mRespawnQrWaitButton = null;
+    private Button mQrScannerCancelButton = null;
     private TextView mHealthLabelTV = null;
     private TextView mPlayerNameTV = null;
     private ProgressBar mHealthBar = null;
@@ -196,11 +198,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private CountDownTimer mSpawnTimer = null;
     private CountDownTimer mReloadTimer = null;
     private CountDownTimer mShieldTimer = null;
+    private CountDownTimer mRespawnShieldBoostTimer = null;
     private CountDownTimer mGameCountdownTimer = null;
     private CountDownTimer mConnectFailTimer = null;
     private CountDownTimer mGameInviteTimer = null;
     private CountDownTimer mQuitGameTimer = null;
     private AlertDialog mGameInviteDialog = null;
+    private AlertDialog mStartWizardDialog = null;
+    private boolean mStartWizardShown;
+    private boolean mWizardUsesHub = true;
+    private boolean mWizardIndoor;
+    private boolean mWizardBoss;
+    private boolean mUseHubAutoJoin = true;
     private String mPendingGameInviteID;
     private String mDismissedGameInviteID;
     private long mDismissedGameInviteUntil;
@@ -238,6 +247,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final long SHIELD_REGEN_DELAY_MILLISECONDS = 4000;
     private static final long SHIELD_REGEN_TICK_MILLISECONDS = 1000;
     private static final int SHIELD_REGEN_TICK_AMOUNT = 1;
+    private static final long RESPAWN_SHIELD_BOOST_MILLISECONDS = 5000;
 
     private boolean mScanning = false;
     private volatile boolean mConnected = false;
@@ -249,12 +259,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final long NEW_WEAPON_DISCOVERY_WINDOW_MS = 3_000L;
     private static final long NEW_WEAPON_TRIGGER_PROBE_TIMEOUT_MS = 6_000L;
     private static final long NEW_WEAPON_TRIGGER_RETRY_DELAY_MS = 500L;
+    private static final long WEAPON_SYNC_TRIGGER_HINT_DELAY_MS = 2_000L;
     private final Handler mWeaponPairingHandler = new Handler(Looper.getMainLooper());
     private final ArrayList<WeaponCandidate> mNewWeaponCandidates = new ArrayList<>();
     private Runnable mNewWeaponDiscoveryRunnable;
     private Runnable mTriggerProbeConnectRunnable;
     private Runnable mTriggerProbeTimeoutRunnable;
     private Runnable mTriggerProbeRetryRunnable;
+    private Runnable mWeaponSyncTriggerHintRunnable;
+    private boolean mWeaponSyncTriggerHintShown;
     private boolean mCollectingNewWeaponCandidates;
     private boolean mTriggerPairingActive;
     private int mTriggerProbeIndex = -1;
@@ -270,6 +283,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private int mHitsTaken = 0; // total hits taken regardless of lives
     private static int mHealth = Globals.MAX_HEALTH;
     private static int mShield = Globals.MAX_SHIELDS;
+    private int mRespawnShieldBonus;
     private byte mLastShotCount = 0;
     private byte mLastTriggerCount = 0;
     private byte mLastReloadButtonCount = 0;
@@ -341,10 +355,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private volatile TextToSpeech mCountdownSpeech;
     private volatile boolean mCountdownSpeechReady;
     private volatile int mLastSpokenGameStartSecond = Integer.MAX_VALUE;
+    private final ArrayDeque<Integer> mPendingVoicePrompts = new ArrayDeque<>();
+    private final KillStreakVoice mKillStreakVoice = new KillStreakVoice(new Random());
+    private long mNextGameStartAllowedAt;
     private volatile boolean mRespawnQrVoiceReminderActive;
     private static final int GAME_START_VOICE_COUNTDOWN_SECONDS = 10;
     private static final long SYNCHRONIZED_COUNTDOWN_TICK_MS = 100;
     private static final String GAME_START_COUNTDOWN_UTTERANCE_ID = "simplecoil-game-start";
+    private static final String ROUND_START_UTTERANCE_ID = "simplecoil-round-start";
+    private static final String ROUND_END_UTTERANCE_ID = "simplecoil-round-end";
+    private static final String KILL_STREAK_UTTERANCE_ID = "simplecoil-kill-streak";
     private static final String ENEMY_DESTROYED_UTTERANCE_ID = "simplecoil-enemy-destroyed";
     private static final long RESPAWN_QR_VOICE_REMINDER_INTERVAL_MS = 5_000;
     private static final String RESPAWN_QR_VOICE_REMINDER_UTTERANCE_ID = "simplecoil-respawn-qr";
@@ -842,7 +862,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     /** Keep an idle, foreground player available for a nearby host invitation. */
     private void startGameInviteListening() {
-        if (mUDPListenerService != null && !mReady && !mIsServer
+        if (mUDPListenerService != null && mUseNetwork && !mReady && !mIsServer
                 && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
             mUDPListenerService.startGameInviteListener();
     }
@@ -859,6 +879,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
      * Android reports Wi-Fi connected instead of requiring another tap.
      */
     private void requestNetworkOptions() {
+        mUseHubAutoJoin = true;
         if (isWifiConnected()) {
             cancelNetworkOptionsWifiWait();
             showNetworkOptionsPopup();
@@ -922,13 +943,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mUseNetworkingButton.setText(R.string.network_menu_button);
             displayAllNetworkingOptions(true);
             setNetworkMenu(NETWORK_TYPE_ENABLED);
+            startGameInviteListening();
         }
         mNetworkPopup.show();
         setTeam();
     }
 
     private void showGameInvite(Intent invite) {
-        if (invite == null || !mActivityResumed || mReady || mIsServer
+        if (invite == null || !mUseNetwork || !mActivityResumed || mReady || mIsServer
                 || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             return;
         String serverAddress = invite.getStringExtra(UDPListenerService.INTENT_SERVERIP);
@@ -981,7 +1003,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     /** Immediately join a nearby peer lobby announced while this player is idle. */
     private void joinNearbyLobby(Intent invite) {
-        if (invite == null || !mActivityResumed || mReady || mIsServer
+        if (invite == null || !mUseNetwork || !mActivityResumed || mReady || mIsServer
                 || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             return;
         String serverAddress = invite.getStringExtra(UDPListenerService.INTENT_SERVERIP);
@@ -1070,7 +1092,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mGameInviteDialog != dialog)
             return;
         dismissGameInvite(dialog, inviteID, false);
-        if (isFinishing() || isDestroyed() || !mActivityResumed || mReady || mIsServer
+        if (isFinishing() || isDestroyed() || !mUseNetwork || !mActivityResumed || mReady || mIsServer
                 || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             return;
         if (mUDPListenerService == null || mTcpClient == null || !isWifiConnected()) {
@@ -1163,11 +1185,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 : Math.max(0, mEliminationCount);
     }
 
-    /** Refresh the local row carried by every protocol-18 peer snapshot. */
+    /** Refresh the local row carried by every protocol-19 redundant snapshot. */
     private void publishPeerRuntimeState() {
-        if (mUDPListenerService != null && mUseNetwork && !isDedicatedServerConnection())
+        if (mUDPListenerService != null && mUseNetwork)
             mUDPListenerService.updatePeerRuntimeState(mScore, currentDeathCount(), mHealth,
-                    mShield, mLastShotCount & 0xff, Globals.getInstance().mGameState);
+                    mShield + mRespawnShieldBonus, mLastShotCount & 0xff,
+                    Globals.getInstance().mGameState);
     }
 
     private void endUDPGame() {
@@ -1289,6 +1312,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         createPeerLobbyIfNeeded();
                         return;
                     }
+                    if (showGameStartWaitIfNeeded())
+                        return;
                     if (Globals.getInstance().mBalancedRandom && !mIsServer) {
                         Toast.makeText(getApplicationContext(), R.string.balanced_waiting_for_checkin,
                                 Toast.LENGTH_SHORT).show();
@@ -1325,8 +1350,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         mTcpServer.startGame();
                     else
                         mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_STARTGAME);
-                } else
+                } else {
+                    if (showGameStartWaitIfNeeded())
+                        return;
                     startGame();
+                }
             }));
         }
         mPlayerSettingsButton = findViewById(R.id.player_settings_button);
@@ -1365,18 +1393,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mEliminatedTV = findViewById(R.id.eliminated_tv);
         mEliminatedByTV = findViewById(R.id.eliminated_by_tv);
         mSpawnInTV = findViewById(R.id.spawn_countdown_tv);
-        mRespawnQrScanButton = findViewById(R.id.respawn_qr_scan_button);
-        if (mRespawnQrScanButton != null)
-            mRespawnQrScanButton.setOnClickListener(v -> openRespawnQrScanner());
         mRespawnQrScannerOverlay = findViewById(R.id.respawn_qr_scanner_overlay);
         mRespawnQrScanner = findViewById(R.id.respawn_qr_scanner);
         mRespawnQrScannerPrompt = findViewById(R.id.respawn_qr_scanner_prompt);
-        mRespawnQrWaitButton = findViewById(R.id.respawn_qr_wait_button);
+        mQrScannerCancelButton = findViewById(R.id.qr_scanner_cancel_button);
         if (mRespawnQrScanner != null)
             mRespawnQrScanner.getBarcodeView().setDecoderFactory(
                     new DefaultDecoderFactory(Collections.singletonList(BarcodeFormat.QR_CODE)));
-        if (mRespawnQrWaitButton != null)
-            mRespawnQrWaitButton.setOnClickListener(v -> hideQrScanner());
+        if (mQrScannerCancelButton != null)
+            mQrScannerCancelButton.setOnClickListener(v -> hideQrScanner());
         mHitIV = findViewById(R.id.hit_animation_iv);
         mIncomingHitFlashView = findViewById(R.id.incoming_hit_flash_view);
         mBatteryLevelIV = findViewById(R.id.battery_iv);
@@ -1384,7 +1409,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mFiringModeButton = findViewById(R.id.firing_mode_button);
         if (mFiringModeButton != null) {
             mFiringModeButton.setOnClickListener(v -> {
-                if (!isLocalBoss()) {
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
                     Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
                             Toast.LENGTH_SHORT).show();
                     return;
@@ -1392,6 +1417,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 PopupMenu popup = new PopupMenu(FullscreenActivity.this, v);
                 MenuInflater inflater = popup.getMenuInflater();
                 inflater.inflate(R.menu.firing_mode_menu, popup.getMenu());
+                popup.getMenu().findItem(R.id.firing_mode_outdoor_with_cone_item)
+                        .setVisible(isLocalBoss());
                 popup.setOnMenuItemClickListener(FullscreenActivity.this);
                 popup.show();
             });
@@ -1406,10 +1433,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         int savedPlayerID = readIntPreference(sharedPreferences, PREF_PLAYER_ID, 0);
         globals.mPlayerID = Globals.isValidPlayerID(savedPlayerID) ? (byte) savedPlayerID : 0;
         globals.mVibrateOnHit = readBooleanPreference(sharedPreferences,
-                PREF_VIBRATE_ON_HIT, false);
+                PREF_VIBRATE_ON_HIT, true);
         globals.mBossMode = readBooleanPreference(sharedPreferences, PREF_BOSS_MODE, false);
         globals.mBossHunterCount = -1;
         globals.applyTournamentRules();
+        // An older saved mode may be malformed or no longer allowed. Keep the
+        // stored profile consistent with the tournament mode used at runtime.
+        sharedPreferences.edit().putInt(PREF_GAME_MODE, globals.mGameMode).apply();
         globals.mBalancedRandom = false;
         globals.clearBalancedAssignments();
         applyBossWeaponRole();
@@ -1526,6 +1556,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mNetworkPopup.getMenu().add(0, R.id.cancel_server_item, 1, R.string.cancel_server_button);
                 mNetworkPopup.getMenu().add(0, R.id.player_name_item, 50,
                         getString(R.string.player_name_button, Globals.getInstance().mPlayerName));
+                if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
+                    mNetworkPopup.getMenu().add(0, R.id.game_mode_item, 60,
+                            R.string.game_mode_toggle_button);
                 break;
         }
     }
@@ -1537,6 +1570,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if(id == R.id.disable_network_item) {
                 displayAllNetworkingOptions(false);
                 mUseNetwork = false;
+                mUseHubAutoJoin = false;
+                if (mRecoilWifiAutoJoiner != null)
+                    mRecoilWifiAutoJoiner.stop();
+                if (mUDPListenerService != null)
+                    mUDPListenerService.stopListen();
                 mUseNetworkingButton.setText(R.string.use_network_button);
                 setTeam();
                 return true;
@@ -1606,20 +1644,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }else if (id == R.id.firing_mode_outdoor_no_cone_item
                     || id == R.id.firing_mode_outdoor_with_cone_item
                     || id == R.id.firing_mode_indoor_no_cone_item) {
-                if (!isLocalBoss()) {
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                        || (id == R.id.firing_mode_outdoor_with_cone_item && !isLocalBoss())) {
                     Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
                             Toast.LENGTH_SHORT).show();
                     return true;
                 }
-                Globals.getInstance().mCurrentFiringMode = id == R.id.firing_mode_outdoor_with_cone_item
+                int firingMode = id == R.id.firing_mode_outdoor_with_cone_item
                         ? Globals.FIRING_MODE_OUTDOOR_WITH_CONE
                         : id == R.id.firing_mode_indoor_no_cone_item
                         ? Globals.FIRING_MODE_INDOOR_NO_CONE
                         : Globals.FIRING_MODE_OUTDOOR_NO_CONE;
-                getFiringMode();
-                setShotMode(mCurrentShotMode);
-                sharedPreferences.edit().putInt(PREF_FIRING_MODE,
-                        Globals.getInstance().mCurrentFiringMode).apply();
+                selectFiringMode(firingMode);
                 return true;
             }else if (id == R.id.game_mode_tournament_item) {
                 setBossMode(false);
@@ -1687,7 +1723,121 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mCurrentShotMode = Globals.SHOT_MODE_SINGLE;
         mBossWeaponInitialized = localBoss;
         if (mFiringModeButton != null)
-            mFiringModeButton.setEnabled(localBoss);
+            mFiringModeButton.setEnabled(true);
+    }
+
+    private void selectFiringMode(int firingMode) {
+        Globals.getInstance().mCurrentFiringMode = firingMode;
+        getFiringMode();
+        setShotMode(mCurrentShotMode);
+        sharedPreferences.edit().putInt(PREF_FIRING_MODE, firingMode).apply();
+    }
+
+    private void maybeShowStartWizard() {
+        if (mStartWizardShown || !mActivityResumed || !mCommunicating || mReady
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                || isFinishing() || isDestroyed())
+            return;
+        mStartWizardShown = true;
+        mWizardUsesHub = mUseNetwork;
+        mWizardIndoor = Globals.getInstance().mCurrentFiringMode
+                == Globals.FIRING_MODE_INDOOR_NO_CONE;
+        mWizardBoss = Globals.getInstance().mBossMode;
+        showStartWizardStep(0);
+    }
+
+    private void showStartWizardStep(int step) {
+        if (isFinishing() || isDestroyed())
+            return;
+        final CharSequence[] choices;
+        final int title;
+        final int selected;
+        if (step == 0) {
+            title = R.string.start_wizard_hub_title;
+            choices = new CharSequence[] {getString(R.string.start_wizard_hub_yes),
+                    getString(R.string.start_wizard_hub_no)};
+            selected = mWizardUsesHub ? 0 : 1;
+        } else if (step == 1) {
+            title = R.string.start_wizard_range_title;
+            choices = new CharSequence[] {getString(R.string.start_wizard_outdoor),
+                    getString(R.string.start_wizard_indoor)};
+            selected = mWizardIndoor ? 1 : 0;
+        } else {
+            title = mWizardUsesHub ? R.string.start_wizard_mode_title
+                    : R.string.start_wizard_mode_no_hub_title;
+            choices = mWizardUsesHub
+                    ? new CharSequence[] {getString(R.string.game_mode_tournament_2teams),
+                            getString(R.string.game_mode_boss)}
+                    : new CharSequence[] {getString(R.string.game_mode_tournament_2teams)};
+            selected = mWizardUsesHub && mWizardBoss ? 1 : 0;
+        }
+        AlertDialog.Builder builder = new AlertDialog.Builder(this,
+                R.style.Theme_AppCompat_DayNight_Dialog_Alert)
+                .setTitle(title)
+                .setSingleChoiceItems(choices, selected, (dialog, which) -> {
+                    if (step == 0) mWizardUsesHub = which == 0;
+                    else if (step == 1) mWizardIndoor = which == 1;
+                    else mWizardBoss = which == 1;
+                })
+                .setPositiveButton(step == 2 ? R.string.start_wizard_finish
+                        : R.string.start_wizard_next, (dialog, which) -> {
+                    if (step == 2) finishStartWizard();
+                    else showStartWizardStep(step + 1);
+                })
+                .setNegativeButton(step == 0 ? R.string.start_wizard_skip
+                        : R.string.start_wizard_back, (dialog, which) -> {
+                    if (step > 0) showStartWizardStep(step - 1);
+                })
+                .setCancelable(false);
+        if (step > 0)
+            builder.setNeutralButton(R.string.start_wizard_skip, null);
+        AlertDialog dialog = builder.create();
+        mStartWizardDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (mStartWizardDialog == dialog)
+                mStartWizardDialog = null;
+        });
+        dialog.show();
+    }
+
+    private void finishStartWizard() {
+        if (mReady || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            return;
+        mUseNetwork = mWizardUsesHub;
+        mUseHubAutoJoin = mWizardUsesHub;
+        if (!mUseNetwork) {
+            if (mGameInviteDialog != null)
+                dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
+            if (mUDPListenerService != null)
+                mUDPListenerService.stopListen();
+        } else {
+            startGameInviteListening();
+        }
+        if (mUseHubAutoJoin && mRecoilWifiAutoJoiner != null)
+            mRecoilWifiAutoJoiner.scanAndJoinNow();
+        else if (mRecoilWifiAutoJoiner != null)
+            mRecoilWifiAutoJoiner.stop();
+        mUseNetworkingButton.setText(mUseNetwork ? R.string.network_menu_button
+                : R.string.use_network_button);
+        displayAllNetworkingOptions(mUseNetwork);
+        setNetworkMenu(NETWORK_TYPE_ENABLED);
+        setBossMode(mUseNetwork && mWizardBoss);
+        selectFiringMode(mWizardIndoor ? Globals.FIRING_MODE_INDOOR_NO_CONE
+                : Globals.FIRING_MODE_OUTDOOR_NO_CONE);
+        displayCurrentTeam();
+        AlertDialog dialog = new AlertDialog.Builder(this,
+                R.style.Theme_AppCompat_DayNight_Dialog_Alert)
+                .setTitle(R.string.start_wizard_ready_title)
+                .setMessage(mUseNetwork ? R.string.start_wizard_ready_hub
+                        : R.string.start_wizard_ready_local)
+                .setPositiveButton(R.string.ok, null)
+                .create();
+        mStartWizardDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (mStartWizardDialog == dialog)
+                mStartWizardDialog = null;
+        });
+        dialog.show();
     }
 
     private void setBossMode(boolean enabled) {
@@ -1697,17 +1847,23 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     Toast.LENGTH_SHORT).show();
             return;
         }
-        globals.mBossMode = enabled;
-        globals.mBossHunterCount = -1;
-        globals.mBalancedRandom = false;
-        globals.clearBalancedAssignments();
-        globals.applyTournamentRules();
+        if (mReady && mIsServer) {
+            if (mTcpServer == null || !mTcpServer.setBossMode(enabled)) {
+                Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.mBossMode = enabled;
+            globals.mBossHunterCount = -1;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.applyTournamentRules();
+        }
         sharedPreferences.edit().putBoolean(PREF_BOSS_MODE, enabled)
                 .putBoolean(PREF_BALANCED_MODE, false).apply();
         mBossWeaponInitialized = false;
         applyBossWeaponRole();
-        if (mTcpServer != null && mReady && mIsServer)
-            mTcpServer.setBossMode(enabled);
         updateGameModeDisplay();
         displayCurrentTeam();
         updatePlayerSettings();
@@ -2108,6 +2264,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void resetVitalStatBars() {
         cancelShieldRegeneration();
+        cancelRespawnShieldBoost();
 
         mHealth = Globals.getInstance().mFullHealth;
         mShield = Globals.getInstance().mFullShields;
@@ -2118,7 +2275,46 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void updateVitalStatBars() {
         mHealthBar.setProgress(mHealth);
-        mShieldBar.setProgress(mShield);
+        mShieldBar.setProgress(mShield + mRespawnShieldBonus);
+    }
+
+    private void cancelRespawnShieldBoost() {
+        if (mRespawnShieldBoostTimer != null) {
+            mRespawnShieldBoostTimer.cancel();
+            mRespawnShieldBoostTimer = null;
+        }
+        mRespawnShieldBonus = 0;
+        if (mShieldBar != null) {
+            mShieldBar.setMax(Globals.getInstance().mFullShields);
+            mShieldBar.setProgressTintList(ColorStateList.valueOf(
+                    ContextCompat.getColor(this, android.R.color.holo_blue_dark)));
+            updateVitalStatBars();
+        }
+    }
+
+    private void startRespawnShieldBoost() {
+        cancelRespawnShieldBoost();
+        mRespawnShieldBonus = (Math.max(0, Globals.getInstance().mFullShields) + 1) / 2;
+        if (mRespawnShieldBonus == 0)
+            return;
+        mShieldBar.setMax(Globals.getInstance().mFullShields + mRespawnShieldBonus);
+        mShieldBar.setProgressTintList(ColorStateList.valueOf(
+                ContextCompat.getColor(this, android.R.color.holo_orange_light)));
+        updateVitalStatBars();
+        mRespawnShieldBoostTimer = new CountDownTimer(RESPAWN_SHIELD_BOOST_MILLISECONDS,
+                RESPAWN_SHIELD_BOOST_MILLISECONDS) {
+            @Override public void onTick(long millisUntilFinished) {
+                // The bonus expires all at once after five seconds.
+            }
+
+            @Override public void onFinish() {
+                if (mRespawnShieldBoostTimer != this)
+                    return;
+                cancelRespawnShieldBoost();
+                publishPeerRuntimeState();
+            }
+        };
+        mRespawnShieldBoostTimer.start();
     }
 
     private void cancelShieldRegeneration() {
@@ -2166,6 +2362,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void showIncomingHitFeedback(byte hitByPlayerID) {
+        // Coalesce the visual flash, but buzz for every damaging hit.
+        vibrateOnHit();
         // A new hit does not need to restart an effect that is still bright on
         // screen. This keeps rapid-fire damage readable instead of flickering.
         if (mIncomingHitCleanup != null)
@@ -2182,7 +2380,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mHitAnimation = (AnimationDrawable) mHitIV.getBackground();
             mHitAnimation.start();
         }
-        vibrateOnHit();
         playSound(R.raw.hit);
         if (mEliminatedByTV != null) {
             mEliminatedByTV.setVisibility(View.VISIBLE);
@@ -2284,13 +2481,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private boolean survivesDamage(int damage) {
-        return mHealth + mShield + damage > 0;
+        return mHealth + mShield + mRespawnShieldBonus + damage > 0;
     }
 
     private void takeDamage(int damage) {
-        int shieldDamage = Math.min(mShield, Math.max(0, -damage));
+        int remainingDamage = Math.max(0, -damage);
+        int bonusDamage = Math.min(mRespawnShieldBonus, remainingDamage);
+        mRespawnShieldBonus -= bonusDamage;
+        remainingDamage -= bonusDamage;
+        int shieldDamage = Math.min(mShield, remainingDamage);
         mShield -= shieldDamage;
-        mHealth = Math.max(0, mHealth + damage + shieldDamage);
+        remainingDamage -= shieldDamage;
+        mHealth = Math.max(0, mHealth + Math.max(0, damage) - remainingDamage);
         updateVitalStatBars();
         publishPeerRuntimeState();
         if (!Globals.getInstance().mBossMode)
@@ -2319,6 +2521,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void startGame() { startGame(null); }
 
     private void startGame(Intent start) {
+        long waitRemaining = Math.max(0, mNextGameStartAllowedAt - SystemClock.elapsedRealtime());
+        long scheduledStart = start == null ? 0 : start.getLongExtra(NetMsg.INTENT_START_AT, 0);
+        if (waitRemaining > 0 && scheduledStart < mNextGameStartAllowedAt) {
+            Log.w(TAG, "Ignoring a game start during the 30-second cooldown");
+            return;
+        }
         if (mUseNetwork && !networkServicesReady()) {
             Log.w(TAG, "Ignoring game start before network services are ready");
             return;
@@ -2356,6 +2564,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         // Refresh the local team before any score or friendly-fire path uses it.
         displayCurrentTeam();
         resetRoundTelemetryState();
+        mKillStreakVoice.resetStreak();
         clearCombatFeedback();
         setGameVolumeToMaximum();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -2383,8 +2592,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             // Install the UI-side token immediately before changing the
             // listener's round. This keeps the two checks adjacent while
             // still allowing the first accepted current-round event through.
-            mActivePeerRoundToken = peerGame ? peerRoundToken : null;
-            mUDPListenerService.startGame(peerGame, peerRoundToken);
+            // Protocol 19 uses the round token for both peer and dedicated
+            // UDP state ticks. Keep it so tokened recovery updates from a
+            // dedicated host are not mistaken for stale peer-round events.
+            mActivePeerRoundToken = TcpServer.isValidRoundToken(peerRoundToken)
+                    ? peerRoundToken : null;
+            mUDPListenerService.startGame(peerGame, peerRoundToken, peerGame && mIsServer);
             if (!mTcpClient.isDedicatedServer())
                 mTcpClient.stopTcpClient();
         } else {
@@ -2589,7 +2802,40 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
     }
 
+    private boolean showGameStartWaitIfNeeded() {
+        long remaining = Math.max(0, mNextGameStartAllowedAt - SystemClock.elapsedRealtime());
+        if (remaining == 0)
+            return false;
+        Toast.makeText(getApplicationContext(), getString(R.string.next_game_wait,
+                (remaining + 999) / 1000), Toast.LENGTH_SHORT).show();
+        return true;
+    }
+
+    private GameOutcome.Result completedRoundOutcome() {
+        if (mHasLivesLimit && mEliminationCount <= 0)
+            return GameOutcome.Result.LOST;
+        Globals globals = Globals.getInstance();
+        if (mUseNetwork && mUDPListenerService != null) {
+            GameOutcome.Result result = GameOutcome.result(globals, globals.mPlayerID, mScore, mTeamScore,
+                    mUDPListenerService.getRoundScoresSnapshot());
+            if (result != GameOutcome.Result.UNKNOWN)
+                return result;
+        }
+        if ((globals.mGameLimit & Globals.GAME_LIMIT_SCORE) != 0 && globals.mScoreLimit > 0)
+            return (globals.mGameMode == Globals.GAME_MODE_FFA ? mScore : mTeamScore)
+                    >= globals.mScoreLimit ? GameOutcome.Result.WON : GameOutcome.Result.LOST;
+        // An offline game has no opposing scoreboard. Survival is its result.
+        return mHealth > 0 ? GameOutcome.Result.WON : GameOutcome.Result.LOST;
+    }
+
     private void endGame() {
+        boolean completedRound = Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                && !mStartGameTimer;
+        GameOutcome.Result roundOutcome = completedRound ? completedRoundOutcome()
+                : GameOutcome.Result.UNKNOWN;
+        if (completedRound)
+            mNextGameStartAllowedAt = Math.max(mNextGameStartAllowedAt,
+                    SystemClock.elapsedRealtime() + Globals.NEXT_GAME_WAIT_MILLISECONDS);
         if (mUseNetwork && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
             int deaths = mHasLivesLimit ? Math.max(0, mLives - mEliminationCount)
                     : Math.max(0, mEliminationCount);
@@ -2651,6 +2897,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mGameCountdownTimer = null;
         }
         cancelShieldRegeneration();
+        cancelRespawnShieldBoost();
         mStartGameButton.setVisibility(View.VISIBLE);
         mPlayerSettingsButton.setVisibility(View.VISIBLE);
         mTeamMinusButton.setVisibility(View.VISIBLE);
@@ -2678,6 +2925,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mFiringModeButton.setVisibility(View.VISIBLE);
         mGameLimitButton.setVisibility(View.VISIBLE);
         setNetworkMenu(NETWORK_TYPE_ENABLED);
+        if (completedRound)
+            announceRoundEnd(roundOutcome);
     }
 
     private void finishOutOfLives() {
@@ -3136,8 +3385,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mRespawnQrOpenWhenResumed = false;
         mTeamAssignmentQrScannerActive = false;
         mTeamAssignmentQrOpenWhenResumed = false;
-        if (mRespawnQrWaitButton != null)
-            mRespawnQrWaitButton.setText(R.string.respawn_qr_wait_button);
+        if (mQrScannerCancelButton != null)
+            mQrScannerCancelButton.setVisibility(View.GONE);
         mRespawnQrScannerOverlay.setVisibility(View.VISIBLE);
         mRespawnQrScannerActive = true;
         resumeQrScanner();
@@ -3173,8 +3422,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mRespawnQrOpenWhenResumed = false;
         mRespawnQrScannerActive = false;
         mTeamAssignmentQrOpenWhenResumed = false;
-        if (mRespawnQrWaitButton != null)
-            mRespawnQrWaitButton.setText(R.string.team_qr_cancel_button);
+        if (mQrScannerCancelButton != null)
+            mQrScannerCancelButton.setVisibility(View.VISIBLE);
         mRespawnQrScannerOverlay.setVisibility(View.VISIBLE);
         mTeamAssignmentQrScannerActive = true;
         resumeQrScanner();
@@ -3194,8 +3443,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         if (mRespawnQrScannerOverlay != null)
             mRespawnQrScannerOverlay.setVisibility(View.GONE);
-        if (mRespawnQrWaitButton != null)
-            mRespawnQrWaitButton.setText(R.string.respawn_qr_wait_button);
+        if (mQrScannerCancelButton != null)
+            mQrScannerCancelButton.setVisibility(View.GONE);
     }
 
     private void resetTeamRespawnQrState() {
@@ -3203,10 +3452,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         hideQrScanner();
         mRespawnQrTeam = 0;
         mRespawnQrRequestPending = false;
-        if (mRespawnQrScanButton != null) {
-            mRespawnQrScanButton.setEnabled(true);
-            mRespawnQrScanButton.setVisibility(View.GONE);
-        }
     }
 
     private void handleRespawnQrCode(String contents) {
@@ -3231,8 +3476,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         hideQrScanner();
         if (isDedicatedServerConnection()) {
             mRespawnQrRequestPending = true;
-            if (mRespawnQrScanButton != null)
-                mRespawnQrScanButton.setEnabled(false);
             mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG
                     + NetMsg.NETMSG_RESPAWNREQUEST, true);
             Toast.makeText(getApplicationContext(), R.string.respawn_qr_request_sent,
@@ -3301,6 +3544,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mReloadTimer = null;
         }
         cancelShieldRegeneration();
+        cancelRespawnShieldBoost();
         Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
         publishPeerRuntimeState();
         updateTeamAssignmentScanButton();
@@ -3323,10 +3567,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         final boolean notifyDedicatedHost = !mStartGameTimer && isDedicatedServerConnection();
         updateSpawnCountdown(spawnDelay, synchronizedCountdown, teamQrRespawn);
         mSpawnInTV.setVisibility(View.VISIBLE);
-        if (teamQrRespawn && mRespawnQrScanButton != null) {
-            mRespawnQrScanButton.setText(getString(R.string.respawn_qr_scan_button, mRespawnQrTeam));
-            mRespawnQrScanButton.setVisibility(View.VISIBLE);
-        }
         if (synchronizedCountdown) {
             announceGameStartCountdown(spawnDelay);
             armSynchronizedSpawnTimer(notifyDedicatedHost);
@@ -3371,6 +3611,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mSpawnInTV.setVisibility(View.GONE);
         resetVitalStatBars();
         Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        if (!startingGame)
+            startRespawnShieldBoost();
         publishPeerRuntimeState();
         playSound(R.raw.spawn);
         finishReload();
@@ -3393,6 +3635,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mGameTimer.setBase(mHasSynchronizedStart ? mSynchronizedStartAt : SystemClock.elapsedRealtime());
                 mGameTimer.start();
             }
+            announceRoundStart();
         }
     }
 
@@ -3565,7 +3808,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mActivityResumed = true;
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             enableGameLock();
-        if (mRecoilWifiAutoJoiner != null)
+        if (mUseHubAutoJoin && mRecoilWifiAutoJoiner != null)
             mRecoilWifiAutoJoiner.start();
         ContextCompat.registerReceiver(this, mGattUpdateReceiver, makeGattUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
         mGattReceiverRegistered = true;
@@ -3649,6 +3892,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        if (mStartWizardDialog != null) {
+            mStartWizardDialog.dismiss();
+            mStartWizardDialog = null;
+        }
         if (mGameInviteDialog != null)
             dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
         cancelNetworkOptionsWifiWait();
@@ -3671,6 +3918,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         stopConnectFailTest();
         cancelShieldRegeneration();
+        cancelRespawnShieldBoost();
         resetBluetoothServices();
         unbindUDPService();
         unbindTcpClientService();
@@ -3697,6 +3945,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     @Override
     public void onBackPressed()
     {
+        // Respawn scanning cannot be dismissed: the countdown keeps running
+        // behind the camera until a valid checkpoint or timeout completes it.
+        if (mRespawnQrScannerActive && isTeamQrRespawnActive())
+            return;
         if (isQrScannerActive()) {
             hideQrScanner();
             return;
@@ -3861,6 +4113,38 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mWeaponPairingHandler.removeCallbacks(mTriggerProbeTimeoutRunnable);
             mTriggerProbeTimeoutRunnable = null;
         }
+    }
+
+    private void scheduleWeaponSyncTriggerHint() {
+        cancelWeaponSyncTriggerHint();
+        if (mTriggerPairingActive)
+            return;
+        mWeaponSyncTriggerHintRunnable = new Runnable() {
+            @Override public void run() {
+                if (mWeaponSyncTriggerHintRunnable != this)
+                    return;
+                mWeaponSyncTriggerHintRunnable = null;
+                if (!mConnected || mCommunicating || mTriggerPairingActive
+                        || isFinishing() || isDestroyed())
+                    return;
+                mWeaponSyncTriggerHintShown = true;
+                TextView status = findViewById(R.id.connect_status_tv);
+                if (status != null)
+                    status.setText(R.string.connect_status_hold_trigger);
+                Toast.makeText(getApplicationContext(), R.string.connect_status_hold_trigger,
+                        Toast.LENGTH_LONG).show();
+            }
+        };
+        mWeaponPairingHandler.postDelayed(mWeaponSyncTriggerHintRunnable,
+                WEAPON_SYNC_TRIGGER_HINT_DELAY_MS);
+    }
+
+    private void cancelWeaponSyncTriggerHint() {
+        if (mWeaponSyncTriggerHintRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mWeaponSyncTriggerHintRunnable);
+            mWeaponSyncTriggerHintRunnable = null;
+        }
+        mWeaponSyncTriggerHintShown = false;
     }
 
     private void connectToWeaponCandidate(WeaponCandidate candidate) {
@@ -4260,6 +4544,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void resetBluetoothServices() {
+        cancelWeaponSyncTriggerHint();
         stopConnectionTest();
         mConnected = false;
         mCommunicating = false;
@@ -4375,6 +4660,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if (BluetoothLeService.ACTION_GATT_CONNECTED.equals(action)) {
                 mConnected = true;
                 mCommunicating = false; // When we receive the first packet, we'll switch layouts
+                scheduleWeaponSyncTriggerHint();
+                if (!mTriggerPairingActive) {
+                    TextView status = findViewById(R.id.connect_status_tv);
+                    if (status != null)
+                        status.setText(R.string.connect_status_communicating);
+                }
                 startConnectionTest();
             } else if (BluetoothLeService.ACTION_GATT_DISCONNECTED.equals(action)) {
                 if (mTriggerPairingActive)
@@ -4386,7 +4677,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 //displayGattServices(mBluetoothLeService.getSupportedGattServices());
                 //Log.d(TAG, "services discovered!");
                 TextView connectStatusTV = findViewById(R.id.connect_status_tv);
-                if (connectStatusTV != null) connectStatusTV.setText(R.string.connect_status_communicating);
+                if (connectStatusTV != null && !mTriggerPairingActive)
+                    connectStatusTV.setText(mWeaponSyncTriggerHintShown
+                            ? R.string.connect_status_hold_trigger
+                            : R.string.connect_status_communicating);
                 BluetoothLeService bluetoothLeService = mBluetoothLeService;
                 if (bluetoothLeService == null) {
                     Log.w(TAG, "Ignoring service discovery after BLE service reset");
@@ -4526,7 +4820,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void vibrateOnHit() {
-        if (!Globals.getInstance().mVibrateOnHit || vibrator == null)
+        Globals globals = Globals.getInstance();
+        if ((!globals.mTournamentMode && !globals.mVibrateOnHit) || vibrator == null)
             return;
         try {
             vibrator.vibrate(HIT_VIBRATE_DURATION_MILLISECONDS);
@@ -4612,7 +4907,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         Log.w(TAG, "Game-start speech language is unavailable");
                         return;
                     }
-                    mCountdownSpeechReady = true;
+                    synchronized (mPendingVoicePrompts) {
+                        if (mCountdownSpeech != speech)
+                            return;
+                        mCountdownSpeechReady = true;
+                        while (!mPendingVoicePrompts.isEmpty())
+                            speakRoundVoicePrompt(mPendingVoicePrompts.removeFirst());
+                    }
                     if (mStartGameTimer && mHasSynchronizedStart
                             && Globals.getInstance().mGameState == Globals.GAME_STATE_ELIMINATED)
                         announceGameStartCountdown(synchronizedStartRemaining());
@@ -4633,22 +4934,29 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void resetGameStartCountdownSpeech() {
-        mLastSpokenGameStartSecond = Integer.MAX_VALUE;
-        if (mCountdownSpeech != null) {
-            try {
-                mCountdownSpeech.stop();
-            } catch (RuntimeException e) {
-                Log.w(TAG, "Unable to stop game-start speech", e);
+        synchronized (mPendingVoicePrompts) {
+            mLastSpokenGameStartSecond = Integer.MAX_VALUE;
+            mPendingVoicePrompts.clear();
+            if (mCountdownSpeech != null) {
+                try {
+                    mCountdownSpeech.stop();
+                } catch (RuntimeException e) {
+                    Log.w(TAG, "Unable to stop game-start speech", e);
+                }
             }
         }
     }
 
     private void shutdownCountdownSpeech() {
         stopRespawnQrVoiceReminder();
-        TextToSpeech speech = mCountdownSpeech;
-        mCountdownSpeech = null;
-        mCountdownSpeechReady = false;
-        mLastSpokenGameStartSecond = Integer.MAX_VALUE;
+        TextToSpeech speech;
+        synchronized (mPendingVoicePrompts) {
+            speech = mCountdownSpeech;
+            mCountdownSpeech = null;
+            mCountdownSpeechReady = false;
+            mLastSpokenGameStartSecond = Integer.MAX_VALUE;
+            mPendingVoicePrompts.clear();
+        }
         if (speech != null) {
             try {
                 speech.stop();
@@ -4681,6 +4989,50 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mLastSpokenGameStartSecond = (int) seconds;
         } catch (RuntimeException e) {
             Log.w(TAG, "Unable to speak game-start countdown", e);
+        }
+    }
+
+    private void announceRoundStart() {
+        speakRoundVoicePrompt(R.string.game_start_voice_prompt);
+    }
+
+    private void announceRoundEnd(GameOutcome.Result result) {
+        speakRoundVoicePrompt(result == GameOutcome.Result.TIED
+                ? R.string.game_end_tied_voice_prompt
+                : result == GameOutcome.Result.WON ? R.string.game_end_won_voice_prompt
+                : R.string.game_end_lost_voice_prompt);
+    }
+
+    private void announceKillStreak() {
+        int prompt = mKillStreakVoice.recordKill();
+        if (prompt != 0)
+            speakRoundVoicePrompt(prompt);
+    }
+
+    private void speakRoundVoicePrompt(int prompt) {
+        if (mCountdownSpeech == null)
+            initializeCountdownSpeech();
+        synchronized (mPendingVoicePrompts) {
+            TextToSpeech speech = mCountdownSpeech;
+            if (!mCountdownSpeechReady || speech == null) {
+                mPendingVoicePrompts.addLast(prompt);
+                return;
+            }
+            try {
+                boolean endPrompt = prompt == R.string.game_end_won_voice_prompt
+                        || prompt == R.string.game_end_lost_voice_prompt
+                        || prompt == R.string.game_end_tied_voice_prompt;
+                boolean killCue = prompt == R.string.enemy_destroyed_voice_prompt;
+                speech.setSpeechRate(killCue ? 1.5f : 1.0f);
+                speech.speak(getString(prompt), endPrompt ? TextToSpeech.QUEUE_FLUSH
+                                : TextToSpeech.QUEUE_ADD,
+                        null, endPrompt ? ROUND_END_UTTERANCE_ID
+                                : killCue ? ENEMY_DESTROYED_UTTERANCE_ID
+                                : prompt == R.string.game_start_voice_prompt ? ROUND_START_UTTERANCE_ID
+                                : KILL_STREAK_UTTERANCE_ID);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Unable to speak round announcement", e);
+            }
         }
     }
 
@@ -4743,20 +5095,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     /** Speak the confirmed-kill cue at 150% of the normal speech rate. */
     private void announceEnemyDestroyed() {
-        if (mCountdownSpeech == null)
-            initializeCountdownSpeech();
-        TextToSpeech speech = mCountdownSpeech;
-        if (!mCountdownSpeechReady || speech == null)
-            return;
-        try {
-            speech.setSpeechRate(1.5f);
-            speech.speak(getString(R.string.enemy_destroyed_voice_prompt),
-                    TextToSpeech.QUEUE_FLUSH, null, ENEMY_DESTROYED_UTTERANCE_ID);
-        } catch (RuntimeException e) {
-            // The kill cue is optional feedback and must never affect scoring
-            // or the rest of the round if a device has no usable TTS engine.
-            Log.w(TAG, "Unable to speak enemy-destroyed cue", e);
-        }
+        speakRoundVoicePrompt(R.string.enemy_destroyed_voice_prompt);
     }
 
     private void playSound(int resId) {
@@ -4916,6 +5255,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mConnectionTest = true;
             if (!mCommunicating) {
                 mCommunicating = true;
+                cancelWeaponSyncTriggerHint();
                 RelativeLayout connectLayout = findViewById(R.id.connect_layout);
                 if (connectLayout != null) connectLayout.setVisibility(View.GONE);
                 RelativeLayout playLayout = findViewById(R.id.play_layout);
@@ -4932,6 +5272,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     setRecoil(true);
                 else if (!mRecoilEnabled)
                     setRecoil(false);
+                maybeShowStartWizard();
             }
             if (trigger_counter != mLastTriggerCount) {
                 mLastTriggerCount = trigger_counter;
@@ -5127,6 +5468,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             if (mHealth > 0) {
                                 showIncomingHitFeedback(hit_by_id);
                             } else {
+                                mKillStreakVoice.resetStreak();
+                                // Drop any queued kill chatter before the team QR
+                                // respawn voice loop begins.
+                                resetGameStartCountdownSpeech();
                                 vibrateOnHit();
                                 playSound(R.raw.eliminated);
                                 if (mHasLivesLimit)
@@ -5228,7 +5573,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUseNetwork) {
             if (isDedicatedServerConnection())
                 mTcpClient.sendPlayerGrenade();
-            else if (mUDPListenerService != null)
+            if (mUDPListenerService != null)
                 mUDPListenerService.publishPeerGrenadePairing();
         }
     }
@@ -5311,7 +5656,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 // OUT is the final, successful hit. It still gets the large
                 // HIT confirmation rather than looking like a miss.
                 showHitConfirmation(intent, false, true);
-                announceEnemyDestroyed();
             } else if (NetMsg.NETMSG_ALREADYDEAD.equals(action)) {
                 showHitConfirmation(intent, true, false);
             } else if (NetMsg.NETMSG_ELIMINATED.equals(action)) {
@@ -5344,6 +5688,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mCombatFeedbackHandler.postDelayed(mScoreFeedbackCleanup,
                         ELIMINATED_ANIMATION_DURATION_MILLISECONDS);
                 playSound(R.raw.score);
+                if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
+                    // Score credit is the reliable kill event. Queue this cue
+                    // first so it always precedes the streak line.
+                    announceEnemyDestroyed();
+                    announceKillStreak();
+                }
                 publishPeerRuntimeState();
                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                     mTeamScore = incrementCounter(mTeamScore, Globals.MAX_TEAM_SCOREBOARD_VALUE);

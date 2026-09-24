@@ -1,20 +1,27 @@
 package com.simplecoil.simplecoil;
 
+import android.Manifest;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattService;
 import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.drawable.AnimationDrawable;
+import android.os.Build;
 import android.os.CountDownTimer;
 import android.os.SystemClock;
 import android.widget.Chronometer;
 import android.widget.PopupMenu;
+import android.widget.ProgressBar;
 import android.view.View;
 import android.widget.TextView;
 
+import androidx.core.content.ContextCompat;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.test.platform.app.InstrumentationRegistry;
 
 import org.junit.After;
 import org.junit.Before;
@@ -24,7 +31,9 @@ import org.junit.runner.RunWith;
 import java.net.InetAddress;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -126,6 +135,8 @@ public class GameplayRegressionTest {
             set(activity, "mHasLivesLimit", false);
         });
         scenario.close();
+        if (udp != null)
+            udp.onDestroy();
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
     }
 
@@ -603,6 +614,7 @@ public class GameplayRegressionTest {
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
             invoke(activity, "endGame");
             set(activity, "mUseNetwork", false);
+            set(activity, "mNextGameStartAllowedAt", SystemClock.elapsedRealtime() - 1);
             invoke(activity, "startGame");
             CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
             spawn.cancel();
@@ -623,6 +635,7 @@ public class GameplayRegressionTest {
 
             invoke(activity, "endGame");
             set(activity, "mUseNetwork", false);
+            set(activity, "mNextGameStartAllowedAt", SystemClock.elapsedRealtime() - 1);
             invoke(activity, "startGame");
             CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
             spawn.cancel();
@@ -633,11 +646,78 @@ public class GameplayRegressionTest {
             // that the old shot ID no longer suppresses a real hit.
             set(activity, "mUseNetwork", true);
 
+            int shieldBeforeHit = (int) get(activity, "mShield");
             telemetry(activity, 17, 1, 0, 0);
-            assertEquals("A reused weapon shot ID was filtered as a prior round's hit", 15,
-                    get(activity, "mHealth"));
+            assertEquals("A reused weapon shot ID was filtered as a prior round's hit",
+                    shieldBeforeHit - 5, get(activity, "mShield"));
             assertEquals("The hit counter carried over from the prior round", 1,
                     get(activity, "mHitsTaken"));
+        });
+    }
+
+    @Test
+    public void completedRoundBlocksNextStartForThirtySeconds() {
+        scenario.onActivity(activity -> {
+            invoke(activity, "endGame");
+            set(activity, "mUseNetwork", false);
+            long deadline = (long) get(activity, "mNextGameStartAllowedAt");
+            assertTrue(deadline - SystemClock.elapsedRealtime() > 29_000);
+
+            invoke(activity, "startGame");
+            assertEquals(false, get(activity, "mStartGameTimer"));
+
+            set(activity, "mNextGameStartAllowedAt", SystemClock.elapsedRealtime() - 1);
+            invoke(activity, "startGame");
+            assertEquals(true, get(activity, "mStartGameTimer"));
+        });
+    }
+
+    @Test
+    public void creditedKillStreakResetsWhenThePlayerIsEliminated() {
+        scenario.onActivity(activity -> {
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            KillStreakVoice voice = (KillStreakVoice) get(activity, "mKillStreakVoice");
+            assertEquals(R.string.kill_streak_3_voice_prompt, voice.recordKill());
+
+            set(activity, "mHealth", 5);
+            telemetry(activity, 17, 1, 0, 0);
+            assertEquals(0, voice.recordKill());
+        });
+    }
+
+    @Test
+    public void creditedKillsQueueTheKillCueBeforeTheStreakLine() {
+        scenario.onActivity(activity -> {
+            @SuppressWarnings("unchecked")
+            ArrayDeque<Integer> pending = (ArrayDeque<Integer>) get(activity, "mPendingVoicePrompts");
+            set(activity, "mCountdownSpeechReady", false);
+
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_OUT));
+            assertTrue(pending.isEmpty());
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+
+            assertEquals(Arrays.asList(R.string.enemy_destroyed_voice_prompt,
+                    R.string.enemy_destroyed_voice_prompt,
+                    R.string.kill_streak_2_voice_prompt), new ArrayList<>(pending));
+        });
+    }
+
+    @Test
+    public void deathDropsQueuedSpeechBeforeStartingTheTeamQrReminder() {
+        scenario.onActivity(activity -> {
+            @SuppressWarnings("unchecked")
+            ArrayDeque<Integer> pending = (ArrayDeque<Integer>) get(activity, "mPendingVoicePrompts");
+            pending.addLast(R.string.enemy_destroyed_voice_prompt);
+            pending.addLast(R.string.kill_streak_5_voice_prompt);
+            set(activity, "mHealth", 5);
+
+            telemetry(activity, 17, 1, 0, 0);
+
+            assertTrue(pending.isEmpty());
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(true, get(activity, "mRespawnQrVoiceReminderActive"));
         });
     }
 
@@ -902,8 +982,7 @@ public class GameplayRegressionTest {
     public void unlimitedLifeOverrideKeepsTheDeathCountOnReconnect() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);
-            Globals.getInstance().mOverrideLives = true;
-            Globals.getInstance().mOverrideLivesVal = 0;
+            Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
             receiveNetwork(activity, gameUpdate(7, 8, 12, 60));
             assertEquals(8, get(activity, "mEliminationCount"));
             assertEquals(false, get(activity, "mHasLivesLimit"));
@@ -1048,8 +1127,11 @@ public class GameplayRegressionTest {
     }
 
     private void changeLifeOverride(FullscreenActivity activity, int limit) {
-        Globals.getInstance().mOverrideLives = true;
-        Globals.getInstance().mOverrideLivesVal = limit;
+        // Per-player life overrides are locked by tournament rules. The host
+        // may still change the round's global life limit.
+        Globals.getInstance().mGameLimit = limit == 0
+                ? Globals.GAME_LIMIT_NONE : Globals.GAME_LIMIT_LIVES;
+        Globals.getInstance().mLivesLimit = limit;
         receiveNetwork(activity, new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
     }
 
@@ -1865,6 +1947,107 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void initialGameSpawnDoesNotReceiveRespawnShieldBonus() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mFullShields = 10;
+            set(activity, "mUseNetwork", false);
+            invoke(activity, "startGame");
+            CountDownTimer initialSpawn = (CountDownTimer) get(activity, "mSpawnTimer");
+            assertTrue(initialSpawn != null);
+            initialSpawn.onFinish();
+            assertEquals(0, get(activity, "mRespawnShieldBonus"));
+            assertNull(get(activity, "mRespawnShieldBoostTimer"));
+        });
+    }
+
+    @Test
+    public void respawnShieldBonusAbsorbsDamageWithoutReducingNormalShields() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mFullShields = 10;
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
+            ((CountDownTimer) get(activity, "mSpawnTimer")).onFinish();
+
+            CountDownTimer boost = (CountDownTimer) get(activity, "mRespawnShieldBoostTimer");
+            ProgressBar shieldBar = activity.findViewById(R.id.shield_pb);
+            assertTrue("Respawn boost must have a five-second expiry", boost != null);
+            assertEquals(10, get(activity, "mShield"));
+            assertEquals(5, get(activity, "mRespawnShieldBonus"));
+            assertEquals(15, shieldBar.getMax());
+            assertEquals(15, shieldBar.getProgress());
+
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -3);
+            assertEquals(10, get(activity, "mShield"));
+            assertEquals(2, get(activity, "mRespawnShieldBonus"));
+            assertEquals(12, shieldBar.getProgress());
+
+            boost.onFinish();
+            assertEquals(10, get(activity, "mShield"));
+            assertEquals(0, get(activity, "mRespawnShieldBonus"));
+            assertEquals(10, shieldBar.getMax());
+            assertEquals(10, shieldBar.getProgress());
+        });
+    }
+
+    @Test
+    public void damagePastRespawnShieldBonusRemainsAfterBoostExpires() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mFullShields = 10;
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
+            ((CountDownTimer) get(activity, "mSpawnTimer")).onFinish();
+            CountDownTimer boost = (CountDownTimer) get(activity, "mRespawnShieldBoostTimer");
+            assertTrue(boost != null);
+
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -7);
+            assertEquals(0, get(activity, "mRespawnShieldBonus"));
+            assertEquals(8, get(activity, "mShield"));
+            assertTrue("Damage to normal shields must still regenerate normally",
+                    get(activity, "mShieldTimer") != null);
+
+            boost.onFinish();
+            assertEquals(8, get(activity, "mShield"));
+            ProgressBar shieldBar = activity.findViewById(R.id.shield_pb);
+            assertEquals(10, shieldBar.getMax());
+            assertEquals(8, shieldBar.getProgress());
+        });
+    }
+
+    @Test
+    public void respawnQrScannerStaysOpenWhileTheTimeoutRuns() {
+        scenario.onActivity(activity -> {
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
+            CountDownTimer timeout = (CountDownTimer) get(activity, "mSpawnTimer");
+            assertTrue("Respawn must keep its fallback timeout", timeout != null);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+
+            boolean cameraAvailable = activity.getPackageManager()
+                    .hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
+                    && (Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                    || ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA)
+                    == PackageManager.PERMISSION_GRANTED);
+            if (cameraAvailable) {
+                View scanner = activity.findViewById(R.id.respawn_qr_scanner_overlay);
+                View cancel = activity.findViewById(R.id.qr_scanner_cancel_button);
+                assertEquals(true, get(activity, "mRespawnQrScannerActive"));
+                assertEquals(View.VISIBLE, scanner.getVisibility());
+                assertEquals(View.GONE, cancel.getVisibility());
+                invoke(activity, "handleRespawnQrCode", new Class<?>[]{String.class}, "not a respawn code");
+                assertEquals("An invalid QR must leave the camera open", View.VISIBLE,
+                        scanner.getVisibility());
+                activity.onBackPressed();
+                assertEquals("Back must not dismiss the respawn camera", View.VISIBLE,
+                        scanner.getVisibility());
+                assertSame(timeout, get(activity, "mSpawnTimer"));
+            }
+
+            timeout.onFinish();
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+            assertEquals(View.GONE, activity.findViewById(R.id.respawn_qr_scanner_overlay)
+                    .getVisibility());
+        });
+    }
+
+    @Test
     public void teamQrAssignmentUsesRespawnCodeAndSkipsAnOccupiedPlayerId() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
@@ -2180,6 +2363,13 @@ public class GameplayRegressionTest {
         Byte lastPeerTeamEliminatedPlayer;
         long lastPeerTeamEventSequence;
         Byte lastPeerTeamRecipient;
+
+        RecordingUDPService() {
+            // Production services always have an application context. The
+            // detached test double needs one for gameplay Wi-Fi locks too.
+            Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+            attachBaseContext(context.getApplicationContext());
+        }
 
         @Override
         public void endGame() { endRequests++; }

@@ -17,12 +17,14 @@
     <string name="connect_status_scanning">Scanning&#8230;</string>
     <string name="connect_status_connecting">Connecting&#8230;</string>
     <string name="connect_status_communicating">Communicating&#8230;</string>
+    <string name="connect_status_hold_trigger">Hold the blaster trigger to finish syncing.</string>
     <string name="weapon_pairing_title">Choose Your Weapon</string>
     <string name="weapon_pairing_message">%1$d compatible weapons are nearby. Hold the trigger on the weapon you want to use. Detecting&#8230;</string>
     <string name="weapon_pairing_checking">Hold the trigger on %1$s&#8230;</string>
     <string name="weapon_pairing_selected">Weapon selected</string>
     //Game strings
     <string name="start_game_button">Start</string>
+    <string name="next_game_wait">Next game can start in %1$d seconds.</string>
     <string name="end_game_button">End Game</string>
     //Team strings
     <string name="team_label">TEAM</string>
@@ -72,9 +74,7 @@
     <string name="eliminated_label">ELIMINATED!</string>
     <string name="spawn_in_label">Spawn in %1$d</string>
     <string name="respawn_qr_wait_label">RESPAWN IN %1$02d:%2$02d\nScan TEAM %3$d RESPAWN QR to return now</string>
-    <string name="respawn_qr_scan_button">SCAN TEAM %1$d RESPAWN QR</string>
     <string name="respawn_qr_scanner_prompt">Scan the TEAM %1$d respawn QR code</string>
-    <string name="respawn_qr_wait_button">WAIT FOR RESPAWN</string>
     <string name="respawn_qr_invalid">This is not a respawn QR code.</string>
     <string name="respawn_qr_wrong_team">That respawn QR belongs to another team.</string>
     <string name="respawn_qr_request_sent">Respawn requested.</string>
@@ -88,6 +88,30 @@
     <string name="combat_feedback_hit">HIT</string>
     <string name="combat_feedback_already_dead">ALREADY\nDEAD</string>
     <string name="enemy_destroyed_voice_prompt">Enemy Destroyed</string>
+    <string name="game_start_voice_prompt">May the odds be ever in your favor.</string>
+    <string name="game_end_won_voice_prompt">Game is over. You won. Have a nice day.</string>
+    <string name="game_end_lost_voice_prompt">Game is over. You lost. Have a nice day.</string>
+    <string name="game_end_tied_voice_prompt">Game is over. It\'s a tie. Have a nice day.</string>
+    <string name="kill_streak_2_voice_prompt">That was left handed.</string>
+    <string name="kill_streak_3_voice_prompt">That one\'s going in the highlight reel.</string>
+    <string name="kill_streak_4_voice_prompt">Piece of cake.</string>
+    <string name="kill_streak_5_voice_prompt">I can do this all day.</string>
+    <string name="kill_streak_6_voice_prompt">That\'s gonna leave a mark.</string>
+    <string name="kill_streak_7_voice_prompt">Okay... this is getting awkward.</string>
+    <string name="kill_streak_8_voice_prompt">Are they even shooting back?</string>
+    <string name="kill_streak_9_a_voice_prompt">Okay... I\'m officially banned from family game night.</string>
+    <string name="kill_streak_9_b_voice_prompt">Somebody unplug me.</string>
+    <string name="kill_streak_9_c_voice_prompt">I have become the problem.</string>
+    <string name="kill_streak_9_d_voice_prompt">I think they know it\'s me now.</string>
+    <string name="kill_streak_9_e_voice_prompt">I swear this thing isn\'t hacked.</string>
+    <string name="kill_streak_9_f_voice_prompt">I\'m gonna need a bigger scoreboard.</string>
+    <string name="kill_streak_9_g_voice_prompt">Somebody check if this thing has cheats enabled.</string>
+    <string name="kill_streak_9_h_voice_prompt">I\'ve stopped counting. The game hasn\'t.</string>
+    <string name="kill_streak_9_i_voice_prompt">Do they know they\'re allowed to shoot back?</string>
+    <string name="kill_streak_9_j_voice_prompt">At this point I\'m just farming XP.</string>
+    <string name="kill_streak_9_k_voice_prompt">Okay, I might actually be the villain.</string>
+    <string name="kill_streak_9_l_voice_prompt">I have become the boss battle.</string>
+    <string name="kill_streak_9_m_voice_prompt">I may have misunderstood the meaning of \'friendly game.\'</string>
     <string name="error_camera_permission_required">Camera permission is required to scan a QR code.</string>
     <string name="error_camera_unavailable">This device has no available camera for QR scanning.</string>
     //Ble Strings
@@ -132,6 +156,21 @@
 
     <string name="use_network_button">Enable Networking</string>
     <string name="network_menu_button">Network Options</string>
+    <string name="start_wizard_hub_title">1/3: Using a Recoil Wi-Fi hub?</string>
+    <string name="start_wizard_hub_yes">Yes, use the hub</string>
+    <string name="start_wizard_hub_no">No, play without a hub</string>
+    <string name="start_wizard_range_title">2/3: Playing indoors or outdoors?</string>
+    <string name="start_wizard_outdoor">Outdoor - full range</string>
+    <string name="start_wizard_indoor">Indoor - shorter range</string>
+    <string name="start_wizard_mode_title">3/3: Choose a game mode</string>
+    <string name="start_wizard_mode_no_hub_title">3/3: Local mode (Boss needs a hub)</string>
+    <string name="start_wizard_next">Next</string>
+    <string name="start_wizard_back">Back</string>
+    <string name="start_wizard_skip">Skip setup</string>
+    <string name="start_wizard_finish">Finish setup</string>
+    <string name="start_wizard_ready_title">Ready to set up the game</string>
+    <string name="start_wizard_ready_hub">Connect each phone to the same Recoil Wi-Fi hub, choose a player/team, then tap Start. Start creates a lobby if none exists. Other phones can join it automatically.</string>
+    <string name="start_wizard_ready_local">Choose a player/team, then tap Start for a local game. You can enable networking later with Network Options.</string>
     <string name="no_network_button">Disable Network</string>
     <string name="ready_button">Join Lobby</string>
     <string name="join_button">Join Lobby</string>

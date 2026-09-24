@@ -19,6 +19,7 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -670,23 +671,184 @@ public class UDPRegressionTest {
         startPeerGame();
 
         service.publishPeerElimination((byte) 17);
-        assertEquals(1, service.peerStatePackets.size());
-        assertEquals(PeerStatePacket.EVENT_ELIMINATED, service.peerPacket(0).players[1].eventType);
-        assertEquals(17, service.peerPacket(0).players[1].eventTargetID);
-        assertEquals(3, (int) service.peerRepeatCounts.get(0));
+        assertEquals(1, service.combatPackets.size());
+        CombatPacket.Decoded elimination = service.combatPacket(0);
+        assertEquals(CombatPacket.KIND_EVENT, elimination.kind);
+        assertEquals(PeerStatePacket.EVENT_ELIMINATED, elimination.eventType);
+        assertEquals(1, elimination.senderID);
+        assertEquals(17, elimination.targetID);
+
+        // A target ACK prevents this test's delayed retry callbacks from
+        // obscuring the packet-type assertions below.
+        receiveCombat(enemy, CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), CombatPacket.KIND_ACK,
+                PeerStatePacket.EVENT_ELIMINATED, 17, 1, elimination.eventSequence));
 
         service.publishPeerTeamElimination((byte) 17, 1, (byte) 2);
-        assertEquals(1, service.peerStatePackets.size());
+        assertEquals(0, service.peerStatePackets.size());
 
         service.announcePeerLeave();
-        assertEquals(PeerStatePacket.EVENT_LEAVE, service.peerPacket(1).players[1].eventType);
-        assertEquals(3, (int) service.peerRepeatCounts.get(1));
+        assertEquals(PeerStatePacket.EVENT_LEAVE, service.peerPacket(0).players[1].eventType);
+        assertEquals(3, (int) service.peerRepeatCounts.get(0));
 
         service.startGame(false);
         service.publishPeerElimination((byte) 17);
         service.publishPeerTeamElimination((byte) 17, 2, (byte) 2);
         service.announcePeerLeave();
-        assertEquals(2, service.peerStatePackets.size());
+        assertEquals(1, service.peerStatePackets.size());
+        assertEquals(1, service.combatPackets.size());
+    }
+
+    @Test
+    public void compactCombatIsAckedImmediatelyAndDuplicateEventsAreIgnored()
+            throws Exception {
+        register(enemy, 17);
+        service.startGame(false, PEER_ROUND_TOKEN);
+        byte[] hit = CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), CombatPacket.KIND_EVENT,
+                PeerStatePacket.EVENT_HIT, 17, 1, 42);
+
+        receiveCombat(enemy, hit);
+        receiveCombat(enemy, hit);
+
+        assertEquals("A retried hit was applied twice", 1, service.events.size());
+        assertEquals(NetMsg.NETMSG_HIT, service.events.get(0).getAction());
+        assertEquals("Every received copy must be ACKed in case the first ACK was lost",
+                2, service.combatAcknowledgements.size());
+        CombatPacket.Decoded ack = CombatPacket.decode(
+                service.combatAcknowledgements.get(0), 0, CombatPacket.PACKET_BYTES);
+        assertNotNull(ack);
+        assertEquals(CombatPacket.KIND_ACK, ack.kind);
+        assertEquals(1, ack.senderID);
+        assertEquals(17, ack.targetID);
+        assertEquals(42, ack.eventSequence);
+        assertEquals(enemy, service.combatAckRecipients.get(0));
+    }
+
+    @Test
+    public void nonTargetOverhearsCombatWithoutActingOrAcking() throws Exception {
+        register(teammate, 2);
+        register(enemy, 17);
+        service.startGame(false, PEER_ROUND_TOKEN);
+        byte[] hitPlayerTwo = CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), CombatPacket.KIND_EVENT,
+                PeerStatePacket.EVENT_HIT, 17, 2, 43);
+
+        receiveCombat(enemy, hitPlayerTwo);
+
+        assertTrue(service.events.isEmpty());
+        assertTrue(service.combatAcknowledgements.isEmpty());
+        long[] seen = (long[]) get(service, "mCombatHighestSequences");
+        assertEquals("The observer did not record the overheard event", 43, seen[17]);
+    }
+
+    @Test
+    public void targetAckCancelsFastRetries() throws Exception {
+        register(enemy, 17);
+        startPeerGame();
+        service.publishPeerElimination((byte) 17);
+        CombatPacket.Decoded event = service.combatPacket(0);
+        byte[] ack = CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), CombatPacket.KIND_ACK,
+                event.eventType, 17, 1, event.eventSequence);
+
+        receiveCombat(enemy, ack);
+        Thread.sleep(90);
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+
+        assertEquals("An ACKed combat event was still retried", 1,
+                service.combatPackets.size());
+    }
+
+    @Test
+    public void missingAckGetsOnlyTwoFastRetries() throws Exception {
+        register(enemy, 17);
+        startPeerGame();
+        service.publishPeerElimination((byte) 17);
+
+        long deadline = SystemClock.elapsedRealtime() + 500;
+        while (service.combatPackets.size() < 3
+                && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(5);
+        assertEquals("Combat did not use the initial/20 ms/60 ms send schedule",
+                3, service.combatPackets.size());
+        assertEquals(Collections.singletonList(enemy), service.combatRecipients.get(1));
+        assertEquals(Collections.singletonList(enemy), service.combatRecipients.get(2));
+        Thread.sleep(80);
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        assertEquals("Combat retries exceeded the three-attempt ceiling",
+                3, service.combatPackets.size());
+    }
+
+    @Test
+    public void missingAuthorityTickRebuildsOnlyNewerStateFromOverheardGossip()
+            throws Exception {
+        register(teammate, 2);
+        register(enemy, 17);
+        Globals.getInstance().mServerIP = enemy;
+        service.startGame(false, PEER_ROUND_TOKEN);
+
+        PeerStatePacket.PlayerState[] gossipRows = new PeerStatePacket.PlayerState[33];
+        gossipRows[2] = new PeerStatePacket.PlayerState(2, PeerStatePacket.FLAG_PRESENT,
+                41, 0, PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_RUNNING,
+                0, 7, 0, 5, 10, 29, 0, 0, 0);
+        byte[] gossip = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), 1, 2,
+                Globals.GAME_MODE_2TEAMS, gossipRows);
+        receiveState(teammate, gossip);
+
+        Method recover = UDPListenerService.class.getDeclaredMethod(
+                "recoverStateFromGossip", String.class);
+        recover.setAccessible(true);
+        recover.invoke(service, PEER_ROUND_TOKEN);
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_TEAMSCORESTATE, service.events.get(0).getAction());
+        assertEquals(7, service.events.get(0).getIntExtra(NetMsg.INTENT_TEAMSCORE, -1));
+
+        // A late host tick carrying an older copy of that row must not roll
+        // back the state reconstructed during the 20% grace-window fallback.
+        PeerStatePacket.PlayerState[] staleRows = new PeerStatePacket.PlayerState[33];
+        staleRows[2] = new PeerStatePacket.PlayerState(2, PeerStatePacket.FLAG_PRESENT,
+                40, 0, PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_RUNNING,
+                0, 1, 0, 5, 10, 30, 0, 0, 0);
+        byte[] authority = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), 1, 0,
+                Globals.GAME_MODE_2TEAMS, staleRows);
+        receiveState(enemy, authority);
+
+        PeerStatePacket.PlayerState[] applied =
+                (PeerStatePacket.PlayerState[]) get(service, "mAppliedPeerStates");
+        assertEquals(41, applied[2].ownerSequence);
+        assertEquals(7, applied[2].score);
+        assertEquals("Stale authority data emitted a rollback update", 1, service.events.size());
+        assertEquals(UDPListenerService.GAME_TICK_INTERVAL_MS / 5,
+                UDPListenerService.GAME_TICK_DRIFT_GRACE_MS);
+    }
+
+    @Test
+    public void peerPhoneHostStillAppliesEventsWhilePublishingAuthorityTicks()
+            throws Exception {
+        register(enemy, 17);
+        service.startGame(true, PEER_ROUND_TOKEN, true);
+        PeerStatePacket.PlayerState[] rows = new PeerStatePacket.PlayerState[33];
+        rows[17] = new PeerStatePacket.PlayerState(17, PeerStatePacket.FLAG_PRESENT,
+                2, 1, PeerStatePacket.EVENT_HIT, 1, Globals.GAME_STATE_RUNNING,
+                0, 0, 0, 5, 10, 29, 0, 0, 0);
+        byte[] gossip = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), 1, 17,
+                Globals.GAME_MODE_2TEAMS, rows);
+
+        receiveState(enemy, gossip);
+
+        boolean hitDelivered = false;
+        for (Intent event : service.events) {
+            if (NetMsg.NETMSG_HIT.equals(event.getAction())) {
+                hitDelivered = true;
+                assertEquals(17, event.getByteExtra(
+                        UDPListenerService.INTENT_PLAYERID, (byte) 0));
+            }
+        }
+        assertTrue("The phone hosting peer authority lost its own hit event", hitDelivered);
     }
 
     @Test
@@ -1067,6 +1229,20 @@ public class UDPRegressionTest {
         method.invoke(service, sender, message);
     }
 
+    private void receiveState(InetAddress sender, byte[] payload) throws Exception {
+        Method method = UDPListenerService.class.getDeclaredMethod("processPeerStatePacket",
+                InetAddress.class, byte[].class, int.class, int.class);
+        method.setAccessible(true);
+        method.invoke(service, sender, payload, 0, payload.length);
+    }
+
+    private void receiveCombat(InetAddress sender, byte[] payload) throws Exception {
+        Method method = UDPListenerService.class.getDeclaredMethod("processCombatPacket",
+                InetAddress.class, byte[].class, int.class, int.class);
+        method.setAccessible(true);
+        method.invoke(service, sender, payload, 0, payload.length);
+    }
+
     private boolean flag(String name) throws Exception { return (boolean) get(service, name); }
 
     private static void register(InetAddress address, int id) {
@@ -1166,6 +1342,10 @@ public class UDPRegressionTest {
         final List<InetAddress> endpointRecipients = new CopyOnWriteArrayList<>();
         final List<byte[]> peerStatePackets = new CopyOnWriteArrayList<>();
         final List<Integer> peerRepeatCounts = new CopyOnWriteArrayList<>();
+        final List<byte[]> combatPackets = new CopyOnWriteArrayList<>();
+        final List<List<InetAddress>> combatRecipients = new CopyOnWriteArrayList<>();
+        final List<byte[]> combatAcknowledgements = new CopyOnWriteArrayList<>();
+        final List<InetAddress> combatAckRecipients = new CopyOnWriteArrayList<>();
         boolean realListener;
         int listenerStarts;
         boolean blockFirstLookup;
@@ -1197,12 +1377,36 @@ public class UDPRegressionTest {
         }
         @Override void sendDatagrams(byte[] payload, List<InetAddress> recipients, int port,
                                      int repeatCount, long generation) {
-            peerStatePackets.add(payload.clone());
-            peerRepeatCounts.add(repeatCount);
+            if (realListener) {
+                super.sendDatagrams(payload, recipients, port, repeatCount, generation);
+                return;
+            }
+            if (CombatPacket.looksLikeCombat(payload, 0, payload.length)) {
+                combatPackets.add(payload.clone());
+            } else {
+                peerStatePackets.add(payload.clone());
+                peerRepeatCounts.add(repeatCount);
+            }
+        }
+        @Override void sendCombatDatagrams(byte[] payload, List<InetAddress> recipients,
+                                           long generation) {
+            combatPackets.add(payload.clone());
+            combatRecipients.add(new java.util.ArrayList<>(recipients));
+        }
+        @Override void sendCombatAcknowledgement(byte[] acknowledgement,
+                                                  InetAddress destination) {
+            combatAcknowledgements.add(acknowledgement.clone());
+            combatAckRecipients.add(destination);
         }
         PeerStatePacket.Decoded peerPacket(int index) {
             byte[] payload = peerStatePackets.get(index);
             PeerStatePacket.Decoded decoded = PeerStatePacket.decode(payload, 0, payload.length);
+            assertNotNull(decoded);
+            return decoded;
+        }
+        CombatPacket.Decoded combatPacket(int index) {
+            byte[] payload = combatPackets.get(index);
+            CombatPacket.Decoded decoded = CombatPacket.decode(payload, 0, payload.length);
             assertNotNull(decoded);
             return decoded;
         }

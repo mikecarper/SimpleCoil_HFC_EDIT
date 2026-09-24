@@ -513,17 +513,23 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     Toast.LENGTH_SHORT).show();
             return;
         }
-        globals.mBossMode = enabled;
-        globals.mBossHunterCount = -1;
-        globals.mBalancedRandom = false;
-        globals.clearBalancedAssignments();
-        globals.applyTournamentRules();
+        if (mTcpServer != null) {
+            if (!mTcpServer.setBossMode(enabled)) {
+                Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.mBossMode = enabled;
+            globals.mBossHunterCount = -1;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.applyTournamentRules();
+        }
         sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_BOSS_MODE, enabled)
                 .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).apply();
         mGameModeButton.setText(enabled ? R.string.game_mode_boss
                 : R.string.game_mode_tournament_2teams);
-        if (mTcpServer != null)
-            mTcpServer.setBossMode(enabled);
         getPlayerDisplayData();
     }
 
@@ -749,6 +755,12 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             Log.w(TAG, "Ignoring game start before dedicated server services are ready");
             return;
         }
+        long wait = mTcpServer.getNextGameStartWaitMillis();
+        if (wait > 0) {
+            Toast.makeText(this, getString(R.string.next_game_wait, (wait + 999) / 1000),
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
             Log.d(TAG, "Ignoring duplicate dedicated game-start event");
             return;
@@ -814,8 +826,10 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     && !Globals.getInstance().mBossMode
                     && mAllowJoinSwitch.isChecked());
             String roundToken = start.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
-            if (TcpServer.isValidRoundToken(roundToken))
+            if (TcpServer.isValidRoundToken(roundToken)) {
+                mUDPListenerService.startAuthoritativeStateTicks(roundToken);
                 mUDPListenerService.inviteNearbyPlayers(roundToken);
+            }
         }
         mEndGameButton.setEnabled(true);
         updateGameMasterRespawnButton();
@@ -874,8 +888,10 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mGPSModeButton.setEnabled(true);
         mAllowJoinSwitch.setEnabled(true);
         mGameStatusTV.setText(R.string.dedicated_game_waiting);
-        if (mUDPListenerService != null)
+        if (mUDPListenerService != null) {
+            mUDPListenerService.finishAuthoritativeStateTicks();
             mUDPListenerService.allowJoin(true);
+        }
         mEndGameButton.setEnabled(false);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().clearBalancedAssignments();

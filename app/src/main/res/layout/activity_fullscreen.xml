@@ -397,17 +397,6 @@
             android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
 
         <Button
-            android:id="@+id/respawn_qr_scan_button"
-            style="@style/Widget.AppCompat.Button.Colored"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_below="@id/spawn_countdown_tv"
-            android:layout_centerHorizontal="true"
-            android:layout_marginTop="10dp"
-            android:text="@string/respawn_qr_scan_button"
-            android:visibility="gone" />
-
-        <Button
             android:id="@+id/start_game_button"
             style="@style/Widget.AppCompat.Button.Colored"
             android:layout_width="wrap_content"
@@ -698,12 +687,13 @@
             android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
 
         <Button
-            android:id="@+id/respawn_qr_wait_button"
+            android:id="@+id/qr_scanner_cancel_button"
             style="@style/Widget.AppCompat.Button.Colored"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="bottom|center_horizontal"
             android:layout_marginBottom="24dp"
-            android:text="@string/respawn_qr_wait_button" />
+            android:text="@string/team_qr_cancel_button"
+            android:visibility="gone" />
     </FrameLayout>
 </FrameLayout>

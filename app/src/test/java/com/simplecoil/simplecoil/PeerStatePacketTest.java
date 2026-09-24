@@ -19,7 +19,8 @@ public class PeerStatePacketTest {
                     37.77491 + id / 100_000.0, -122.41942 - id / 100_000.0);
         }
 
-        byte[] encoded = PeerStatePacket.encode(17, UUID.randomUUID(), 9, 32,
+        byte[] encoded = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                UUID.randomUUID(), 9, 32,
                 Globals.GAME_MODE_FFA, players);
 
         assertEquals(1312, encoded.length);
@@ -39,11 +40,28 @@ public class PeerStatePacketTest {
         players[1] = new PeerStatePacket.PlayerState(1, PeerStatePacket.FLAG_PRESENT,
                 1, 0, PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_RUNNING,
                 0, 0, 0, 20, 5, 30, 0, 0, 0);
-        byte[] encoded = PeerStatePacket.encode(17, UUID.randomUUID(), 1, 1,
+        byte[] encoded = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                UUID.randomUUID(), 1, 1,
                 Globals.GAME_MODE_FFA, players);
 
         assertNull(PeerStatePacket.decode(encoded, 0, encoded.length - 1));
         encoded[0] = 0;
         assertNull(PeerStatePacket.decode(encoded, 0, encoded.length));
+    }
+
+    @Test
+    public void authorityTickUsesReservedSenderZero() {
+        PeerStatePacket.PlayerState[] players = new PeerStatePacket.PlayerState[33];
+        players[7] = new PeerStatePacket.PlayerState(7, PeerStatePacket.FLAG_PRESENT,
+                12, 0, PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_RUNNING,
+                0, 2, 1, 15, 4, 29, 0, 0, 0);
+
+        byte[] encoded = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                UUID.randomUUID(), 4, 0, Globals.GAME_MODE_2TEAMS, players);
+        PeerStatePacket.Decoded decoded = PeerStatePacket.decode(encoded, 0, encoded.length);
+
+        assertNotNull(decoded);
+        assertEquals(0, decoded.senderID);
+        assertEquals(12, decoded.players[7].ownerSequence);
     }
 }

@@ -189,7 +189,9 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         mShotModeAuto.setChecked(Globals.getInstance().mAllowAutoShotMode);
         setFiringModeSelection(Globals.getInstance().mCurrentFiringMode);
         mVibratePhoneSwitch.setVisibility(View.VISIBLE);
-        mVibratePhoneSwitch.setChecked(Globals.getInstance().mVibrateOnHit);
+        mVibratePhoneSwitch.setChecked(Globals.getInstance().mTournamentMode
+                || Globals.getInstance().mVibrateOnHit);
+        mVibratePhoneSwitch.setEnabled(!Globals.getInstance().mTournamentMode);
         mAllowPlayerSettingsSwitch.setVisibility(View.GONE);
         mFiringModeButton.setVisibility(View.GONE);
         mApplyAllSwitch.setVisibility(View.GONE);
@@ -329,7 +331,7 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
             mShotModeBurst3.setChecked(true);
             mShotModeSingle.setChecked(true);
             setFiringModeSelection(Globals.FIRING_MODE_OUTDOOR_NO_CONE);
-            if (!isServer)
+            if (!isServer && !Globals.getInstance().mTournamentMode)
                 mVibratePhoneSwitch.setChecked(false);
             mLivesET.setText("" + 0);
 

@@ -77,7 +77,8 @@ public class SavedProfileRegressionTest {
             assertEquals("Player", preferences.getString(PREF_PLAYER_NAME, null));
             assertEquals("", preferences.getString(FullscreenActivity.PREF_DEVICE_ADDRESS, null));
             assertEquals(Globals.GAME_MODE_2TEAMS, Globals.getInstance().mGameMode);
-            assertEquals(false, preferences.contains(FullscreenActivity.PREF_GAME_MODE));
+            assertEquals(Globals.GAME_MODE_2TEAMS,
+                    preferences.getInt(FullscreenActivity.PREF_GAME_MODE, -1));
             assertEquals(View.GONE, activity.findViewById(R.id.reconnect_weapon_button).getVisibility());
         });
     }

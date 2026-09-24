@@ -1,6 +1,7 @@
 package com.simplecoil.simplecoil;
 
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.SharedPreferences;
 
 /** Match totals stored on the player's own phone, independent of their lobby name or ID. */
@@ -20,6 +21,11 @@ final class PlayerHistory {
     }
 
     private static int read(Context context, String key) {
+        // Unit-style service instances have not been attached to Android yet.
+        // Registration can still proceed with an empty history in that state.
+        if (context == null || context instanceof ContextWrapper
+                && ((ContextWrapper) context).getBaseContext() == null)
+            return 0;
         SharedPreferences preferences = context.getSharedPreferences(FullscreenActivity.PREF_NAME,
                 Context.MODE_PRIVATE);
         return Math.max(0, Math.min(MAX_TOTAL,
@@ -27,6 +33,9 @@ final class PlayerHistory {
     }
 
     static void record(Context context, int kills, int deaths) {
+        if (context == null || context instanceof ContextWrapper
+                && ((ContextWrapper) context).getBaseContext() == null)
+            return;
         SharedPreferences preferences = context.getSharedPreferences(FullscreenActivity.PREF_NAME,
                 Context.MODE_PRIVATE);
         preferences.edit()

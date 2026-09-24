@@ -197,12 +197,12 @@ public class MapRegressionTest {
     public void gameModeChangeRecomputesMarkerTeamsWithoutMovement() {
         scenario.onActivity(current -> {
             Globals.getInstance().mGPSMode = Globals.GPS_TEAMMATE;
-            putLocation(6, 10); // A teammate in two-team mode, an enemy in four-team mode.
+            putLocation(10, 10); // A teammate in two-team mode, an enemy in four-team mode.
             receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
-            assertNotNull(marker(6));
+            assertNotNull(marker(10));
             Globals.getInstance().mGameMode = Globals.GAME_MODE_4TEAMS;
             receive(new Intent(NetMsg.NETMSG_LISTPLAYERS));
-            assertNull("Old team assignment kept an enemy marker visible", marker(6));
+            assertNull("Old team assignment kept an enemy marker visible", marker(10));
         });
     }
 

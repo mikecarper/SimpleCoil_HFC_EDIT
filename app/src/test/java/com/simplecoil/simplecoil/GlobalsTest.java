@@ -52,6 +52,27 @@ public class GlobalsTest {
         assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE, settings.firingMode);
     }
 
+    @Test public void localTournamentProfileKeepsIndoorRangeWithoutUnlockingCone() {
+        Globals globals = Globals.getInstance();
+        boolean oldBossMode = globals.mBossMode;
+        byte oldPlayerID = globals.mPlayerID;
+        int oldFiringMode = globals.mCurrentFiringMode;
+        try {
+            globals.mBossMode = false;
+            globals.mPlayerID = 2;
+            globals.mCurrentFiringMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
+            globals.applyTournamentRules();
+            assertEquals(Globals.FIRING_MODE_INDOOR_NO_CONE, globals.mCurrentFiringMode);
+            globals.mCurrentFiringMode = Globals.FIRING_MODE_OUTDOOR_WITH_CONE;
+            globals.applyTournamentRules();
+            assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE, globals.mCurrentFiringMode);
+        } finally {
+            globals.mBossMode = oldBossMode;
+            globals.mPlayerID = oldPlayerID;
+            globals.mCurrentFiringMode = oldFiringMode;
+        }
+    }
+
     @Test public void bossProfileScalesAndUnlocksTheBossWeaponOnly() {
         Globals.PlayerSettings boss = new Globals.PlayerSettings();
         Globals.applyTournamentRules(boss);

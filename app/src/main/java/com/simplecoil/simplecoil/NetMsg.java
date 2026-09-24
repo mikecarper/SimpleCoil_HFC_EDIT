@@ -20,11 +20,11 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    // Clock calibration now requires a longer, low-latency sample burst. Keep
-    // older clients out of a lobby rather than leaving them unable to satisfy
-    // the updated start barrier.
-    public static final int NETWORK_VERSION_NUMBER = 18;
-    public static final String NETWORK_VERSION = "18";
+    // Protocol 19 adds all-player state gossip, sender-zero authority ticks,
+    // and missed-tick reconstruction. Older clients must not interpret those
+    // binary snapshots as the protocol-18 peer-only stream.
+    public static final int NETWORK_VERSION_NUMBER = 19;
+    public static final String NETWORK_VERSION = "19";
 
     // Most of these messages are straightforward and contain no extra data.
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";

@@ -36,6 +36,8 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -68,7 +70,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * of the combat path means it remains useful with a full 32-player game.</p>
  */
 public final class LaptopHost {
-    private static final int NETWORK_VERSION = 18;
+    private static final int NETWORK_VERSION = 19;
     private static final String MESSAGE_PREFIX = "SimpleCoil:";
     private static final String TCP_PREFIX = MESSAGE_PREFIX + NETWORK_VERSION;
     private static final String TCP_JSON_PREFIX = TCP_PREFIX + "JSON";
@@ -81,6 +83,13 @@ public final class LaptopHost {
     private static final int CLOCK_SAMPLES_REQUIRED = 12;
 
     private static final int MAX_PLAYERS = 32;
+    private static final int STATE_PACKET_BYTES = 32 + MAX_PLAYERS * 40;
+    private static final int UDP_RECEIVE_BYTES = 1_472;
+    private static final int STATE_PACKET_MAGIC = 0x53434F49;
+    private static final int STATE_PACKET_FORMAT = 1;
+    private static final int COMBAT_PACKET_BYTES = 32;
+    private static final int COMBAT_PACKET_MAGIC = 0x53434F43;
+    private static final int COMBAT_PACKET_FORMAT = 1;
     private static final int MAX_GRENADE_IDS = 16;
     private static final int MAX_SCOREBOARD_VALUE = Integer.MAX_VALUE / MAX_PLAYERS;
     private static final long CLOCK_MAX_VALUE = Long.MAX_VALUE / 4;
@@ -93,6 +102,7 @@ public final class LaptopHost {
     private static final long LASER_LIFETIME_MS = 1_500;
     private static final long JOIN_ASSIGNMENT_TIMEOUT_MS = 10_000;
     private static final long BALANCED_QR_CHECK_IN_TIMEOUT_MS = 90_000;
+    private static final long NEXT_GAME_WAIT_MS = 30_000;
     // Match the dedicated phone host's practical heartbeat window. A Wi-Fi
     // disappearance must not leave a ghost player occupying an ID or marker.
     private static final long CLIENT_IDLE_TIMEOUT_MS = 35_000;
@@ -128,6 +138,15 @@ public final class LaptopHost {
     private final Map<InetAddress, PendingAssignment> pendingAssignments = new HashMap<>();
     private final Map<Integer, Integer> grenadeOwners = new HashMap<>();
     private final Deque<LaserEvent> lasers = new ArrayDeque<>();
+    private final StateRow[] gossipState = new StateRow[MAX_PLAYERS + 1];
+    private final long[] lastGossipPacketSequence = new long[MAX_PLAYERS + 1];
+    // A compact combat event can beat its sender's first full state row to the
+    // laptop. Retain only the latest fixed-width event per player so the next
+    // one-second authority tick can still repair phones that missed the burst.
+    private final long[] observedCombatSequence = new long[MAX_PLAYERS + 1];
+    private final int[] observedCombatType = new int[MAX_PLAYERS + 1];
+    private final int[] observedCombatTarget = new int[MAX_PLAYERS + 1];
+    private long authorityTickSequence;
     // Recipient player ID -> the enemy player IDs that a confirmed IR hit may
     // reveal. These maps are protected by stateLock. Every active teammate of
     // each participant shares the reveal, but no other enemy is exposed.
@@ -163,6 +182,7 @@ public final class LaptopHost {
     private long roundStartAt;
     private long roundDuration;
     private long roundEndAt;
+    private long nextRoundStartAllowedAt;
     // Boss health is fixed from the roster that existed when Start was
     // accepted. A temporary Wi-Fi disconnect must not lower the boss's maximum
     // health before that hunter has a chance to reconnect.
@@ -227,6 +247,7 @@ public final class LaptopHost {
         udpThread.start();
 
         scheduler.scheduleAtFixedRate(this::sendHeartbeats, 1, 1, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::publishAuthorityStateTick, 1, 1, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(this::publishGps, GPS_PUBLISH_INTERVAL_MS,
                 GPS_PUBLISH_INTERVAL_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(this::advanceRoundClock, 100, 100, TimeUnit.MILLISECONDS);
@@ -302,14 +323,26 @@ public final class LaptopHost {
     }
 
     private void runUdpLoop() {
-        byte[] buffer = new byte[512];
+        // Keep headroom above the exact state size so an oversized datagram is
+        // observable as oversized and rejected instead of being truncated into
+        // what looks like a valid packet.
+        byte[] buffer = new byte[UDP_RECEIVE_BYTES];
         while (!stopping) {
             try {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 udpServer.receive(packet);
-                String message = new String(packet.getData(), packet.getOffset(), packet.getLength(),
-                        StandardCharsets.UTF_8);
-                handleUdpDiscovery(packet.getAddress(), message);
+                if (CombatPacket.looksLike(packet.getData(), packet.getOffset(),
+                        packet.getLength())) {
+                    handleCombatEvent(packet.getAddress(), packet.getData(), packet.getOffset(),
+                            packet.getLength());
+                } else if (StatePacket.looksLike(packet.getData(), packet.getOffset(), packet.getLength())) {
+                    handleStateGossip(packet.getAddress(), packet.getData(), packet.getOffset(),
+                            packet.getLength());
+                } else {
+                    String message = new String(packet.getData(), packet.getOffset(), packet.getLength(),
+                            StandardCharsets.UTF_8);
+                    handleUdpDiscovery(packet.getAddress(), message);
+                }
             } catch (SocketException e) {
                 if (!stopping)
                     System.err.println("UDP discovery stopped: " + e.getMessage());
@@ -406,6 +439,110 @@ public final class LaptopHost {
         } catch (IOException ignored) {
             // Discovery is retried by the phone; one lost reply should not affect
             // the TCP host or dashboard.
+        }
+    }
+
+    private void handleStateGossip(InetAddress source, byte[] payload, int offset, int length) {
+        StatePacket decoded = StatePacket.decode(payload, offset, length);
+        if (decoded == null || decoded.networkVersion != NETWORK_VERSION || decoded.senderID <= 0
+                || decoded.gameMode != config.gameMode.wireValue)
+            return;
+        synchronized (stateLock) {
+            if (!isRoundActiveLocked() || roundToken == null
+                    || !roundToken.equals(decoded.roundToken.toString()))
+                return;
+            Player player = players.get(decoded.senderID);
+            StateRow owned = decoded.rows[decoded.senderID];
+            if (player == null || owned == null || !source.equals(player.address)
+                    || decoded.packetSequence <= lastGossipPacketSequence[decoded.senderID])
+                return;
+            lastGossipPacketSequence[decoded.senderID] = decoded.packetSequence;
+            StateRow current = gossipState[decoded.senderID];
+            if (current == null || owned.ownerSequence > current.ownerSequence) {
+                if (owned.eventSequence > observedCombatSequence[decoded.senderID]) {
+                    observedCombatSequence[decoded.senderID] = owned.eventSequence;
+                    observedCombatType[decoded.senderID] = owned.eventType;
+                    observedCombatTarget[decoded.senderID] = owned.eventTargetID;
+                }
+                gossipState[decoded.senderID] = mergeObservedCombatLocked(
+                        decoded.senderID, owned);
+            }
+        }
+    }
+
+    private void handleCombatEvent(InetAddress source, byte[] payload, int offset, int length) {
+        CombatPacket decoded = CombatPacket.decode(payload, offset, length);
+        if (decoded == null || decoded.networkVersion != NETWORK_VERSION
+                || decoded.kind != CombatPacket.KIND_EVENT)
+            return;
+        synchronized (stateLock) {
+            if (!isRoundActiveLocked() || roundToken == null
+                    || !roundToken.equals(decoded.roundToken.toString()))
+                return;
+            Player player = players.get(decoded.senderID);
+            if (player == null || player.address == null || !source.equals(player.address)
+                    || decoded.eventSequence <= observedCombatSequence[decoded.senderID])
+                return;
+            observedCombatSequence[decoded.senderID] = decoded.eventSequence;
+            observedCombatType[decoded.senderID] = decoded.eventType;
+            observedCombatTarget[decoded.senderID] = decoded.targetID;
+            StateRow current = gossipState[decoded.senderID];
+            if (current != null)
+                gossipState[decoded.senderID] = mergeObservedCombatLocked(
+                        decoded.senderID, current);
+        }
+    }
+
+    // Caller holds stateLock.
+    private StateRow mergeObservedCombatLocked(int playerID, StateRow row) {
+        long sequence = observedCombatSequence[playerID];
+        if (row == null || sequence <= row.eventSequence)
+            return row;
+        return new StateRow(row.flags, row.ownerSequence, sequence, row.gameState,
+                row.grenadeID, observedCombatType[playerID], observedCombatTarget[playerID],
+                row.score, row.deaths, row.health, row.shield, row.shotsRemaining,
+                row.gpsAgeSeconds, row.latitude, row.longitude);
+    }
+
+    private void publishAuthorityStateTick() {
+        final byte[] payload;
+        final List<InetAddress> recipients = new ArrayList<>();
+        synchronized (stateLock) {
+            updateRoundStateLocked();
+            if (!isRoundActiveLocked() || roundToken == null)
+                return;
+            UUID token;
+            try {
+                token = UUID.fromString(roundToken);
+            } catch (IllegalArgumentException e) {
+                return;
+            }
+            if (authorityTickSequence >= 0xffffffffL)
+                return;
+            payload = StatePacket.encode(NETWORK_VERSION, token, ++authorityTickSequence,
+                    config.gameMode.wireValue, gossipState);
+            // Broadcast lets every nearby phone hear the same tick. Targeted
+            // copies retain normal Wi-Fi unicast acknowledgements and make a
+            // congested access point's broadcast loss much less noticeable.
+            for (Player player : players.values()) {
+                if (player.connected && player.address != null
+                        && !recipients.contains(player.address))
+                    recipients.add(player.address);
+            }
+        }
+        DatagramSocket socket = udpServer;
+        if (socket == null || socket.isClosed())
+            return;
+        for (InetAddress address : broadcastAddresses()) {
+            if (!recipients.contains(address))
+                recipients.add(address);
+        }
+        for (InetAddress address : recipients) {
+            try {
+                socket.send(new DatagramPacket(payload, payload.length, address, config.udpPort));
+            } catch (IOException ignored) {
+                // The next one-second authority tick repairs a dropped send.
+            }
         }
     }
 
@@ -828,6 +965,10 @@ public final class LaptopHost {
         boolean publishedAssignment = false;
         synchronized (stateLock) {
             updateRoundStateLocked();
+            long cooldown = Math.max(0, nextRoundStartAllowedAt - elapsedMillis());
+            if (cooldown > 0)
+                return StartResult.error("Next game can start in "
+                        + ((cooldown + 999) / 1_000) + " seconds.", false);
             if (roundState != RoundState.LOBBY)
                 return StartResult.error("A game is already running.", false);
             recipients = connectedClientsLocked();
@@ -851,6 +992,10 @@ public final class LaptopHost {
             broadcastRoster();
         synchronized (stateLock) {
             updateRoundStateLocked();
+            long cooldown = Math.max(0, nextRoundStartAllowedAt - elapsedMillis());
+            if (cooldown > 0)
+                return StartResult.error("Next game can start in "
+                        + ((cooldown + 999) / 1_000) + " seconds.", false);
             if (roundState != RoundState.LOBBY)
                 return StartResult.error("A game is already running.", false);
             recipients = connectedClientsLocked();
@@ -870,6 +1015,14 @@ public final class LaptopHost {
             roundID++;
             roundToken = UUID.randomUUID().toString();
             token = roundToken;
+            authorityTickSequence = 0;
+            for (int playerID = 0; playerID <= MAX_PLAYERS; playerID++) {
+                gossipState[playerID] = null;
+                lastGossipPacketSequence[playerID] = 0;
+                observedCombatSequence[playerID] = 0;
+                observedCombatType[playerID] = 0;
+                observedCombatTarget[playerID] = 0;
+            }
             roundStartAt = elapsedMillis() + (config.balanced ? 10 : config.startDelaySeconds) * 1_000L;
             roundDuration = config.durationMinutes * 60_000L;
             roundEndAt = roundDuration == 0 ? 0 : roundStartAt + roundDuration;
@@ -978,6 +1131,8 @@ public final class LaptopHost {
             if (roundState != RoundState.COUNTDOWN && roundState != RoundState.RUNNING)
                 return;
             roundState = RoundState.FINISHED;
+            nextRoundStartAllowedAt = Math.max(nextRoundStartAllowedAt,
+                    elapsedMillis() + NEXT_GAME_WAIT_MS);
             recipients = connectedClientsLocked();
         }
         System.out.println("Game finished: " + reason);
@@ -1407,6 +1562,14 @@ public final class LaptopHost {
         roundDuration = 0;
         roundEndAt = 0;
         bossHunterCount = 0;
+        authorityTickSequence = 0;
+        for (int playerID = 0; playerID <= MAX_PLAYERS; playerID++) {
+            gossipState[playerID] = null;
+            lastGossipPacketSequence[playerID] = 0;
+            observedCombatSequence[playerID] = 0;
+            observedCombatType[playerID] = 0;
+            observedCombatTarget[playerID] = 0;
+        }
     }
 
     private void disconnect(ClientConnection client) {
@@ -1777,6 +1940,235 @@ public final class LaptopHost {
         }
     }
 
+    /** Protocol-19 fixed-size state gossip and authority tick. */
+    private static final class StatePacket {
+        static final int FLAG_PRESENT = 1;
+        static final int FLAG_LEFT = 1 << 1;
+        static final int FLAG_GPS_VALID = 1 << 2;
+
+        final int networkVersion;
+        final UUID roundToken;
+        final long packetSequence;
+        final int senderID;
+        final int gameMode;
+        final StateRow[] rows;
+
+        StatePacket(int networkVersion, UUID roundToken, long packetSequence, int senderID,
+                    int gameMode, StateRow[] rows) {
+            this.networkVersion = networkVersion;
+            this.roundToken = roundToken;
+            this.packetSequence = packetSequence;
+            this.senderID = senderID;
+            this.gameMode = gameMode;
+            this.rows = rows;
+        }
+
+        static boolean looksLike(byte[] payload, int offset, int length) {
+            return payload != null && offset >= 0 && length >= 4
+                    && offset <= payload.length - length
+                    && ByteBuffer.wrap(payload, offset, 4).order(ByteOrder.BIG_ENDIAN).getInt()
+                    == STATE_PACKET_MAGIC;
+        }
+
+        static StatePacket decode(byte[] payload, int offset, int length) {
+            if (payload == null || offset < 0 || length != STATE_PACKET_BYTES
+                    || offset > payload.length - length)
+                return null;
+            ByteBuffer buffer = ByteBuffer.wrap(payload, offset, length).slice()
+                    .order(ByteOrder.BIG_ENDIAN);
+            if (buffer.getInt() != STATE_PACKET_MAGIC || u8(buffer.get()) != STATE_PACKET_FORMAT)
+                return null;
+            int networkVersion = u8(buffer.get());
+            int senderID = u8(buffer.get());
+            int gameMode = u8(buffer.get());
+            long packetSequence = buffer.getLong();
+            UUID token = new UUID(buffer.getLong(), buffer.getLong());
+            if (senderID < 0 || senderID > MAX_PLAYERS || packetSequence <= 0
+                    || gameMode != 1 && gameMode != 2 && gameMode != 4)
+                return null;
+            StateRow[] rows = new StateRow[MAX_PLAYERS + 1];
+            for (int slot = 1; slot <= MAX_PLAYERS; slot++) {
+                int flags = u8(buffer.get());
+                int playerID = u8(buffer.get());
+                int gameState = u8(buffer.get());
+                int grenadeID = u8(buffer.get());
+                int eventType = u8(buffer.get());
+                int eventTargetID = u8(buffer.get());
+                buffer.getShort();
+                long ownerSequence = u32(buffer.getInt());
+                long eventSequence = u32(buffer.getInt());
+                int score = buffer.getInt();
+                int deaths = buffer.getInt();
+                int health = u16(buffer.getShort());
+                int shield = u16(buffer.getShort());
+                int shotsRemaining = u16(buffer.getShort());
+                int gpsAgeSeconds = u16(buffer.getShort());
+                int latitude = buffer.getInt();
+                int longitude = buffer.getInt();
+                if (playerID != slot)
+                    return null;
+                if ((flags & FLAG_PRESENT) == 0)
+                    continue;
+                if ((flags & ~(FLAG_PRESENT | FLAG_LEFT | FLAG_GPS_VALID)) != 0
+                        || ownerSequence <= 0 || gameState > 2 || grenadeID >= MAX_GRENADE_IDS
+                        || eventType > 7 || eventTargetID > MAX_PLAYERS || score < 0
+                        || score > MAX_SCOREBOARD_VALUE || deaths < 0
+                        || deaths > MAX_SCOREBOARD_VALUE)
+                    return null;
+                if ((flags & FLAG_GPS_VALID) != 0
+                        && !validCoordinates(longitude / 100_000.0, latitude / 100_000.0))
+                    return null;
+                rows[playerID] = new StateRow(flags, ownerSequence, eventSequence, gameState,
+                        grenadeID, eventType, eventTargetID, score, deaths, health, shield,
+                        shotsRemaining, gpsAgeSeconds, latitude, longitude);
+            }
+            return new StatePacket(networkVersion, token, packetSequence, senderID, gameMode, rows);
+        }
+
+        static byte[] encode(int networkVersion, UUID token, long sequence, int gameMode,
+                             StateRow[] rows) {
+            ByteBuffer buffer = ByteBuffer.allocate(STATE_PACKET_BYTES).order(ByteOrder.BIG_ENDIAN);
+            buffer.putInt(STATE_PACKET_MAGIC);
+            buffer.put((byte) STATE_PACKET_FORMAT);
+            buffer.put((byte) networkVersion);
+            buffer.put((byte) 0); // authoritative host
+            buffer.put((byte) gameMode);
+            buffer.putLong(sequence);
+            buffer.putLong(token.getMostSignificantBits());
+            buffer.putLong(token.getLeastSignificantBits());
+            for (int playerID = 1; playerID <= MAX_PLAYERS; playerID++) {
+                StateRow row = rows == null ? null : rows[playerID];
+                buffer.put((byte) (row == null ? 0 : row.flags | FLAG_PRESENT));
+                buffer.put((byte) playerID);
+                buffer.put((byte) (row == null ? 0 : row.gameState));
+                buffer.put((byte) (row == null ? 0 : row.grenadeID));
+                buffer.put((byte) (row == null ? 0 : row.eventType));
+                buffer.put((byte) (row == null ? 0 : row.eventTargetID));
+                buffer.putShort((short) 0);
+                buffer.putInt((int) (row == null ? 0 : row.ownerSequence));
+                buffer.putInt((int) (row == null ? 0 : row.eventSequence));
+                buffer.putInt(row == null ? 0 : row.score);
+                buffer.putInt(row == null ? 0 : row.deaths);
+                buffer.putShort((short) clamp16(row == null ? 0 : row.health));
+                buffer.putShort((short) clamp16(row == null ? 0 : row.shield));
+                buffer.putShort((short) clamp16(row == null ? 0 : row.shotsRemaining));
+                buffer.putShort((short) clamp16(row == null ? 0 : row.gpsAgeSeconds));
+                buffer.putInt(row == null ? 0 : row.latitude);
+                buffer.putInt(row == null ? 0 : row.longitude);
+            }
+            return buffer.array();
+        }
+
+        private static int clamp16(int value) { return Math.max(0, Math.min(0xffff, value)); }
+        private static int u8(byte value) { return value & 0xff; }
+        private static int u16(short value) { return value & 0xffff; }
+        private static long u32(int value) { return value & 0xffffffffL; }
+    }
+
+    private static final class StateRow {
+        final int flags;
+        final long ownerSequence;
+        final long eventSequence;
+        final int gameState;
+        final int grenadeID;
+        final int eventType;
+        final int eventTargetID;
+        final int score;
+        final int deaths;
+        final int health;
+        final int shield;
+        final int shotsRemaining;
+        final int gpsAgeSeconds;
+        final int latitude;
+        final int longitude;
+
+        StateRow(int flags, long ownerSequence, long eventSequence, int gameState, int grenadeID,
+                 int eventType, int eventTargetID, int score, int deaths, int health, int shield,
+                 int shotsRemaining, int gpsAgeSeconds, int latitude, int longitude) {
+            this.flags = flags;
+            this.ownerSequence = ownerSequence;
+            this.eventSequence = eventSequence;
+            this.gameState = gameState;
+            this.grenadeID = grenadeID;
+            this.eventType = eventType;
+            this.eventTargetID = eventTargetID;
+            this.score = score;
+            this.deaths = deaths;
+            this.health = health;
+            this.shield = shield;
+            this.shotsRemaining = shotsRemaining;
+            this.gpsAgeSeconds = gpsAgeSeconds;
+            this.latitude = latitude;
+            this.longitude = longitude;
+        }
+    }
+
+    /** Protocol-19 compact event; phones ACK only the addressed target. */
+    private static final class CombatPacket {
+        static final int KIND_EVENT = 1;
+        static final int KIND_ACK = 2;
+
+        final int networkVersion;
+        final int kind;
+        final int eventType;
+        final int senderID;
+        final int targetID;
+        final long eventSequence;
+        final UUID roundToken;
+
+        CombatPacket(int networkVersion, int kind, int eventType, int senderID,
+                     int targetID, long eventSequence, UUID roundToken) {
+            this.networkVersion = networkVersion;
+            this.kind = kind;
+            this.eventType = eventType;
+            this.senderID = senderID;
+            this.targetID = targetID;
+            this.eventSequence = eventSequence;
+            this.roundToken = roundToken;
+        }
+
+        static boolean looksLike(byte[] payload, int offset, int length) {
+            return payload != null && offset >= 0 && length >= 4
+                    && offset <= payload.length - length
+                    && ByteBuffer.wrap(payload, offset, 4).order(ByteOrder.BIG_ENDIAN).getInt()
+                    == COMBAT_PACKET_MAGIC;
+        }
+
+        static CombatPacket decode(byte[] payload, int offset, int length) {
+            if (payload == null || offset < 0 || length != COMBAT_PACKET_BYTES
+                    || offset > payload.length - length)
+                return null;
+            ByteBuffer buffer = ByteBuffer.wrap(payload, offset, length).slice()
+                    .order(ByteOrder.BIG_ENDIAN);
+            if (buffer.getInt() != COMBAT_PACKET_MAGIC
+                    || u8(buffer.get()) != COMBAT_PACKET_FORMAT)
+                return null;
+            int networkVersion = u8(buffer.get());
+            int kind = u8(buffer.get());
+            int eventType = u8(buffer.get());
+            int senderID = u8(buffer.get());
+            int targetID = u8(buffer.get());
+            if (buffer.getShort() != 0)
+                return null;
+            long eventSequence = u32(buffer.getInt());
+            UUID token = new UUID(buffer.getLong(), buffer.getLong());
+            if ((kind != KIND_EVENT && kind != KIND_ACK) || eventType < 1 || eventType > 5
+                    || !validPlayerID(senderID) || eventSequence <= 0)
+                return null;
+            if (kind == KIND_EVENT && eventType == 1) {
+                if (targetID != 0)
+                    return null;
+            } else if (!validPlayerID(targetID)) {
+                return null;
+            }
+            return new CombatPacket(networkVersion, kind, eventType, senderID, targetID,
+                    eventSequence, token);
+        }
+
+        private static int u8(byte value) { return value & 0xff; }
+        private static long u32(int value) { return value & 0xffffffffL; }
+    }
+
     private static final class Settings {
         int health = 5;
         int reloadShots = 30;
@@ -1953,7 +2345,9 @@ public final class LaptopHost {
             state.put("startInMs", roundState == RoundState.COUNTDOWN ? Math.max(0, roundStartAt - now) : 0);
             state.put("remainingMs", roundEndAt > 0 && isRoundActiveLocked()
                     ? Math.max(0, roundEndAt - now) : 0);
+            state.put("cooldownMs", Math.max(0, nextRoundStartAllowedAt - now));
             state.put("canStart", roundState == RoundState.LOBBY && activeClients.size() >= 2
+                    && now >= nextRoundStartAllowedAt
                     && (!config.boss || activeClients.containsKey(1))
                     && clockReadyCountLocked() == activeClients.size()
                     && (!config.balancedQr || balancedTeams.isEmpty()));
@@ -2554,7 +2948,7 @@ public final class LaptopHost {
             start.onclick=()=>control('/api/start');end.onclick=()=>control('/api/end');
             function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.awaitingRespawn)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}
             function color(team){return team===1?'#49a5ff':team===2?'#ff5d67':`hsl(${(team*57)%360} 90% 63%)`}
-            function label(s){if(!s)return 'Connecting…';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s · ${p} players`;if(s.state==='running')return s.remainingMs?`Running · ${Math.ceil(s.remainingMs/1000)}s left · ${p} players`:`Running · ${p} players`;if(s.state==='finished')return 'Finished — final scores remain visible';if(s.balancedQr&&s.assignedCount)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount} · auto-start in ${Math.ceil(s.checkInRemainingMs/1000)}s`;return `${p} players · clocks ${ready}/${p}`}
+            function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - final scores visible; next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores remain visible';if(s.balancedQr&&s.assignedCount)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount} - auto-start in ${Math.ceil(s.checkInRemainingMs/1000)}s`;return `${p} players - clocks ${ready}/${p}`}
             function draw(){const w=innerWidth,h=innerHeight-60;ctx.clearRect(0,0,w,h);ctx.fillStyle='#0d1720';ctx.fillRect(0,0,w,h);if(!state){respawns.replaceChildren();return}status.textContent=label(state);start.disabled=!state.canStart;end.disabled=!['countdown','running'].includes(state.state);drawRespawns(state);const ps=state.players.filter(p=>Number.isFinite(p.longitude)&&Number.isFinite(p.latitude));if(!ps.length){ctx.fillStyle='#aab9c6';ctx.font='18px system-ui';ctx.fillText('Waiting for usable GPS fixes…',24,36);return}
               let minLat=Math.min(...ps.map(p=>p.latitude)),maxLat=Math.max(...ps.map(p=>p.latitude)),minLon=Math.min(...ps.map(p=>p.longitude)),maxLon=Math.max(...ps.map(p=>p.longitude));let midLat=(minLat+maxLat)/2,metersLat=Math.max(30,(maxLat-minLat)*111320),metersLon=Math.max(30,(maxLon-minLon)*111320*Math.cos(midLat*Math.PI/180));let scale=Math.min((w-100)/metersLon,(h-100)/metersLat);function xy(p){return{x:w/2+(p.longitude-(minLon+maxLon)/2)*111320*Math.cos(midLat*Math.PI/180)*scale,y:h/2-(p.latitude-(minLat+maxLat)/2)*111320*scale}}
               ctx.strokeStyle='#203445';ctx.lineWidth=1;for(let x=0;x<w;x+=50){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}for(let y=0;y<h;y+=50){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}

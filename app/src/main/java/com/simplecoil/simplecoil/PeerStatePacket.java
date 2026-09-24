@@ -54,7 +54,9 @@ final class PeerStatePacket {
 
     static byte[] encode(int networkVersion, UUID roundToken, long snapshotSequence,
                          int senderID, int gameMode, PlayerState[] players) {
-        if (roundToken == null || senderID < 1 || senderID > PLAYER_CAPACITY
+        // Sender zero is reserved for the authoritative host tick. Player
+        // gossip always uses the sender's real 1..32 identity.
+        if (roundToken == null || senderID < 0 || senderID > PLAYER_CAPACITY
                 || snapshotSequence <= 0)
             throw new IllegalArgumentException("Invalid peer snapshot header");
 
@@ -105,7 +107,7 @@ final class PeerStatePacket {
         int gameMode = unsigned(buffer.get());
         long snapshotSequence = buffer.getLong();
         UUID roundToken = new UUID(buffer.getLong(), buffer.getLong());
-        if (senderID < 1 || senderID > PLAYER_CAPACITY || snapshotSequence <= 0
+        if (senderID < 0 || senderID > PLAYER_CAPACITY || snapshotSequence <= 0
                 || !Globals.isValidGameMode(gameMode))
             return null;
 

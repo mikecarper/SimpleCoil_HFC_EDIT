@@ -514,6 +514,8 @@ public class TcpServerDispatchRegressionTest {
         dispatchThenChange(server::endGame, () -> { });
         MemorySocket nextRound = new MemorySocket();
         addClient(1, nextRound);
+        assertFalse("The cooldown must block immediate restarts", server.startGame());
+        set(server, "mNextGameStartAllowedAt", SystemClock.elapsedRealtime() - 1);
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         assertTrue(nextRound.bytes.size() > 0);
         assertEquals(2, java.util.Collections.frequency(server.events, NetMsg.NETMSG_STARTGAME));
@@ -623,6 +625,8 @@ public class TcpServerDispatchRegressionTest {
             end.interrupt();
             end.join(1000);
             assertFalse(end.isAlive());
+            assertFalse("An interrupted end still starts the cooldown", server.startGame());
+            set(server, "mNextGameStartAllowedAt", SystemClock.elapsedRealtime() - 1);
             assertTrue("A cancelled cleanup permanently blocked new starts", server.startGame());
             start = queuedWorker();
         } finally { clientsLock.release(); }
@@ -702,7 +706,7 @@ public class TcpServerDispatchRegressionTest {
         MemorySocket teammate = new MemorySocket();
         MemorySocket enemy = new MemorySocket();
         addClient(2, teammate);
-        addClient(11, enemy);
+        addClient(17, enemy);
         clientsLock.acquire();
         Thread worker;
         try {
@@ -735,10 +739,10 @@ public class TcpServerDispatchRegressionTest {
     @Test
     public void disconnectedTeammatesStillQueueMessagesWithoutQueuingForOpponents() throws Exception {
         addClient(2, new MemorySocket());
-        addClient(11, new MemorySocket());
+        addClient(17, new MemorySocket());
         closeClient(1);
         closeClient(2);
-        closeClient(11);
+        closeClient(17);
         clientsLock.acquire();
         Thread worker;
         try {
@@ -748,7 +752,7 @@ public class TcpServerDispatchRegressionTest {
         worker.join(1000);
         assertFalse(worker.isAlive());
         assertTrue(queuedMessages(1).isEmpty());
-        assertTrue(queuedMessages(11).isEmpty());
+        assertTrue(queuedMessages(17).isEmpty());
         assertEquals(1, queuedMessages(2).size());
         assertEquals("team", queuedMessages(2).peek());
     }

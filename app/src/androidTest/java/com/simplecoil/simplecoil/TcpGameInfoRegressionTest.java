@@ -370,23 +370,23 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
-    public void validSettingsApplyUnsignedAmmoAndAllLocalFields() throws Exception {
+    public void validSettingsStillEnforceTheTournamentProfile() throws Exception {
+        globals.mCurrentFiringMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
         parse(settingsMessage(settings(1), settings(2)));
-        assertEquals(50, globals.mFullHealth);
-        assertEquals(200, globals.mFullReload & 0xff);
-        assertEquals(2500, globals.mReloadTime);
+        assertEquals(Globals.MAX_HEALTH, globals.mFullHealth);
+        assertEquals(Globals.RELOAD_COUNT, globals.mFullReload);
+        assertEquals(Globals.RELOAD_TIME_MILLISECONDS, globals.mReloadTime);
         assertFalse(globals.mReloadOnEmpty);
-        assertEquals(20, globals.mRespawnTime);
-        assertEquals(-10, globals.mDamage);
-        assertTrue(globals.mOverrideLives);
-        assertEquals(3, globals.mOverrideLivesVal);
-        assertFalse(globals.mAllowSingleShotMode);
+        assertEquals(Globals.RESPAWN_TIME_SECONDS, globals.mRespawnTime);
+        assertEquals(Globals.DAMAGE_PER_HIT, globals.mDamage);
+        assertFalse(globals.mOverrideLives);
+        assertTrue(globals.mAllowSingleShotMode);
         assertFalse(globals.mAllowBurst3ShotMode);
-        assertTrue(globals.mAllowAutoShotMode);
+        assertFalse(globals.mAllowAutoShotMode);
         assertEquals(Globals.FIRING_MODE_INDOOR_NO_CONE, globals.mCurrentFiringMode);
         assertFalse(globals.mAllowPlayerSettings);
         assertEquals(2, globals.mPlayerSettings.size());
-        assertEquals(50, globals.mPlayerSettings.get((byte) 2).health);
+        assertEquals(Globals.MAX_HEALTH, globals.mPlayerSettings.get((byte) 2).health);
         assertEquals(NetMsg.NETMSG_PLAYERSETTINGSUPDATE, client.events.get(0).getAction());
         assertEquals(1, globals.mPlayerSettingsSemaphore.availablePermits());
     }
@@ -415,7 +415,7 @@ public class TcpGameInfoRegressionTest {
         parse(roster(new JSONArray().put(player(3)))
                 .put(TcpServer.JSON_PLAYERSETTINGS, new JSONArray().put(settings(1)))
                 .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, false));
-        assertEquals(50, globals.mFullHealth);
+        assertEquals(Globals.MAX_HEALTH, globals.mFullHealth);
         assertEquals("Player 3", globals.mTeamPlayerNameMap.get((byte) 3));
         assertEquals(2, client.events.size());
         assertEquals(NetMsg.NETMSG_PLAYERSETTINGSUPDATE, client.events.get(0).getAction());
@@ -944,7 +944,7 @@ public class TcpGameInfoRegressionTest {
         assertEquals(baselineLocalSettings, localSettings());
         assertEquals(1, globals.mPlayerSettings.size());
         assertSame(baselineSettings, globals.mPlayerSettings.get((byte) 1));
-        assertEquals(20, baselineSettings.health);
+        assertEquals(Globals.MAX_HEALTH, baselineSettings.health);
         assertTrue(client.events.isEmpty());
         assertEquals(1, globals.mPlayerSettingsSemaphore.availablePermits());
     }
@@ -952,7 +952,8 @@ public class TcpGameInfoRegressionTest {
     private static JSONObject settingsMessage(JSONObject... players) throws Exception {
         JSONArray settings = new JSONArray();
         for (JSONObject player : players) settings.put(player);
-        return new JSONObject().put(TcpServer.JSON_PLAYERSETTINGS, settings)
+        return new JSONObject().put(TcpServer.JSON_TOURNAMENT_MODE, true)
+                .put(TcpServer.JSON_PLAYERSETTINGS, settings)
                 .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, false);
     }
 
@@ -980,7 +981,9 @@ public class TcpGameInfoRegressionTest {
 
     private static JSONObject roster(JSONArray players) throws Exception {
         return new JSONObject().put(TcpServer.JSON_PLAYERS, players).put(TcpServer.JSON_LIMITS, new JSONObject())
-                .put(TcpServer.JSON_GAMEMODE, Globals.GAME_MODE_2TEAMS).put(TcpServer.JSON_ONLY_SERVER_SETTINGS, false);
+                .put(TcpServer.JSON_GAMEMODE, Globals.GAME_MODE_2TEAMS)
+                .put(TcpServer.JSON_TOURNAMENT_MODE, true)
+                .put(TcpServer.JSON_ONLY_SERVER_SETTINGS, false);
     }
 
     private void assertOriginalRoster() {

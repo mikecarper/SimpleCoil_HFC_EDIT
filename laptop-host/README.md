@@ -4,9 +4,22 @@
 keeps the game authority and live display on a laptop; players still use the
 Android app and their BLE laser-tag hardware.
 
-It speaks the protocol-18 TCP lobby, clock synchronization, GPS,
+It speaks the protocol-19 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
+
+During a round, the laptop continues sending an authoritative state tick once
+per second by broadcast and per-phone unicast. Phones also broadcast their
+fixed-size state snapshots to the whole local network once per second. If a
+phone misses a host tick, it waits the 20% drift allowance (200 ms) and then
+fills only newer rows from the player snapshots it overheard; delayed data
+never replaces newer state.
+
+Latency-sensitive combat remains phone-to-phone: every phone can overhear each
+32-byte initial event, only its target sends a unicast ACK, and any 20 ms and
+60 ms retries are unicast only to that target. The laptop also records valid
+overheard events and includes the newest one in its next authority tick,
+providing a slower final repair without adding per-player ACK traffic.
 
 ## Run it
 

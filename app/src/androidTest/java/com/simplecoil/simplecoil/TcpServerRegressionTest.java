@@ -167,6 +167,7 @@ public class TcpServerRegressionTest {
 
     @Test
     public void normalAndEmptyNamesStillWorkForRegistrationAndRename() throws Exception {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Object player = client(1, 0);
         String name = TcpInputTestData.repeat('a', 20);
         parse(player, new JSONObject().put(TcpServer.JSON_PLAYERID, 1).put(TcpServer.JSON_PLAYERNAME, name));
@@ -732,9 +733,11 @@ public class TcpServerRegressionTest {
 
     @Test
     public void leavingRetainsTheLatestPlayerNameOnlyInRoundHistory() throws Exception {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Object departed = client(1, 1);
         parse(departed, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
                 .put(TcpServer.JSON_PLAYERNAMECHANGE, "Renamed player"));
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
         remove(departed, 1);
         assertEquals("Renamed player", server.getScore((byte) 1).playerName);
         assertFalse(Globals.getInstance().mTeamPlayerNameMap.containsKey((byte) 1));
@@ -749,6 +752,7 @@ public class TcpServerRegressionTest {
         set(departed, "eliminated", 5);
         remove(departed, 1);
         Object replacement = client(3, 1);
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         parse(replacement, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
                 .put(TcpServer.JSON_PLAYERNAMECHANGE, "Rejoined player"));
         set(server, "keepListening", true);

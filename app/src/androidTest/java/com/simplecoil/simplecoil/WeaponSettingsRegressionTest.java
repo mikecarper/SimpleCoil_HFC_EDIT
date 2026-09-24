@@ -46,7 +46,7 @@ public class WeaponSettingsRegressionTest {
         String[] savedFields = {"mAllowSingleShotMode", "mAllowBurst3ShotMode", "mAllowAutoShotMode",
                 "mCurrentFiringMode", "mGameState", "mUseGPS", "mPlayerID", "mPlayerName",
                 "mGameMode", "mGameLimit", "mTimeLimit", "mLivesLimit", "mScoreLimit",
-                "mOverrideLives", "mFullReload"};
+                "mOverrideLives", "mFullReload", "mBossMode"};
         for (String name : savedFields) {
             Field field = Globals.class.getDeclaredField(name);
             originalGlobals.put(field, field.get(globals));
@@ -117,10 +117,16 @@ public class WeaponSettingsRegressionTest {
 
     private void assertRangeUpdate(int mode, int firingMode, int power, int cone) {
         scenario.onActivity(current -> {
+            if (mode != Globals.SHOT_MODE_SINGLE
+                    || firingMode == Globals.FIRING_MODE_OUTDOOR_WITH_CONE) {
+                enableBossRole();
+                set("mBossWeaponInitialized", true);
+            }
             set("mCurrentShotMode", mode);
             Globals.getInstance().mCurrentFiringMode = firingMode;
             settingsUpdated();
-            assertEquals("A settings update did not configure the blaster", 1, bluetooth.configs.size());
+            assertEquals("Recoil and shot-mode configurations were not both sent",
+                    2, bluetooth.configs.size());
             assertMode(mode);
             assertEquals(power, lastConfig()[5] & 0xff);
             assertEquals(cone, lastConfig()[6] & 0xff);
@@ -147,8 +153,8 @@ public class WeaponSettingsRegressionTest {
             set("mCurrentShotMode", mode);
             allowModes(single, burst, automatic);
             settingsUpdated();
-            assertEquals(1, bluetooth.configs.size());
-            assertMode(expected);
+            assertEquals(2, bluetooth.configs.size());
+            assertMode(Globals.SHOT_MODE_SINGLE);
         });
     }
 
@@ -159,9 +165,9 @@ public class WeaponSettingsRegressionTest {
             set("mConfigCharacteristic", null);
             allowModes(false, true, false);
             settingsUpdated();
-            assertEquals(Globals.SHOT_MODE_BURST, get("mCurrentShotMode"));
-            assertEquals(Globals.SHOT_MODE_BURST, preferences.getInt("ShotMode", -1));
-            assertEquals(current.getString(R.string.shot_mode_burst3),
+            assertEquals(Globals.SHOT_MODE_SINGLE, get("mCurrentShotMode"));
+            assertEquals(Globals.SHOT_MODE_SINGLE, preferences.getInt("ShotMode", -1));
+            assertEquals(current.getString(R.string.shot_mode_single),
                     ((TextView) get("mShotModeTV")).getText().toString());
             assertTrue(bluetooth.configs.isEmpty());
         });
@@ -190,9 +196,9 @@ public class WeaponSettingsRegressionTest {
             settingsUpdated();
             set("mConfigCharacteristic", characteristic(GattAttributes.RECOIL_CONFIG_UUID));
             firstTelemetry();
-            assertEquals(1, bluetooth.configs.size());
+            assertEquals(2, bluetooth.configs.size());
             assertMode(Globals.SHOT_MODE_SINGLE);
-            assertEquals(0x19, lastConfig()[5] & 0xff);
+            assertEquals(0x19, lastShotConfig()[5] & 0xff);
         });
     }
 
@@ -202,8 +208,8 @@ public class WeaponSettingsRegressionTest {
             set("mCurrentShotMode", 99);
             allowModes(false, true, false);
             firstTelemetry();
-            assertEquals(1, bluetooth.configs.size());
-            assertMode(Globals.SHOT_MODE_BURST);
+            assertEquals(2, bluetooth.configs.size());
+            assertMode(Globals.SHOT_MODE_SINGLE);
         });
     }
 
@@ -219,6 +225,7 @@ public class WeaponSettingsRegressionTest {
     @Test
     public void lateRifleIdentificationCorrectsTheBurstRecoil() {
         scenario.onActivity(current -> {
+            enableBossRole();
             selectMode(Globals.SHOT_MODE_BURST);
             assertEquals(0x80, lastConfig()[9] & 0xff);
             identify((byte) 1);
@@ -231,6 +238,7 @@ public class WeaponSettingsRegressionTest {
     @Test
     public void latePistolIdentificationRemovesTheOldRifleRecoilSetting() {
         scenario.onActivity(current -> {
+            enableBossRole();
             set("mBlasterType", (byte) 1);
             selectMode(Globals.SHOT_MODE_BURST);
             assertEquals(0x78, lastConfig()[9] & 0xff);
@@ -244,6 +252,7 @@ public class WeaponSettingsRegressionTest {
     @Test
     public void rifleIdentificationKeepsTheAllowedAutomaticMode() {
         scenario.onActivity(current -> {
+            enableBossRole();
             selectMode(Globals.SHOT_MODE_FULL_AUTO);
             identify((byte) 1);
             assertEquals(2, bluetooth.configs.size());
@@ -282,19 +291,35 @@ public class WeaponSettingsRegressionTest {
 
     private void assertMode(int mode) {
         assertEquals(mode, get("mCurrentShotMode"));
-        assertEquals(9, lastConfig()[2]);
-        assertEquals(mode == Globals.SHOT_MODE_BURST ? 3 : 0xfe, lastConfig()[3] & 0xff);
+        assertEquals(9, lastShotConfig()[2]);
+        assertEquals(mode == Globals.SHOT_MODE_BURST ? 3 : 0xfe, lastShotConfig()[3] & 0xff);
         assertEquals(mode == Globals.SHOT_MODE_BURST ? 3 : mode == Globals.SHOT_MODE_SINGLE ? 0 : 1,
-                lastConfig()[4] & 0xff);
+                lastShotConfig()[4] & 0xff);
     }
 
     private byte[] lastConfig() { return bluetooth.configs.get(bluetooth.configs.size() - 1); }
+
+    private byte[] lastShotConfig() {
+        for (int index = bluetooth.configs.size() - 1; index >= 0; index--) {
+            byte[] config = bluetooth.configs.get(index);
+            if (config[2] == 9)
+                return config;
+        }
+        throw new AssertionError("No shot-mode configuration was sent");
+    }
 
     private static void allowModes(boolean single, boolean burst, boolean automatic) {
         Globals globals = Globals.getInstance();
         globals.mAllowSingleShotMode = single;
         globals.mAllowBurst3ShotMode = burst;
         globals.mAllowAutoShotMode = automatic;
+    }
+
+    private static void enableBossRole() {
+        Globals globals = Globals.getInstance();
+        globals.mBossMode = true;
+        globals.mPlayerID = Globals.BOSS_PLAYER_ID;
+        allowModes(true, true, true);
     }
 
     private Object get(String name) {

@@ -43,7 +43,7 @@ public class PlayerSettingsRegressionTest {
         String[] savedFields = {"mFullHealth", "mFullReload", "mReloadTime", "mReloadOnEmpty",
                 "mRespawnTime", "mDamage", "mOverrideLives", "mOverrideLivesVal",
                 "mAllowSingleShotMode", "mAllowBurst3ShotMode", "mAllowAutoShotMode",
-                "mCurrentFiringMode", "mVibrateOnHit", "mAllowPlayerSettings", "mGameState", "mUseGPS",
+                "mCurrentFiringMode", "mVibrateOnHit", "mTournamentMode", "mAllowPlayerSettings", "mGameState", "mUseGPS",
                 "mGameMode", "mGameLimit", "mTimeLimit", "mLivesLimit", "mScoreLimit", "mPlayerID"};
         for (String name : savedFields) {
             Field field = Globals.class.getDeclaredField(name);
@@ -73,6 +73,9 @@ public class PlayerSettingsRegressionTest {
             globals.mAllowSingleShotMode = true;
             globals.mAllowBurst3ShotMode = true;
             globals.mAllowAutoShotMode = true;
+            // Exercise the still-supported dialog behavior separately from the
+            // tournament lock test below.
+            globals.mTournamentMode = false;
             client = new RecordingClient();
             server = new RecordingServer();
             dialog = new PlayerSettingsAlertDialog(activity);
@@ -114,7 +117,7 @@ public class PlayerSettingsRegressionTest {
     }
 
     @Test
-    public void localMaximumSettingsRoundTripWithoutTruncation() {
+    public void localMaximumSettingsAreResetByTournamentRules() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
             globals.mFullHealth = 1000;
@@ -126,7 +129,7 @@ public class PlayerSettingsRegressionTest {
         show(false);
         click(DialogInterface.BUTTON_POSITIVE);
         scenario.onActivity(activity -> {
-            assertLocalMaxima();
+            assertTournamentProfile();
             assertEquals(1, client.saves);
             assertFalse(dialog.isShowing());
         });
@@ -159,7 +162,7 @@ public class PlayerSettingsRegressionTest {
     }
 
     @Test
-    public void allFourFieldsAcceptTheSupportedMaximum() {
+    public void allFourFieldsAreResetByTournamentRules() {
         show(false);
         scenario.onActivity(activity -> {
             field(R.id.health_et).setText("1000");
@@ -169,7 +172,7 @@ public class PlayerSettingsRegressionTest {
             toggle(R.id.override_lives_limit_switch).setChecked(true);
         });
         click(DialogInterface.BUTTON_POSITIVE);
-        scenario.onActivity(activity -> assertLocalMaxima());
+        scenario.onActivity(activity -> assertTournamentProfile());
     }
 
     @Test
@@ -209,7 +212,7 @@ public class PlayerSettingsRegressionTest {
         });
         click(DialogInterface.BUTTON_POSITIVE);
         scenario.onActivity(activity -> {
-            assertEquals(77, Globals.getInstance().mFullHealth);
+            assertEquals(Globals.MAX_HEALTH, Globals.getInstance().mFullHealth);
             assertTrue(Globals.getInstance().mAllowSingleShotMode);
             assertFalse(Globals.getInstance().mAllowBurst3ShotMode);
             assertFalse(Globals.getInstance().mAllowAutoShotMode);
@@ -269,17 +272,21 @@ public class PlayerSettingsRegressionTest {
     }
 
     @Test
-    public void localVibrationPreferenceIsSavedAndServerSettingsDoNotExposeIt() {
-        scenario.onActivity(activity -> Globals.getInstance().mVibrateOnHit = false);
+    public void tournamentForcesVibrationAndLocksTheLocalSwitch() {
+        scenario.onActivity(activity -> {
+            preferences.edit().putBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT, false).commit();
+            Globals.getInstance().mVibrateOnHit = false;
+            Globals.getInstance().applyTournamentRules();
+        });
         show(false);
         scenario.onActivity(activity -> {
-            assertFalse(toggle(R.id.vibrate_phone_switch).isChecked());
-            toggle(R.id.vibrate_phone_switch).setChecked(true);
+            assertTrue(toggle(R.id.vibrate_phone_switch).isChecked());
+            assertFalse(toggle(R.id.vibrate_phone_switch).isEnabled());
         });
         click(DialogInterface.BUTTON_POSITIVE);
         scenario.onActivity(activity -> {
             assertTrue(Globals.getInstance().mVibrateOnHit);
-            assertTrue(preferences.getBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT, false));
+            assertFalse(preferences.getBoolean(FullscreenActivity.PREF_VIBRATE_ON_HIT, true));
             dialog = new PlayerSettingsAlertDialog(activity);
         });
         show(true);
@@ -384,12 +391,12 @@ public class PlayerSettingsRegressionTest {
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
 
-    private void assertLocalMaxima() {
+    private void assertTournamentProfile() {
         Globals globals = Globals.getInstance();
-        assertEquals(1000, globals.mFullHealth);
-        assertEquals(1000, globals.mRespawnTime);
-        assertEquals(-1000, globals.mDamage);
-        assertEquals(1000, globals.mOverrideLivesVal);
+        assertEquals(Globals.MAX_HEALTH, globals.mFullHealth);
+        assertEquals(Globals.RESPAWN_TIME_SECONDS, globals.mRespawnTime);
+        assertEquals(Globals.DAMAGE_PER_HIT, globals.mDamage);
+        assertEquals(0, globals.mOverrideLivesVal);
     }
 
     private EditText field(int id) { return dialog.findViewById(id); }

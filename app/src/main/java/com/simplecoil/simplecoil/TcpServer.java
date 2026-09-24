@@ -198,6 +198,7 @@ public class TcpServer extends Service {
     private Thread mCancellationThread;
     private Runnable mCancellationTimeout;
     private final Handler mShutdownHandler = new Handler(Looper.getMainLooper());
+    private long mNextGameStartAllowedAt;
     private static final long CANCEL_FLUSH_TIMEOUT_MS = 1000;
     private volatile Map<Integer, ClientData> mClientData = null;
     // Explicitly leaving must not reset a player's score or spent lives in this round.
@@ -488,6 +489,8 @@ public class TcpServer extends Service {
     }
 
     public boolean startGame() {
+        if (getNextGameStartWaitMillis() > 0)
+            return false;
         if (!balancedStartReady())
             return false;
         final List<ClientRecipient> recipients = getClientRecipients();
@@ -512,7 +515,8 @@ public class TcpServer extends Service {
             return false;
         synchronized (mServerStateLock) {
             if (!keepListening || mDestroyed || mEndingGame || mCancellationThread != null
-                    || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                    || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                    || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
                 return false;
             // Repeated clicks and remote requests share the pending start instead
             // of scheduling duplicate sends or resetting a confirmed countdown.
@@ -550,7 +554,8 @@ public class TcpServer extends Service {
                 final long gpsStartTime;
                 synchronized (mServerStateLock) {
                     if (!isClientTaskActive() || mEndingGame
-                            || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                            || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                            || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
                         return;
                     // A shared round start always leaves enough time for the
                     // complete spoken 10-to-0 countdown, even if an operator
@@ -576,7 +581,8 @@ public class TcpServer extends Service {
                 for (ClientRecipient recipient : recipients) {
                     synchronized (mServerStateLock) {
                         if (!isClientTaskActive() || mEndingGame
-                                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                                || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
                             return;
                     }
                     if (recipient.canStartGame())
@@ -586,7 +592,8 @@ public class TcpServer extends Service {
                     return;
                 synchronized (mServerStateLock) {
                     if (!isClientTaskActive() || mEndingGame
-                            || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                            || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                            || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
                         return;
                     mScheduledStart = startAt;
                     mScheduledDuration = duration;
@@ -604,6 +611,12 @@ public class TcpServer extends Service {
                     }
                 }
             }, RoundTask.START);
+        }
+    }
+
+    public long getNextGameStartWaitMillis() {
+        synchronized (mServerStateLock) {
+            return Math.max(0, mNextGameStartAllowedAt - SystemClock.elapsedRealtime());
         }
     }
 
@@ -706,7 +719,14 @@ public class TcpServer extends Service {
                 armBalancedCheckInTimeout();
             else {
                 cancelBalancedCheckInTimeout();
-                startGame();
+                if (!startGame()) {
+                    long wait = getNextGameStartWaitMillis();
+                    if (wait > 0)
+                        mShutdownHandler.postDelayed(() -> {
+                            if (globals.mBalancedRandom && globals.mGameState == Globals.GAME_STATE_NONE)
+                                startGame();
+                        }, wait);
+                }
             }
         });
     }
@@ -890,6 +910,10 @@ public class TcpServer extends Service {
     }
 
     public void endGame() {
+        synchronized (mServerStateLock) {
+            mNextGameStartAllowedAt = Math.max(mNextGameStartAllowedAt,
+                    SystemClock.elapsedRealtime() + Globals.NEXT_GAME_WAIT_MILLISECONDS);
+        }
         runClientTask(() -> {
             // Keep registration excluded until every shared roster has been
             // cleared, not just until the old client sockets have been closed.
@@ -1746,16 +1770,22 @@ public class TcpServer extends Service {
     }
 
     /** Switch between standard Tournament and the fixed Player-1 Boss variant. */
-    public void setBossMode(boolean enabled) {
+    public boolean setBossMode(boolean enabled) {
         Globals globals = Globals.getInstance();
-        globals.mBossMode = enabled;
-        globals.mBossHunterCount = -1;
-        mBossHunterCount = -1;
-        globals.mBalancedRandom = false;
-        globals.clearBalancedAssignments();
-        globals.applyTournamentRules();
+        synchronized (mServerStateLock) {
+            if (globals.mGameState != Globals.GAME_STATE_NONE || mStartingGame
+                    || mStartAnnounced)
+                return false;
+            globals.mBossMode = enabled;
+            globals.mBossHunterCount = -1;
+            mBossHunterCount = -1;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.applyTournamentRules();
+        }
         sendAllGameInfo(SEND_ALL);
         sendPlayerSettingsUpdate(SEND_ALL, false);
+        return true;
     }
 
     void startTcpServer() {

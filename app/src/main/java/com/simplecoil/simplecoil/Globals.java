@@ -99,9 +99,8 @@ public class Globals {
     public static final boolean TOURNAMENT_RULES_REQUIRED = true;
     public volatile boolean mTournamentMode = TOURNAMENT_RULES_REQUIRED;
     public volatile boolean mReloadOnEmpty = false; // Primarily intended for instagib
-    // This is local phone feedback, not a weapon setting that a server can impose.
-    // Keep the historical default off until the player explicitly enables it.
-    public volatile boolean mVibrateOnHit = false;
+    // Local feedback defaults on. Tournament mode also forces it on.
+    public volatile boolean mVibrateOnHit = true;
    //TODO checks // add new presets in player settings alert dialog and in the menu list item(frontend)
    // public static final int PLAYER_PRESET_DEFAULT = 0;
    // public static final int PLAYER_PRESET_RECON = 1;
@@ -159,6 +158,7 @@ public class Globals {
     public static final int GAME_LIMIT_TIME = 1;
     public static final int GAME_LIMIT_LIVES = 2;
     public static final int GAME_LIMIT_SCORE = 4;
+    public static final long NEXT_GAME_WAIT_MILLISECONDS = 30_000L;
     public volatile int mGameLimit = GAME_LIMIT_NONE;
     public volatile int mTimeLimit = 0;
     public volatile int mScoreLimit = 0;
@@ -273,6 +273,7 @@ public class Globals {
     /** Apply the common tournament profile to the local phone and weapon configuration. */
     public void applyTournamentRules() {
         mTournamentMode = true;
+        mVibrateOnHit = true;
         mGameMode = GAME_MODE_2TEAMS;
         if (mBossMode) {
             int hunterCount = mBossHunterCount >= 0 ? mBossHunterCount
@@ -299,7 +300,10 @@ public class Globals {
         mAllowSingleShotMode = true;
         mAllowBurst3ShotMode = localBoss;
         mAllowAutoShotMode = localBoss;
-        if (!localBoss || !isValidFiringMode(mCurrentFiringMode))
+        // Indoor range is a field choice, not a weapon advantage. Keep it for
+        // every player while continuing to reserve the wide cone for the boss.
+        if (!isValidFiringMode(mCurrentFiringMode)
+                || (!localBoss && mCurrentFiringMode == FIRING_MODE_OUTDOOR_WITH_CONE))
             mCurrentFiringMode = FIRING_MODE_OUTDOOR_NO_CONE;
         mAllowPlayerSettings = false;
         mOnlyServerSettings = true;

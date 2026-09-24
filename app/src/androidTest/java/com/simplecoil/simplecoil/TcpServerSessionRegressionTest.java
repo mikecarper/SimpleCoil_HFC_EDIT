@@ -497,9 +497,9 @@ public class TcpServerSessionRegressionTest {
             Globals.GPSData location = new Globals.GPSData();
             location.longitude = 10;
             location.latitude = 20;
-            location.team = 1; // Player 6's old team in a two-team lobby.
+            location.team = 1; // Player 10's old team in a two-team lobby.
             location.hasUpdate = true;
-            Globals.getInstance().mGPSData.put((byte) 6, location);
+            Globals.getInstance().mGPSData.put((byte) 10, location);
             set(server, "keepListening", true);
             InstrumentationRegistry.getInstrumentation().runOnMainSync(server::sendGPSData);
             Runnable update = (Runnable) get(server, "mGPSRunnable");

@@ -13,10 +13,13 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.function.Predicate;
 
 /** End-to-end smoke test for the wire protocol used by stock Android clients. */
@@ -24,8 +27,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static final int TCP_PORT = 19_510;
     private static final int UDP_PORT = 19_500;
     private static final int DASHBOARD_PORT = 19_511;
-    private static final String JSON_PREFIX = "SimpleCoil:18JSON";
-    private static final String MESSAGE_PREFIX = "SimpleCoil:18MESG";
+    private static final String JSON_PREFIX = "SimpleCoil:19JSON";
+    private static final String MESSAGE_PREFIX = "SimpleCoil:19MESG";
     private static final long GPS_UTC_BASE = 1_800_000_000_000L;
 
     public static void main(String[] args) throws Exception {
@@ -54,8 +57,17 @@ public final class LaptopHostProtocolSmokeTest {
                 first.send(JSON_PREFIX + "{\"gpslongitude\":-122.1,\"gpslatitude\":47.6}");
                 second.send(JSON_PREFIX + "{\"gpslongitude\":-122.2,\"gpslatitude\":47.7}");
                 require(post("/api/start").contains("\"ok\":true"), "host did not start the round");
-                require(first.readUntil(frame -> frame.contains("\"gpsstarttime\"")) != null,
+                String startFrame = first.readUntil(frame -> frame.contains("\"gpsstarttime\""));
+                require(startFrame != null,
                         "GPS-calibrated start time was not delivered to the phone");
+                String roundToken = jsonString(startFrame, "roundtoken");
+                require(roundToken != null, "start frame omitted its round token");
+                first.sendStateGossip(roundToken, 41, 7);
+                require(first.receivesAuthorityState(roundToken, 41, 7),
+                        "host tick did not merge and return a player's state gossip");
+                first.sendCombat(roundToken, 9, 2, 17);
+                require(first.receivesAuthorityCombat(roundToken, 1, 9, 2, 17),
+                        "host tick did not retain an overheard compact combat event");
                 Thread.sleep(1_150);
                 require(get("/api/state").contains("\"state\":\"running\""),
                         "round did not leave the start countdown");
@@ -89,6 +101,12 @@ public final class LaptopHostProtocolSmokeTest {
                         "game-master respawn was not accepted");
                 require(second.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "RESPAWNGRANTED")) != null,
                         "respawning player did not receive the grant");
+                require(post("/api/end").contains("\"ok\":true"), "host did not end the round");
+                String finishedState = get("/api/state");
+                require(finishedState.contains("\"canStart\":false"),
+                        "dashboard allowed another round during the cooldown");
+                require(post("/api/start").contains("Next game can start in"),
+                        "host accepted a new round before the 30-second wait");
             }
             System.out.println("LaptopHost protocol smoke test passed.");
         } finally {
@@ -151,7 +169,7 @@ public final class LaptopHostProtocolSmokeTest {
                 socket.bind(new InetSocketAddress("127.0.0." + (20 + index), UDP_PORT));
                 socket.setSoTimeout(1_000);
                 pendingJoins.add(socket);
-                byte[] request = "SimpleCoil:JOIN181".getBytes(StandardCharsets.UTF_8);
+                byte[] request = "SimpleCoil:JOIN191".getBytes(StandardCharsets.UTF_8);
                 socket.send(new DatagramPacket(request, request.length,
                         InetAddress.getByName("127.0.0.1"), UDP_PORT));
                 byte[] reply = new byte[128];
@@ -269,8 +287,13 @@ public final class LaptopHostProtocolSmokeTest {
                         "hunter did not receive the locked single-shot profile");
                 boss.synchronizeClock();
                 hunter.synchronizeClock();
-                require(post("/api/start").contains("\"ok\":true"),
-                        "a valid Boss roster did not start");
+                long readyDeadline = System.nanoTime() + 3_000_000_000L;
+                while (!get("/api/state").contains("\"canStart\":true")
+                        && System.nanoTime() < readyDeadline)
+                    Thread.sleep(25);
+                String startResponse = post("/api/start");
+                require(startResponse.contains("\"ok\":true"),
+                        "a valid Boss roster did not start: " + startResponse);
                 require(boss.readUntil(frame -> frame.contains("\"gamestart\"")) != null,
                         "Boss Mode countdown was not delivered");
                 verifyDirectLateJoinBlockedAs(3);
@@ -300,7 +323,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.3", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN181".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN191".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -316,7 +339,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.4", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN182".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN192".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -379,12 +402,31 @@ public final class LaptopHostProtocolSmokeTest {
                 && frame.contains("\"playerID\":" + playerID);
     }
 
+    private static String jsonString(String frame, String key) {
+        String prefix = "\"" + key + "\":\"";
+        int start = frame.indexOf(prefix);
+        if (start < 0)
+            return null;
+        start += prefix.length();
+        int end = frame.indexOf('"', start);
+        return end < 0 ? null : frame.substring(start, end);
+    }
+
     private static final class FakePhone implements AutoCloseable {
+        private static final int STATE_PACKET_BYTES = 1_312;
+        private static final int STATE_PACKET_MAGIC = 0x53434F49;
         private final Socket socket = new Socket();
+        private final DatagramSocket udp;
         private final DataInputStream input;
         private final DataOutputStream output;
+        private final int playerID;
 
         FakePhone(String localAddress, int playerID, String name) throws IOException {
+            this.playerID = playerID;
+            udp = new DatagramSocket(null);
+            udp.setReuseAddress(true);
+            udp.bind(new InetSocketAddress(localAddress, UDP_PORT));
+            udp.setSoTimeout(3_000);
             socket.bind(new InetSocketAddress(localAddress, 0));
             socket.connect(new InetSocketAddress("127.0.0.1", TCP_PORT), 1_000);
             socket.setSoTimeout(2_000);
@@ -392,6 +434,121 @@ public final class LaptopHostProtocolSmokeTest {
             output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             send(JSON_PREFIX + "{\"playerID\":" + playerID + ",\"playername\":\"" + name + "\"}");
             readUntil(frame -> frame.startsWith(JSON_PREFIX + "{\"players\""));
+        }
+
+        void sendStateGossip(String roundToken, long ownerSequence, int score) throws IOException {
+            ByteBuffer packet = ByteBuffer.allocate(STATE_PACKET_BYTES).order(ByteOrder.BIG_ENDIAN);
+            UUID token = UUID.fromString(roundToken);
+            packet.putInt(STATE_PACKET_MAGIC);
+            packet.put((byte) 1); // state-packet format
+            packet.put((byte) 19); // network protocol
+            packet.put((byte) playerID);
+            packet.put((byte) 2); // two-team mode
+            packet.putLong(1); // sender packet sequence
+            packet.putLong(token.getMostSignificantBits());
+            packet.putLong(token.getLeastSignificantBits());
+            for (int id = 1; id <= 32; id++) {
+                boolean present = id == playerID;
+                packet.put((byte) (present ? 1 : 0));
+                packet.put((byte) id);
+                packet.put((byte) (present ? 1 : 0)); // running
+                packet.put((byte) 0); // grenade
+                packet.put((byte) 0); // event
+                packet.put((byte) 0); // target
+                packet.putShort((short) 0);
+                packet.putInt((int) (present ? ownerSequence : 0));
+                packet.putInt(0);
+                packet.putInt(present ? score : 0);
+                packet.putInt(0);
+                packet.putShort((short) (present ? 5 : 0));
+                packet.putShort((short) (present ? 10 : 0));
+                packet.putShort((short) (present ? 29 : 0));
+                packet.putShort((short) 0);
+                packet.putInt(0);
+                packet.putInt(0);
+            }
+            byte[] payload = packet.array();
+            udp.send(new DatagramPacket(payload, payload.length,
+                    InetAddress.getByName("127.0.0.1"), UDP_PORT));
+        }
+
+        void sendCombat(String roundToken, long eventSequence, int eventType, int targetID)
+                throws IOException {
+            ByteBuffer packet = ByteBuffer.allocate(32).order(ByteOrder.BIG_ENDIAN);
+            UUID token = UUID.fromString(roundToken);
+            packet.putInt(0x53434F43); // SCOC
+            packet.put((byte) 1); // combat-packet format
+            packet.put((byte) 19); // network protocol
+            packet.put((byte) 1); // event, not ACK
+            packet.put((byte) eventType);
+            packet.put((byte) playerID);
+            packet.put((byte) targetID);
+            packet.putShort((short) 0);
+            packet.putInt((int) eventSequence);
+            packet.putLong(token.getMostSignificantBits());
+            packet.putLong(token.getLeastSignificantBits());
+            byte[] payload = packet.array();
+            udp.send(new DatagramPacket(payload, payload.length,
+                    InetAddress.getByName("127.0.0.1"), UDP_PORT));
+        }
+
+        boolean receivesAuthorityState(String roundToken, long ownerSequence, int score)
+                throws IOException {
+            UUID expectedToken = UUID.fromString(roundToken);
+            long deadline = System.nanoTime() + 4_000_000_000L;
+            while (System.nanoTime() < deadline) {
+                byte[] payload = new byte[STATE_PACKET_BYTES];
+                DatagramPacket datagram = new DatagramPacket(payload, payload.length);
+                try {
+                    udp.receive(datagram);
+                } catch (SocketTimeoutException e) {
+                    return false;
+                }
+                if (datagram.getLength() != STATE_PACKET_BYTES)
+                    continue;
+                ByteBuffer packet = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
+                if (packet.getInt() != STATE_PACKET_MAGIC || (packet.get(6) & 0xff) != 0)
+                    continue;
+                UUID token = new UUID(packet.getLong(16), packet.getLong(24));
+                if (!expectedToken.equals(token))
+                    continue;
+                int rowOffset = 32 + (playerID - 1) * 40;
+                if ((packet.get(rowOffset) & 1) != 0
+                        && (packet.getInt(rowOffset + 8) & 0xffffffffL) == ownerSequence
+                        && packet.getInt(rowOffset + 16) == score)
+                    return true;
+            }
+            return false;
+        }
+
+        boolean receivesAuthorityCombat(String roundToken, int senderID, long eventSequence,
+                                        int eventType, int targetID) throws IOException {
+            UUID expectedToken = UUID.fromString(roundToken);
+            long deadline = System.nanoTime() + 4_000_000_000L;
+            while (System.nanoTime() < deadline) {
+                byte[] payload = new byte[STATE_PACKET_BYTES];
+                DatagramPacket datagram = new DatagramPacket(payload, payload.length);
+                try {
+                    udp.receive(datagram);
+                } catch (SocketTimeoutException e) {
+                    return false;
+                }
+                if (datagram.getLength() != STATE_PACKET_BYTES)
+                    continue;
+                ByteBuffer packet = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
+                if (packet.getInt() != STATE_PACKET_MAGIC || (packet.get(6) & 0xff) != 0)
+                    continue;
+                UUID token = new UUID(packet.getLong(16), packet.getLong(24));
+                if (!expectedToken.equals(token))
+                    continue;
+                int rowOffset = 32 + (senderID - 1) * 40;
+                if ((packet.get(rowOffset) & 1) != 0
+                        && (packet.getInt(rowOffset + 12) & 0xffffffffL) == eventSequence
+                        && (packet.get(rowOffset + 4) & 0xff) == eventType
+                        && (packet.get(rowOffset + 5) & 0xff) == targetID)
+                    return true;
+            }
+            return false;
         }
 
         void synchronizeClock() throws IOException {
@@ -443,7 +600,11 @@ public final class LaptopHostProtocolSmokeTest {
 
         @Override
         public void close() throws IOException {
-            socket.close();
+            try {
+                socket.close();
+            } finally {
+                udp.close();
+            }
         }
     }
 }
