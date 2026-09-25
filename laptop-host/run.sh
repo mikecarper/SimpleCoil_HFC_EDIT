@@ -9,4 +9,5 @@ source_file="$script_dir/src/main/java/com/simplecoil/laptophost/LaptopHost.java
 
 mkdir -p "$output_dir"
 javac --release 17 --add-modules jdk.httpserver -d "$output_dir" "$source_file"
-exec java --add-modules jdk.httpserver -cp "$output_dir" com.simplecoil.laptophost.LaptopHost "$@"
+exec java --add-modules jdk.httpserver -Dsimplecoil.home="$script_dir" -cp "$output_dir" \
+    com.simplecoil.laptophost.LaptopHost "$@"

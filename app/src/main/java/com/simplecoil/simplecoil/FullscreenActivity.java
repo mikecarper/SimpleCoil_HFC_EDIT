@@ -122,8 +122,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final int REQUEST_ENABLE_BT = 1;
     private static final int REQUEST_QR_SCAN = 2;
     private static final int REQUEST_CODE_QR_CAMERA_PERMISSION = 1024;
+    private static final int REQUEST_CODE_POWERUP_CAMERA_PERMISSION = 1025;
     private static final float GAME_MODE_TEXT_SIZE_SP = 22f;
     private static final float TEAM_ROSTER_TEXT_SIZE_SP = 13f;
+    private static final float PLAYING_SHOTS_TEXT_SIZE_SP = 64f;
 
     // For testing and debugging network only -- dumps you straight to the play game layout and allows you to switch teams without connecting a blaster
     private static final boolean TEST_NETWORK = false;
@@ -135,6 +137,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private Button mTeamMinusButton = null;
     private Button mTeamPlusButton = null;
     private Button mTeamQrScanButton = null;
+    private Button mPowerupScanButton = null;
+    private Button mPowerupSettingsButton = null;
+    private Button mSecondGunButton = null;
+    private TextView mSecondGunStatusTV = null;
+    private View mBossAmmoRow = null;
+    private TextView mBossPrimaryShotsTV = null;
+    private TextView mBossShotModeTV = null;
     private Button mStartGameButton = null;
     private Button mPlayerSettingsButton = null;
     private Button mEndGameButton = null;
@@ -142,6 +151,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private Button mPlayerDataButton = null;
     private ImageView mNetworkStatusIV = null;
     private TextView mNetworkPlayerCountTV = null;
+    private TextView mGpsCoordinatesTV = null;
     private TextView mScoreTV = null;
     private TextView mScoreLabelTV = null;
     private TextView mTeamScoreTV = null;
@@ -154,6 +164,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private TextView mEliminationCountTV = null;
     private TextView mShotsRemainingLabelTV = null;
     private TextView mShotsRemainingTV = null;
+    private float mLobbyShotsTextSizePx;
     private TextView mRecoilModeTV = null;
     private TextView mHitsTakenTV = null;
     private TextView mTeamLabelTV = null;
@@ -166,6 +177,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private DecoratedBarcodeView mRespawnQrScanner = null;
     private TextView mRespawnQrScannerPrompt = null;
     private Button mQrScannerCancelButton = null;
+    private View mPowerupQrScannerWindow = null;
+    private DecoratedBarcodeView mPowerupQrScanner = null;
+    private TextView mPowerupQrPrompt = null;
+    private boolean mPowerupQrScannerActive;
+    private boolean mPowerupQrOpenWhenResumed;
+    private final PowerupQrProgress mPowerupQrProgress = new PowerupQrProgress();
+    private final DualGunHitDeduper mDualGunHitDeduper = new DualGunHitDeduper();
+    private final Random mPowerupRandom = new Random();
     private TextView mHealthLabelTV = null;
     private TextView mPlayerNameTV = null;
     private ProgressBar mHealthBar = null;
@@ -198,6 +217,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private CountDownTimer mSpawnTimer = null;
     private CountDownTimer mReloadTimer = null;
     private CountDownTimer mShieldTimer = null;
+    private CountDownTimer mHealthTimer = null;
     private CountDownTimer mRespawnShieldBoostTimer = null;
     private CountDownTimer mGameCountdownTimer = null;
     private CountDownTimer mConnectFailTimer = null;
@@ -247,12 +267,43 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final long SHIELD_REGEN_DELAY_MILLISECONDS = 4000;
     private static final long SHIELD_REGEN_TICK_MILLISECONDS = 1000;
     private static final int SHIELD_REGEN_TICK_AMOUNT = 1;
+    private static final long HEALTH_REGEN_DELAY_MILLISECONDS = 30_000;
+    private static final long HEALTH_REGEN_TICK_MILLISECONDS = 1000;
+    private static final int HEALTH_REGEN_TICK_AMOUNT = 1;
     private static final long RESPAWN_SHIELD_BOOST_MILLISECONDS = 5000;
 
     private boolean mScanning = false;
     private volatile boolean mConnected = false;
     private boolean mCommunicating = false; // Used to make sure that we start receiving telemetry data after initial connection
     private String mDeviceAddress = ""; // MAC address of the tagger
+    private String mSecondaryDeviceAddress = "";
+    private ServiceConnection mSecondaryBLEServiceConnection;
+    private BluetoothLeService mSecondaryBluetoothLeService;
+    private boolean mSecondaryBLEServiceBound;
+    private BluetoothGattCharacteristic mSecondaryTelemetryCharacteristic;
+    private BluetoothGattCharacteristic mSecondaryCommandCharacteristic;
+    private BluetoothGattCharacteristic mSecondaryConfigCharacteristic;
+    private BluetoothGattCharacteristic mSecondaryIdCharacteristic;
+    private boolean mSecondaryConnected;
+    private boolean mSecondaryCommunicating;
+    private byte mSecondaryBlasterType = BLASTER_TYPE_PISTOL;
+    private byte mSecondaryCommandID;
+    private byte mSecondaryLastShotCount;
+    private byte mSecondaryLastTriggerCount;
+    private byte mSecondaryLastReloadButtonCount;
+    private byte mSecondaryLastThumbButtonCount;
+    private byte mSecondaryLastPowerButtonCount;
+    private int mSecondaryReloading = RELOADING_STATE_ELIMINATED;
+    private int mSecondaryEmptyTriggerCount;
+    private byte[] mSecondaryPendingReloadCommand;
+    private CountDownTimer mSecondaryReloadTimer;
+    private final ArrayList<WeaponCandidate> mSecondaryWeaponCandidates = new ArrayList<>();
+    private boolean mScanningSecondary;
+    private boolean mSecondaryScanPendingPermission;
+    private Runnable mSecondaryScanFinish;
+    private long mSecondaryTeamCommandAt;
+    private Runnable mSecondaryReconnectRunnable;
+    private int mSecondaryReconnectAttempts;
     // A first-time scan must not connect to whichever nearby blaster happens to
     // advertise first. Collect viable SRG1 devices briefly, then use a held
     // trigger notification to identify the player's gun if there is a choice.
@@ -368,6 +419,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final String ENEMY_DESTROYED_UTTERANCE_ID = "simplecoil-enemy-destroyed";
     private static final long RESPAWN_QR_VOICE_REMINDER_INTERVAL_MS = 5_000;
     private static final String RESPAWN_QR_VOICE_REMINDER_UTTERANCE_ID = "simplecoil-respawn-qr";
+    private static final long RELOAD_VOICE_REMINDER_INTERVAL_MS = 3_000;
+    private static final String RELOAD_VOICE_REMINDER_UTTERANCE_ID = "simplecoil-reload";
+    private volatile boolean mReloadVoiceReminderActive;
     private final Runnable mRespawnQrVoiceReminder = new Runnable() {
         @Override
         public void run() {
@@ -377,6 +431,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
             announceRespawnQrReminder();
             scheduleRespawnQrVoiceReminder(RESPAWN_QR_VOICE_REMINDER_INTERVAL_MS);
+        }
+    };
+    private final Runnable mReloadVoiceReminder = new Runnable() {
+        @Override
+        public void run() {
+            if (!shouldAnnounceReloadReminder()) {
+                stopReloadVoiceReminder();
+                return;
+            }
+            announceReloadReminder();
+            scheduleReloadVoiceReminder(RELOAD_VOICE_REMINDER_INTERVAL_MS);
         }
     };
 
@@ -449,6 +514,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean mJoinedFromGameInvite;
     private int mScore = 0;
     private int mTeamScore = 0;
+    private double mLastGpsLatitude = Double.NaN;
+    private double mLastGpsLongitude = Double.NaN;
 
     private static int boundedCounter(int value, int maximum) {
         return Math.max(0, Math.min(maximum, value));
@@ -511,13 +578,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final String PREF_RECOIL_ENABLED = "RecoilEnabled";
     static final String PREF_VIBRATE_ON_HIT = "VibrateOnHit";
     public static final String PREF_GAME_MODE = "GameMode";
+    public static final String PREF_TOURNAMENT_MODE = "TournamentMode";
     public static final String PREF_BALANCED_MODE = "BalancedRandomMode";
     public static final String PREF_BALANCED_QR = "BalancedRandomRequireQr";
     public static final String PREF_BOSS_MODE = "BossMode";
+    public static final String PREF_POWERUP_QR_REQUIRED = "PowerupQrRequired";
     public static final String PREF_LIMIT_TIME = "TimeLimit";
     public static final String PREF_LIMIT_LIVES = "LivesLimit";
     public static final String PREF_LIMIT_SCORE = "ScoreLimit";
     public static final String PREF_DEVICE_ADDRESS = "DeviceAddress";
+    private static final String PREF_SECONDARY_DEVICE_ADDRESS = "BossSecondDeviceAddress";
     // New installs begin with a bounded round; players can still select
     // Unlimited from the Game Limit menu.
     static final int DEFAULT_TIME_LIMIT_MINUTES = 5;
@@ -572,12 +642,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         String playerName = normalizePlayerName(savedPlayerName);
         String savedDeviceAddress = readStringPreference(sharedPreferences, PREF_DEVICE_ADDRESS, "");
         String deviceAddress = normalizeBluetoothAddress(savedDeviceAddress);
+        String savedSecondaryAddress = readStringPreference(sharedPreferences,
+                PREF_SECONDARY_DEVICE_ADDRESS, "");
+        String secondaryAddress = normalizeBluetoothAddress(savedSecondaryAddress);
+        if (secondaryAddress.equals(deviceAddress))
+            secondaryAddress = "";
         Globals.getInstance().mPlayerName = playerName;
         mDeviceAddress = deviceAddress;
-        if (!playerName.equals(savedPlayerName) || !deviceAddress.equals(savedDeviceAddress)) {
+        mSecondaryDeviceAddress = secondaryAddress;
+        if (!playerName.equals(savedPlayerName) || !deviceAddress.equals(savedDeviceAddress)
+                || !secondaryAddress.equals(savedSecondaryAddress)) {
             SharedPreferences.Editor editor = sharedPreferences.edit();
             editor.putString(PREF_PLAYER_NAME, playerName);
             editor.putString(PREF_DEVICE_ADDRESS, deviceAddress);
+            editor.putString(PREF_SECONDARY_DEVICE_ADDRESS, secondaryAddress);
             editor.apply();
         }
     }
@@ -627,6 +705,92 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mBluetoothLeService = null;
             }
         };
+    }
+
+    private void setupSecondaryBLEServiceConnection() {
+        if (mSecondaryBLEServiceBound || !isLocalBoss() || mSecondaryDeviceAddress.isEmpty()
+                || mSecondaryDeviceAddress.equals(mDeviceAddress) || isFinishing() || isDestroyed())
+            return;
+        mSecondaryBLEServiceConnection = new ServiceConnection() {
+            @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+                if (mSecondaryBLEServiceConnection != this || !mSecondaryBLEServiceBound
+                        || !isLocalBoss() || isFinishing() || isDestroyed())
+                    return;
+                mSecondaryBluetoothLeService =
+                        ((BluetoothLeService.LocalBinder) binder).getService();
+                if (!mSecondaryBluetoothLeService.initialize()
+                        || !mSecondaryBluetoothLeService.connect(mSecondaryDeviceAddress)) {
+                    Log.w(TAG, "Unable to connect second boss gun");
+                    resetSecondaryBluetoothServices();
+                }
+                updateSecondGunControls();
+            }
+
+            @Override public void onServiceDisconnected(ComponentName name) {
+                if (mSecondaryBLEServiceConnection != this)
+                    return;
+                mSecondaryBluetoothLeService = null;
+                mSecondaryConnected = false;
+                mSecondaryCommunicating = false;
+                updateSecondGunControls();
+            }
+        };
+        mSecondaryBLEServiceBound = bindService(
+                new Intent(this, BossSecondaryBluetoothLeService.class),
+                mSecondaryBLEServiceConnection, BIND_AUTO_CREATE);
+        if (!mSecondaryBLEServiceBound)
+            mSecondaryBLEServiceConnection = null;
+        updateSecondGunControls();
+    }
+
+    private void resetSecondaryBluetoothServices() {
+        if (mSecondaryReconnectRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mSecondaryReconnectRunnable);
+            mSecondaryReconnectRunnable = null;
+        }
+        mSecondaryReconnectAttempts = 0;
+        if (mSecondaryReloadTimer != null) {
+            mSecondaryReloadTimer.cancel();
+            mSecondaryReloadTimer = null;
+        }
+        mSecondaryPendingReloadCommand = null;
+        mSecondaryReloading = RELOADING_STATE_ELIMINATED;
+        mSecondaryConnected = false;
+        mSecondaryCommunicating = false;
+        mSecondaryTelemetryCharacteristic = null;
+        mSecondaryCommandCharacteristic = null;
+        mSecondaryConfigCharacteristic = null;
+        mSecondaryIdCharacteristic = null;
+        if (mSecondaryBluetoothLeService != null)
+            mSecondaryBluetoothLeService.close();
+        if (mSecondaryBLEServiceBound && mSecondaryBLEServiceConnection != null) {
+            try {
+                unbindService(mSecondaryBLEServiceConnection);
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "Second boss gun service was already unbound", e);
+            }
+        }
+        mSecondaryBLEServiceBound = false;
+        mSecondaryBLEServiceConnection = null;
+        mSecondaryBluetoothLeService = null;
+        updateSecondGunControls();
+    }
+
+    private void scheduleSecondaryReconnect() {
+        if (mSecondaryReconnectRunnable != null || !mActivityResumed
+                || !isLocalBoss() || mSecondaryDeviceAddress.isEmpty()
+                || mSecondaryReconnectAttempts >= 5)
+            return;
+        mSecondaryReconnectRunnable = () -> {
+            mSecondaryReconnectRunnable = null;
+            if (!mActivityResumed || !isLocalBoss() || mSecondaryConnected
+                    || mSecondaryBluetoothLeService == null)
+                return;
+            mSecondaryReconnectAttempts++;
+            if (!mSecondaryBluetoothLeService.connect(mSecondaryDeviceAddress))
+                scheduleSecondaryReconnect();
+        };
+        mWeaponPairingHandler.postDelayed(mSecondaryReconnectRunnable, 2000);
     }
 
     // Code to manage Service lifecycle.
@@ -1187,9 +1351,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     /** Refresh the local row carried by every protocol-19 redundant snapshot. */
     private void publishPeerRuntimeState() {
+        int shots = (mLastShotCount & 0xff)
+                + (isLocalBoss() && mSecondaryCommunicating
+                ? mSecondaryLastShotCount & 0xff : 0);
         if (mUDPListenerService != null && mUseNetwork)
             mUDPListenerService.updatePeerRuntimeState(mScore, currentDeathCount(), mHealth,
-                    mShield + mRespawnShieldBonus, mLastShotCount & 0xff,
+                    mShield + mRespawnShieldBonus, Math.min(255, shots),
                     Globals.getInstance().mGameState);
     }
 
@@ -1293,6 +1460,21 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mTeamQrScanButton = findViewById(R.id.team_qr_scan_button);
         if (mTeamQrScanButton != null)
             mTeamQrScanButton.setOnClickListener(v -> openTeamAssignmentQrScanner());
+        mPowerupScanButton = findViewById(R.id.powerup_scan_button);
+        if (mPowerupScanButton != null)
+            mPowerupScanButton.setOnClickListener(v -> {
+                if (mPowerupQrScannerActive)
+                    hidePowerupQrScanner();
+                else
+                    openPowerupQrScanner();
+            });
+        mPowerupSettingsButton = findViewById(R.id.powerup_settings_button);
+        if (mPowerupSettingsButton != null)
+            mPowerupSettingsButton.setOnClickListener(this::showPowerupSettingsMenu);
+        updatePowerupSettingsButton();
+        mSecondGunButton = findViewById(R.id.second_gun_button);
+        if (mSecondGunButton != null)
+            mSecondGunButton.setOnClickListener(v -> beginSecondGunScan());
         mStartGameButton = findViewById(R.id.start_game_button);
         if (mStartGameButton != null) {
             mStartGameButton.setOnClickListener((v -> {
@@ -1380,6 +1562,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         mShotsRemainingLabelTV = findViewById(R.id.shots_label_tv);
         mShotsRemainingTV = findViewById(R.id.shots_remaining_tv);
+        mBossAmmoRow = findViewById(R.id.boss_ammo_row);
+        mBossPrimaryShotsTV = findViewById(R.id.boss_primary_shots_tv);
+        mBossShotModeTV = findViewById(R.id.boss_shot_mode_tv);
+        mSecondGunStatusTV = findViewById(R.id.second_gun_status_tv);
+        updateSecondGunControls();
+        if (mShotsRemainingTV != null)
+            mLobbyShotsTextSizePx = mShotsRemainingTV.getTextSize();
         mHitsTakenTV = findViewById(R.id.hits_taken_tv);
         mTeamLabelTV = findViewById(R.id.team_label_tv);
         mTeamTV = findViewById(R.id.team_tv);
@@ -1402,6 +1591,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     new DefaultDecoderFactory(Collections.singletonList(BarcodeFormat.QR_CODE)));
         if (mQrScannerCancelButton != null)
             mQrScannerCancelButton.setOnClickListener(v -> hideQrScanner());
+        mPowerupQrScannerWindow = findViewById(R.id.powerup_qr_scanner_window);
+        mPowerupQrScanner = findViewById(R.id.powerup_qr_scanner);
+        mPowerupQrPrompt = findViewById(R.id.powerup_qr_prompt);
+        if (mPowerupQrScanner != null) {
+            mPowerupQrScanner.getBarcodeView().setDecoderFactory(
+                    new DefaultDecoderFactory(Collections.singletonList(BarcodeFormat.QR_CODE)));
+            if (mPowerupQrScanner.getStatusView() != null)
+                mPowerupQrScanner.getStatusView().setVisibility(View.GONE);
+        }
+        Button powerupQrCloseButton = findViewById(R.id.powerup_qr_close_button);
+        if (powerupQrCloseButton != null)
+            powerupQrCloseButton.setOnClickListener(v -> hidePowerupQrScanner());
         mHitIV = findViewById(R.id.hit_animation_iv);
         mIncomingHitFlashView = findViewById(R.id.incoming_hit_flash_view);
         mBatteryLevelIV = findViewById(R.id.battery_iv);
@@ -1434,14 +1635,26 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         globals.mPlayerID = Globals.isValidPlayerID(savedPlayerID) ? (byte) savedPlayerID : 0;
         globals.mVibrateOnHit = readBooleanPreference(sharedPreferences,
                 PREF_VIBRATE_ON_HIT, true);
-        globals.mBossMode = readBooleanPreference(sharedPreferences, PREF_BOSS_MODE, false);
+        int savedGameMode = readIntPreference(sharedPreferences, PREF_GAME_MODE,
+                Globals.GAME_MODE_2TEAMS);
+        globals.mGameMode = Globals.isValidGameMode(savedGameMode)
+                ? savedGameMode : Globals.GAME_MODE_2TEAMS;
+        globals.mTournamentMode = readBooleanPreference(sharedPreferences,
+                PREF_TOURNAMENT_MODE, true);
+        globals.mBossMode = globals.mTournamentMode
+                && readBooleanPreference(sharedPreferences, PREF_BOSS_MODE, false);
         globals.mBossHunterCount = -1;
-        globals.applyTournamentRules();
-        // An older saved mode may be malformed or no longer allowed. Keep the
-        // stored profile consistent with the tournament mode used at runtime.
-        sharedPreferences.edit().putInt(PREF_GAME_MODE, globals.mGameMode).apply();
+        if (globals.mTournamentMode)
+            globals.applyTournamentRules();
+        else
+            globals.applyClassicRules(globals.mGameMode);
+        sharedPreferences.edit().putInt(PREF_GAME_MODE, globals.mGameMode)
+                .putBoolean(PREF_TOURNAMENT_MODE, globals.mTournamentMode).apply();
         globals.mBalancedRandom = false;
         globals.clearBalancedAssignments();
+        int savedPowerupCount = readIntPreference(sharedPreferences, PREF_POWERUP_QR_REQUIRED, 0);
+        globals.mPowerupQrRequired = PowerupQrProgress.isValidRequiredCount(savedPowerupCount)
+                ? savedPowerupCount : 0;
         applyBossWeaponRole();
         mRecoilEnabled = true;
         getFiringMode();
@@ -1476,12 +1689,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
         mNetworkStatusIV = findViewById(R.id.network_status_iv);
         mNetworkPlayerCountTV = findViewById(R.id.player_count_tv);
+        mGpsCoordinatesTV = findViewById(R.id.gps_coordinates_tv);
         mUseNetworkingButton = findViewById(R.id.use_network_button);
         if (mUseNetworkingButton != null) {
             mUseNetworkingButton.setOnClickListener(v -> requestNetworkOptions());
         }
         mGameModeLabelTV = findViewById(R.id.game_mode_label_tv);
         mGameModeTV = findViewById(R.id.game_mode_tv);
+        View.OnClickListener gameModeClickListener = this::showGameModeMenu;
+        if (mGameModeLabelTV != null)
+            mGameModeLabelTV.setOnClickListener(gameModeClickListener);
+        if (mGameModeTV != null)
+            mGameModeTV.setOnClickListener(gameModeClickListener);
         updateGameModeDisplay();
         mScoreLabelTV = findViewById(R.id.score_label_tv);
         mScoreTV = findViewById(R.id.score_tv);
@@ -1608,11 +1827,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     requestPlayerName();
                     return true;
             }else if(id == R.id.game_mode_item) {
-                    PopupMenu popup = new PopupMenu(FullscreenActivity.this, mUseNetworkingButton);
-                    MenuInflater inflater = popup.getMenuInflater();
-                    inflater.inflate(R.menu.game_mode_menu, popup.getMenu());
-                    popup.setOnMenuItemClickListener(FullscreenActivity.this);
-                    popup.show();
+                    showGameModeMenu(mUseNetworkingButton);
                     return true;
             }else if (id == R.id.please_wait_item) {
                     return true;
@@ -1665,18 +1880,84 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 return true;
             }else if (id == R.id.game_mode_2teams_item
                     || id == R.id.game_mode_4teams_item
-                    || id == R.id.game_mode_ffa_item
-                    || id == R.id.game_mode_balanced_qr_item
+                    || id == R.id.game_mode_ffa_item) {
+                int gameMode = id == R.id.game_mode_4teams_item ? Globals.GAME_MODE_4TEAMS
+                        : id == R.id.game_mode_ffa_item ? Globals.GAME_MODE_FFA
+                        : Globals.GAME_MODE_2TEAMS;
+                setClassicGameMode(gameMode);
+                return true;
+            }else if (id == R.id.game_mode_balanced_qr_item
                     || id == R.id.game_mode_balanced_no_qr_item) {
-                Globals.getInstance().applyTournamentRules();
-                updateGameModeDisplay();
-                Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
-                        Toast.LENGTH_SHORT).show();
                 return true;
             }else {
                 return false;
             }
 
+    }
+
+    private boolean canChangeGameModeInLobby() {
+        return Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                && (!mReady || mIsServer);
+    }
+
+    private void updatePowerupSettingsButton() {
+        if (mPowerupSettingsButton == null)
+            return;
+        int required = Globals.getInstance().mPowerupQrRequired;
+        if (required == 0)
+            mPowerupSettingsButton.setText(R.string.powerup_settings_off);
+        else
+            mPowerupSettingsButton.setText(getString(R.string.powerup_settings_count, required));
+        mPowerupSettingsButton.setVisibility(Globals.getInstance().mGameState
+                == Globals.GAME_STATE_NONE ? View.VISIBLE : View.GONE);
+        mPowerupSettingsButton.setEnabled(canChangeGameModeInLobby());
+    }
+
+    private void showPowerupSettingsMenu(View anchor) {
+        if (!canChangeGameModeInLobby())
+            return;
+        PopupMenu popup = new PopupMenu(this, anchor);
+        popup.getMenu().add(0, 0, 0, R.string.powerup_settings_choice_off);
+        for (int count = PowerupQrProgress.MIN_REQUIRED;
+                count <= PowerupQrProgress.MAX_REQUIRED; count++)
+            popup.getMenu().add(0, count, count,
+                    getString(R.string.powerup_settings_choice_count, count));
+        popup.setOnMenuItemClickListener(item -> {
+            int selected = item.getItemId();
+            if (!canChangeGameModeInLobby()
+                    || (selected != 0 && !PowerupQrProgress.isValidRequiredCount(selected)))
+                return true;
+            Globals.getInstance().mPowerupQrRequired = selected;
+            mPowerupQrProgress.reset();
+            sharedPreferences.edit().putInt(PREF_POWERUP_QR_REQUIRED, selected).apply();
+            updatePowerupSettingsButton();
+            updatePowerupScanButton();
+            if (mIsServer && mTcpServer != null)
+                mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+            return true;
+        });
+        popup.show();
+    }
+
+    private void showGameModeMenu(View anchor) {
+        if (!canChangeGameModeInLobby()) {
+            Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        PopupMenu popup = new PopupMenu(FullscreenActivity.this,
+                anchor == null ? mUseNetworkingButton : anchor);
+        MenuInflater inflater = popup.getMenuInflater();
+        inflater.inflate(R.menu.game_mode_menu, popup.getMenu());
+        Globals globals = Globals.getInstance();
+        int selectedMode = globals.mBossMode ? R.id.game_mode_boss_item
+                : globals.mTournamentMode ? R.id.game_mode_tournament_item
+                : globals.mGameMode == Globals.GAME_MODE_FFA ? R.id.game_mode_ffa_item
+                : globals.mGameMode == Globals.GAME_MODE_4TEAMS ? R.id.game_mode_4teams_item
+                : R.id.game_mode_2teams_item;
+        popup.getMenu().findItem(selectedMode).setChecked(true);
+        popup.setOnMenuItemClickListener(FullscreenActivity.this);
+        popup.show();
     }
 
     private void setBalancedMode(boolean enabled, boolean requireQr) {
@@ -1714,16 +1995,65 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return globals.mBossMode && globals.mPlayerID == Globals.BOSS_PLAYER_ID;
     }
 
+    private void updateSecondGunControls() {
+        boolean localBoss = isLocalBoss();
+        if (mBossAmmoRow != null)
+            mBossAmmoRow.setVisibility(localBoss ? View.VISIBLE : View.GONE);
+        int standardVisibility = localBoss ? View.INVISIBLE : View.VISIBLE;
+        if (mShotsRemainingLabelTV != null)
+            mShotsRemainingLabelTV.setVisibility(standardVisibility);
+        if (mShotsRemainingTV != null)
+            mShotsRemainingTV.setVisibility(localBoss ? View.INVISIBLE
+                    : mReloading == RELOADING_STATE_STARTED
+                    || mReloading == RELOADING_STATE_FINISHING ? View.INVISIBLE : View.VISIBLE);
+        if (mReloadBar != null)
+            mReloadBar.setVisibility(!localBoss && (mReloading == RELOADING_STATE_STARTED
+                    || mReloading == RELOADING_STATE_FINISHING) ? View.VISIBLE : View.GONE);
+        View recoilLabel = findViewById(R.id.recoil_label_tv);
+        if (recoilLabel != null)
+            recoilLabel.setVisibility(standardVisibility);
+        if (mRecoilModeTV != null)
+            mRecoilModeTV.setVisibility(standardVisibility);
+        View shotModeLabel = findViewById(R.id.shot_mode_label_tv);
+        if (shotModeLabel != null)
+            shotModeLabel.setVisibility(standardVisibility);
+        if (mShotModeTV != null)
+            mShotModeTV.setVisibility(standardVisibility);
+        if (mBossPrimaryShotsTV != null)
+            mBossPrimaryShotsTV.setText(!mCommunicating ? "--"
+                    : mReloading == RELOADING_STATE_STARTED
+                    || mReloading == RELOADING_STATE_FINISHING ? "..."
+                    : String.valueOf(mLastShotCount & 0xff));
+        if (mSecondGunButton != null) {
+            mSecondGunButton.setVisibility(localBoss && mCommunicating
+                    && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                    ? View.VISIBLE : View.GONE);
+            mSecondGunButton.setEnabled(!mScanning && !mScanningSecondary);
+            mSecondGunButton.setText(R.string.second_gun_button);
+        }
+        if (mSecondGunStatusTV != null) {
+            mSecondGunStatusTV.setText(!mSecondaryCommunicating ? "--"
+                    : mSecondaryReloading == RELOADING_STATE_STARTED
+                    || mSecondaryReloading == RELOADING_STATE_FINISHING ? "..."
+                    : String.valueOf(mSecondaryLastShotCount & 0xff));
+        }
+    }
+
     /** Apply the locked hunter weapon or initialize a newly selected boss in automatic mode. */
     private void applyBossWeaponRole() {
         boolean localBoss = isLocalBoss();
         if (localBoss && !mBossWeaponInitialized)
             mCurrentShotMode = Globals.SHOT_MODE_FULL_AUTO;
-        else if (!localBoss)
+        else if (!localBoss && Globals.getInstance().mTournamentMode)
             mCurrentShotMode = Globals.SHOT_MODE_SINGLE;
         mBossWeaponInitialized = localBoss;
         if (mFiringModeButton != null)
             mFiringModeButton.setEnabled(true);
+        updateSecondGunControls();
+        if (localBoss && mCommunicating && !mSecondaryDeviceAddress.isEmpty())
+            setupSecondaryBLEServiceConnection();
+        else if (!localBoss && mSecondaryBLEServiceBound)
+            resetSecondaryBluetoothServices();
     }
 
     private void selectFiringMode(int firingMode) {
@@ -1861,7 +2191,36 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             globals.applyTournamentRules();
         }
         sharedPreferences.edit().putBoolean(PREF_BOSS_MODE, enabled)
+                .putBoolean(PREF_TOURNAMENT_MODE, true)
+                .putInt(PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
                 .putBoolean(PREF_BALANCED_MODE, false).apply();
+        mBossWeaponInitialized = false;
+        applyBossWeaponRole();
+        updateGameModeDisplay();
+        displayCurrentTeam();
+        updatePlayerSettings();
+    }
+
+    private void setClassicGameMode(int gameMode) {
+        Globals globals = Globals.getInstance();
+        if (!Globals.isValidGameMode(gameMode) || !canChangeGameModeInLobby()) {
+            Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (mReady && mIsServer) {
+            if (mTcpServer == null || !mTcpServer.setClassicGameMode(gameMode)) {
+                Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.applyClassicRules(gameMode);
+        }
+        sharedPreferences.edit().putBoolean(PREF_TOURNAMENT_MODE, false)
+                .putBoolean(PREF_BOSS_MODE, false)
+                .putBoolean(PREF_BALANCED_MODE, false)
+                .putInt(PREF_GAME_MODE, gameMode).apply();
         mBossWeaponInitialized = false;
         applyBossWeaponRole();
         updateGameModeDisplay();
@@ -2203,12 +2562,26 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } else {
             mJoinedFromGameInvite = false;
             mLobbyTakeoverPending = false;
-            Globals.getInstance().mBossMode = readBooleanPreference(sharedPreferences,
-                    PREF_BOSS_MODE, false);
-            Globals.getInstance().mBossHunterCount = -1;
-            Globals.getInstance().applyTournamentRules();
-            Globals.getInstance().mBalancedRandom = false;
-            Globals.getInstance().clearBalancedAssignments();
+            Globals globals = Globals.getInstance();
+            int savedMode = readIntPreference(sharedPreferences, PREF_GAME_MODE,
+                    Globals.GAME_MODE_2TEAMS);
+            if (!Globals.isValidGameMode(savedMode))
+                savedMode = Globals.GAME_MODE_2TEAMS;
+            globals.mTournamentMode = readBooleanPreference(sharedPreferences,
+                    PREF_TOURNAMENT_MODE, true);
+            globals.mBossMode = globals.mTournamentMode
+                    && readBooleanPreference(sharedPreferences, PREF_BOSS_MODE, false);
+            globals.mBossHunterCount = -1;
+            if (globals.mTournamentMode)
+                globals.applyTournamentRules();
+            else
+                globals.applyClassicRules(savedMode);
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            int savedPowerupCount = readIntPreference(sharedPreferences,
+                    PREF_POWERUP_QR_REQUIRED, 0);
+            globals.mPowerupQrRequired = PowerupQrProgress.isValidRequiredCount(savedPowerupCount)
+                    ? savedPowerupCount : 0;
             mBossWeaponInitialized = false;
             applyBossWeaponRole();
             cancelPlayerQuitWindow();
@@ -2238,6 +2611,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         updateGameModeDisplay();
         updateTeamAssignmentScanButton();
+        updatePowerupSettingsButton();
         Intent intent = new Intent(NetMsg.NETMSG_GPSSETTING);
         sendBroadcast(intent);
     }
@@ -2264,6 +2638,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void resetVitalStatBars() {
         cancelShieldRegeneration();
+        cancelHealthRegeneration();
         cancelRespawnShieldBoost();
 
         mHealth = Globals.getInstance().mFullHealth;
@@ -2293,8 +2668,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void startRespawnShieldBoost() {
+        startTemporaryShieldBoost((Math.max(0, Globals.getInstance().mFullShields) + 1) / 2);
+    }
+
+    private void startTemporaryShieldBoost(int bonus) {
         cancelRespawnShieldBoost();
-        mRespawnShieldBonus = (Math.max(0, Globals.getInstance().mFullShields) + 1) / 2;
+        mRespawnShieldBonus = Math.max(0, bonus);
         if (mRespawnShieldBonus == 0)
             return;
         mShieldBar.setMax(Globals.getInstance().mFullShields + mRespawnShieldBonus);
@@ -2321,6 +2700,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mShieldTimer != null) {
             mShieldTimer.cancel();
             mShieldTimer = null;
+        }
+    }
+
+    private void cancelHealthRegeneration() {
+        if (mHealthTimer != null) {
+            mHealthTimer.cancel();
+            mHealthTimer = null;
         }
     }
 
@@ -2480,6 +2866,36 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mShieldTimer.start();
     }
 
+    private void startHealthRegeneration(long delayMilliseconds) {
+        cancelHealthRegeneration();
+        if (mHealth <= 0 || mHealth >= Globals.getInstance().mFullHealth)
+            return;
+
+        mHealthTimer = new CountDownTimer(delayMilliseconds, delayMilliseconds) {
+            @Override
+            public void onTick(long millisUntilFinished) {
+                // Regeneration is applied when the timer completes.
+            }
+
+            @Override
+            public void onFinish() {
+                if (mHealthTimer != this)
+                    return;
+                mHealthTimer = null;
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING || mHealth <= 0)
+                    return;
+
+                mHealth = Math.min(Globals.getInstance().mFullHealth,
+                        mHealth + HEALTH_REGEN_TICK_AMOUNT);
+                updateVitalStatBars();
+                publishPeerRuntimeState();
+                if (mHealth < Globals.getInstance().mFullHealth)
+                    startHealthRegeneration(HEALTH_REGEN_TICK_MILLISECONDS);
+            }
+        };
+        mHealthTimer.start();
+    }
+
     private boolean survivesDamage(int damage) {
         return mHealth + mShield + mRespawnShieldBonus + damage > 0;
     }
@@ -2495,8 +2911,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mHealth = Math.max(0, mHealth + Math.max(0, damage) - remainingDamage);
         updateVitalStatBars();
         publishPeerRuntimeState();
-        if (!Globals.getInstance().mBossMode)
+        if (!Globals.getInstance().mBossMode) {
             startShieldRegeneration(SHIELD_REGEN_DELAY_MILLISECONDS);
+            startHealthRegeneration(HEALTH_REGEN_DELAY_MILLISECONDS);
+        } else {
+            cancelShieldRegeneration();
+            cancelHealthRegeneration();
+        }
     }
 
     /**
@@ -2531,9 +2952,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             Log.w(TAG, "Ignoring game start before network services are ready");
             return;
         }
-        Globals.getInstance().applyTournamentRules();
+        if (Globals.getInstance().mTournamentMode)
+            Globals.getInstance().applyTournamentRules();
         applyBossWeaponRole();
-        setRecoil(true);
+        if (Globals.getInstance().mTournamentMode)
+            setRecoil(true);
         final boolean peerGame = mUseNetwork && !isDedicatedServerConnection();
         final String peerRoundToken = start == null ? null
                 : start.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
@@ -2564,6 +2987,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         // Refresh the local team before any score or friendly-fire path uses it.
         displayCurrentTeam();
         resetRoundTelemetryState();
+        mDualGunHitDeduper.reset();
         mKillStreakVoice.resetStreak();
         clearCombatFeedback();
         setGameVolumeToMaximum();
@@ -2579,8 +3003,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mEliminationCount = 0;
         mEliminationCountTV.setText(getString(R.string.integer,mEliminationCount));
         resetVitalStatBars();
+        mPowerupQrProgress.reset();
         mEliminatedTV.setText(R.string.starting_game_label);
         mStartGameButton.setVisibility(View.GONE);
+        updatePowerupScanButton();
         mTeamMinusButton.setVisibility(View.INVISIBLE);
         mTeamPlusButton.setVisibility(View.INVISIBLE);
         mGameLimitButton.setVisibility(View.GONE);
@@ -2607,9 +3033,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         mUseNetworkingButton.setVisibility(View.INVISIBLE);
         mFiringModeButton.setVisibility(View.INVISIBLE);
+        setPlayingShotsCounter(true);
         mStartGameTimer = true;
         setShotMode(mCurrentShotMode); // make sure that the shot mode is correctly set at the start of each game
         startSpawn("");
+        updateGpsCoordinatesDisplay();
         if (mHasSynchronizedStart && mSynchronizedEndAt > 0 && !mGameTimerRunning
                 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             startGameCountdownMillis(Math.max(0, mSynchronizedEndAt - SystemClock.elapsedRealtime()));
@@ -2794,12 +3222,44 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void enableGameLock() {
         if (isFinishing() || isDestroyed())
             return;
+        // Some Android 5.1 devices briefly ignore sticky visibility flags when
+        // focus changes. The window flag keeps the top status bar removed too.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
         getWindow().getDecorView().setSystemUiVisibility(GAME_LOCK_SYSTEM_UI_FLAGS);
     }
 
     private void disableGameLock() {
-        if (!isFinishing() && !isDestroyed())
+        if (!isFinishing() && !isDestroyed()) {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
             getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+        }
+    }
+
+    private void updateGpsCoordinatesDisplay() {
+        if (mGpsCoordinatesTV == null)
+            return;
+        Globals globals = Globals.getInstance();
+        if (globals.mGameState == Globals.GAME_STATE_NONE || !globals.mUseGPS) {
+            mGpsCoordinatesTV.setVisibility(View.GONE);
+            return;
+        }
+        mGpsCoordinatesTV.setVisibility(View.VISIBLE);
+        if (Globals.isValidCoordinates(mLastGpsLongitude, mLastGpsLatitude)) {
+            mGpsCoordinatesTV.setText(getString(R.string.gps_coordinates_format,
+                    mLastGpsLatitude, mLastGpsLongitude));
+        } else {
+            mGpsCoordinatesTV.setText(R.string.gps_acquiring);
+        }
+    }
+
+    private void receiveLocalGpsLocation(Intent intent) {
+        double latitude = intent.getDoubleExtra(NetMsg.INTENT_LATITUDE, Double.NaN);
+        double longitude = intent.getDoubleExtra(NetMsg.INTENT_LONGITUDE, Double.NaN);
+        if (Globals.isValidCoordinates(longitude, latitude)) {
+            mLastGpsLatitude = latitude;
+            mLastGpsLongitude = longitude;
+        }
+        updateGpsCoordinatesDisplay();
     }
 
     private boolean showGameStartWaitIfNeeded() {
@@ -2842,6 +3302,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             PlayerHistory.record(this, mScore, deaths);
         }
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        updateSecondGunControls();
+        mPowerupQrProgress.reset();
+        updatePowerupScanButton();
+        updateGpsCoordinatesDisplay();
+        stopReloadVoiceReminder();
+        setPlayingShotsCounter(false);
         Globals.getInstance().clearBalancedAssignments();
         Globals.getInstance().mBalancedRandom = false;
         updateTeamAssignmentScanButton();
@@ -2862,7 +3328,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mStartGameTimer = false;
         resetGameStartCountdownSpeech();
         mActivePeerRoundToken = null;
-        Globals.getInstance().applyTournamentRules();
+        if (Globals.getInstance().mTournamentMode)
+            Globals.getInstance().applyTournamentRules();
         applyBossWeaponRole();
         mFiringModeButton.setVisibility(View.VISIBLE);
         mStartGameButton.setVisibility(View.VISIBLE);
@@ -2897,6 +3364,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mGameCountdownTimer = null;
         }
         cancelShieldRegeneration();
+        cancelHealthRegeneration();
         cancelRespawnShieldBoost();
         mStartGameButton.setVisibility(View.VISIBLE);
         mPlayerSettingsButton.setVisibility(View.VISIBLE);
@@ -2953,7 +3421,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             displayCurrentTeam();
             return;
         }
-        Globals.getInstance().applyTournamentRules();
+        if (Globals.getInstance().mTournamentMode)
+            Globals.getInstance().applyTournamentRules();
         applyBossWeaponRole();
         if (!TEST_NETWORK && mBluetoothLeService != null && mCommandCharacteristic != null) {
             Log.d(TAG, "setting player ID to " + Globals.getInstance().mPlayerID);
@@ -2969,6 +3438,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             // until a disconnected blaster is available to receive it.
             Log.d(TAG, "Saving player ID until the blaster command is available");
         }
+        setSecondWeaponTeam();
         if (sharedPreferences != null) {
             SharedPreferences.Editor editor = sharedPreferences.edit();
             editor.putInt(PREF_PLAYER_ID, Globals.getInstance().mPlayerID);
@@ -3212,7 +3682,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mReloadBar != null)
             mReloadBar.setVisibility(View.GONE);
         if (mShotsRemainingTV != null)
-            mShotsRemainingTV.setVisibility(View.VISIBLE);
+            mShotsRemainingTV.setVisibility(isLocalBoss() ? View.INVISIBLE : View.VISIBLE);
+        updateSecondGunControls();
+    }
+
+    private void setPlayingShotsCounter(boolean playing) {
+        if (mShotsRemainingTV == null)
+            return;
+        if (playing)
+            mShotsRemainingTV.setTextSize(TypedValue.COMPLEX_UNIT_SP, PLAYING_SHOTS_TEXT_SIZE_SP);
+        else if (mLobbyShotsTextSizePx > 0)
+            mShotsRemainingTV.setTextSize(TypedValue.COMPLEX_UNIT_PX, mLobbyShotsTextSizePx);
     }
 
     /* Initial reload command that tells the tagger not to shoot anymore (or maybe it just sets the
@@ -3220,10 +3700,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
        of the usual 0x02. The command format is F0 00 02 00 PLAYER_ID and then 0 filled to the end. */
     private void startReload(int reloadStatus) {
         boolean disablingWeapon = reloadStatus == RELOADING_STATE_ELIMINATED;
+        if (disablingWeapon)
+            startSecondaryReload(RELOADING_STATE_ELIMINATED);
         if (!disablingWeapon && mReloading != RELOADING_STATE_NONE)
             return;
         // Elimination must supersede even a refill whose acknowledgement is in flight.
         if (disablingWeapon) {
+            stopReloadVoiceReminder();
             if (mReloadTimer != null) {
                 mReloadTimer.cancel();
                 mReloadTimer = null;
@@ -3231,11 +3714,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mPendingReloadCommand = null;
             mReloading = RELOADING_STATE_ELIMINATED;
         }
-        if (mCommandCharacteristic == null || mBluetoothLeService == null)
+        if (mCommandCharacteristic == null || mBluetoothLeService == null) {
+            updateSecondGunControls();
             return;
+        }
         mReloading = reloadStatus;
         mShotsRemainingTV.setVisibility(View.INVISIBLE);
-        mReloadBar.setVisibility(View.VISIBLE);
+        mReloadBar.setVisibility(isLocalBoss() ? View.GONE : View.VISIBLE);
+        updateSecondGunControls();
         byte[] command = new byte[20];
         command[0] = mCommandID;
         mCommandID += COMMAND_ID_INCREMENT;
@@ -3254,6 +3740,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return;
         mReloading = RELOADING_STATE_FINISHING;
         mEmptyTriggerCount = 0;
+        updateSecondGunControls();
         Log.d(TAG, "Finishing reload");
         byte[] command = new byte[20];
         command[0] = mCommandID;
@@ -3271,6 +3758,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         String shotsRemainingStr = "" + (shotsRemaining & 0xff);
         mShotsRemainingTV.setText(shotsRemainingStr);
         mLastShotCount = shotsRemaining;
+        updateSecondGunControls();
+        if ((shotsRemaining & 0xff) == 0
+                && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING)
+            startReloadVoiceReminder();
+        else
+            stopReloadVoiceReminder();
         publishPeerRuntimeState();
     }
 
@@ -3323,6 +3816,165 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private boolean isQrScannerActive() {
         return mRespawnQrScannerActive || mTeamAssignmentQrScannerActive;
+    }
+
+    private boolean isPowerupScanAvailable() {
+        return Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                && !mStartGameTimer
+                && PowerupQrProgress.isValidRequiredCount(
+                        Globals.getInstance().mPowerupQrRequired)
+                && mPowerupQrProgress.canUnlockAnother(
+                        Globals.getInstance().mPowerupQrRequired);
+    }
+
+    private void updatePowerupScanButton() {
+        boolean available = isPowerupScanAvailable();
+        if (!available)
+            hidePowerupQrScanner();
+        if (mPowerupScanButton != null) {
+            mPowerupScanButton.setVisibility(available ? View.VISIBLE : View.GONE);
+            if (available)
+                mPowerupScanButton.setText(getString(R.string.powerup_scan_progress,
+                        mPowerupQrProgress.progressCount(
+                                Globals.getInstance().mPowerupQrRequired),
+                        Globals.getInstance().mPowerupQrRequired));
+        }
+        updatePowerupSettingsButton();
+    }
+
+    private void grantRandomPowerup() {
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                || Globals.getInstance().mPowerupQrRequired == 0)
+            return;
+        List<Integer> rewards = new ArrayList<>();
+        if (mHealth < Globals.getInstance().mFullHealth)
+            rewards.add(0);
+        if (mShield < Globals.getInstance().mFullShields)
+            rewards.add(1);
+        // A temporary shield boost is useful even when health and normal shields are full.
+        rewards.add(2);
+        int reward = rewards.get(mPowerupRandom.nextInt(rewards.size()));
+        if (reward == 0) {
+            mHealth = Globals.getInstance().mFullHealth;
+            cancelHealthRegeneration();
+            updateVitalStatBars();
+            publishPeerRuntimeState();
+            Toast.makeText(this, R.string.powerup_reward_health, Toast.LENGTH_LONG).show();
+        } else if (reward == 1) {
+            mShield = Globals.getInstance().mFullShields;
+            cancelShieldRegeneration();
+            updateVitalStatBars();
+            publishPeerRuntimeState();
+            Toast.makeText(this, R.string.powerup_reward_shields, Toast.LENGTH_LONG).show();
+        } else {
+            startTemporaryShieldBoost(Math.max(1,
+                    (Math.max(0, Globals.getInstance().mFullShields) + 1) / 2));
+            publishPeerRuntimeState();
+            Toast.makeText(this, R.string.powerup_reward_boost, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private final BarcodeCallback mPowerupQrBarcodeCallback = new BarcodeCallback() {
+        @Override
+        public void barcodeResult(BarcodeResult result) {
+            if (!mPowerupQrScannerActive || !isPowerupScanAvailable())
+                return;
+            PowerupQrProgress.ScanResult scan = mPowerupQrProgress.scan(
+                    result == null ? null : result.getText(),
+                    Globals.getInstance().mPowerupQrRequired);
+            if (scan == PowerupQrProgress.ScanResult.INVALID) {
+                Toast.makeText(FullscreenActivity.this, R.string.powerup_scan_invalid,
+                        Toast.LENGTH_SHORT).show();
+                mPowerupQrScanner.postDelayed(() -> {
+                    if (mPowerupQrScannerActive && mActivityResumed
+                            && isPowerupScanAvailable() && !isFinishing() && !isDestroyed())
+                        mPowerupQrScanner.decodeSingle(mPowerupQrBarcodeCallback);
+                }, 800);
+                return;
+            }
+            hidePowerupQrScanner();
+            if (scan == PowerupQrProgress.ScanResult.DUPLICATE) {
+                Toast.makeText(FullscreenActivity.this, R.string.powerup_scan_duplicate,
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+            updatePowerupScanButton();
+            if (scan == PowerupQrProgress.ScanResult.UNLOCKED)
+                grantRandomPowerup();
+            else
+                Toast.makeText(FullscreenActivity.this, getString(R.string.powerup_scan_progress,
+                        mPowerupQrProgress.progressCount(
+                                Globals.getInstance().mPowerupQrRequired),
+                        Globals.getInstance().mPowerupQrRequired), Toast.LENGTH_SHORT).show();
+        }
+
+        @Override
+        public void possibleResultPoints(List<ResultPoint> resultPoints) { }
+    };
+
+    private void openPowerupQrScanner() {
+        if (!isPowerupScanAvailable() || isQrScannerActive()
+                || isFinishing() || isDestroyed())
+            return;
+        if (!mActivityResumed) {
+            mPowerupQrOpenWhenResumed = true;
+            return;
+        }
+        if (!getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
+            Toast.makeText(this, R.string.error_camera_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            mPowerupQrOpenWhenResumed = true;
+            requestPermissions(new String[]{Manifest.permission.CAMERA},
+                    REQUEST_CODE_POWERUP_CAMERA_PERMISSION);
+            return;
+        }
+        if (mPowerupQrScannerWindow == null || mPowerupQrScanner == null)
+            return;
+        mPowerupQrOpenWhenResumed = false;
+        mPowerupQrScannerActive = true;
+        if (mPowerupQrPrompt != null)
+            mPowerupQrPrompt.setText(getString(R.string.powerup_qr_prompt,
+                    mPowerupQrProgress.progressCount(Globals.getInstance().mPowerupQrRequired),
+                    Globals.getInstance().mPowerupQrRequired));
+        mPowerupQrScannerWindow.setVisibility(View.VISIBLE);
+        resumePowerupQrScanner();
+    }
+
+    private void resumePowerupQrScanner() {
+        if (!mPowerupQrScannerActive || !mActivityResumed || mPowerupQrScanner == null
+                || isFinishing() || isDestroyed())
+            return;
+        if (!isPowerupScanAvailable()) {
+            hidePowerupQrScanner();
+            return;
+        }
+        try {
+            mPowerupQrScanner.resume();
+            mPowerupQrScanner.decodeSingle(mPowerupQrBarcodeCallback);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to resume power-up QR scanner", e);
+            hidePowerupQrScanner();
+            Toast.makeText(this, R.string.error_camera_unavailable, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void hidePowerupQrScanner() {
+        mPowerupQrOpenWhenResumed = false;
+        boolean wasActive = mPowerupQrScannerActive;
+        mPowerupQrScannerActive = false;
+        if (wasActive && mPowerupQrScanner != null) {
+            try {
+                mPowerupQrScanner.pause();
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Unable to pause power-up QR scanner", e);
+            }
+        }
+        if (mPowerupQrScannerWindow != null)
+            mPowerupQrScannerWindow.setVisibility(View.GONE);
     }
 
     private void scheduleQrDecoder() {
@@ -3379,6 +4031,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         if (mRespawnQrScannerOverlay == null || mRespawnQrScanner == null)
             return;
+        hidePowerupQrScanner();
         if (mRespawnQrScannerPrompt != null)
             mRespawnQrScannerPrompt.setText(getString(R.string.respawn_qr_scanner_prompt,
                     mRespawnQrTeam));
@@ -3414,6 +4067,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         if (mRespawnQrScannerOverlay == null || mRespawnQrScanner == null)
             return;
+        hidePowerupQrScanner();
         if (mRespawnQrScannerPrompt != null)
             mRespawnQrScannerPrompt.setText(Globals.getInstance().mBalancedRandom && mReady
                     ? getString(R.string.balanced_scan_assigned_team, Globals.getInstance()
@@ -3535,6 +4189,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void startSpawn(String eliminatedBy) {
         clearIncomingHitFeedback();
+        mPowerupQrProgress.reset();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
             mSpawnTimer = null;
@@ -3544,8 +4199,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mReloadTimer = null;
         }
         cancelShieldRegeneration();
+        cancelHealthRegeneration();
         cancelRespawnShieldBoost();
         Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+        updateSecondGunControls();
+        updatePowerupScanButton();
         publishPeerRuntimeState();
         updateTeamAssignmentScanButton();
         resetTeamRespawnQrState();
@@ -3611,11 +4269,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mSpawnInTV.setVisibility(View.GONE);
         resetVitalStatBars();
         Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        updateSecondGunControls();
         if (!startingGame)
             startRespawnShieldBoost();
         publishPeerRuntimeState();
         playSound(R.raw.spawn);
         finishReload();
+        // A spawn enables both guns; ordinary magazine reloads remain independent.
+        finishSecondaryReload();
         if (notifyDedicatedHost && !startingGame && isDedicatedServerConnection()) {
             mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG
                     + NetMsg.NETMSG_RESPAWNCOMPLETE, true);
@@ -3637,6 +4298,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
             announceRoundStart();
         }
+        updatePowerupScanButton();
     }
 
     private void startGameCountdown() {
@@ -3691,7 +4353,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private int resolveShotMode(int shotMode) {
         Globals globals = Globals.getInstance();
-        if (Globals.TOURNAMENT_RULES_REQUIRED && !isLocalBoss())
+        if (Globals.getInstance().mTournamentMode && !isLocalBoss())
             return Globals.SHOT_MODE_SINGLE;
         switch (shotMode) {
             case Globals.SHOT_MODE_SINGLE:
@@ -3716,18 +4378,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void setShotMode(int shotMode) {
         shotMode = resolveShotMode(shotMode);
         mCurrentShotMode = shotMode;
+        int labelResource;
         if (shotMode == Globals.SHOT_MODE_SINGLE)
-            mShotModeTV.setText(R.string.shot_mode_single);
+            labelResource = R.string.shot_mode_single;
         else if (shotMode == Globals.SHOT_MODE_BURST)
-            mShotModeTV.setText(R.string.shot_mode_burst3);
+            labelResource = R.string.shot_mode_burst3;
         else
-            mShotModeTV.setText(R.string.shot_mode_auto);
+            labelResource = R.string.shot_mode_auto;
+        mShotModeTV.setText(labelResource);
+        if (mBossShotModeTV != null)
+            mBossShotModeTV.setText(labelResource);
         SharedPreferences.Editor editor = sharedPreferences.edit();
         editor.putInt(PREF_SHOT_MODE, mCurrentShotMode);
         editor.apply();
         // Keep the permitted selection even while disconnected so reconnects cannot restore a banned mode.
-        if (mConfigCharacteristic == null || mBluetoothLeService == null)
-            return;
         byte[] config = new byte[20];
         config[0]  = WEAPON_PROFILE;
         config[2]  = (byte)0x09;
@@ -3767,8 +4431,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 config[5]  = (byte)0x19;
                 config[6]  = (byte)0x00;
         }
-        mConfigCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-        mBluetoothLeService.writeCharacteristic(mConfigCharacteristic, config);
+        if (mConfigCharacteristic != null && mBluetoothLeService != null) {
+            mConfigCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            mBluetoothLeService.writeCharacteristic(mConfigCharacteristic, config);
+        }
+        if (isLocalBoss() && mSecondaryConfigCharacteristic != null
+                && mSecondaryBluetoothLeService != null) {
+            byte[] secondaryConfig = config.clone();
+            if (shotMode == Globals.SHOT_MODE_BURST)
+                secondaryConfig[9] = mSecondaryBlasterType == BLASTER_TYPE_RIFLE
+                        ? (byte) 0x78 : (byte) 0x80;
+            mSecondaryConfigCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            mSecondaryBluetoothLeService.writeCharacteristic(mSecondaryConfigCharacteristic,
+                    secondaryConfig);
+        }
     }
 
     // Config 10 00 02 02 ff and 15 sets of 00 disables recoil
@@ -3777,7 +4453,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         // A tournament match must never depend on a player's saved recoil preference or a
         // power-button toggle.  Retain the enforced state while disconnected as well, so the
         // first telemetry packet programs the blaster correctly after it reconnects.
-        if (Globals.TOURNAMENT_RULES_REQUIRED)
+        if (Globals.getInstance().mTournamentMode)
             enabled = true;
         mRecoilEnabled = enabled;
         if (mRecoilModeTV != null)
@@ -3787,8 +4463,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             editor.putBoolean(PREF_RECOIL_ENABLED, mRecoilEnabled);
             editor.apply();
         }
-        if (mConfigCharacteristic == null || mBluetoothLeService == null)
-            return;
         byte[] config = new byte[20];
         config[0]  = (byte)0x10;
         config[2]  = (byte)0x02;
@@ -3798,8 +4472,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } else {
             config[3] = (byte)0x02;
         }
-        mConfigCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-        mBluetoothLeService.writeCharacteristic(mConfigCharacteristic, config);
+        if (mConfigCharacteristic != null && mBluetoothLeService != null) {
+            mConfigCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            mBluetoothLeService.writeCharacteristic(mConfigCharacteristic, config);
+        }
+        if (isLocalBoss() && mSecondaryConfigCharacteristic != null
+                && mSecondaryBluetoothLeService != null) {
+            mSecondaryConfigCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            mSecondaryBluetoothLeService.writeCharacteristic(mSecondaryConfigCharacteristic,
+                    config);
+        }
     }
 
     @Override
@@ -3808,6 +4490,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mActivityResumed = true;
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             enableGameLock();
+        updateGpsCoordinatesDisplay();
         if (mUseHubAutoJoin && mRecoilWifiAutoJoiner != null)
             mRecoilWifiAutoJoiner.start();
         ContextCompat.registerReceiver(this, mGattUpdateReceiver, makeGattUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
@@ -3815,6 +4498,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mBluetoothLeService != null && mDeviceAddress != null && !mDeviceAddress.isEmpty()) {
             final boolean result = mBluetoothLeService.connect(mDeviceAddress);
             Log.d(TAG, "Connect request result=" + result);
+        }
+        if (isLocalBoss() && !mSecondaryDeviceAddress.isEmpty()) {
+            if (mSecondaryBluetoothLeService != null)
+                mSecondaryBluetoothLeService.connect(mSecondaryDeviceAddress);
+            else
+                setupSecondaryBLEServiceConnection();
         }
         IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
         registerReceiver(mBluetoothReceiver, filter);
@@ -3839,6 +4528,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } else {
             resumeQrScanner();
         }
+        updatePowerupScanButton();
+        if (mPowerupQrOpenWhenResumed) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                    || ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                    == PackageManager.PERMISSION_GRANTED)
+                openPowerupQrScanner();
+        } else {
+            resumePowerupQrScanner();
+        }
         startRespawnQrVoiceReminder();
     }
 
@@ -3853,6 +4551,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onPause() {
+        if (mScanningSecondary)
+            stopBLEScan();
         if (mGameInviteDialog != null)
             dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
         cancelNetworkOptionsWifiWait();
@@ -3873,6 +4573,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mRespawnQrScanner.pause();
             } catch (RuntimeException e) {
                 Log.w(TAG, "Unable to pause QR scanner", e);
+            }
+        }
+        if (mPowerupQrScannerActive && mPowerupQrScanner != null) {
+            try {
+                mPowerupQrScanner.pause();
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Unable to pause power-up QR scanner", e);
             }
         }
         if (mGattReceiverRegistered) {
@@ -3902,6 +4609,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         cancelNewWeaponPairing();
         clearCombatFeedback();
         resetTeamRespawnQrState();
+        hidePowerupQrScanner();
         hideWeaponDisconnect();
         stopBLEScan();
         if (mSpawnTimer != null) {
@@ -3918,7 +4626,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         stopConnectFailTest();
         cancelShieldRegeneration();
+        cancelHealthRegeneration();
         cancelRespawnShieldBoost();
+        resetSecondaryBluetoothServices();
         resetBluetoothServices();
         unbindUDPService();
         unbindTcpClientService();
@@ -3953,6 +4663,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             hideQrScanner();
             return;
         }
+        if (mPowerupQrScannerActive) {
+            hidePowerupQrScanner();
+            return;
+        }
         Fragment f = getSupportFragmentManager().findFragmentById(R.id.map_fragment);
         if (f != null && mFragmentMgr.getBackStackEntryCount() > 0) {
             mFragmentMgr.popBackStack();
@@ -3976,6 +4690,100 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mCollectingNewWeaponCandidates = true;
         mNewWeaponCandidates.clear();
         scheduleNewWeaponDiscoveryFinish();
+    }
+
+    @SuppressLint("MissingPermission") // Permissions are checked before starting the scan.
+    private void beginSecondGunScan() {
+        if (!isLocalBoss() || !mCommunicating
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE || mScanning)
+            return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                && (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)
+                != PackageManager.PERMISSION_GRANTED
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED)) {
+            mSecondaryScanPendingPermission = true;
+            requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_CONNECT}, REQUEST_CODE_BLUETOOTH_PERMISSIONS);
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            mSecondaryScanPendingPermission = true;
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
+                    REQUEST_CODE_LOCATION_PERMISSIONS);
+            return;
+        }
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null || !adapter.isEnabled()) {
+            Toast.makeText(this, R.string.second_gun_scan_failed, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        mBluetoothLeScanner = adapter.getBluetoothLeScanner();
+        if (mBluetoothLeScanner == null) {
+            Toast.makeText(this, R.string.second_gun_scan_failed, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        mSecondaryWeaponCandidates.clear();
+        mLeScanCallback = createLEScanCallback();
+        mScanning = true;
+        mScanningSecondary = true;
+        try {
+            mBluetoothLeScanner.startScan(mLeScanCallback);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "Unable to scan for second boss gun", e);
+            stopBLEScan();
+            Toast.makeText(this, R.string.second_gun_scan_failed, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        mSecondaryScanFinish = () -> {
+            mSecondaryScanFinish = null;
+            finishSecondGunScan();
+        };
+        mWeaponPairingHandler.postDelayed(mSecondaryScanFinish,
+                NEW_WEAPON_DISCOVERY_WINDOW_MS);
+        updateSecondGunControls();
+    }
+
+    private void finishSecondGunScan() {
+        if (!mScanningSecondary)
+            return;
+        stopBLEScan();
+        if (mSecondaryWeaponCandidates.isEmpty()) {
+            Toast.makeText(this, R.string.second_gun_scan_empty, Toast.LENGTH_LONG).show();
+            return;
+        }
+        String[] labels = new String[mSecondaryWeaponCandidates.size()];
+        for (int index = 0; index < labels.length; index++) {
+            WeaponCandidate candidate = mSecondaryWeaponCandidates.get(index);
+            labels[index] = candidate.name + " (" + candidate.address + ")";
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.second_gun_scan_title)
+                .setItems(labels, (dialog, which) -> {
+                    if (which >= 0 && which < mSecondaryWeaponCandidates.size())
+                        selectSecondGun(mSecondaryWeaponCandidates.get(which).address);
+                    mSecondaryWeaponCandidates.clear();
+                })
+                .setNegativeButton(android.R.string.cancel, (dialog, which) ->
+                        mSecondaryWeaponCandidates.clear())
+                .show();
+    }
+
+    private void selectSecondGun(String address) {
+        String normalized = normalizeBluetoothAddress(address);
+        if (normalized.isEmpty() || normalized.equals(mDeviceAddress)) {
+            Toast.makeText(this, R.string.second_gun_same_as_primary,
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        resetSecondaryBluetoothServices();
+        mSecondaryDeviceAddress = normalized;
+        sharedPreferences.edit().putString(PREF_SECONDARY_DEVICE_ADDRESS, normalized).apply();
+        setupSecondaryBLEServiceConnection();
+        updateSecondGunControls();
     }
 
     private void scheduleNewWeaponDiscoveryFinish() {
@@ -4274,6 +5082,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 super.onScanFailed(errorCode);
                 if (!isCurrentScan()) return;
                 Log.w(TAG, "Bluetooth scan failed: " + errorCode);
+                if (mScanningSecondary) {
+                    stopBLEScan();
+                    Toast.makeText(FullscreenActivity.this, R.string.second_gun_scan_failed,
+                            Toast.LENGTH_SHORT).show();
+                    return;
+                }
                 stopBLEScan();
                 handleDisconnect();
             }
@@ -4288,6 +5102,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 } catch (SecurityException e) {
                     Log.w(TAG, "Bluetooth permission was revoked while scanning", e);
                     stopBLEScan();
+                    return false;
+                }
+                if (mScanningSecondary) {
+                    if (deviceName != null && deviceName.startsWith("SRG1")
+                            && !deviceAddress.equals(mDeviceAddress)) {
+                        for (WeaponCandidate candidate : mSecondaryWeaponCandidates) {
+                            if (deviceAddress.equals(candidate.address))
+                                return false;
+                        }
+                        mSecondaryWeaponCandidates.add(new WeaponCandidate(deviceAddress,
+                                deviceName));
+                    }
                     return false;
                 }
                 boolean hasSavedDevice = mDeviceAddress != null && !mDeviceAddress.isEmpty();
@@ -4316,6 +5142,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_CODE_POWERUP_CAMERA_PERMISSION) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted && mPowerupQrOpenWhenResumed && mActivityResumed)
+                openPowerupQrScanner();
+            else if (!granted) {
+                mPowerupQrOpenWhenResumed = false;
+                Toast.makeText(this, R.string.error_camera_permission_required,
+                        Toast.LENGTH_SHORT).show();
+            }
+            return;
+        }
         if (requestCode == REQUEST_CODE_QR_CAMERA_PERMISSION) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
@@ -4340,8 +5178,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             granted &= result == PackageManager.PERMISSION_GRANTED;
         }
         if (granted) {
-            connectWeapon();
+            if (mSecondaryScanPendingPermission) {
+                mSecondaryScanPendingPermission = false;
+                beginSecondGunScan();
+            } else {
+                connectWeapon();
+            }
         } else {
+            mSecondaryScanPendingPermission = false;
             Toast.makeText(this, getString(R.string.error_location_permission_required), Toast.LENGTH_SHORT)
                     .show();
         }
@@ -4529,12 +5373,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @SuppressLint("MissingPermission") // Permission is checked before scanning begins.
     private void stopBLEScan() {
+        if (mSecondaryScanFinish != null) {
+            mWeaponPairingHandler.removeCallbacks(mSecondaryScanFinish);
+            mSecondaryScanFinish = null;
+        }
+        boolean wasSecondary = mScanningSecondary;
+        mScanningSecondary = false;
         ScanCallback callback = mLeScanCallback;
         BluetoothLeScanner scanner = mBluetoothLeScanner;
         // Invalidate first, including callbacks dispatched during scanner cleanup.
         mLeScanCallback = null;
         mBluetoothLeScanner = null;
         mScanning = false;
+        if (wasSecondary)
+            updateSecondGunControls();
         try {
             if (scanner != null && callback != null)
                 scanner.stopScan(callback);
@@ -4545,6 +5397,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void resetBluetoothServices() {
         cancelWeaponSyncTriggerHint();
+        stopReloadVoiceReminder();
         stopConnectionTest();
         mConnected = false;
         mCommunicating = false;
@@ -4597,7 +5450,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
             Log.e(TAG, "blaster disconnected mid-game, attempt to reconnect");
             connectWeapon();
-            showWeaponDisconnect();
+            if (isLocalBoss() && mSecondaryCommunicating) {
+                // The second boss blaster remains usable while the first reconnects.
+                updateSecondGunControls();
+            } else {
+                showWeaponDisconnect();
+            }
             return;
         }
         showConnectLayout();
@@ -4650,12 +5508,182 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
     }
 
+    private void handleSecondaryGattUpdate(Intent intent) {
+        if (!isLocalBoss() || mSecondaryBluetoothLeService == null)
+            return;
+        String action = intent.getAction();
+        if (BluetoothLeService.ACTION_GATT_CONNECTED.equals(action)) {
+            mSecondaryConnected = true;
+            mSecondaryCommunicating = false;
+            mSecondaryReconnectAttempts = 0;
+            if (mSecondaryReconnectRunnable != null) {
+                mWeaponPairingHandler.removeCallbacks(mSecondaryReconnectRunnable);
+                mSecondaryReconnectRunnable = null;
+            }
+        } else if (BluetoothLeService.ACTION_GATT_DISCONNECTED.equals(action)) {
+            mSecondaryConnected = false;
+            mSecondaryCommunicating = false;
+            mSecondaryTelemetryCharacteristic = null;
+            mSecondaryCommandCharacteristic = null;
+            mSecondaryConfigCharacteristic = null;
+            mSecondaryIdCharacteristic = null;
+            if (mSecondaryReloadTimer != null) {
+                mSecondaryReloadTimer.cancel();
+                mSecondaryReloadTimer = null;
+            }
+            mSecondaryPendingReloadCommand = null;
+            mSecondaryReloading = RELOADING_STATE_ELIMINATED;
+            Toast.makeText(this, R.string.second_gun_disconnected, Toast.LENGTH_SHORT).show();
+            scheduleSecondaryReconnect();
+        } else if (BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED.equals(action)) {
+            List<BluetoothGattService> services = mSecondaryBluetoothLeService.getSupportedGattServices();
+            if (services == null)
+                return;
+            for (BluetoothGattService service : services) {
+                if (!GattAttributes.RECOIL_MAIN_SERVICE.equals(service.getUuid().toString()))
+                    continue;
+                mSecondaryTelemetryCharacteristic = service.getCharacteristic(
+                        UUID.fromString(GattAttributes.RECOIL_TELEMETRY_UUID));
+                mSecondaryCommandCharacteristic = service.getCharacteristic(
+                        UUID.fromString(GattAttributes.RECOIL_COMMAND_UUID));
+                mSecondaryConfigCharacteristic = service.getCharacteristic(
+                        UUID.fromString(GattAttributes.RECOIL_CONFIG_UUID));
+                mSecondaryIdCharacteristic = service.getCharacteristic(
+                        UUID.fromString(GattAttributes.RECOIL_ID_UUID));
+                if (mSecondaryTelemetryCharacteristic != null)
+                    mSecondaryBluetoothLeService.setCharacteristicNotification(
+                            mSecondaryTelemetryCharacteristic, true);
+                if (mSecondaryIdCharacteristic != null)
+                    mSecondaryBluetoothLeService.readCharacteristic(mSecondaryIdCharacteristic);
+                if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
+                    mSecondaryReloading = RELOADING_STATE_NONE;
+                    startSecondaryReload(RELOADING_STATE_STARTED);
+                } else if (Globals.getInstance().mGameState
+                        == Globals.GAME_STATE_ELIMINATED)
+                    startSecondaryReload(RELOADING_STATE_ELIMINATED);
+                break;
+            }
+        } else if (BluetoothLeService.TELEMETRY_DATA_AVAILABLE.equals(action)) {
+            processTelemetryData(intent.getByteArrayExtra(BluetoothLeService.EXTRA_DATA), true);
+        } else if (BluetoothLeService.ID_DATA_AVAILABLE.equals(action)) {
+            mSecondaryBlasterType = intent.getByteExtra(BluetoothLeService.EXTRA_DATA,
+                    BLASTER_TYPE_PISTOL);
+            setShotMode(mCurrentShotMode);
+        } else if (BluetoothLeService.CHARACTERISTIC_WRITE_FINISHED.equals(action)) {
+            handleSecondaryWriteFinished(intent);
+        }
+        updateSecondGunControls();
+    }
+
+    private void handleSecondaryWriteFinished(Intent intent) {
+        byte[] completed = intent.getByteArrayExtra(BluetoothLeService.EXTRA_DATA);
+        if (!GattAttributes.RECOIL_COMMAND_UUID.equals(
+                intent.getStringExtra(BluetoothLeService.EXTRA_UUID))
+                || mSecondaryPendingReloadCommand == null
+                || !Arrays.equals(mSecondaryPendingReloadCommand, completed))
+            return;
+        mSecondaryPendingReloadCommand = null;
+        if (intent.getIntExtra(BluetoothLeService.EXTRA_STATUS, BluetoothGatt.GATT_FAILURE)
+                != BluetoothGatt.GATT_SUCCESS) {
+            mSecondaryReloading = Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                    ? RELOADING_STATE_NONE : RELOADING_STATE_ELIMINATED;
+            return;
+        }
+        if (mSecondaryReloading == RELOADING_STATE_STARTED) {
+            if (mSecondaryReloadTimer != null)
+                mSecondaryReloadTimer.cancel();
+            long reloadTime = Math.max(1L, Globals.getInstance().mReloadTime);
+            mSecondaryReloadTimer = new CountDownTimer(reloadTime, reloadTime) {
+                @Override public void onTick(long remaining) { }
+                @Override public void onFinish() {
+                    if (mSecondaryReloadTimer != this)
+                        return;
+                    mSecondaryReloadTimer = null;
+                    finishSecondaryReload();
+                }
+            };
+            mSecondaryReloadTimer.start();
+        } else if (mSecondaryReloading == RELOADING_STATE_FINISHING) {
+            mSecondaryReloading = RELOADING_STATE_NONE;
+            mSecondaryLastShotCount = completed[6];
+            publishPeerRuntimeState();
+            if (!Globals.getInstance().mReloadOnEmpty)
+                playSound(R.raw.reload);
+        }
+    }
+
+    private void setSecondWeaponTeam() {
+        if (!isLocalBoss() || mSecondaryBluetoothLeService == null
+                || mSecondaryCommandCharacteristic == null)
+            return;
+        byte[] command = new byte[20];
+        command[0] = mSecondaryCommandID;
+        mSecondaryCommandID += COMMAND_ID_INCREMENT;
+        command[2] = (byte) 0x80;
+        command[4] = Globals.getInstance().mPlayerID;
+        mSecondaryCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        mSecondaryBluetoothLeService.writeCharacteristic(mSecondaryCommandCharacteristic, command);
+        mSecondaryTeamCommandAt = SystemClock.elapsedRealtime();
+    }
+
+    private void startSecondaryReload(int reloadStatus) {
+        boolean disabling = reloadStatus == RELOADING_STATE_ELIMINATED;
+        if (!disabling && mSecondaryReloading != RELOADING_STATE_NONE)
+            return;
+        if (disabling) {
+            if (mSecondaryReloadTimer != null) {
+                mSecondaryReloadTimer.cancel();
+                mSecondaryReloadTimer = null;
+            }
+            mSecondaryPendingReloadCommand = null;
+            mSecondaryReloading = RELOADING_STATE_ELIMINATED;
+        }
+        if (mSecondaryBluetoothLeService == null || mSecondaryCommandCharacteristic == null)
+            return;
+        mSecondaryReloading = reloadStatus;
+        byte[] command = new byte[20];
+        command[0] = mSecondaryCommandID;
+        mSecondaryCommandID += COMMAND_ID_INCREMENT;
+        command[2] = (byte) 0x02;
+        command[4] = Globals.getInstance().mPlayerID;
+        mSecondaryPendingReloadCommand = command.clone();
+        mSecondaryCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        mSecondaryBluetoothLeService.writeCharacteristic(mSecondaryCommandCharacteristic, command);
+        updateSecondGunControls();
+    }
+
+    private void finishSecondaryReload() {
+        if ((mSecondaryReloading != RELOADING_STATE_STARTED
+                && mSecondaryReloading != RELOADING_STATE_ELIMINATED)
+                || mSecondaryBluetoothLeService == null
+                || mSecondaryCommandCharacteristic == null
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
+            return;
+        mSecondaryReloading = RELOADING_STATE_FINISHING;
+        mSecondaryEmptyTriggerCount = 0;
+        byte[] command = new byte[20];
+        command[0] = mSecondaryCommandID;
+        mSecondaryCommandID += COMMAND_ID_INCREMENT;
+        command[2] = (byte) 0x04;
+        command[4] = Globals.getInstance().mPlayerID;
+        command[5] = WEAPON_PROFILE;
+        command[6] = Globals.getInstance().mFullReload;
+        mSecondaryPendingReloadCommand = command.clone();
+        mSecondaryCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        mSecondaryBluetoothLeService.writeCharacteristic(mSecondaryCommandCharacteristic, command);
+        updateSecondGunControls();
+    }
+
     // Handles various events fired by the BLE Service.
     private final BroadcastReceiver mGattUpdateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (!mGattReceiverRegistered || isFinishing() || isDestroyed() || intent == null)
                 return;
+            if (intent.getIntExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, 0) == 1) {
+                handleSecondaryGattUpdate(intent);
+                return;
+            }
             final String action = intent.getAction();
             if (BluetoothLeService.ACTION_GATT_CONNECTED.equals(action)) {
                 mConnected = true;
@@ -4919,6 +5947,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         announceGameStartCountdown(synchronizedStartRemaining());
                     if (mRespawnQrVoiceReminderActive)
                         scheduleRespawnQrVoiceReminder(0);
+                    if (mReloadVoiceReminderActive)
+                        scheduleReloadVoiceReminder(0);
                 } catch (RuntimeException e) {
                     mCountdownSpeechReady = false;
                     Log.w(TAG, "Unable to prepare game-start speech", e);
@@ -4949,6 +5979,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void shutdownCountdownSpeech() {
         stopRespawnQrVoiceReminder();
+        stopReloadVoiceReminder();
         TextToSpeech speech;
         synchronized (mPendingVoicePrompts) {
             speech = mCountdownSpeech;
@@ -5093,6 +6124,50 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
     }
 
+    private boolean shouldAnnounceReloadReminder() {
+        return mReloadVoiceReminderActive
+                && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                && mReloading != RELOADING_STATE_ELIMINATED
+                && (mLastShotCount & 0xff) == 0;
+    }
+
+    private void startReloadVoiceReminder() {
+        if (mReloadVoiceReminderActive
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                || mReloading == RELOADING_STATE_ELIMINATED
+                || (mLastShotCount & 0xff) != 0)
+            return;
+        mReloadVoiceReminderActive = true;
+        scheduleReloadVoiceReminder(0);
+    }
+
+    private void scheduleReloadVoiceReminder(long delayMillis) {
+        if (!shouldAnnounceReloadReminder())
+            return;
+        mCombatFeedbackHandler.removeCallbacks(mReloadVoiceReminder);
+        mCombatFeedbackHandler.postDelayed(mReloadVoiceReminder, delayMillis);
+    }
+
+    private void stopReloadVoiceReminder() {
+        mReloadVoiceReminderActive = false;
+        mCombatFeedbackHandler.removeCallbacks(mReloadVoiceReminder);
+    }
+
+    private void announceReloadReminder() {
+        if (mCountdownSpeech == null)
+            initializeCountdownSpeech();
+        TextToSpeech speech = mCountdownSpeech;
+        if (!mCountdownSpeechReady || speech == null)
+            return;
+        try {
+            speech.setSpeechRate(1.0f);
+            speech.speak(getString(R.string.reload_voice_prompt), TextToSpeech.QUEUE_ADD,
+                    null, RELOAD_VOICE_REMINDER_UTTERANCE_ID);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to speak reload reminder", e);
+        }
+    }
+
     /** Speak the confirmed-kill cue at 150% of the normal speech rate. */
     private void announceEnemyDestroyed() {
         speakRoundVoicePrompt(R.string.enemy_destroyed_voice_prompt);
@@ -5229,10 +6304,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
        19 00 Unused?
      */
     private void processTelemetryData(final byte[] data) {
-        if (mTelemetryCharacteristic == null)
+        processTelemetryData(data, false);
+    }
+
+    private void processTelemetryData(final byte[] data, boolean secondary) {
+        if (secondary ? mSecondaryTelemetryCharacteristic == null
+                : mTelemetryCharacteristic == null)
             return;
         if (data != null && data.length > RECOIL_OFFSET_SHOTS_REMAINING) {
-            if (mTriggerPairingActive) {
+            if (!secondary && mTriggerPairingActive) {
                 // This is a level bit, so holding the trigger before this GATT
                 // connection finishes is still detected; a counter-only test
                 // could miss that first press.
@@ -5248,12 +6328,40 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             int hit_by_player1 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY1]);
             // Often, hit_by_player2 is the same player ID as player1
             int hit_by_player2 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY2]);
+            if (isLocalBoss() && mSecondaryCommunicating) {
+                long seenAt = SystemClock.elapsedRealtime();
+                int slot = secondary ? 1 : 0;
+                int source1 = hit_by_player1 == Globals.GRENADE_PLAYER_ID
+                        ? 33 : hit_by_player1 >> 2;
+                int source2 = hit_by_player2 == Globals.GRENADE_PLAYER_ID
+                        ? 33 : hit_by_player2 >> 2;
+                int shot1 = data[RECOIL_OFFSET_HIT_BY1_SHOTID]
+                        & (source1 == 33 ? 0xff : 0x07);
+                int shot2 = data[RECOIL_OFFSET_HIT_BY2_SHOTID]
+                        & (source2 == 33 ? 0xff : 0x07);
+                if (!mDualGunHitDeduper.accept(slot, source1, shot1, seenAt))
+                    hit_by_player1 = 0;
+                if (!mDualGunHitDeduper.accept(slot, source2, shot2, seenAt))
+                    hit_by_player2 = 0;
+            }
             byte trigger_counter = (byte)(data[RECOIL_OFFSET_RELOAD_TRIGGER_COUNTER] & (byte)0x0F);
             byte reload_counter = (byte)(data[RECOIL_OFFSET_RELOAD_TRIGGER_COUNTER] & (byte)0xF0);
             byte thumb_counter = data[RECOIL_OFFSET_THUMB_COUNTER];
             byte power_counter = data[RECOIL_OFFSET_POWER_COUNTER];
-            mConnectionTest = true;
-            if (!mCommunicating) {
+            if (!secondary)
+                mConnectionTest = true;
+            if (secondary && !mSecondaryCommunicating) {
+                mSecondaryCommunicating = true;
+                mSecondaryLastTriggerCount = trigger_counter;
+                mSecondaryLastReloadButtonCount = reload_counter;
+                mSecondaryLastThumbButtonCount = thumb_counter;
+                mSecondaryLastPowerButtonCount = power_counter;
+                mSecondaryLastShotCount = shotsRemaining;
+                setSecondWeaponTeam();
+                setShotMode(mCurrentShotMode);
+                setRecoil(mRecoilEnabled);
+                updateSecondGunControls();
+            } else if (!secondary && !mCommunicating) {
                 mCommunicating = true;
                 cancelWeaponSyncTriggerHint();
                 RelativeLayout connectLayout = findViewById(R.id.connect_layout);
@@ -5268,19 +6376,31 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 setShotMode(mCurrentShotMode);
                 if (Globals.getInstance().mPlayerID != 0)
                     setTeam();
-                if (Globals.TOURNAMENT_RULES_REQUIRED)
+                if (Globals.getInstance().mTournamentMode)
                     setRecoil(true);
                 else if (!mRecoilEnabled)
                     setRecoil(false);
                 maybeShowStartWizard();
+                if (isLocalBoss() && !mSecondaryDeviceAddress.isEmpty())
+                    setupSecondaryBLEServiceConnection();
+                updateSecondGunControls();
             }
-            if (trigger_counter != mLastTriggerCount) {
-                mLastTriggerCount = trigger_counter;
+            byte lastTriggerCount = secondary ? mSecondaryLastTriggerCount : mLastTriggerCount;
+            if (trigger_counter != lastTriggerCount) {
+                if (secondary)
+                    mSecondaryLastTriggerCount = trigger_counter;
+                else
+                    mLastTriggerCount = trigger_counter;
                 if (shotsRemaining == 0 || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING) {
                     playSound(R.raw.empty);
-                    mEmptyTriggerCount++;
-                    if (mEmptyTriggerCount >= MAX_EMPTY_TRIGGER_PULLS && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING)
-                        startReload(); // Auto reload after this many empty trigger pulls (for young players)
+                    int emptyPulls = secondary ? ++mSecondaryEmptyTriggerCount : ++mEmptyTriggerCount;
+                    if (emptyPulls >= MAX_EMPTY_TRIGGER_PULLS
+                            && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
+                        if (secondary)
+                            startSecondaryReload(RELOADING_STATE_STARTED);
+                        else
+                            startReload(); // Auto reload after repeated empty trigger pulls.
+                    }
                 }
             }
             /* Rather than monitor if a button is currently pressed, we monitor the counter. Usually
@@ -5288,13 +6408,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                pressed. We don't want to toggle recoil or modes with every packet we receive so it
                makes more sense to just monitor when the counter changes so we can toggle eactly
                once each time that button is pressed. */
-            if (reload_counter != mLastReloadButtonCount) {
-                mLastReloadButtonCount = reload_counter;
-                if (shotsRemaining != Globals.getInstance().mFullReload)
-                    startReload();
+            if (reload_counter != (secondary ? mSecondaryLastReloadButtonCount
+                    : mLastReloadButtonCount)) {
+                if (secondary)
+                    mSecondaryLastReloadButtonCount = reload_counter;
+                else
+                    mLastReloadButtonCount = reload_counter;
+                if (shotsRemaining != Globals.getInstance().mFullReload) {
+                    if (secondary)
+                        startSecondaryReload(RELOADING_STATE_STARTED);
+                    else
+                        startReload();
+                }
             }
-            if (thumb_counter != mLastThumbButtonCount) {
-                mLastThumbButtonCount = thumb_counter;
+            if (thumb_counter != (secondary ? mSecondaryLastThumbButtonCount : mLastThumbButtonCount)) {
+                if (secondary)
+                    mSecondaryLastThumbButtonCount = thumb_counter;
+                else
+                    mLastThumbButtonCount = thumb_counter;
                 if (mCurrentShotMode == Globals.SHOT_MODE_SINGLE) {
                     if (Globals.getInstance().mAllowBurst3ShotMode)
                         setShotMode(Globals.SHOT_MODE_BURST);
@@ -5318,9 +6449,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         setShotMode(Globals.SHOT_MODE_FULL_AUTO);
                 }
             }
-            if (power_counter != mLastPowerButtonCount) {
-                mLastPowerButtonCount = power_counter;
-                if (Globals.TOURNAMENT_RULES_REQUIRED) {
+            if (power_counter != (secondary ? mSecondaryLastPowerButtonCount : mLastPowerButtonCount)) {
+                if (secondary)
+                    mSecondaryLastPowerButtonCount = power_counter;
+                else
+                    mLastPowerButtonCount = power_counter;
+                if (Globals.getInstance().mTournamentMode) {
                     // Ignore an otherwise valid local recoil toggle while the ruleset is active.
                     setRecoil(true);
                 } else {
@@ -5328,7 +6462,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     setRecoil(mRecoilEnabled);
                 }
             }
-            updateBatteryLevel(data[RECOIL_OFFSET_BATTERY_LEVEL]);
+            if (!secondary)
+                updateBatteryLevel(data[RECOIL_OFFSET_BATTERY_LEVEL]);
             /*if (buttons != 0) {
                 boolean trigger = false;
                 boolean reload = false;
@@ -5511,7 +6646,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                displaying the actual ID that the tagger is currently using. */
             // Zero is an unconfigured/reset blaster, not a new player selection.
             // Invalid status bytes must not become reload or network identities.
-            if (player_id > 0 && Globals.isValidPlayerID(player_id) && mLastTeam != player_id) {
+            if (secondary && player_id != Globals.getInstance().mPlayerID
+                    && SystemClock.elapsedRealtime() - mSecondaryTeamCommandAt > 2000) {
+                setSecondWeaponTeam();
+            } else if (!secondary && player_id > 0 && Globals.isValidPlayerID(player_id)
+                    && mLastTeam != player_id) {
                 Log.d(TAG, "Player ID changed to " + player_id);
                 mLastTeam = player_id;
                 Globals.getInstance().mPlayerID = player_id;
@@ -5519,15 +6658,23 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
             /* We monitor the last shot count rather than trigger pulls here so we know when to
                update the displayed shots remaining and play shooting sounds. pew! pew! */
-            if (mLastShotCount != shotsRemaining) {
-                int previousShots = mLastShotCount & 0xff;
+            if ((secondary ? mSecondaryLastShotCount : mLastShotCount) != shotsRemaining) {
+                int previousShots = (secondary ? mSecondaryLastShotCount : mLastShotCount) & 0xff;
                 int currentShots = shotsRemaining & 0xff;
                 // A lower magazine count is the only reliable sign of one or more
                 // real shots. Packet loss can skip a count, so preserve that delta
                 // for hosted accuracy instead of treating it as a single shot.
                 int shotDelta = previousShots > currentShots ? previousShots - currentShots : 0;
-                setShotsRemaining(shotsRemaining);
-                if (shotsRemaining != Globals.getInstance().mFullReload && mReloading == RELOADING_STATE_NONE) {
+                if (secondary) {
+                    mSecondaryLastShotCount = shotsRemaining;
+                    updateSecondGunControls();
+                    publishPeerRuntimeState();
+                } else {
+                    setShotsRemaining(shotsRemaining);
+                }
+                int reloadState = secondary ? mSecondaryReloading : mReloading;
+                if (shotsRemaining != Globals.getInstance().mFullReload
+                        && reloadState == RELOADING_STATE_NONE) {
                     if (shotDelta > 0)
                         reportHostedShots(shotDelta);
                     playSound(R.raw.shootingshort);
@@ -5535,8 +6682,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         mLastShotFired = System.currentTimeMillis() + HIT_ANIMATION_DURATION_MILLISECONDS;
                         sendUDPMessageAll(NetMsg.NETMSG_SHOTFIRED);
                     }
-                    if (Globals.getInstance().mReloadOnEmpty && shotsRemaining == 0 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
-                        startReload();
+                    if (Globals.getInstance().mReloadOnEmpty && shotsRemaining == 0
+                            && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+                        if (secondary)
+                            startSecondaryReload(RELOADING_STATE_STARTED);
+                        else
+                            startReload();
+                    }
                 }
             }
             // Handy utility code if you want to see the raw data
@@ -5599,6 +6751,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return; // Already handled, or belongs to an earlier session/service.
             }
             final String action = intent.getAction();
+            if (NetMsg.NETMSG_GPSLOCUPDATE.equals(action)) {
+                receiveLocalGpsLocation(intent);
+                return;
+            }
             if (NetMsg.NETMSG_GAMEINVITE.equals(action)) {
                 showGameInvite(intent);
                 return;
@@ -5727,6 +6883,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     updateNetworkRosterDisplay();
                     setTeam();
                     updateTeamAssignmentScanButton();
+                    updatePowerupScanButton();
                     if (!mIsServer && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
                         setGameLimit();
                         setNetworkMenu(NETWORK_TYPE_JOINED);
@@ -6002,6 +7159,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         intentFilter.addAction(NetMsg.NETMSG_NETWORKDISCONNECTED);
         intentFilter.addAction(NetMsg.NETMSG_PLAYERSETTINGSUPDATE);
         intentFilter.addAction(NetMsg.NETMSG_BALANCEDLOBBY);
+        intentFilter.addAction(NetMsg.NETMSG_GPSLOCUPDATE);
         return intentFilter;
     }
     //TODO player presets
@@ -6149,9 +7307,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void updatePlayerSettings() {
         // Reapply at the last point before programming the weapon. This prevents a saved profile
         // or stale network frame from creating a different magazine, reload, recoil, or fire mode.
-        Globals.getInstance().applyTournamentRules();
+        if (Globals.getInstance().mTournamentMode)
+            Globals.getInstance().applyTournamentRules();
         applyBossWeaponRole();
-        setRecoil(true);
+        if (Globals.getInstance().mTournamentMode)
+            setRecoil(true);
         updateGameModeDisplay();
         mHealthLabelTV.setText(getString(R.string.health_label, Globals.getInstance().mFullHealth));
         mShotsRemainingLabelTV.setText(getString(R.string.shots_remaining_label,

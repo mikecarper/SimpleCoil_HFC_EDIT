@@ -40,7 +40,7 @@ public class GlobalsTest {
 
         Globals.applyTournamentRules(settings);
 
-        assertTrue(Globals.TOURNAMENT_RULES_REQUIRED);
+        assertFalse(Globals.TOURNAMENT_RULES_REQUIRED);
         assertEquals(Globals.MAX_HEALTH, settings.health);
         assertEquals(Globals.RELOAD_COUNT, settings.shots);
         assertEquals(Globals.RELOAD_TIME_MILLISECONDS, settings.reloadTime);
@@ -91,6 +91,29 @@ public class GlobalsTest {
         assertTrue(hunter.allowShotModeSingle);
         assertFalse(hunter.allowShotModeBurst3);
         assertFalse(hunter.allowShotModeAuto);
+    }
+
+    @Test public void classicModesDisableTournamentWithoutChangingTheSelectedTeamMode() {
+        Globals globals = Globals.getInstance();
+        boolean oldTournament = globals.mTournamentMode;
+        boolean oldBoss = globals.mBossMode;
+        int oldMode = globals.mGameMode;
+        try {
+            for (int mode : new int[]{Globals.GAME_MODE_FFA, Globals.GAME_MODE_2TEAMS,
+                    Globals.GAME_MODE_4TEAMS}) {
+                globals.applyClassicRules(mode);
+                assertFalse(globals.mTournamentMode);
+                assertFalse(globals.mBossMode);
+                assertEquals(mode, globals.mGameMode);
+                assertTrue(globals.mAllowSingleShotMode);
+                assertTrue(globals.mAllowBurst3ShotMode);
+                assertTrue(globals.mAllowAutoShotMode);
+            }
+        } finally {
+            globals.mTournamentMode = oldTournament;
+            globals.mBossMode = oldBoss;
+            globals.mGameMode = oldMode;
+        }
     }
 
     @Test public void clearingLimitsRemovesAllActiveLimitValues() {

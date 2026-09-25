@@ -1336,10 +1336,16 @@ public class TcpClient extends Service {
                         && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_MODE);
                 boolean balancedQr = game.has(TcpServer.JSON_BALANCED_QR)
                         && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_QR);
+                int powerupQrRequired = game.has(TcpServer.JSON_POWERUP_QR_REQUIRED)
+                        ? TcpJson.getInt(game, TcpServer.JSON_POWERUP_QR_REQUIRED) : 0;
+                if (powerupQrRequired != 0
+                        && !PowerupQrProgress.isValidRequiredCount(powerupQrRequired))
+                    throw new JSONException("Invalid power-up QR count");
                 JSONArray players = game.getJSONArray(TcpServer.JSON_PLAYERS);
                 if (players.length() > Globals.MAX_PLAYER_ID)
                     throw new JSONException("Too many players in roster snapshot");
                 boolean[] seenPlayers = new boolean[Globals.MAX_PLAYER_ID + 1];
+                int rosterBossHunterCount = bossMode ? 0 : -1;
                 for (int x = 0; x < players.length(); x++) {
                     JSONObject player = players.getJSONObject(x);
                     int rawPlayerID = TcpJson.getInt(player, TcpServer.JSON_PLAYERID);
@@ -1349,6 +1355,8 @@ public class TcpClient extends Service {
                         throw new JSONException("Conflicting player roster snapshot");
                     seenPlayers[rawPlayerID] = true;
                     byte playerID = (byte) rawPlayerID;
+                    if (bossMode && playerID != Globals.BOSS_PLAYER_ID)
+                        rosterBossHunterCount++;
                     if (player.has(TcpServer.JSON_TEAM)) {
                         int assignedTeam = TcpJson.getInt(player, TcpServer.JSON_TEAM);
                         if (!balancedMode || assignedTeam < 1 || assignedTeam > 2)
@@ -1472,6 +1480,14 @@ public class TcpClient extends Service {
                     }
                 }
                 boolean dedicatedServer = game.has(TcpServer.JSON_DEDICATED) && game.getBoolean(TcpServer.JSON_DEDICATED);
+                int mapTilePort = 0;
+                if (game.has(TcpServer.JSON_MAP_TILE_PORT)) {
+                    int advertisedPort = TcpJson.getInt(game, TcpServer.JSON_MAP_TILE_PORT);
+                    if (advertisedPort > 0 && advertisedPort <= 65535)
+                        mapTilePort = advertisedPort;
+                    else
+                        Log.w(TAG, "Ignoring invalid map tile port from server: " + advertisedPort);
+                }
                 if (dedicatedServer) {
                     int gameState = TcpJson.getInt(game, TcpServer.JSON_GAMESTATE);
                     if (gameState >= Globals.GAME_STATE_NONE && gameState <= Globals.GAME_STATE_ELIMINATED)
@@ -1497,7 +1513,14 @@ public class TcpClient extends Service {
                                         return;
                                     globals.mTournamentMode = tournamentMode;
                                     globals.mBossMode = bossMode;
-                                    globals.applyTournamentRules();
+                                    // We already hold the team/IP roster locks here. Seed Boss
+                                    // scaling from the validated snapshot so applyTournamentRules()
+                                    // never tries to reacquire the non-reentrant team-map semaphore.
+                                    globals.mBossHunterCount = rosterBossHunterCount;
+                                    if (tournamentMode)
+                                        globals.applyTournamentRules();
+                                    else
+                                        globals.applyClassicRules(gameMode);
                                     if (settingsUpdate != null)
                                         applyPlayerSettingsLocked(settingsUpdate, allowPlayerSettings);
                                     globals.mTeamIPMap.clear();
@@ -1510,15 +1533,18 @@ public class TcpClient extends Service {
                                     globals.mTimeLimit = timeLimit;
                                     globals.mLivesLimit = livesLimit;
                                     globals.mScoreLimit = scoreLimit;
-                                    globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+                                    globals.mGameMode = gameMode;
                                     globals.mBalancedRandom = balancedMode;
                                     globals.mBalancedRequireQr = balancedQr;
+                                    globals.mPowerupQrRequired = powerupQrRequired;
                                     globals.setBalancedAssignments(balancedTeams, balancedCheckedIn);
                                     globals.mUseGPS = useGPS;
                                     globals.mGPSMode = gpsMode;
                                     globals.mOnlyServerSettings = onlyServerSettings;
+                                    globals.mMapTilePort = mapTilePort;
                                     // Boss health and shields scale from this newly installed roster.
-                                    globals.applyTournamentRules();
+                                    if (tournamentMode)
+                                        globals.applyTournamentRules();
                                     mIsDedicatedServer = dedicatedServer;
                                 }
                             } finally {
@@ -1545,12 +1571,16 @@ public class TcpClient extends Service {
                         if (tournamentModeSpecified) {
                             Globals.getInstance().mTournamentMode = tournamentMode;
                             Globals.getInstance().mBossMode = bossMode;
-                            Globals.getInstance().applyTournamentRules();
-                            allowPlayerSettings = false;
+                            if (tournamentMode) {
+                                Globals.getInstance().applyTournamentRules();
+                                allowPlayerSettings = false;
+                            }
                         } else if (onlyServerSettingsUpdate != null) {
                             Globals.getInstance().mBossMode = bossMode;
-                            Globals.getInstance().applyTournamentRules();
-                            allowPlayerSettings = false;
+                            if (Globals.getInstance().mTournamentMode) {
+                                Globals.getInstance().applyTournamentRules();
+                                allowPlayerSettings = false;
+                            }
                         }
                         applyPlayerSettingsLocked(settingsUpdate, allowPlayerSettings);
                     }
@@ -1580,7 +1610,9 @@ public class TcpClient extends Service {
         globals.mPlayerSettings.clear();
         globals.mPlayerSettings.putAll(settings);
         if (globals.mTournamentMode) {
-            int bossHunterCount = -1;
+            // A bundled roster seeds this before taking the map locks. A
+            // settings-only update reuses the last authoritative lobby count.
+            int bossHunterCount = globals.mBossMode ? globals.mBossHunterCount : -1;
             if (globals.mBossMode) {
                 Globals.PlayerSettings boss = globals.mPlayerSettings.get(Globals.BOSS_PLAYER_ID);
                 if (boss != null)

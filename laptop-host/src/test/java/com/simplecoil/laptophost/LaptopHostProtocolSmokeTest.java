@@ -16,6 +16,7 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -27,29 +28,52 @@ public final class LaptopHostProtocolSmokeTest {
     private static final int TCP_PORT = 19_510;
     private static final int UDP_PORT = 19_500;
     private static final int DASHBOARD_PORT = 19_511;
+    private static final int TILE_PORT = 19_512;
     private static final String JSON_PREFIX = "SimpleCoil:19JSON";
     private static final String MESSAGE_PREFIX = "SimpleCoil:19MESG";
     private static final long GPS_UTC_BASE = 1_800_000_000_000L;
 
     public static void main(String[] args) throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
+        Path tiles = Files.createTempDirectory("simplecoil-map-tiles");
+        Path testTile = tiles.resolve(Path.of("0", "0", "0.png"));
+        Files.createDirectories(testTile.getParent());
+        byte[] testTileBytes = new byte[] {(byte) 0x89, 0x50, 0x4e, 0x47};
+        Files.write(testTile, testTileBytes);
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1",
-                "--no-late-join")
+                "--powerup-qr", "4",
+                "--no-late-join", "--tiles", tiles.toString(), "--tile-port",
+                String.valueOf(TILE_PORT))
                 .redirectErrorStream(true)
                 .start();
         try {
             waitForHost();
             require(get("/map").contains("Tactical GPS Map"), "map display was unavailable");
+            require(get("/map").contains("/assets/leaflet/leaflet.js"),
+                    "map display did not load the bundled renderer");
+            require(get("/assets/leaflet/leaflet.js").contains("Leaflet"),
+                    "bundled map renderer was unavailable");
+            require(get("/api/map-config").contains("\"available\":true"),
+                    "offline map tile configuration was not detected");
+            require(java.util.Arrays.equals(getBytes("/tiles/0/0/0.png"), testTileBytes),
+                    "offline map tile was not served intact");
+            require(java.util.Arrays.equals(getBytes(TILE_PORT, "/tiles/0/0/0.png"), testTileBytes),
+                    "read-only phone map tile service was unavailable");
+            require(responseCode("/tiles/0/0/1.png") == 404,
+                    "invalid tile coordinates were accepted");
             require(get("/leaderboard").contains("Leaderboard"), "leaderboard display was unavailable");
             verifyUdpDiscovery();
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
                  FakePhone blueTeammate = new FakePhone("127.0.0.5", 2, "Blue Two");
                  FakePhone second = new FakePhone("127.0.0.2", 17, "Red");
                  FakePhone redTeammate = new FakePhone("127.0.0.6", 18, "Red Two")) {
+                require(first.readUntil(frame -> frame.startsWith(JSON_PREFIX + "{\"players\"")
+                                && frame.contains("\"powerupqrrequired\":4")) != null,
+                        "laptop host did not advertise the power-up QR requirement");
                 first.synchronizeClock();
                 blueTeammate.synchronizeClock();
                 second.synchronizeClock();
@@ -375,21 +399,49 @@ public final class LaptopHostProtocolSmokeTest {
         return request(path, "GET");
     }
 
+    private static byte[] getBytes(String path) throws IOException {
+        return getBytes(DASHBOARD_PORT, path);
+    }
+
+    private static byte[] getBytes(int port, String path) throws IOException {
+        HttpURLConnection connection = open(port, path, "GET");
+        require(connection.getResponseCode() == 200, "GET " + path + " was not successful");
+        byte[] body = connection.getInputStream().readAllBytes();
+        connection.disconnect();
+        return body;
+    }
+
+    private static int responseCode(String path) throws IOException {
+        HttpURLConnection connection = open(path, "GET");
+        int code = connection.getResponseCode();
+        connection.disconnect();
+        return code;
+    }
+
     private static String post(String path) throws IOException {
         return request(path, "POST");
     }
 
     private static String request(String path, String method) throws IOException {
-        HttpURLConnection connection = (HttpURLConnection) new URL("http://127.0.0.1:" + DASHBOARD_PORT + path)
-                .openConnection();
-        connection.setRequestMethod(method);
-        connection.setConnectTimeout(500);
-        connection.setReadTimeout(1_000);
+        HttpURLConnection connection = open(path, method);
         int code = connection.getResponseCode();
         java.io.InputStream stream = code >= 400 ? connection.getErrorStream() : connection.getInputStream();
         byte[] body = stream == null ? new byte[0] : stream.readAllBytes();
         connection.disconnect();
         return new String(body, StandardCharsets.UTF_8);
+    }
+
+    private static HttpURLConnection open(String path, String method) throws IOException {
+        return open(DASHBOARD_PORT, path, method);
+    }
+
+    private static HttpURLConnection open(int port, String path, String method) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(
+                "http://127.0.0.1:" + port + path).openConnection();
+        connection.setRequestMethod(method);
+        connection.setConnectTimeout(500);
+        connection.setReadTimeout(1_000);
+        return connection;
     }
 
     private static void require(boolean condition, String message) {
@@ -433,7 +485,11 @@ public final class LaptopHostProtocolSmokeTest {
             input = new DataInputStream(socket.getInputStream());
             output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             send(JSON_PREFIX + "{\"playerID\":" + playerID + ",\"playername\":\"" + name + "\"}");
-            readUntil(frame -> frame.startsWith(JSON_PREFIX + "{\"players\""));
+            String roster = readUntil(frame -> frame.startsWith(JSON_PREFIX + "{\"players\""));
+            require(roster != null && roster.contains("\"maptileport\":"),
+                    "laptop host did not advertise its phone map tile service");
+            require(roster.contains("\"powerupqrrequired\":"),
+                    "laptop host did not advertise its power-up setting");
         }
 
         void sendStateGossip(String roundToken, long ownerSequence, int score) throws IOException {

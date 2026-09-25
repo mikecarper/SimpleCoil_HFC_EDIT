@@ -82,6 +82,34 @@
     <string name="team_qr_scan_button">SCAN TEAM QR</string>
     <string name="team_qr_scanner_prompt">Scan a TEAM respawn QR code to choose your team</string>
     <string name="team_qr_cancel_button">CANCEL</string>
+    <string name="powerup_scan_button">Scan power-up</string>
+    <string name="powerup_qr_prompt">Power-up QR: %1$d/%2$d</string>
+    <string name="powerup_qr_close_button">X</string>
+    <string name="powerup_qr_close_description">Close power-up scanner</string>
+    <string name="powerup_scan_progress">Scan power-up %1$d/%2$d</string>
+    <string name="powerup_scan_duplicate">Already scanned this power-up QR this life</string>
+    <string name="powerup_scan_invalid">Scan a SIMPLECOIL:POWERUP:1 through 8 QR</string>
+    <string name="powerup_settings_off">Power-ups: Off</string>
+    <string name="powerup_settings_count">Power-ups: %1$d QR</string>
+    <string name="powerup_settings_choice_off">Off</string>
+    <string name="powerup_settings_choice_count">%1$d different QR codes</string>
+    <string name="powerup_reward_health">Power-up: health restored</string>
+    <string name="powerup_reward_shields">Power-up: shields restored</string>
+    <string name="powerup_reward_boost">Power-up: extra shields for 5 seconds</string>
+    <string name="second_gun_button">Gun 2...</string>
+    <string name="second_gun_action_description">Pair or replace boss gun 2</string>
+    <string name="boss_gun_one_label">GUN 1</string>
+    <string name="boss_gun_two_label">GUN 2</string>
+    <string name="second_gun_not_connected">Gun 2: not connected</string>
+    <string name="second_gun_connecting">Gun 2: connecting</string>
+    <string name="second_gun_shots">Gun 2: %1$d shots</string>
+    <string name="second_gun_reloading">Gun 2: reloading</string>
+    <string name="second_gun_scan_title">Choose the second boss gun</string>
+    <string name="second_gun_scan_empty">No other SRG1 blaster found. Try again with gun 2 powered on.</string>
+    <string name="second_gun_scan_failed">Could not scan for the second blaster.</string>
+    <string name="second_gun_disconnected">Gun 2 disconnected; gun 1 remains active.</string>
+    <string name="second_gun_primary_disconnected">Gun 1 offline; gun 2: %1$d shots</string>
+    <string name="second_gun_same_as_primary">Gun 2 must be a different blaster.</string>
     <string name="team_qr_assigned">Joined Team %1$d as Player %2$d.</string>
     <string name="team_qr_unavailable_team">This game does not have Team %1$d.</string>
     <string name="team_qr_no_available_player">That team has no free player IDs.</string>
@@ -254,6 +282,8 @@
     <string name="gps_mode_disabled">GPS Off</string>
     <string name="gps_mode_teammate">GPS Teammates Only</string>
     <string name="gps_mode_all">GPS All On</string>
+    <string name="gps_acquiring">GPS acquiring...</string>
+    <string name="gps_coordinates_format">LAT %1$.5f\nLON %2$.5f</string>
     <string name="player_name_not_connected">{Not Connected}</string>
     <string name="scoreboard_button">KILLS</string>
 
@@ -286,6 +316,7 @@
     <string name="vibrate_phone_switch">Vibrate Phone</string>
     <string name="clock_sync_waiting">Synchronizing player clocks. Please try Start again in a moment.</string>
     <string name="game_start_countdown">Game starts in %1$d</string>
+    <string name="reload_voice_prompt">Reload</string>
 
 
 </resources>

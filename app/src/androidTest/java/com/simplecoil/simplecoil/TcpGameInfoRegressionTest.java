@@ -45,6 +45,10 @@ public class TcpGameInfoRegressionTest {
     private int originalGPSMode;
     private boolean originalOnlyServerSettings;
     private boolean originalTournamentMode;
+    private boolean originalBossMode;
+    private int originalBossHunterCount;
+    private int originalPowerupQrRequired;
+    private int originalMapTilePort;
     private int[] originalPairings;
     private InetAddress originalPeer;
     private Map<Byte, Globals.PlayerSettings> originalSettings;
@@ -70,6 +74,10 @@ public class TcpGameInfoRegressionTest {
         originalGPSMode = globals.mGPSMode;
         originalOnlyServerSettings = globals.mOnlyServerSettings;
         originalTournamentMode = globals.mTournamentMode;
+        originalBossMode = globals.mBossMode;
+        originalBossHunterCount = globals.mBossHunterCount;
+        originalPowerupQrRequired = globals.mPowerupQrRequired;
+        originalMapTilePort = globals.mMapTilePort;
         originalPairings = globals.mGrenadePairings.clone();
         originalLocalSettings = localSettings();
         Globals.getmPlayerSettingsSemaphore();
@@ -85,6 +93,8 @@ public class TcpGameInfoRegressionTest {
         globals.mFullReload = 30;
         globals.mAllowPlayerSettings = true;
         globals.mTournamentMode = false;
+        globals.mBossMode = false;
+        globals.mBossHunterCount = -1;
         baselineLocalSettings = localSettings();
         globals.mPlayerID = 1;
         globals.mGameMode = Globals.GAME_MODE_2TEAMS;
@@ -113,6 +123,10 @@ public class TcpGameInfoRegressionTest {
         globals.mGPSMode = originalGPSMode;
         globals.mOnlyServerSettings = originalOnlyServerSettings;
         globals.mTournamentMode = originalTournamentMode;
+        globals.mBossMode = originalBossMode;
+        globals.mBossHunterCount = originalBossHunterCount;
+        globals.mPowerupQrRequired = originalPowerupQrRequired;
+        globals.mMapTilePort = originalMapTilePort;
         System.arraycopy(originalPairings, 0, globals.mGrenadePairings, 0, originalPairings.length);
         Globals.getmPlayerSettingsSemaphore();
         try {
@@ -158,6 +172,71 @@ public class TcpGameInfoRegressionTest {
         assertTrue(local.allowShotModeSingle);
         assertFalse(local.allowShotModeBurst3);
         assertFalse(local.allowShotModeAuto);
+    }
+
+    @Test
+    public void classicFourTeamRosterRemainsClassicAndAllowsWeaponModes() throws Exception {
+        parse(roster(new JSONArray().put(player(1)).put(player(2)))
+                .put(TcpServer.JSON_GAMEMODE, Globals.GAME_MODE_4TEAMS)
+                .put(TcpServer.JSON_TOURNAMENT_MODE, false)
+                .put(TcpServer.JSON_PLAYERSETTINGS,
+                        new JSONArray().put(classicSettings(1)).put(classicSettings(2)))
+                .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, true)
+                .put(TcpServer.JSON_ONLY_SERVER_SETTINGS, false));
+
+        assertFalse(globals.mTournamentMode);
+        assertFalse(globals.mBossMode);
+        assertEquals(Globals.GAME_MODE_4TEAMS, globals.mGameMode);
+        assertTrue(globals.mAllowSingleShotMode);
+        assertTrue(globals.mAllowBurst3ShotMode);
+        assertTrue(globals.mAllowAutoShotMode);
+    }
+
+    @Test
+    public void powerupQrCountFollowsHostAndInvalidCountsAreRejected() throws Exception {
+        parse(roster(new JSONArray().put(player(3)))
+                .put(TcpServer.JSON_POWERUP_QR_REQUIRED, 6));
+        assertEquals(6, globals.mPowerupQrRequired);
+
+        parse(roster(new JSONArray().put(player(3)))
+                .put(TcpServer.JSON_POWERUP_QR_REQUIRED, 9));
+        assertEquals(6, globals.mPowerupQrRequired);
+
+        parse(roster(new JSONArray().put(player(3))));
+        assertEquals(0, globals.mPowerupQrRequired);
+    }
+
+    @Test
+    public void joiningBossLobbyDoesNotDeadlockOnTheRosterLock() throws Exception {
+        JSONObject message = roster(new JSONArray().put(player(1)).put(player(2)))
+                .put(TcpServer.JSON_TOURNAMENT_MODE, true)
+                .put(TcpServer.JSON_BOSS_MODE, true)
+                .put(TcpServer.JSON_PLAYERSETTINGS,
+                        new JSONArray().put(settings(1).put(TcpServer.JSON_HEALTH,
+                                Globals.BOSS_BASE_HEALTH + Globals.BOSS_HEALTH_PER_HUNTER))
+                                .put(settings(2)))
+                .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, false);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            try {
+                parse(message);
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        }, "Boss lobby parser");
+        worker.start();
+        worker.join(2000);
+        if (worker.isAlive()) {
+            worker.interrupt();
+            worker.join(1000);
+        }
+
+        assertFalse("Joining a Boss lobby deadlocked on the team roster", worker.isAlive());
+        assertNull(failure.get());
+        assertTrue(globals.mBossMode);
+        assertEquals(1, globals.mBossHunterCount);
+        assertEquals(1, globals.mTeamIPMap.size());
+        assertEquals(1, globals.mTeamIPMapSemaphore.availablePermits());
     }
 
     private void assertDeepMessageIgnored(boolean arrays) throws Exception {
@@ -261,6 +340,15 @@ public class TcpGameInfoRegressionTest {
                 assertTrue(client.events.isEmpty());
             }
         }
+    }
+
+    @Test
+    public void rosterInstallsAndClearsLaptopMapTilePort() throws Exception {
+        parse(roster(new JSONArray().put(player(3))).put(TcpServer.JSON_MAP_TILE_PORT, 17512));
+        assertEquals(17512, globals.mMapTilePort);
+
+        parse(roster(new JSONArray().put(player(3))));
+        assertEquals(0, globals.mMapTilePort);
     }
 
     @Test
@@ -965,6 +1053,12 @@ public class TcpGameInfoRegressionTest {
                 .put(TcpServer.JSON_SHOT_MODE_SINGLE, false).put(TcpServer.JSON_SHOT_MODE_BURST3, false)
                 .put(TcpServer.JSON_SHOT_MODE_AUTO, true)
                 .put(TcpServer.JSON_FIRING_MODE, Globals.FIRING_MODE_INDOOR_NO_CONE);
+    }
+
+    private static JSONObject classicSettings(int id) throws Exception {
+        return settings(id).put(TcpServer.JSON_SHOT_MODE_SINGLE, true)
+                .put(TcpServer.JSON_SHOT_MODE_BURST3, true)
+                .put(TcpServer.JSON_SHOT_MODE_AUTO, true);
     }
 
     private static JSONObject player(int id) throws Exception {

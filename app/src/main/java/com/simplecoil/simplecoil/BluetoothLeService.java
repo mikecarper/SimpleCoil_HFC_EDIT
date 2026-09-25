@@ -77,6 +77,13 @@ public class BluetoothLeService extends Service {
             "com.example.bluetooth.le.EXTRA_UUID";
     public final static String EXTRA_STATUS =
             "com.example.bluetooth.le.EXTRA_STATUS";
+    public final static String EXTRA_WEAPON_SLOT =
+            "com.example.bluetooth.le.EXTRA_WEAPON_SLOT";
+
+    /** A separate service component supplies its own GATT handle and operation queue. */
+    protected int weaponSlot() {
+        return 0;
+    }
 
     public final static UUID UUID_RECOIL_TELEMETRY =
             UUID.fromString(GattAttributes.RECOIL_TELEMETRY_UUID);
@@ -149,6 +156,7 @@ public class BluetoothLeService extends Service {
 
     private void broadcastWriteFinished(CharacteristicWrite write, int status) {
         Intent intent = new Intent(CHARACTERISTIC_WRITE_FINISHED);
+        intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
         intent.putExtra(EXTRA_UUID, write.characteristic.getUuid().toString());
         intent.putExtra(EXTRA_DATA, write.value.clone());
         intent.putExtra(EXTRA_STATUS, status);
@@ -355,6 +363,7 @@ public class BluetoothLeService extends Service {
 
     private void broadcastUpdate(final String action) {
         final Intent intent = new Intent(action);
+        intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
         sendBroadcast(intent);
     }
 
@@ -364,6 +373,7 @@ public class BluetoothLeService extends Service {
             if (data == null)
                 return;
             final Intent intent = new Intent(TELEMETRY_DATA_AVAILABLE);
+            intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
             intent.putExtra(EXTRA_DATA, data.clone());
             sendBroadcast(intent);
         } else if (UUID_RECOIL_ID.equals((characteristic.getUuid()))) {
@@ -376,6 +386,7 @@ public class BluetoothLeService extends Service {
             Log.d(TAG, "Firmware version: " + firmwareVer);
             // This gets the blaster type, 1 for rifle and 2 for pistol
             final Intent intent = new Intent(ID_DATA_AVAILABLE);
+            intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
             intent.putExtra(EXTRA_DATA, data[10]);
             sendBroadcast(intent);
         } else {

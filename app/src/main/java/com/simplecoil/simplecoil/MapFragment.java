@@ -51,6 +51,8 @@ import com.mousebird.maply.SphericalMercatorCoordSystem;
 import androidx.core.content.ContextCompat;
 
 import java.io.File;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.util.Map;
 
 public class MapFragment extends GlobeMapFragment {
@@ -72,6 +74,8 @@ public class MapFragment extends GlobeMapFragment {
     private LocationListener mLocationListener = null;
     private boolean mResumed;
     private boolean mGPSRequested;
+    private QuadImageTileLayer mBaseLayer;
+    private String mBaseTileUrl;
 
     private double mLongitude = 0;
     private double mLatitude = 0;
@@ -301,6 +305,8 @@ public class MapFragment extends GlobeMapFragment {
                     removeMissingPlayerMarkers();
                 insertPlayerMarkers(false);
             } else if (action.equals(NetMsg.NETMSG_LISTPLAYERS) || action.equals(NetMsg.NETMSG_GPSSETTING)) {
+                if (action.equals(NetMsg.NETMSG_LISTPLAYERS))
+                    updateBaseTileLayer();
                 enableGPS(Globals.getInstance().mUseGPS);
             }
         }
@@ -397,25 +403,7 @@ public class MapFragment extends GlobeMapFragment {
     protected void controlHasStarted() {
         if (!isAdded() || mapControl == null)
             return;
-        // setup base layer tiles
-        String cacheDirName = "empty";
-        File cacheDir = new File(requireActivity().getCacheDir(), cacheDirName);
-        cacheDir.mkdir();
-        RemoteTileSource remoteTileSource = new RemoteTileSource(mapControl, new RemoteTileInfo("http://localhost/", "png", 0, 18));
-        remoteTileSource.setCacheDir(cacheDir);
-        SphericalMercatorCoordSystem coordSystem = new SphericalMercatorCoordSystem();
-
-        // globeControl is the controller when using MapDisplayType.Globe
-        // mapControl is the controller when using MapDisplayType.Map
-        QuadImageTileLayer baseLayer = new QuadImageTileLayer(mapControl, coordSystem, remoteTileSource);
-        baseLayer.setImageDepth(1);
-        baseLayer.setSingleLevelLoading(false);
-        baseLayer.setUseTargetZoomLevel(false);
-        baseLayer.setCoverPoles(true);
-        baseLayer.setHandleEdges(true);
-
-        // add layer and position
-        mapControl.addLayer(baseLayer);
+        updateBaseTileLayer();
         //mapControl.setAllowRotateGesture(true); // need to figure out a rose compass or something so you can tell which way you have rotated
         mapControl.gestureDelegate = this;
 
@@ -424,6 +412,48 @@ public class MapFragment extends GlobeMapFragment {
         for (int x = 0; x <= Globals.MAX_PLAYER_ID; x++)
             mPlayerMarkers[x] = null;
         enableGPS(Globals.getInstance().mUseGPS);
+    }
+
+    static String laptopTileBaseUrl(InetAddress serverAddress, int port) {
+        if (!(serverAddress instanceof Inet4Address) || port <= 0 || port > 65535)
+            return null;
+        return "http://" + serverAddress.getHostAddress() + ":" + port + "/tiles/";
+    }
+
+    private void updateBaseTileLayer() {
+        if (!isAdded() || mapControl == null)
+            return;
+        Globals globals = Globals.getInstance();
+        String nextUrl = laptopTileBaseUrl(globals.mServerIP, globals.mMapTilePort);
+        if (nextUrl == null ? mBaseTileUrl == null : nextUrl.equals(mBaseTileUrl))
+            return;
+        if (mBaseLayer != null) {
+            mapControl.removeLayer(mBaseLayer);
+            mBaseLayer = null;
+        }
+        mBaseTileUrl = null;
+        if (nextUrl == null)
+            return;
+        String cacheName = "map-tiles-" + globals.mServerIP.getHostAddress().replace('.', '_')
+                + "-" + globals.mMapTilePort;
+        File cacheDir = new File(requireActivity().getCacheDir(), cacheName);
+        if (!cacheDir.isDirectory() && !cacheDir.mkdirs()) {
+            Log.w(TAG, "Unable to create map tile cache " + cacheDir);
+            return;
+        }
+        RemoteTileInfo tileInfo = new RemoteTileInfo(nextUrl, "png", 0, 22);
+        RemoteTileSource tileSource = new RemoteTileSource(mapControl, tileInfo);
+        tileSource.setCacheDir(cacheDir);
+        QuadImageTileLayer layer = new QuadImageTileLayer(mapControl,
+                new SphericalMercatorCoordSystem(), tileSource);
+        layer.setImageDepth(1);
+        layer.setSingleLevelLoading(false);
+        layer.setUseTargetZoomLevel(false);
+        layer.setCoverPoles(true);
+        layer.setHandleEdges(true);
+        mapControl.addLayer(layer);
+        mBaseLayer = layer;
+        mBaseTileUrl = nextUrl;
     }
 
     @Override

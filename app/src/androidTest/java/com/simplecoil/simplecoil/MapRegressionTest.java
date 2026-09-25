@@ -30,6 +30,7 @@ import org.junit.runner.RunWith;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.net.InetAddress;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +55,8 @@ public class MapRegressionTest {
     private int originalGameMode;
     private int originalGPSMode;
     private int originalGameState;
+    private InetAddress originalServerIP;
+    private int originalMapTilePort;
     private Map<Byte, Globals.GPSData> originalLocations;
     private final List<Intent> locationUpdates = new CopyOnWriteArrayList<>();
     private Context receiverContext;
@@ -62,6 +65,13 @@ public class MapRegressionTest {
             locationUpdates.add(new Intent(intent));
         }
     };
+
+    @Test
+    public void laptopTileUrlUsesAdvertisedHostAndPort() throws Exception {
+        assertEquals("http://192.168.137.1:17512/tiles/", MapFragment.laptopTileBaseUrl(
+                InetAddress.getByName("192.168.137.1"), 17512));
+        assertNull(MapFragment.laptopTileBaseUrl(InetAddress.getByName("192.168.137.1"), 0));
+    }
 
     @Before
     public void setUp() throws Exception {
@@ -78,6 +88,8 @@ public class MapRegressionTest {
         originalGameMode = globals.mGameMode;
         originalGPSMode = globals.mGPSMode;
         originalGameState = globals.mGameState;
+        originalServerIP = globals.mServerIP;
+        originalMapTilePort = globals.mMapTilePort;
         Globals.getmGPSDataSemaphore();
         try {
             originalLocations = new HashMap<>(globals.mGPSData);
@@ -85,6 +97,8 @@ public class MapRegressionTest {
         } finally { globals.mGPSDataSemaphore.release(); }
         globals.mUseGPS = false;
         globals.mGameState = Globals.GAME_STATE_NONE;
+        globals.mServerIP = null;
+        globals.mMapTilePort = 0;
         scenario = ActivityScenario.launch(FullscreenActivity.class);
         scenario.onActivity(current -> {
             current.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
@@ -144,6 +158,8 @@ public class MapRegressionTest {
         globals.mGameMode = originalGameMode;
         globals.mGPSMode = originalGPSMode;
         globals.mGameState = originalGameState;
+        globals.mServerIP = originalServerIP;
+        globals.mMapTilePort = originalMapTilePort;
         if (originalLocations != null) {
             Globals.getmGPSDataSemaphore();
             try {

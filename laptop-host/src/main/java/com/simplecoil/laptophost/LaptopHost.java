@@ -39,6 +39,9 @@ import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -173,6 +176,7 @@ public final class LaptopHost {
     private ServerSocket tcpServer;
     private DatagramSocket udpServer;
     private HttpServer dashboard;
+    private HttpServer tileServer;
     private Thread tcpAcceptThread;
     private Thread udpThread;
 
@@ -232,11 +236,20 @@ public final class LaptopHost {
         dashboard.createContext("/", this::handleDashboardIndex);
         dashboard.createContext("/map", exchange -> sendHtml(exchange, MAP_PAGE));
         dashboard.createContext("/leaderboard", exchange -> sendHtml(exchange, LEADERBOARD_PAGE));
+        dashboard.createContext("/assets/leaflet/", this::handleLeafletAsset);
+        dashboard.createContext("/tiles/", this::handleMapTile);
+        dashboard.createContext("/api/map-config", this::handleMapConfigApi);
         dashboard.createContext("/api/state", this::handleStateApi);
         dashboard.createContext("/api/start", this::handleStartApi);
         dashboard.createContext("/api/end", this::handleEndApi);
         dashboard.createContext("/api/respawn", this::handleRespawnApi);
         dashboard.start();
+
+        tileServer = HttpServer.create(new InetSocketAddress(config.tileBind, config.tilePort), 0);
+        tileServer.setExecutor(dashboardExecutor);
+        tileServer.createContext("/tiles/", this::handleMapTile);
+        tileServer.createContext("/api/map-config", this::handleMapConfigApi);
+        tileServer.start();
 
         tcpAcceptThread = new Thread(this::runTcpAcceptLoop, "SimpleCoil laptop TCP accept");
         tcpAcceptThread.setDaemon(true);
@@ -265,6 +278,8 @@ public final class LaptopHost {
             udpServer.close();
         if (dashboard != null)
             dashboard.stop(0);
+        if (tileServer != null)
+            tileServer.stop(0);
 
         List<ClientConnection> clients;
         synchronized (stateLock) {
@@ -282,6 +297,8 @@ public final class LaptopHost {
         System.out.println("SimpleCoil laptop host is ready.");
         System.out.println("  TCP lobby port: " + config.tcpPort + "  |  UDP discovery port: " + config.udpPort);
         System.out.println("  Dashboard: http://" + config.dashboardBind + ":" + config.dashboardPort + "/");
+        System.out.println("  Offline map tiles: " + config.tileDirectory);
+        System.out.println("  Phone tile port: " + config.tilePort + " (read-only)");
         List<String> addresses = localIPv4Addresses();
         if (!addresses.isEmpty()) {
             System.out.println("  Phones: in SimpleCoil choose Join Game and enter one of these laptop IPs:");
@@ -1382,8 +1399,10 @@ public final class LaptopHost {
             game.put("gamemode", config.gameMode.wireValue);
             game.put("balancedrandom", config.balanced);
             game.put("balancedqr", config.balancedQr);
+            game.put("powerupqrrequired", config.powerupQrRequired);
             game.put("bossmode", config.boss);
             game.put("dedicatedserver", true);
+            game.put("maptileport", config.tilePort);
             game.put("gamestate", isRoundActiveLocked() ? 1 : 0);
             if (config.useGps)
                 game.put("usegps", config.gpsMode.wireValue);
@@ -2287,6 +2306,98 @@ public final class LaptopHost {
         sendJson(exchange, 200, dashboardState());
     }
 
+    private void handleMapConfigApi(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("error", "Use GET."));
+            return;
+        }
+        int minimumZoom = Integer.MAX_VALUE;
+        int maximumZoom = -1;
+        if (Files.isDirectory(config.tileDirectory)) {
+            try (DirectoryStream<Path> entries = Files.newDirectoryStream(config.tileDirectory)) {
+                for (Path entry : entries) {
+                    if (!Files.isDirectory(entry))
+                        continue;
+                    try {
+                        int zoom = Integer.parseInt(entry.getFileName().toString());
+                        if (zoom >= 0 && zoom <= 22) {
+                            minimumZoom = Math.min(minimumZoom, zoom);
+                            maximumZoom = Math.max(maximumZoom, zoom);
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // Ignore metadata and unrelated directories in the tile root.
+                    }
+                }
+            }
+        }
+        boolean available = maximumZoom >= 0;
+        sendJson(exchange, 200, mapOf("available", available,
+                "minZoom", available ? minimumZoom : 0,
+                "maxZoom", available ? maximumZoom : 19));
+    }
+
+    private void handleLeafletAsset(HttpExchange exchange) throws IOException {
+        String prefix = "/assets/leaflet/";
+        String path = exchange.getRequestURI().getPath();
+        if (path == null || !path.startsWith(prefix)) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        String relative = path.substring(prefix.length());
+        Set<String> allowed = Set.of("leaflet.js", "leaflet.css", "images/layers.png",
+                "images/layers-2x.png", "images/marker-icon.png", "images/marker-icon-2x.png",
+                "images/marker-shadow.png");
+        if (!allowed.contains(relative)) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        String contentType = relative.endsWith(".css") ? "text/css; charset=utf-8"
+                : relative.endsWith(".js") ? "text/javascript; charset=utf-8" : "image/png";
+        sendFile(exchange, config.webDirectory.resolve("leaflet").resolve(relative), contentType,
+                "public, max-age=86400");
+    }
+
+    private void handleMapTile(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
+        String[] parts = path == null ? new String[0] : path.split("/");
+        if (parts.length != 5 || !"tiles".equals(parts[1]) || !parts[4].endsWith(".png")) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        int zoom;
+        long x;
+        long y;
+        try {
+            zoom = Integer.parseInt(parts[2]);
+            x = Long.parseLong(parts[3]);
+            y = Long.parseLong(parts[4].substring(0, parts[4].length() - 4));
+        } catch (NumberFormatException e) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        if (zoom < 0 || zoom > 22 || x < 0 || y < 0 || x >= (1L << zoom) || y >= (1L << zoom)) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        Path tile = config.tileDirectory.resolve(String.valueOf(zoom)).resolve(String.valueOf(x))
+                .resolve(y + ".png");
+        if (!Files.isDirectory(config.tileDirectory)) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        Path root = config.tileDirectory.toRealPath();
+        if (!Files.exists(tile)) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        Path resolved = tile.toRealPath();
+        if (!resolved.startsWith(root)) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        sendFile(exchange, resolved, "image/png", "public, max-age=604800, immutable");
+    }
+
     private void handleStartApi(HttpExchange exchange) throws IOException {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             sendJson(exchange, 405, mapOf("error", "Use POST."));
@@ -2417,6 +2528,37 @@ public final class LaptopHost {
         exchange.close();
     }
 
+    private static void sendFile(HttpExchange exchange, Path file, String contentType,
+                                 String cacheControl) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!"GET".equalsIgnoreCase(method) && !"HEAD".equalsIgnoreCase(method)) {
+            exchange.getResponseHeaders().set("Allow", "GET, HEAD");
+            sendStatus(exchange, 405);
+            return;
+        }
+        if (!Files.isRegularFile(file)) {
+            sendStatus(exchange, 404);
+            return;
+        }
+        long size = Files.size(file);
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        exchange.getResponseHeaders().set("Cache-Control", cacheControl);
+        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        if ("HEAD".equalsIgnoreCase(method)) {
+            exchange.getResponseHeaders().set("Content-Length", String.valueOf(size));
+            exchange.sendResponseHeaders(200, -1);
+        } else {
+            exchange.sendResponseHeaders(200, size);
+            Files.copy(file, exchange.getResponseBody());
+        }
+        exchange.close();
+    }
+
+    private static void sendStatus(HttpExchange exchange, int status) throws IOException {
+        exchange.sendResponseHeaders(status, -1);
+        exchange.close();
+    }
+
     private static void sendJson(HttpExchange exchange, int status, Object body) throws IOException {
         byte[] bytes = Json.stringify(body).getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
@@ -2504,10 +2646,14 @@ public final class LaptopHost {
     }
 
     private static final class HostConfig {
+        private static final Path HOST_DIRECTORY = Path.of(
+                System.getProperty("simplecoil.home", "laptop-host")).toAbsolutePath().normalize();
         int tcpPort = 17_510;
         int udpPort = 17_500;
         int dashboardPort = 17_511;
         String dashboardBind = "127.0.0.1";
+        int tilePort = 17_512;
+        String tileBind = "0.0.0.0";
         GameMode gameMode = GameMode.TWO_TEAMS;
         // Phones see teammates by default. The laptop dashboard is a trusted
         // game-master display and remains an all-player view.
@@ -2518,12 +2664,15 @@ public final class LaptopHost {
         boolean boss;
         boolean balanced;
         boolean balancedQr;
+        int powerupQrRequired;
         boolean allowLateJoin = true;
         boolean takeover;
         int startDelaySeconds = 10;
         int durationMinutes = 5;
         int scoreLimit;
         int livesLimit;
+        Path tileDirectory = HOST_DIRECTORY.resolve("maps");
+        Path webDirectory = HOST_DIRECTORY.resolve("web");
         boolean noBrowser;
         boolean showHelp;
 
@@ -2583,6 +2732,15 @@ public final class LaptopHost {
                     case "--dashboard-bind":
                         config.dashboardBind = value;
                         break;
+                    case "--tile-port":
+                        config.tilePort = port(value, argument);
+                        break;
+                    case "--tile-bind":
+                        config.tileBind = value;
+                        break;
+                    case "--tiles":
+                        config.tileDirectory = Path.of(value).toAbsolutePath().normalize();
+                        break;
                     case "--teams":
                         if ("2".equals(value)) {
                             config.gameMode = GameMode.TWO_TEAMS;
@@ -2610,6 +2768,9 @@ public final class LaptopHost {
                         break;
                     case "--lives-limit":
                         config.livesLimit = bounded(value, argument, 0, 100);
+                        break;
+                    case "--powerup-qr":
+                        config.powerupQrRequired = bounded(value, argument, 4, 8);
                         break;
                     default:
                         throw new IllegalArgumentException("Unknown option " + argument + "\n\n" + usage());
@@ -2650,12 +2811,16 @@ public final class LaptopHost {
                     + "  --duration-minutes 0..100   0 means unlimited (default: 5)\n"
                     + "  --score-limit 0..100        0 means unlimited\n"
                     + "  --lives-limit 0..100        0 means unlimited\n"
+                    + "  --powerup-qr 4..8           Enable QR power-ups (default: off)\n"
                     + "  --gps all|team              Phone GPS visibility (default: team)\n"
                     + "  --start-delay 1..1000       Shared countdown seconds (default: 10)\n"
                     + "  --tcp-port PORT             Must remain 17510 for stock phones\n"
                     + "  --udp-port PORT             Must remain 17500 for stock phones\n"
                     + "  --dashboard-port PORT       Local dashboard (default: 17511)\n"
                     + "  --dashboard-bind ADDRESS    Defaults to 127.0.0.1\n"
+                    + "  --tile-port PORT            Read-only phone tiles (default: 17512)\n"
+                    + "  --tile-bind ADDRESS         Phone tile bind (default: 0.0.0.0)\n"
+                    + "  --tiles DIRECTORY           Offline XYZ tiles (default: laptop-host/maps)\n"
                     + "  --no-late-join              Reject joins after the start\n"
                     + "  --takeover                  Replace an idle phone-hosted lobby on this Wi-Fi\n"
                     + "  --no-browser                Do not open the dashboard automatically";
@@ -2937,32 +3102,31 @@ public final class LaptopHost {
 
     private static final String MAP_PAGE = """
             <!doctype html><html><head><meta charset="utf-8"><title>SimpleCoil Tactical Map</title>
+            <link rel="stylesheet" href="/assets/leaflet/leaflet.css">
             <style>
-            :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:15px system-ui,sans-serif;overflow:hidden}header{height:60px;display:flex;align-items:center;gap:16px;padding:10px 16px;background:#111c27;border-bottom:1px solid #274257}h1{font-size:20px;margin:0;white-space:nowrap}#status{color:#b8c8d8;flex:1}button{border:0;border-radius:7px;padding:9px 13px;background:#267ec8;color:#fff;font:inherit;cursor:pointer}button.danger{background:#b83d46}button:disabled{opacity:.45;cursor:not-allowed}#map{display:block;width:100vw;height:calc(100vh - 60px);touch-action:none}.legend{position:fixed;right:16px;bottom:16px;background:#101a25d9;border:1px solid #34516a;border-radius:8px;padding:10px;line-height:1.7}.swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.team1{background:#49a5ff}.team2{background:#ff5d67}.dead{opacity:.45}#respawns:empty{display:none}#respawns{border-top:1px solid #34516a;margin-top:7px;padding-top:7px}.respawn{font-size:12px;padding:5px 7px;margin:3px 3px 0 0;background:#466c32}@media(max-width:650px){header{gap:8px}h1{font-size:15px}#status{font-size:12px}}
-            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting…</span><button id="start">Start game</button><button id="end" class="danger">End game</button></header><canvas id="map"></canvas><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<div id="respawns"></div></div>
-            <script>
-            const canvas=document.querySelector('#map'),ctx=canvas.getContext('2d');let state=null;
-            const status=document.querySelector('#status'),start=document.querySelector('#start'),end=document.querySelector('#end'),respawns=document.querySelector('#respawns');
-            function fit(){const d=devicePixelRatio||1;canvas.width=innerWidth*d;canvas.height=(innerHeight-60)*d;canvas.style.width=innerWidth+'px';canvas.style.height=(innerHeight-60)+'px';ctx.setTransform(d,0,0,d,0,0);draw()};addEventListener('resize',fit);fit();
-            async function control(path){try{const r=await fetch(path,{method:'POST'}),j=await r.json();status.textContent=j.message|| (j.ok?'Done.':'Unable to complete action.')}catch(e){status.textContent='Host control error.'}}
-            start.onclick=()=>control('/api/start');end.onclick=()=>control('/api/end');
-            function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.awaitingRespawn)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}
+            :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:15px system-ui,sans-serif;overflow:hidden}header{height:60px;display:flex;align-items:center;gap:12px;padding:9px 14px;background:#111c27;border-bottom:1px solid #274257}h1{font-size:20px;margin:0;white-space:nowrap}#status{color:#b8c8d8;flex:1}button{border:0;border-radius:7px;padding:9px 12px;background:#267ec8;color:#fff;font:inherit;cursor:pointer}button.danger{background:#b83d46}button:disabled{opacity:.45;cursor:not-allowed}#map{width:100vw;height:calc(100vh - 60px);background-color:#0d1720;background-image:linear-gradient(#203445 1px,transparent 1px),linear-gradient(90deg,#203445 1px,transparent 1px);background-size:50px 50px}.legend{position:fixed;z-index:1000;right:16px;bottom:16px;max-width:340px;background:#101a25e8;border:1px solid #34516a;border-radius:8px;padding:10px;line-height:1.7}.swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.team1{background:#49a5ff}.team2{background:#ff5d67}#tile-status{color:#ffd98a;font-size:12px}#respawns:empty{display:none}#respawns{border-top:1px solid #34516a;margin-top:7px;padding-top:7px}.respawn{font-size:12px;padding:5px 7px;margin:3px 3px 0 0;background:#466c32}.player-label{background:#101a25e8;border:1px solid #7890a5;color:#fff;font-weight:700;box-shadow:none}.player-label:before{border-top-color:#7890a5}.leaflet-control-zoom a{background:#152332;color:#fff;border-color:#35516a}.leaflet-control-zoom a:hover{background:#22384b;color:#fff}@media(max-width:760px){header{gap:6px;padding:7px}h1{font-size:15px}#status{font-size:11px}button{padding:7px 8px;font-size:12px}}
+            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div></div>
+            <script src="/assets/leaflet/leaflet.js"></script><script>
+            const status=document.querySelector('#status'),start=document.querySelector('#start'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status');
+            const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:false}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],fitted=false,mapConfig={maxZoom:19};
             function color(team){return team===1?'#49a5ff':team===2?'#ff5d67':`hsl(${(team*57)%360} 90% 63%)`}
-            function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - final scores visible; next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores remain visible';if(s.balancedQr&&s.assignedCount)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount} - auto-start in ${Math.ceil(s.checkInRemainingMs/1000)}s`;return `${p} players - clocks ${ready}/${p}`}
-            function draw(){const w=innerWidth,h=innerHeight-60;ctx.clearRect(0,0,w,h);ctx.fillStyle='#0d1720';ctx.fillRect(0,0,w,h);if(!state){respawns.replaceChildren();return}status.textContent=label(state);start.disabled=!state.canStart;end.disabled=!['countdown','running'].includes(state.state);drawRespawns(state);const ps=state.players.filter(p=>Number.isFinite(p.longitude)&&Number.isFinite(p.latitude));if(!ps.length){ctx.fillStyle='#aab9c6';ctx.font='18px system-ui';ctx.fillText('Waiting for usable GPS fixes…',24,36);return}
-              let minLat=Math.min(...ps.map(p=>p.latitude)),maxLat=Math.max(...ps.map(p=>p.latitude)),minLon=Math.min(...ps.map(p=>p.longitude)),maxLon=Math.max(...ps.map(p=>p.longitude));let midLat=(minLat+maxLat)/2,metersLat=Math.max(30,(maxLat-minLat)*111320),metersLon=Math.max(30,(maxLon-minLon)*111320*Math.cos(midLat*Math.PI/180));let scale=Math.min((w-100)/metersLon,(h-100)/metersLat);function xy(p){return{x:w/2+(p.longitude-(minLon+maxLon)/2)*111320*Math.cos(midLat*Math.PI/180)*scale,y:h/2-(p.latitude-(minLat+maxLat)/2)*111320*scale}}
-              ctx.strokeStyle='#203445';ctx.lineWidth=1;for(let x=0;x<w;x+=50){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}for(let y=0;y<h;y+=50){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
-              for(const p of ps){const t=(p.trail||[]).filter(q=>Number.isFinite(q.longitude)&&Number.isFinite(q.latitude));if(t.length>1){ctx.strokeStyle=color(p.team)+'66';ctx.lineWidth=2;ctx.beginPath();t.forEach((q,i)=>{const pt=xy(q);i?ctx.lineTo(pt.x,pt.y):ctx.moveTo(pt.x,pt.y)});ctx.stroke()}}
-              const byId=Object.fromEntries(ps.map(p=>[p.id,p]));function savedPoint(l,prefix,fallback){const longitude=l[prefix+'Longitude'],latitude=l[prefix+'Latitude'];return Number.isFinite(longitude)&&Number.isFinite(latitude)?{longitude,latitude}:fallback}for(const l of state.lasers||[]){const a=byId[l.shooter],b=byId[l.target];if(!a||!b)continue;const aa=xy(savedPoint(l,'shooter',a)),bb=xy(savedPoint(l,'target',b)),alpha=Math.max(0,1-l.ageMs/1500);ctx.save();ctx.globalAlpha=alpha;ctx.strokeStyle=l.kind==='kill'?'#ff3047':'#fff36b';ctx.shadowColor=ctx.strokeStyle;ctx.shadowBlur=12;ctx.lineWidth=l.kind==='kill'?6:4;ctx.beginPath();ctx.moveTo(aa.x,aa.y);ctx.lineTo(bb.x,bb.y);ctx.stroke();ctx.restore()}
-              for(const p of ps){const q=xy(p);ctx.save();ctx.globalAlpha=p.connected?1:.4;ctx.fillStyle=color(p.team);ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.arc(q.x,q.y,p.awaitingRespawn?8:11,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.fillStyle='#fff';ctx.font='bold 13px system-ui';ctx.textAlign='center';ctx.fillText(`${p.name} #${p.id}`,q.x,q.y-17);if(p.awaitingRespawn){ctx.fillStyle='#ffb1b7';ctx.fillText('RESPAWN',q.x,q.y+29)}ctx.restore()}
-            }
-            async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();draw()}catch(e){status.textContent='Disconnected from laptop host.'}setTimeout(refresh,150)}refresh();
+            function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)}function ll(p){return[p.latitude,p.longitude]}
+            async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tiles=L.tileLayer('/tiles/{z}/{x}/{y}.png',{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom,maxNativeZoom:mapConfig.maxZoom,noWrap:true,keepBuffer:4,updateWhenIdle:false}).addTo(map);let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent=`Offline map loaded (zoom ${mapConfig.minZoom}-${mapConfig.maxZoom})`}});tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.'}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
+            async function control(path){try{const r=await fetch(path,{method:'POST'}),j=await r.json();status.textContent=j.message||(j.ok?'Done.':'Unable to complete action.')}catch(e){status.textContent='Host control error.'}}
+            start.onclick=()=>control('/api/start');end.onclick=()=>control('/api/end');fitButton.onclick=()=>fitPlayers(true);
+            function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.awaitingRespawn)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}
+            function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores visible';if(s.balancedQr&&s.assignedCount)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount}`;return `${p} players - clocks ${ready}/${p}`}
+            function fitPlayers(force){const points=(state?.players||[]).filter(valid).map(ll),maxZoom=Number.isFinite(mapConfig.maxZoom)?mapConfig.maxZoom:18;if(!points.length)return;if(points.length===1)map.setView(points[0],Math.min(18,maxZoom));else map.fitBounds(points,{padding:[70,70],maxZoom:Math.min(18,maxZoom)});if(force||!fitted)fitted=true}
+            function drawPlayers(s){const visible=new Set();for(const p of s.players.filter(valid)){visible.add(p.id);let item=players.get(p.id);if(!item){const trail=L.polyline([],{color:color(p.team),weight:3,opacity:.48,interactive:false}).addTo(map);const marker=L.circleMarker(ll(p),{radius:11,color:'#fff',weight:2,fillColor:color(p.team),fillOpacity:1}).addTo(map).bindTooltip('',{permanent:true,direction:'top',className:'player-label',offset:[0,-9]});item={marker,trail};players.set(p.id,item)}const opacity=p.connected?1:.4;item.marker.setLatLng(ll(p)).setRadius(p.awaitingRespawn?8:11).setStyle({fillColor:color(p.team),opacity,fillOpacity:opacity});const label=document.createElement('span');label.textContent=`${p.name} #${p.id}${p.awaitingRespawn?' - RESPAWN':''}`;item.marker.setTooltipContent(label);item.trail.setStyle({color:color(p.team),opacity:.48*opacity});item.trail.setLatLngs((p.trail||[]).filter(valid).map(ll))}for(const [id,item] of players){if(visible.has(id))continue;map.removeLayer(item.marker);map.removeLayer(item.trail);players.delete(id)}}
+            function drawLasers(s){for(const layer of laserLayers)map.removeLayer(layer);laserLayers=[];const byId=Object.fromEntries(s.players.filter(valid).map(p=>[p.id,p]));function point(event,prefix,fallback){const p={longitude:event[prefix+'Longitude'],latitude:event[prefix+'Latitude']};return valid(p)?p:fallback}for(const event of s.lasers||[]){const a=point(event,'shooter',byId[event.shooter]),b=point(event,'target',byId[event.target]);if(!valid(a)||!valid(b))continue;const kill=event.kind==='kill',opacity=Math.max(0,1-event.ageMs/1500);laserLayers.push(L.polyline([ll(a),ll(b)],{color:kill?'#ff3047':'#fff36b',weight:kill?7:5,opacity,interactive:false}).addTo(map))}}
+            function draw(s){status.textContent=label(s);start.disabled=!s.canStart;end.disabled=!['countdown','running'].includes(s.state);drawRespawns(s);drawPlayers(s);drawLasers(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}
+            async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();draw(state)}catch(e){status.textContent='Disconnected from laptop host.'}setTimeout(refresh,150)}setupTiles();refresh();
             </script></body></html>
             """;
 
     private static final String LEADERBOARD_PAGE = """
             <!doctype html><html><head><meta charset="utf-8"><title>SimpleCoil Leaderboard</title>
-            <style>:root{color-scheme:dark}body{margin:0;background:#0b121b;color:#eef4f9;font:18px system-ui,sans-serif;padding:26px}h1{margin:0 0 4px}#subtitle{color:#aebdca;margin:0 0 22px}table{width:100%;border-collapse:collapse;background:#111c27;border-radius:10px;overflow:hidden}th,td{padding:13px 14px;text-align:left;border-bottom:1px solid #263c50}th{color:#aabdd0;font-size:.78em;letter-spacing:.06em;text-transform:uppercase}tr:last-child td{border:0}.team1 td:first-child{border-left:6px solid #49a5ff}.team2 td:first-child{border-left:6px solid #ff5d67}.offline{opacity:.48}.dead{color:#ffb0b7}#empty{color:#aebdca;padding:24px 0}@media(max-width:600px){body{padding:14px;font-size:15px}th,td{padding:9px 7px}}</style></head><body><h1>Leaderboard</h1><p id="subtitle">Connecting…</p><table><thead><tr><th>Player</th><th>Team</th><th>Kills</th><th>Hits</th><th>Shots</th><th>Accuracy</th></tr></thead><tbody id="rows"></tbody></table><p id="empty"></p>
-            <script>const rows=document.querySelector('#rows'),subtitle=document.querySelector('#subtitle'),empty=document.querySelector('#empty');function pct(p){return p.accuracy==null?'—':Math.round(p.accuracy)+'%'}function title(s){if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)} seconds`;if(s.state==='running')return s.remainingMs?`Game running · ${Math.ceil(s.remainingMs/1000)} seconds remaining`:'Game running';if(s.state==='finished')return 'Final scores';return `Lobby · ${s.clockReady||0}/${s.playerCount||0} clocks synchronized`};function draw(s){subtitle.textContent=title(s);const players=[...(s.players||[])].sort((a,b)=>b.kills-a.kills||b.accuracy-a.accuracy||b.hits-a.hits||a.id-b.id);rows.replaceChildren();empty.textContent=players.length?'':'Waiting for players to join…';for(const p of players){const tr=document.createElement('tr');tr.className=`team${p.team}${p.connected?'':' offline'}`;const name=document.createElement('td');name.textContent=p.name+(p.awaitingRespawn?' · RESPAWN':'');if(p.awaitingRespawn)name.className='dead';const vals=[p.team,p.kills,p.hits,p.shots,pct(p)];tr.append(name,...vals.map(v=>{const td=document.createElement('td');td.textContent=v;return td}));rows.append(tr)}}async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();draw(await r.json())}catch(e){subtitle.textContent='Disconnected from laptop host.'}setTimeout(refresh,200)}refresh();</script></body></html>
+            <style>:root{color-scheme:dark}body{margin:0;background:#0b121b;color:#eef4f9;font:18px system-ui,sans-serif;padding:26px}h1{margin:0 0 4px}#subtitle{color:#aebdca;margin:0 0 22px}table{width:100%;border-collapse:collapse;background:#111c27;border-radius:10px;overflow:hidden}th,td{padding:13px 14px;text-align:left;border-bottom:1px solid #263c50}th{color:#aabdd0;font-size:.78em;letter-spacing:.06em;text-transform:uppercase}tr:last-child td{border:0}.team1 td:first-child{border-left:6px solid #49a5ff}.team2 td:first-child{border-left:6px solid #ff5d67}.offline{opacity:.48}.dead{color:#ffb0b7}#empty{color:#aebdca;padding:24px 0}@media(max-width:600px){body{padding:14px;font-size:15px}th,td{padding:9px 7px}}</style></head><body><h1>Leaderboard</h1><p id="subtitle">Connecting...</p><table><thead><tr><th>Player</th><th>Team</th><th>Kills</th><th>Hits</th><th>Shots</th><th>Accuracy</th></tr></thead><tbody id="rows"></tbody></table><p id="empty"></p>
+            <script>const rows=document.querySelector('#rows'),subtitle=document.querySelector('#subtitle'),empty=document.querySelector('#empty');function pct(p){return p.accuracy==null?'-':Math.round(p.accuracy)+'%'}function title(s){if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)} seconds`;if(s.state==='running')return s.remainingMs?`Game running - ${Math.ceil(s.remainingMs/1000)} seconds remaining`:'Game running';if(s.state==='finished')return 'Final scores';return `Lobby - ${s.clockReady||0}/${s.playerCount||0} clocks synchronized`};function draw(s){subtitle.textContent=title(s);const players=[...(s.players||[])].sort((a,b)=>b.kills-a.kills||b.accuracy-a.accuracy||b.hits-a.hits||a.id-b.id);rows.replaceChildren();empty.textContent=players.length?'':'Waiting for players to join...';for(const p of players){const tr=document.createElement('tr');tr.className=`team${p.team}${p.connected?'':' offline'}`;const name=document.createElement('td');name.textContent=p.name+(p.awaitingRespawn?' - RESPAWN':'');if(p.awaitingRespawn)name.className='dead';const vals=[p.team,p.kills,p.hits,p.shots,pct(p)];tr.append(name,...vals.map(v=>{const td=document.createElement('td');td.textContent=v;return td}));rows.append(tr)}}async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();draw(await r.json())}catch(e){subtitle.textContent='Disconnected from laptop host.'}setTimeout(refresh,200)}refresh();</script></body></html>
             """;
 }

@@ -10,6 +10,7 @@
 /captures
 .externalNativeBuild
 /laptop-host/out/
+/laptop-host/maps/
 release.properties
 *.jks
 *.keystore

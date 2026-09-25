@@ -45,6 +45,17 @@ cannot roll state back. Names, addresses, and other bulky mappings remain in
 TCP lobby setup. Android holds Wi-Fi performance and multicast locks only while
 gameplay is active.
 
+QR power-ups are off by default. Before starting a game, the lobby host can
+choose Off or 4 through 8 different codes with the Power-ups control. All phones
+receive the host's choice. During play, Scan power-up opens a small camera window
+without replacing the game screen. Print eight QR codes with these exact text
+payloads: `SIMPLECOIL:POWERUP:1` through `SIMPLECOIL:POWERUP:8`. A code counts
+only once per life; team respawn codes never count. Every configured number of
+different codes grants a random health refill, shield refill, or five-second
+temporary shield boost. Death clears unused progress and allows the codes to
+be collected again. With power-ups off, this gameplay scanner stays closed;
+the full-screen team QR scanner still opens after death for respawn.
+
 Combat feedback does not wait for that one-second state cadence. `HIT`, `OUT`,
 `ALREADY DEAD`, and elimination use a 32-byte subnet broadcast that every phone
 can overhear. Only the addressed phone returns a 32-byte unicast ACK, avoiding
@@ -69,14 +80,23 @@ included dedicated host, so no phone is consumed as the host.
 Every game uses the same server-authoritative tournament profile: 5 health, 10 shields,
 30-shot magazines, a 1.5-second reload, one damage per hit, recoil enabled,
 and single-shot firing. Player and host controls cannot change those rules.
+After health damage, another damaging hit restarts a 30-second inactivity
+wait. Health then regenerates one point per second until full, like shields.
+Eliminated players cannot regenerate.
 
 Boss Mode is the alternate locked tournament variant. Player 1 is the boss;
 everyone else is a hunter. Hunters have 2 health, 3 shields, a 30-round
-magazine, no shield regeneration, and forced single-shot fire. The boss starts
+magazine, no health or shield regeneration, and forced single-shot fire. The boss starts
 with 5 health and 10 shields, then gains 1 health and 2 shields per hunter. For
 example, against 10 hunters the boss has 15 health and 30 shields. The boss has
 120 rounds, starts each game in automatic, and may switch among single, burst,
 and automatic fire. The starting roster fixes boss strength for the round.
+In the boss lobby, use "Gun 2..." to select another nearby SRG1 blaster.
+The two blasters use the same boss player ID, health, and score, but each has its
+own 120-round magazine and reload. The second gun reconnects automatically if
+it was previously paired. The boss HUD shows gun 2's ammo on the left and gun
+1's on the right; "--" means disconnected and "..." means reloading. Pairing a
+second gun is unavailable to hunters.
 
 Balanced Random is an optional two-team assignment method on the laptop host.
 Everyone joins the lobby, then the host presses **Start** to assign teams using
@@ -109,9 +129,13 @@ The repository includes a dependency-free Java 17 laptop host at
 [`laptop-host/`](laptop-host/). It is protocol-compatible with the Android
 dedicated host and provides a local two-window dashboard:
 
-- A tactical GPS map for the two teams, including movement trails, position
-  snapshots, and laser lines for verified hits and eliminations. It also has
-  Game Master Respawn buttons for players currently waiting to return.
+- An offline tactical GPS map for the two teams, including movement trails,
+  position snapshots, and laser lines for verified hits and eliminations. It
+  uses locally stored XYZ map tiles and still shows the tactical overlay when
+  no base tiles are installed. It also has Game Master Respawn buttons for
+  players currently waiting to return.
+- A read-only tile service for phone maps. Joined phones learn the laptop tile
+  port from the lobby and cache fetched tiles in their private app cache.
 - A leaderboard with KILLS, HITS, SHOTS, and live accuracy.
 
 Run it on the same Wi-Fi network as the phones:

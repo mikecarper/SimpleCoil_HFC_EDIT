@@ -91,13 +91,9 @@ public class Globals {
     public volatile boolean mOverrideLives = false;
     public volatile int mOverrideLivesVal = 0;
     public volatile boolean mAllowPlayerSettings = false;
-    /**
-     * This build always runs the fixed two-team tournament ruleset.  Keeping the policy in the
-     * shared model (instead of relying only on disabled UI controls) prevents saved preferences,
-     * reconnects, or a stale network settings frame from restoring unequal weapon profiles.
-     */
-    public static final boolean TOURNAMENT_RULES_REQUIRED = true;
-    public volatile boolean mTournamentMode = TOURNAMENT_RULES_REQUIRED;
+    /** Tournament remains the default, but classic FFA/team modes may be selected in the lobby. */
+    public static final boolean TOURNAMENT_RULES_REQUIRED = false;
+    public volatile boolean mTournamentMode = true;
     public volatile boolean mReloadOnEmpty = false; // Primarily intended for instagib
     // Local feedback defaults on. Tournament mode also forces it on.
     public volatile boolean mVibrateOnHit = true;
@@ -136,6 +132,9 @@ public class Globals {
     public volatile int mBossHunterCount = -1;
     public volatile boolean mBalancedRandom = false;
     public volatile boolean mBalancedRequireQr = true;
+    // Zero disables the gameplay camera and QR rewards. The host advertises
+    // this setting to every phone before a round starts.
+    public volatile int mPowerupQrRequired = 0;
     // Published as immutable snapshots so UDP and UI readers never see a partial assignment.
     public volatile Map<Byte, Integer> mBalancedTeams = Collections.emptyMap();
     public volatile Set<Byte> mBalancedCheckedIn = Collections.emptySet();
@@ -257,6 +256,24 @@ public class Globals {
         settings.firingMode = FIRING_MODE_OUTDOOR_NO_CONE;
     }
 
+    /** Restore the common baseline while allowing the classic firing-mode choices. */
+    public static void applyClassicRules(PlayerSettings settings) {
+        if (settings == null)
+            return;
+        settings.health = MAX_HEALTH;
+        settings.shots = RELOAD_COUNT;
+        settings.reloadTime = RELOAD_TIME_MILLISECONDS;
+        settings.reloadOnEmpty = false;
+        settings.spawnTime = RESPAWN_TIME_SECONDS;
+        settings.damage = DAMAGE_PER_HIT;
+        settings.overrideLives = false;
+        settings.lives = 0;
+        settings.allowShotModeSingle = true;
+        settings.allowShotModeBurst3 = true;
+        settings.allowShotModeAuto = true;
+        settings.firingMode = FIRING_MODE_OUTDOOR_NO_CONE;
+    }
+
     /** Apply Boss Mode health to a server-owned player profile. */
     public static void applyBossHealth(PlayerSettings settings, int playerID, int hunterCount) {
         if (settings == null)
@@ -309,6 +326,33 @@ public class Globals {
         mOnlyServerSettings = true;
     }
 
+    public void applyClassicRules(int gameMode) {
+        if (!isValidGameMode(gameMode))
+            gameMode = GAME_MODE_2TEAMS;
+        mTournamentMode = false;
+        mBossMode = false;
+        mBossHunterCount = -1;
+        mBalancedRandom = false;
+        clearBalancedAssignments();
+        mGameMode = gameMode;
+        mFullHealth = MAX_HEALTH;
+        mFullShields = MAX_SHIELDS;
+        mFullReload = RELOAD_COUNT;
+        mReloadTime = RELOAD_TIME_MILLISECONDS;
+        mReloadOnEmpty = false;
+        mRespawnTime = RESPAWN_TIME_SECONDS;
+        mDamage = DAMAGE_PER_HIT;
+        mOverrideLives = false;
+        mOverrideLivesVal = 0;
+        mAllowSingleShotMode = true;
+        mAllowBurst3ShotMode = true;
+        mAllowAutoShotMode = true;
+        if (!isValidFiringMode(mCurrentFiringMode))
+            mCurrentFiringMode = FIRING_MODE_OUTDOOR_NO_CONE;
+        mAllowPlayerSettings = true;
+        mOnlyServerSettings = false;
+    }
+
     public volatile byte mPlayerID = 0;
     public volatile String mPlayerName = "";
     public volatile Map<InetAddress, Byte> mIPTeamMap;
@@ -337,6 +381,8 @@ public class Globals {
     public volatile long mServerGameTimeRemaining = 0; // in seconds
 
     public volatile InetAddress mServerIP = null;
+    // Zero means the current host did not advertise an offline map tile service.
+    public volatile int mMapTilePort = 0;
 
     protected Globals(){}
 

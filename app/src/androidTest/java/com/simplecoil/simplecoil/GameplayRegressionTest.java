@@ -16,6 +16,8 @@ import android.widget.Chronometer;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.TextView;
 
 import androidx.core.content.ContextCompat;
@@ -41,6 +43,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -57,10 +60,12 @@ public class GameplayRegressionTest {
     private TcpServer originalTcpServer;
     private RecordingTcpClient tcp;
     private byte originalPairedGrenade;
+    private int originalPowerupQrRequired;
 
     @Before
     public void setUp() {
         originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
+        originalPowerupQrRequired = Globals.getInstance().mPowerupQrRequired;
         Globals.getInstance().mPairedGrenadeID = 0;
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().mUseGPS = false;
@@ -129,6 +134,9 @@ public class GameplayRegressionTest {
             set(activity, "mTcpClient", originalTcpClient);
             set(activity, "mTcpServer", originalTcpServer);
             Globals.getInstance().mFullShields = Globals.MAX_SHIELDS;
+            Globals.getInstance().mFullHealth = Globals.MAX_HEALTH;
+            Globals.getInstance().mFullReload = Globals.RELOAD_COUNT;
+            Globals.getInstance().mBossMode = false;
             Globals.getInstance().mReloadTime = Globals.RELOAD_TIME_MILLISECONDS;
             Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
             Globals.getInstance().mOverrideLives = false;
@@ -138,6 +146,7 @@ public class GameplayRegressionTest {
         if (udp != null)
             udp.onDestroy();
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
+        Globals.getInstance().mPowerupQrRequired = originalPowerupQrRequired;
     }
 
     @Test
@@ -159,6 +168,44 @@ public class GameplayRegressionTest {
             assertEquals("Cancellation must not use a separate racing broadcast", 0, calls[2]);
             assertEquals(false, get(activity, "mIsServer"));
             assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
+    public void runningGameShowsLocalGpsCoordinatesInTheUpperRightHud() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+            globals.mUseGPS = true;
+            TextView coordinates = activity.findViewById(R.id.gps_coordinates_tv);
+
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            assertEquals(View.VISIBLE, coordinates.getVisibility());
+            assertEquals(activity.getString(R.string.gps_acquiring), coordinates.getText().toString());
+
+            Intent fix = new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                    .putExtra(NetMsg.INTENT_LATITUDE, 47.60621)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, -122.33207);
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class}, fix);
+            assertEquals(activity.getString(R.string.gps_coordinates_format,
+                    47.60621, -122.33207), coordinates.getText().toString());
+
+            globals.mGameState = Globals.GAME_STATE_NONE;
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            assertEquals(View.GONE, coordinates.getVisibility());
+        });
+    }
+
+    @Test
+    public void gameLockUsesTheFullscreenWindowFlagForTheStatusBar() {
+        scenario.onActivity(activity -> {
+            invoke(activity, "enableGameLock");
+            assertTrue((activity.getWindow().getAttributes().flags
+                    & WindowManager.LayoutParams.FLAG_FULLSCREEN) != 0);
+
+            invoke(activity, "disableGameLock");
+            assertEquals(0, activity.getWindow().getAttributes().flags
+                    & WindowManager.LayoutParams.FLAG_FULLSCREEN);
         });
     }
 
@@ -774,6 +821,63 @@ public class GameplayRegressionTest {
             assertEquals(4, bluetooth.writes.get(1)[2]);
             assertEquals(30, bluetooth.writes.get(1)[6]);
             assertNull(get(activity, "mReloadTimer"));
+        });
+    }
+
+    @Test
+    public void emptyMagazineStartsReloadVoiceReminderUntilAmmoReturns() {
+        scenario.onActivity(activity -> {
+            invoke(activity, "setShotsRemaining", new Class<?>[]{byte.class}, (byte) 0);
+            assertEquals(true, get(activity, "mReloadVoiceReminderActive"));
+            assertEquals(3000L, get(activity, "RELOAD_VOICE_REMINDER_INTERVAL_MS"));
+
+            invoke(activity, "setShotsRemaining", new Class<?>[]{byte.class}, (byte) 30);
+            assertEquals(false, get(activity, "mReloadVoiceReminderActive"));
+        });
+    }
+
+    @Test
+    public void eliminationStopsReloadVoiceReminder() {
+        scenario.onActivity(activity -> {
+            invoke(activity, "setShotsRemaining", new Class<?>[]{byte.class}, (byte) 0);
+            assertEquals(true, get(activity, "mReloadVoiceReminderActive"));
+
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
+            assertEquals(false, get(activity, "mReloadVoiceReminderActive"));
+        });
+    }
+
+    @Test
+    public void shotsCounterIsMuchLargerDuringPlay() {
+        scenario.onActivity(activity -> {
+            TextView shots = (TextView) get(activity, "mShotsRemainingTV");
+            float lobbySize = shots.getTextSize();
+
+            invoke(activity, "setPlayingShotsCounter", new Class<?>[]{boolean.class}, true);
+            assertTrue(shots.getTextSize() > lobbySize * 2);
+
+            invoke(activity, "setPlayingShotsCounter", new Class<?>[]{boolean.class}, false);
+            assertEquals(lobbySize, shots.getTextSize(), 0.01f);
+        });
+    }
+
+    @Test
+    public void gameModeCanBeChangedByTheLobbyHostButNotDuringPlay() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mReady", false);
+            set(activity, "mIsServer", false);
+            assertEquals(true, invokeResult(activity, "canChangeGameModeInLobby"));
+            assertTrue(((View) get(activity, "mGameModeTV")).hasOnClickListeners());
+
+            set(activity, "mReady", true);
+            assertEquals(false, invokeResult(activity, "canChangeGameModeInLobby"));
+
+            set(activity, "mIsServer", true);
+            assertEquals(true, invokeResult(activity, "canChangeGameModeInLobby"));
+
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            assertEquals(false, invokeResult(activity, "canChangeGameModeInLobby"));
         });
     }
 
@@ -2012,6 +2116,78 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void healthRegeneratesAfterThirtySecondsThenTicksOncePerSecond() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mFullHealth = 20;
+            globals.mFullShields = 0;
+            globals.mBossMode = false;
+            set(activity, "mHealth", 20);
+            set(activity, "mShield", 0);
+
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -5);
+            assertEquals(15, get(activity, "mHealth"));
+            assertEquals(30_000L, get(activity, "HEALTH_REGEN_DELAY_MILLISECONDS"));
+            CountDownTimer initialDelay = (CountDownTimer) get(activity, "mHealthTimer");
+            assertTrue("Health damage must arm the inactivity timer", initialDelay != null);
+
+            initialDelay.onFinish();
+            assertEquals(16, get(activity, "mHealth"));
+            CountDownTimer nextTick = (CountDownTimer) get(activity, "mHealthTimer");
+            assertTrue("Health must continue regenerating after the first point", nextTick != null);
+            assertNotSame(initialDelay, nextTick);
+
+            // A retired timer must not apply its point twice.
+            initialDelay.onFinish();
+            assertEquals(16, get(activity, "mHealth"));
+            nextTick.onFinish();
+            assertEquals(17, get(activity, "mHealth"));
+        });
+    }
+
+    @Test
+    public void anotherHitRestartsHealthInactivityAndEliminationCannotRegenerate() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mFullHealth = 20;
+            globals.mFullShields = 0;
+            globals.mBossMode = false;
+            set(activity, "mHealth", 20);
+            set(activity, "mShield", 0);
+
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -5);
+            CountDownTimer first = (CountDownTimer) get(activity, "mHealthTimer");
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -1);
+            CountDownTimer restarted = (CountDownTimer) get(activity, "mHealthTimer");
+            assertNotSame("A later hit must restart the thirty-second wait", first, restarted);
+            first.onFinish();
+            assertEquals(14, get(activity, "mHealth"));
+
+            set(activity, "mHealth", 1);
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -1);
+            assertEquals(0, get(activity, "mHealth"));
+            assertNull("An eliminated player must not regenerate", get(activity, "mHealthTimer"));
+        });
+    }
+
+    @Test
+    public void bossModeKeepsItsNoRegenerationRule() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mFullHealth = 20;
+            globals.mFullShields = 10;
+            globals.mBossMode = true;
+            set(activity, "mHealth", 20);
+            set(activity, "mShield", 0);
+
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -5);
+            assertEquals(15, get(activity, "mHealth"));
+            assertNull(get(activity, "mHealthTimer"));
+            assertNull(get(activity, "mShieldTimer"));
+        });
+    }
+
+    @Test
     public void respawnQrScannerStaysOpenWhileTheTimeoutRuns() {
         scenario.onActivity(activity -> {
             invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
@@ -2044,6 +2220,178 @@ public class GameplayRegressionTest {
             assertNull(get(activity, "mSpawnTimer"));
             assertEquals(View.GONE, activity.findViewById(R.id.respawn_qr_scanner_overlay)
                     .getVisibility());
+        });
+    }
+
+    @Test
+    public void powerupQrPreviewUsesASmallWindowWithoutChangingRespawnScanning() {
+        scenario.onActivity(activity -> {
+            View preview = activity.findViewById(R.id.powerup_qr_scanner_window);
+            View respawn = activity.findViewById(R.id.respawn_qr_scanner_overlay);
+            View powerupButton = activity.findViewById(R.id.powerup_scan_button);
+            ViewGroup.LayoutParams previewSize = preview.getLayoutParams();
+            ViewGroup.LayoutParams respawnSize = respawn.getLayoutParams();
+            assertTrue(previewSize.width > 0
+                    && previewSize.width < activity.getResources().getDisplayMetrics().widthPixels);
+            assertTrue(previewSize.height > 0
+                    && previewSize.height < activity.getResources().getDisplayMetrics().heightPixels);
+            assertEquals(ViewGroup.LayoutParams.MATCH_PARENT, respawnSize.width);
+            assertEquals(ViewGroup.LayoutParams.MATCH_PARENT, respawnSize.height);
+
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            Globals.getInstance().mPowerupQrRequired = 0;
+            invoke(activity, "updatePowerupScanButton");
+            assertEquals(View.GONE, powerupButton.getVisibility());
+            assertEquals(View.GONE, preview.getVisibility());
+
+            Globals.getInstance().mPowerupQrRequired = 4;
+            invoke(activity, "updatePowerupScanButton");
+            assertEquals(View.VISIBLE, powerupButton.getVisibility());
+            assertEquals(View.GONE, preview.getVisibility());
+
+            Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+            invoke(activity, "updatePowerupScanButton");
+            assertEquals(View.GONE, powerupButton.getVisibility());
+            assertEquals(View.GONE, preview.getVisibility());
+        });
+    }
+
+    @Test
+    public void deathClearsPowerupQrProgress() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 4;
+            globals.mFullShields = 10;
+            set(activity, "mUseNetwork", false);
+            set(activity, "mShield", 3);
+            set(activity, "mHealth", globals.mFullHealth);
+            PowerupQrProgress progress = (PowerupQrProgress) get(activity, "mPowerupQrProgress");
+            progress.scan("SIMPLECOIL:POWERUP:1", 4);
+            progress.scan("SIMPLECOIL:POWERUP:2", 4);
+            assertEquals(2, progress.scannedCount());
+
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
+            assertEquals(0, progress.scannedCount());
+            assertEquals(View.GONE, activity.findViewById(R.id.powerup_scan_button).getVisibility());
+            CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
+            spawn.onFinish();
+            assertEquals(View.VISIBLE,
+                    activity.findViewById(R.id.powerup_scan_button).getVisibility());
+        });
+    }
+
+    @Test
+    public void completedPowerupCanGrantTemporaryShieldBoost() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 4;
+            globals.mFullShields = 10;
+            set(activity, "mShield", 10);
+            set(activity, "mHealth", globals.mFullHealth);
+
+            invoke(activity, "grantRandomPowerup");
+
+            assertEquals(5, get(activity, "mRespawnShieldBonus"));
+            ProgressBar shieldBar = activity.findViewById(R.id.shield_pb);
+            assertEquals(15, shieldBar.getMax());
+            assertEquals(15, shieldBar.getProgress());
+        });
+    }
+
+    @Test
+    public void bossSecondGunReloadDoesNotChangeFirstGunReloadState() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mBossMode = true;
+            globals.mPlayerID = Globals.BOSS_PLAYER_ID;
+            globals.mFullReload = Globals.BOSS_RELOAD_COUNT;
+            RecordingBluetoothService second = new RecordingBluetoothService();
+            set(activity, "mSecondaryBluetoothLeService", second);
+            set(activity, "mSecondaryCommandCharacteristic",
+                    characteristic(GattAttributes.RECOIL_COMMAND_UUID));
+            set(activity, "mSecondaryReloading", 0);
+            set(activity, "mReloading", 0);
+            int firstWrites = bluetooth.writes.size();
+
+            invoke(activity, "startSecondaryReload", new Class<?>[]{int.class}, 1);
+            assertEquals(firstWrites, bluetooth.writes.size());
+            assertEquals(1, get(activity, "mSecondaryReloading"));
+            assertEquals(0, get(activity, "mReloading"));
+            assertEquals(0x02, second.writes.get(0)[2]);
+            assertEquals(Globals.BOSS_PLAYER_ID, second.writes.get(0)[4]);
+
+            BroadcastReceiver receiver = (BroadcastReceiver) get(activity, "mGattUpdateReceiver");
+            boolean registered = (boolean) get(activity, "mGattReceiverRegistered");
+            set(activity, "mGattReceiverRegistered", true);
+            try {
+                receiver.onReceive(activity, new Intent(BluetoothLeService.CHARACTERISTIC_WRITE_FINISHED)
+                        .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, 1)
+                        .putExtra(BluetoothLeService.EXTRA_UUID, GattAttributes.RECOIL_COMMAND_UUID)
+                        .putExtra(BluetoothLeService.EXTRA_STATUS, BluetoothGatt.GATT_SUCCESS)
+                        .putExtra(BluetoothLeService.EXTRA_DATA, second.writes.get(0)));
+            } finally {
+                set(activity, "mGattReceiverRegistered", registered);
+            }
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSecondaryReloadTimer");
+            assertTrue(timer != null);
+            timer.onFinish();
+            assertEquals(0x04, second.writes.get(1)[2]);
+            assertEquals(0, get(activity, "mReloading"));
+        });
+    }
+
+    @Test
+    public void bossFirstGunReloadDoesNotFinishSecondGunReload() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mBossMode = true;
+            globals.mPlayerID = Globals.BOSS_PLAYER_ID;
+            globals.mFullReload = Globals.BOSS_RELOAD_COUNT;
+            RecordingBluetoothService second = new RecordingBluetoothService();
+            set(activity, "mSecondaryBluetoothLeService", second);
+            set(activity, "mSecondaryCommandCharacteristic",
+                    characteristic(GattAttributes.RECOIL_COMMAND_UUID));
+            set(activity, "mReloading", 1);
+            set(activity, "mSecondaryReloading", 1);
+
+            invoke(activity, "finishReload");
+
+            assertEquals(1, bluetooth.writes.size());
+            assertEquals(0x04, bluetooth.writes.get(0)[2]);
+            assertEquals(0, second.writes.size());
+            assertEquals(1, get(activity, "mSecondaryReloading"));
+        });
+    }
+
+    @Test
+    public void twoBossGunSensorsDoNotApplyTheSameHitTwice() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mBossMode = true;
+            globals.mPlayerID = Globals.BOSS_PLAYER_ID;
+            set(activity, "mSecondaryBluetoothLeService", new RecordingBluetoothService());
+            set(activity, "mSecondaryTelemetryCharacteristic",
+                    characteristic(GattAttributes.RECOIL_TELEMETRY_UUID));
+            set(activity, "mSecondaryCommunicating", true);
+            set(activity, "mSecondaryReloading", 0);
+            set(activity, "mSecondaryLastShotCount", (byte) 30);
+            byte[] hit = telemetryPacket(17, 1, 0, 0);
+            receiveTelemetry(activity, hit);
+            assertEquals(15, get(activity, "mHealth"));
+            receiveTelemetry(activity, telemetryPacket(0, 0, 0, 0));
+            BroadcastReceiver receiver = (BroadcastReceiver) get(activity, "mGattUpdateReceiver");
+            boolean registered = (boolean) get(activity, "mGattReceiverRegistered");
+            set(activity, "mGattReceiverRegistered", true);
+            try {
+                receiver.onReceive(activity, new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                        .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, 1)
+                        .putExtra(BluetoothLeService.EXTRA_DATA, hit));
+            } finally {
+                set(activity, "mGattReceiverRegistered", registered);
+            }
+            assertEquals(15, get(activity, "mHealth"));
+            assertEquals((byte) 30, get(activity, "mLastShotCount"));
+            assertEquals((byte) 30, get(activity, "mSecondaryLastShotCount"));
         });
     }
 
@@ -2284,6 +2632,16 @@ public class GameplayRegressionTest {
             Method method = FullscreenActivity.class.getDeclaredMethod(name, types);
             method.setAccessible(true);
             method.invoke(activity, args);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static Object invokeResult(FullscreenActivity activity, String name) {
+        try {
+            Method method = FullscreenActivity.class.getDeclaredMethod(name);
+            method.setAccessible(true);
+            return method.invoke(activity);
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }

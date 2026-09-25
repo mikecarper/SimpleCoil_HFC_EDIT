@@ -484,14 +484,16 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             return;
         }
         globals.applyTournamentRules();
-        sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).apply();
+        sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, true)
+                .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false)
+                .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS).apply();
         if (mGameModeButton != null) {
             mGameModeButton.setText(globals.mBossMode ? R.string.game_mode_boss
                     : R.string.game_mode_tournament_2teams);
             mGameModeButton.setEnabled(globals.mGameState == Globals.GAME_STATE_NONE);
         }
         if (mTournamentModeSwitch != null) {
-            mTournamentModeSwitch.setChecked(true);
+            mTournamentModeSwitch.setChecked(Globals.getInstance().mTournamentMode);
             mTournamentModeSwitch.setEnabled(false);
         }
         if (mOnlyServerSettingsSwitch != null) {
@@ -527,9 +529,45 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             globals.applyTournamentRules();
         }
         sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_BOSS_MODE, enabled)
+                .putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, true)
+                .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
                 .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).apply();
         mGameModeButton.setText(enabled ? R.string.game_mode_boss
                 : R.string.game_mode_tournament_2teams);
+        getPlayerDisplayData();
+    }
+
+    private void setClassicGameMode(int gameMode) {
+        Globals globals = Globals.getInstance();
+        if (!Globals.isValidGameMode(gameMode)
+                || globals.mGameState != Globals.GAME_STATE_NONE) {
+            Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (mTcpServer != null) {
+            if (!mTcpServer.setClassicGameMode(gameMode)) {
+                Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.applyClassicRules(gameMode);
+        }
+        sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_BOSS_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false)
+                .putInt(FullscreenActivity.PREF_GAME_MODE, gameMode).apply();
+        mGameModeButton.setText(gameMode == Globals.GAME_MODE_FFA ? R.string.game_mode_ffa
+                : gameMode == Globals.GAME_MODE_4TEAMS ? R.string.game_mode_4teams
+                : R.string.game_mode_2teams);
+        if (mTournamentModeSwitch != null)
+            mTournamentModeSwitch.setChecked(false);
+        if (mOnlyServerSettingsSwitch != null) {
+            mOnlyServerSettingsSwitch.setChecked(globals.mOnlyServerSettings);
+            mOnlyServerSettingsSwitch.setEnabled(true);
+        }
+        setGPSMode(globals.mGPSMode);
         getPlayerDisplayData();
     }
 
@@ -557,12 +595,13 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             return true;
         } else if (id == R.id.game_mode_2teams_item
                 || id == R.id.game_mode_4teams_item
-                || id == R.id.game_mode_ffa_item
-                || id == R.id.game_mode_balanced_qr_item
+                || id == R.id.game_mode_ffa_item) {
+            setClassicGameMode(id == R.id.game_mode_4teams_item ? Globals.GAME_MODE_4TEAMS
+                    : id == R.id.game_mode_ffa_item ? Globals.GAME_MODE_FFA
+                    : Globals.GAME_MODE_2TEAMS);
+            return true;
+        } else if (id == R.id.game_mode_balanced_qr_item
                 || id == R.id.game_mode_balanced_no_qr_item) {
-            setTournamentMode(true);
-            Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
-                    Toast.LENGTH_SHORT).show();
             return true;
         } else if (id == R.id.gps_mode_disabled) {
             setGPSMode(Globals.GPS_DISABLED);
@@ -881,7 +920,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mStartGameButton.setEnabled(true);
         mGameModeButton.setEnabled(true);
         if (mTournamentModeSwitch != null) {
-            mTournamentModeSwitch.setChecked(true);
+            mTournamentModeSwitch.setChecked(Globals.getInstance().mTournamentMode);
             mTournamentModeSwitch.setEnabled(false);
         }
         mGameLimitButton.setEnabled(true);

@@ -160,6 +160,22 @@
             android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
 
         <TextView
+            android:id="@+id/gps_coordinates_tv"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/player_count_tv"
+            android:layout_alignParentEnd="true"
+            android:layout_marginTop="2dp"
+            android:layout_marginEnd="10dp"
+            android:background="#99000000"
+            android:gravity="end"
+            android:padding="3dp"
+            android:text="@string/gps_acquiring"
+            android:textColor="#FFFFFF"
+            android:textSize="10sp"
+            android:visibility="gone" />
+
+        <TextView
             android:id="@+id/eliminations_count_label_tv"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -299,6 +315,81 @@
             android:text="@string/shot_mode_single"
             android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
 
+        <LinearLayout
+            android:id="@+id/boss_ammo_row"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/team_tv"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal"
+            android:paddingStart="15dp"
+            android:paddingEnd="15dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="start"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/boss_gun_two_label"
+                    android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
+
+                <TextView
+                    android:id="@+id/second_gun_status_tv"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="--"
+                    android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="center_horizontal"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/shot_mode_label"
+                    android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
+
+                <TextView
+                    android:id="@+id/boss_shot_mode_tv"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/shot_mode_auto"
+                    android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="end"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/boss_gun_one_label"
+                    android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
+
+                <TextView
+                    android:id="@+id/boss_primary_shots_tv"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="0"
+                    android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+            </LinearLayout>
+        </LinearLayout>
+
         <TextView
             android:id="@+id/hits_taken_tv"
             android:layout_width="wrap_content"
@@ -407,6 +498,18 @@
             android:text="@string/start_game_button" />
 
         <Button
+            android:id="@+id/powerup_scan_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/health_pb"
+            android:layout_marginStart="15dp"
+            android:layout_marginTop="7dp"
+            android:text="@string/powerup_scan_button"
+            android:textAllCaps="false"
+            android:visibility="gone" />
+
+        <Button
             android:id="@+id/player_settings_button"
             style="@style/Widget.AppCompat.Button.Colored"
             android:layout_width="wrap_content"
@@ -474,19 +577,21 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_above="@id/game_mode_tv"
-            android:layout_centerHorizontal="true"
+            android:layout_alignParentEnd="true"
+            android:layout_marginEnd="15dp"
             android:text="@string/game_mode_label"
             android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
 
-        <TextView
+        <Button
             android:id="@+id/game_mode_tv"
+            style="@style/Widget.AppCompat.Button.Colored"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_alignParentBottom="true"
-            android:layout_marginBottom="10dp"
+            android:layout_marginBottom="5dp"
             android:layout_centerHorizontal="true"
             android:text="@string/game_mode_2teams"
-            android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+            android:textAllCaps="false" />
 
         <Button
             android:id="@+id/game_limit_button"
@@ -497,6 +602,30 @@
             android:layout_toEndOf="@id/firing_mode_button"
             android:layout_alignBaseline="@id/firing_mode_button"
             android:text="@string/game_limit_button" />
+
+        <Button
+            android:id="@+id/powerup_settings_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/firing_mode_button"
+            android:layout_marginStart="15dp"
+            android:layout_marginTop="5dp"
+            android:text="@string/powerup_settings_off"
+            android:textAllCaps="false" />
+
+        <Button
+            android:id="@+id/second_gun_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignBaseline="@id/powerup_settings_button"
+            android:layout_toEndOf="@id/powerup_settings_button"
+            android:layout_marginStart="5dp"
+            android:contentDescription="@string/second_gun_action_description"
+            android:text="@string/second_gun_button"
+            android:textAllCaps="false"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/score_label_tv"
@@ -660,6 +789,54 @@
         android:textSize="88sp"
         android:textStyle="bold"
         android:visibility="gone" />
+
+    <!-- A gameplay-only camera preview. It does not cover the rest of the HUD. -->
+    <FrameLayout
+        android:id="@+id/powerup_qr_scanner_window"
+        android:layout_width="232dp"
+        android:layout_height="264dp"
+        android:layout_gravity="center_vertical|end"
+        android:layout_marginEnd="8dp"
+        android:background="#EE101820"
+        android:clickable="true"
+        android:elevation="12dp"
+        android:visibility="gone">
+
+        <com.journeyapps.barcodescanner.DecoratedBarcodeView
+            android:id="@+id/powerup_qr_scanner"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_marginTop="48dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_gravity="top"
+            android:background="#EE101820"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/powerup_qr_prompt"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:paddingStart="8dp"
+                android:text="@string/powerup_qr_prompt"
+                android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
+
+            <Button
+                android:id="@+id/powerup_qr_close_button"
+                style="@style/Widget.AppCompat.Button.Colored"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:contentDescription="@string/powerup_qr_close_description"
+                android:text="@string/powerup_qr_close_button" />
+        </LinearLayout>
+    </FrameLayout>
 
     <FrameLayout
         android:id="@+id/respawn_qr_scanner_overlay"

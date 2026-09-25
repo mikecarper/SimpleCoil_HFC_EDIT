@@ -94,11 +94,13 @@ public class TcpServer extends Service {
     public static final String JSON_GAMEMODE = "gamemode";
     public static final String JSON_BALANCED_MODE = "balancedrandom";
     public static final String JSON_BALANCED_QR = "balancedqr";
+    public static final String JSON_POWERUP_QR_REQUIRED = "powerupqrrequired";
     public static final String JSON_BALANCED_CHECKIN = "balancedcheckin";
     public static final String JSON_PRIOR_KILLS = "priorkills";
     public static final String JSON_PRIOR_DEATHS = "priordeaths";
     public static final String JSON_REJOIN = "rejoin";
     public static final String JSON_DEDICATED = "dedicatedserver";
+    public static final String JSON_MAP_TILE_PORT = "maptileport";
     public static final String JSON_USEGPS = "usegps";
     public static final String JSON_TEAM = "team";
     public static final String JSON_GAMESTATE = "gamestate";
@@ -547,11 +549,31 @@ public class TcpServer extends Service {
                             return;
                     }
                 }
+                // Drop players who disconnected while this start waited for the
+                // client lock. Boss scaling must use the roster that will actually
+                // receive STARTGAME, not the earlier lobby snapshot.
+                Set<ClientData> currentStartPlayers = new HashSet<>();
+                for (ClientRecipient recipient : recipients) {
+                    if (recipient.canStartGame())
+                        currentStartPlayers.add(recipient.client);
+                }
+                startPlayers.retainAll(currentStartPlayers);
+                int finalPlayerCount = startPlayers.size() + (mIsDedicated ? 0 : 1);
+                boolean finalRosterHasBoss = !mIsDedicated
+                        && Globals.getInstance().mPlayerID == Globals.BOSS_PLAYER_ID;
+                for (ClientRecipient recipient : recipients) {
+                    if (recipient.canStartGame() && recipient.playerID == Globals.BOSS_PLAYER_ID)
+                        finalRosterHasBoss = true;
+                }
+                if (Globals.getInstance().mBossMode
+                        && (!finalRosterHasBoss || finalPlayerCount < 2))
+                    return;
                 final long startAt;
                 final long duration;
                 final long roundID;
                 final String roundToken;
                 final long gpsStartTime;
+                final boolean bossMode;
                 synchronized (mServerStateLock) {
                     if (!isClientTaskActive() || mEndingGame
                             || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
@@ -574,7 +596,19 @@ public class TcpServer extends Service {
                     mRoundToken = roundToken;
                     gpsStartTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(startAt,
                             SystemClock.elapsedRealtime());
+                    bossMode = Globals.getInstance().mBossMode;
+                    if (bossMode) {
+                        mBossHunterCount = Math.max(0, finalPlayerCount - 1);
+                        Globals.getInstance().mBossHunterCount = mBossHunterCount;
+                    }
                 }
+                // Send the final Boss profile immediately before STARTGAME on each
+                // player's TCP stream. TCP ordering guarantees that the health update
+                // is applied before that phone enters the synchronized countdown.
+                String bossSettingsMessage = bossMode
+                        ? createPlayerSettingsMessage(SEND_ALL, false) : null;
+                if (bossMode && bossSettingsMessage == null)
+                    return;
                 String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON
                         + createStartInfo(roundID, startAt, duration, roundToken, gpsStartTime);
                 boolean delivered = false;
@@ -585,8 +619,12 @@ public class TcpServer extends Service {
                                 || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
                             return;
                     }
-                    if (recipient.canStartGame())
+                    if (recipient.canStartGame()) {
+                        if (bossSettingsMessage != null
+                                && !recipient.client.sendTCPMessage(bossSettingsMessage))
+                            continue;
                         delivered = recipient.client.sendTCPMessage(message) || delivered;
+                    }
                 }
                 if (!delivered)
                     return;
@@ -597,11 +635,6 @@ public class TcpServer extends Service {
                         return;
                     mScheduledStart = startAt;
                     mScheduledDuration = duration;
-                    if (Globals.getInstance().mBossMode) {
-                        int playerCount = startPlayers.size() + (mIsDedicated ? 0 : 1);
-                        mBossHunterCount = Math.max(0, playerCount - 1);
-                        Globals.getInstance().mBossHunterCount = mBossHunterCount;
-                    }
                     mStartAnnounced = true;
                     cancelBalancedCheckInTimeoutLocked();
                     sendBroadcast(getScheduledGameStart());
@@ -1161,6 +1194,7 @@ public class TcpServer extends Service {
             game.put(JSON_GAMEMODE, Globals.getInstance().mGameMode);
             game.put(JSON_BALANCED_MODE, Globals.getInstance().mBalancedRandom);
             game.put(JSON_BALANCED_QR, Globals.getInstance().mBalancedRequireQr);
+            game.put(JSON_POWERUP_QR_REQUIRED, Globals.getInstance().mPowerupQrRequired);
             if (mIsDedicated) {
                 game.put(JSON_DEDICATED, true);
                 game.put(JSON_GAMESTATE, Globals.getInstance().mGameState);
@@ -1720,9 +1754,15 @@ public class TcpServer extends Service {
     }
 
     private void sendPlayerSettingsUpdate(int playerID, boolean applyAll) {
+        String message = createPlayerSettingsMessage(playerID, applyAll);
+        if (message != null)
+            sendTCPMessageAll(message);
+    }
+
+    private String createPlayerSettingsMessage(int playerID, boolean applyAll) {
         JSONArray players = getPlayerSettings(playerID, applyAll);
         if (players == null)
-            return;
+            return null;
         try {
             JSONObject game = new JSONObject();
             // A reply must not restore a policy captured before waiting for settings.
@@ -1731,10 +1771,10 @@ public class TcpServer extends Service {
             game.put(JSON_ONLY_SERVER_SETTINGS, Globals.getInstance().mOnlyServerSettings);
             game.put(JSON_TOURNAMENT_MODE, Globals.getInstance().mTournamentMode);
             game.put(JSON_BOSS_MODE, Globals.getInstance().mBossMode);
-            String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
-            sendTCPMessageAll(message);
+            return TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
         } catch (JSONException e) {
             e.printStackTrace();
+            return null;
         }
     }
 
@@ -1767,6 +1807,30 @@ public class TcpServer extends Service {
         // single-shot profile regardless of which queued frame reaches it first.
         sendAllGameInfo(SEND_ALL);
         sendPlayerSettingsUpdate(SEND_ALL, false);
+    }
+
+    /** Switch an idle lobby from the locked tournament profile to a classic game mode. */
+    public boolean setClassicGameMode(int gameMode) {
+        if (!Globals.isValidGameMode(gameMode))
+            return false;
+        Globals globals = Globals.getInstance();
+        synchronized (mServerStateLock) {
+            if (globals.mGameState != Globals.GAME_STATE_NONE || mStartingGame || mStartAnnounced)
+                return false;
+            globals.applyClassicRules(gameMode);
+            mBossHunterCount = -1;
+            cancelBalancedCheckInTimeoutLocked();
+        }
+        Globals.getmPlayerSettingsSemaphore();
+        try {
+            for (Globals.PlayerSettings settings : globals.mPlayerSettings.values())
+                Globals.applyClassicRules(settings);
+        } finally {
+            globals.mPlayerSettingsSemaphore.release();
+        }
+        sendAllGameInfo(SEND_ALL);
+        sendPlayerSettingsUpdate(SEND_ALL, false);
+        return true;
     }
 
     /** Switch between standard Tournament and the fixed Player-1 Boss variant. */

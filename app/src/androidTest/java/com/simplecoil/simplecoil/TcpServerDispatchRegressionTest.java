@@ -1213,6 +1213,63 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void finalBossHealthIsSentBeforeTheCountdownStarts() throws Exception {
+        Globals globals = Globals.getInstance();
+        boolean tournamentMode = globals.mTournamentMode;
+        boolean bossMode = globals.mBossMode;
+        boolean allowPlayerSettings = globals.mAllowPlayerSettings;
+        boolean onlyServerSettings = globals.mOnlyServerSettings;
+        int bossHunterCount = globals.mBossHunterCount;
+        Map<Byte, Globals.PlayerSettings> savedSettings = copyPlayerSettings();
+        try {
+            globals.mTournamentMode = true;
+            globals.mBossMode = true;
+            globals.mAllowPlayerSettings = false;
+            globals.mOnlyServerSettings = true;
+            globals.mBossHunterCount = -1;
+            Globals.getmPlayerSettingsSemaphore();
+            try {
+                globals.mPlayerSettings.clear();
+            } finally {
+                globals.mPlayerSettingsSemaphore.release();
+            }
+            addClient(2, new MemorySocket());
+            addClient(3, new MemorySocket());
+
+            dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+
+            for (MemorySocket socket : sockets) {
+                DataInputStream frames = new DataInputStream(
+                        new ByteArrayInputStream(socket.bytes.toByteArray()));
+                JSONObject settings = readJsonFrame(frames.readUTF());
+                JSONObject start = readJsonFrame(frames.readUTF());
+                assertTrue(settings.getBoolean(TcpServer.JSON_BOSS_MODE));
+                JSONArray players = settings.getJSONArray(TcpServer.JSON_PLAYERSETTINGS);
+                assertEquals(Globals.BOSS_BASE_HEALTH + 2 * Globals.BOSS_HEALTH_PER_HUNTER,
+                        playerSettings(players, Globals.BOSS_PLAYER_ID)
+                                .getInt(TcpServer.JSON_HEALTH));
+                assertEquals(Globals.BOSS_HUNTER_HEALTH,
+                        playerSettings(players, 2).getInt(TcpServer.JSON_HEALTH));
+                assertTrue(start.getLong(TcpServer.JSON_GAMESTART) > 0);
+            }
+            assertEquals(2, globals.mBossHunterCount);
+        } finally {
+            globals.mTournamentMode = tournamentMode;
+            globals.mBossMode = bossMode;
+            globals.mAllowPlayerSettings = allowPlayerSettings;
+            globals.mOnlyServerSettings = onlyServerSettings;
+            globals.mBossHunterCount = bossHunterCount;
+            Globals.getmPlayerSettingsSemaphore();
+            try {
+                globals.mPlayerSettings.clear();
+                globals.mPlayerSettings.putAll(savedSettings);
+            } finally {
+                globals.mPlayerSettingsSemaphore.release();
+            }
+        }
+    }
+
+    @Test
     public void reconnectRequiresClockResynchronizationBeforeQueuedStart() throws Exception {
         MemorySocket replacement = new MemorySocket();
         sockets.add(replacement);
@@ -1373,8 +1430,49 @@ public class TcpServerDispatchRegressionTest {
 
     private JSONObject readJson(MemorySocket socket) throws Exception {
         String message = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray())).readUTF();
+        return readJsonFrame(message);
+    }
+
+    private JSONObject readJsonFrame(String message) throws Exception {
         assertTrue(message.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
         return new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length()));
+    }
+
+    private JSONObject playerSettings(JSONArray settings, int playerID) throws Exception {
+        for (int index = 0; index < settings.length(); index++) {
+            JSONObject player = settings.getJSONObject(index);
+            if (player.getInt(TcpServer.JSON_PLAYERID) == playerID)
+                return player;
+        }
+        throw new AssertionError("Missing settings for player " + playerID);
+    }
+
+    private Map<Byte, Globals.PlayerSettings> copyPlayerSettings() {
+        Map<Byte, Globals.PlayerSettings> copy = new HashMap<>();
+        Globals.getmPlayerSettingsSemaphore();
+        try {
+            for (Map.Entry<Byte, Globals.PlayerSettings> entry
+                    : Globals.getInstance().mPlayerSettings.entrySet()) {
+                Globals.PlayerSettings source = entry.getValue();
+                Globals.PlayerSettings target = new Globals.PlayerSettings();
+                target.health = source.health;
+                target.shots = source.shots;
+                target.reloadTime = source.reloadTime;
+                target.reloadOnEmpty = source.reloadOnEmpty;
+                target.spawnTime = source.spawnTime;
+                target.damage = source.damage;
+                target.overrideLives = source.overrideLives;
+                target.lives = source.lives;
+                target.allowShotModeSingle = source.allowShotModeSingle;
+                target.allowShotModeBurst3 = source.allowShotModeBurst3;
+                target.allowShotModeAuto = source.allowShotModeAuto;
+                target.firingMode = source.firingMode;
+                copy.put(entry.getKey(), target);
+            }
+        } finally {
+            Globals.getInstance().mPlayerSettingsSemaphore.release();
+        }
+        return copy;
     }
 
     private void assertStartFrame(String frame) throws Exception {
