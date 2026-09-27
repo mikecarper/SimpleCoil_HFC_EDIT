@@ -84,6 +84,14 @@ public class TcpServer extends Service {
 
     public static final String JSON_PLAYERS = "players";
     public static final String JSON_PLAYERNAME = "playername";
+    public static final String JSON_LOBBY_READY = "lobbyready";
+    public static final String JSON_LOBBY_BENCHED = "lobbybenched";
+    public static final String JSON_LOBBY_CONNECTED = "lobbyconnected";
+    public static final String JSON_LOBBY_HOST = "lobbyhost";
+    public static final String JSON_LOBBY_PLAYING = "lobbyplaying";
+    public static final String JSON_LOBBY_WAIT = "lobbywait";
+    public static final String JSON_END_VOTE = "endvote";
+    public static final String JSON_END_VOTES = "endvotes";
     public static final String JSON_PLAYERNAMECHANGE = "playernamechange";
     public static final String JSON_PLAYERID = "playerID";
     public static final String JSON_PLAYERIP = "playerIP";
@@ -107,6 +115,8 @@ public class TcpServer extends Service {
     public static final String JSON_ONLY_SERVER_SETTINGS = "onlyserversettings";
     public static final String JSON_TOURNAMENT_MODE = "tournamentmode";
     public static final String JSON_BOSS_MODE = "bossmode";
+    public static final String JSON_CTF_MODE = "capturetheflag";
+    public static final String JSON_INFECTION_MODE = "infectionmode";
     public static final String JSON_PAIRED_GRENADE_ID = "pairedgrenadeID";
     public static final String JSON_GRENADE_PAIRINGS = "grenadepairings";
 
@@ -187,6 +197,7 @@ public class TcpServer extends Service {
     // created for the next lobby. It protects UDP messages that can outlive a
     // closed socket or a prior game session.
     private String mRoundToken;
+    private long mEndVotes;
     private volatile long mClockSamplingUntil;
     private ServerSocket mListenSocket;
     private volatile Thread mServerThread = null;
@@ -282,6 +293,10 @@ public class TcpServer extends Service {
         }
 
         boolean canStartGame() {
+            return isConnectedPlayer() && !client.lobbyBenched;
+        }
+
+        boolean isConnectedPlayer() {
             // TCP registration reserves zero for an unregistered socket.
             return isCurrent() && playerID > 0 && Globals.isValidPlayerID(playerID)
                     && client.clientSocket != null && client.out != null;
@@ -491,6 +506,8 @@ public class TcpServer extends Service {
     }
 
     public boolean startGame() {
+        if (!areLobbyPlayersReady())
+            return false;
         if (getNextGameStartWaitMillis() > 0)
             return false;
         if (!balancedStartReady())
@@ -525,6 +542,8 @@ public class TcpServer extends Service {
             if (mStartingGame || mStartAnnounced)
                 return true;
             return runClientTask(() -> {
+                if (!areLobbyPlayersReady())
+                    return;
                 if (!balancedStartReady())
                     return;
                 // Send to clients before confirming the start locally. A queued
@@ -583,6 +602,8 @@ public class TcpServer extends Service {
                     // complete spoken 10-to-0 countdown, even if an operator
                     // configured a shorter per-player respawn delay.  Longer
                     // configured delays are still honored.
+                    if (Globals.getInstance().mInfectionMode)
+                        Globals.getInstance().applyInfectionGameLimits();
                     long countdown = Globals.getInstance().mBalancedRandom ? 10
                             : Math.max(Globals.RESPAWN_TIME_SECONDS,
                             Math.max(Globals.MIN_RESPAWN_TIME_SECONDS,
@@ -594,6 +615,9 @@ public class TcpServer extends Service {
                     roundID = ++mRoundSequence;
                     roundToken = createRoundToken();
                     mRoundToken = roundToken;
+                    mEndVotes = 0;
+                    Globals.getInstance().mEndGameVotes = 0;
+                    Globals.getInstance().mEndGameVoteRequested = false;
                     gpsStartTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(startAt,
                             SystemClock.elapsedRealtime());
                     bossMode = Globals.getInstance().mBossMode;
@@ -611,6 +635,9 @@ public class TcpServer extends Service {
                     return;
                 String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON
                         + createStartInfo(roundID, startAt, duration, roundToken, gpsStartTime);
+                Globals.getInstance().mLobbyPlayers = java.util.Collections.unmodifiableMap(
+                        getLobbyPlayersSnapshot());
+                Globals.getInstance().removeBenchedPlayersFromGameRoster();
                 boolean delivered = false;
                 for (ClientRecipient recipient : recipients) {
                     synchronized (mServerStateLock) {
@@ -624,6 +651,9 @@ public class TcpServer extends Service {
                                 && !recipient.client.sendTCPMessage(bossSettingsMessage))
                             continue;
                         delivered = recipient.client.sendTCPMessage(message) || delivered;
+                    } else if (recipient.isConnectedPlayer() && recipient.client.lobbyBenched) {
+                        recipient.client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
+                                + "{\"" + JSON_LOBBY_WAIT + "\":true}");
                     }
                 }
                 if (!delivered)
@@ -659,6 +689,59 @@ public class TcpServer extends Service {
                 return false;
         }
         return true;
+    }
+
+    public Map<Byte, Boolean> getLobbyReadySnapshot() {
+        Map<Byte, Boolean> ready = new HashMap<>();
+        for (ClientRecipient recipient : getClientRecipients()) {
+            if (recipient.canStartGame())
+                ready.put(recipient.playerID, recipient.client.lobbyReady);
+        }
+        if (!mIsDedicated && Globals.getInstance().mPlayerID > 0)
+            ready.put(Globals.getInstance().mPlayerID, Globals.getInstance().mLocalLobbyReady);
+        return ready;
+    }
+
+    public boolean areLobbyPlayersReady() {
+        for (LobbyPlayer player : getLobbyPlayersSnapshot().values())
+            if (!player.benched && !player.gunReady) return false;
+        return true;
+    }
+
+    public Map<Byte, LobbyPlayer> getLobbyPlayersSnapshot() {
+        Map<Byte, LobbyPlayer> players = new HashMap<>();
+        for (ClientRecipient recipient : getClientRecipients()) {
+            if (recipient.playerID <= 0 || !Globals.isValidPlayerID(recipient.playerID)) continue;
+            ClientData client = recipient.client;
+            players.put(recipient.playerID, new LobbyPlayer(recipient.playerID,
+                    Globals.getInstance().getPlayerName(recipient.playerID),
+                    recipient.isConnectedPlayer(), client.lobbyReady,
+                    client.clockSynchronized, client.lobbyBenched, false));
+        }
+        Globals globals = Globals.getInstance();
+        if (!mIsDedicated && globals.mPlayerID > 0)
+            players.put(globals.mPlayerID, new LobbyPlayer(globals.mPlayerID, globals.mPlayerName,
+                    true, globals.mLocalLobbyReady, true, false, true));
+        return players;
+    }
+
+    /** Only the host UI can change participation, before a start is committed. */
+    public boolean setLobbyPlayerBenched(byte playerID, boolean benched) {
+        return runClientTask(() -> {
+            synchronized (mServerStateLock) {
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                        || mStartingGame || mStartAnnounced) return;
+                for (ClientRecipient recipient : getClientRecipients()) {
+                    if (recipient.playerID != playerID || !recipient.isConnectedPlayer()) continue;
+                    recipient.client.lobbyBenched = benched;
+                    Globals.getInstance().clearBalancedAssignments();
+                    cancelBalancedCheckInTimeoutLocked();
+                    break;
+                }
+            }
+            sendGameInfo(SEND_ALL, getClientRecipients());
+            sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+        });
     }
 
     private boolean balancedStartReady() {
@@ -942,6 +1025,52 @@ public class TcpServer extends Service {
         }
     }
 
+    /** A non-playing game master requests consent, but does not count as a player. */
+    public void requestEndGameVote() {
+        runClientTask(() -> updateEndGameVote(null, null, false));
+    }
+
+    private void updateEndGameVote(ClientData voter, String token, boolean approve) {
+        synchronized (mServerStateLock) {
+            if (!mIsDedicated || !mStartAnnounced || mEndingGame || !isValidRoundToken(mRoundToken)) return;
+            if (voter != null && !mRoundToken.equals(token)) return;
+            long participants = 0;
+            boolean validVoter = voter == null;
+            for (ClientRecipient recipient : getClientRecipients()) {
+                if (!recipient.canStartGame()) continue;
+                participants |= EndGameVotes.playerBit(recipient.playerID);
+                if (recipient.client == voter) validVoter = true;
+            }
+            if (!validVoter) return;
+            mEndVotes &= participants;
+            if (voter != null) {
+                long bit = EndGameVotes.playerBit(voter.mPlayerID);
+                mEndVotes = approve ? mEndVotes | bit : mEndVotes & ~bit;
+            }
+            Globals.getInstance().mEndGameVotes = mEndVotes;
+            Globals.getInstance().mEndGameVoteRequested = true;
+        }
+        publishEndGameVotes();
+        if (EndGameVotes.hasQuorum(mEndVotes)) endGame();
+    }
+
+    private void publishEndGameVotes() {
+        final String token;
+        final long votes;
+        synchronized (mServerStateLock) {
+            if (!mStartAnnounced || !isValidRoundToken(mRoundToken)) return;
+            token = mRoundToken;
+            votes = mEndVotes;
+        }
+        try {
+            String message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + new JSONObject()
+                    .put(JSON_END_VOTES, votes).put(JSON_END_VOTE, true).put(JSON_ROUND_TOKEN, token);
+            for (ClientRecipient recipient : getClientRecipients())
+                if (recipient.canStartGame()) recipient.client.sendTCPMessage(message);
+            sendBroadcast(new Intent(NetMsg.NETMSG_ENDVOTE).putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+        } catch (JSONException e) { Log.w(TAG, "Unable to publish end-game votes", e); }
+    }
+
     public void endGame() {
         synchronized (mServerStateLock) {
             mNextGameStartAllowedAt = Math.max(mNextGameStartAllowedAt,
@@ -1148,13 +1277,23 @@ public class TcpServer extends Service {
     private void sendGameInfo(int id, List<ClientRecipient> recipients) {
         try {
             JSONArray players = new JSONArray();
+            Map<Byte, LobbyPlayer> lobbyPlayers = getLobbyPlayersSnapshot();
             Map<Byte, InetAddress> teamIPMap = getTeamIPMapSnapshot();
+            for (ClientRecipient recipient : recipients)
+                if (recipient.client.lobbyBenched && recipient.isConnectedPlayer()
+                        && recipient.client.lobbyAddress != null)
+                    teamIPMap.put(recipient.playerID, recipient.client.lobbyAddress);
             if (teamIPMap.isEmpty())
                 return;
             for (Map.Entry<Byte, InetAddress> entry : teamIPMap.entrySet()) {
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERNAME, Globals.getInstance().getPlayerName(entry.getKey()));
                 player.put(JSON_PLAYERID, entry.getKey());
+                LobbyPlayer presence = lobbyPlayers.get(entry.getKey());
+                player.put(JSON_LOBBY_READY, presence != null && presence.gunReady);
+                player.put(JSON_CLOCK_READY, presence != null && presence.clockReady);
+                player.put(JSON_LOBBY_CONNECTED, presence != null && presence.connected);
+                player.put(JSON_LOBBY_BENCHED, presence != null && presence.benched);
                 player.put(JSON_PLAYERIP, entry.getValue());
                 Integer balancedTeam = Globals.getInstance().mBalancedTeams.get(entry.getKey());
                 if (balancedTeam != null) {
@@ -1168,6 +1307,10 @@ public class TcpServer extends Service {
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERNAME, Globals.getInstance().mPlayerName);
                 player.put(JSON_PLAYERID, Globals.getInstance().mPlayerID);
+                player.put(JSON_LOBBY_READY, Globals.getInstance().mLocalLobbyReady);
+                player.put(JSON_CLOCK_READY, true);
+                player.put(JSON_LOBBY_CONNECTED, true);
+                player.put(JSON_LOBBY_HOST, true);
                 player.put(JSON_PLAYERIP, Globals.getIPAddressStr(getApplicationContext()));
                 Integer balancedTeam = Globals.getInstance().mBalancedTeams.get(
                         Globals.getInstance().mPlayerID);
@@ -1180,6 +1323,8 @@ public class TcpServer extends Service {
             }
             JSONObject game = new JSONObject();
             game.put(JSON_PLAYERS, players);
+            game.put(JSON_LOBBY_PLAYING, mStartAnnounced
+                    || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE);
             JSONObject limits = new JSONObject();
             if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
                 limits.put(JSON_TIMELIMIT, Globals.getInstance().mTimeLimit);
@@ -1208,6 +1353,8 @@ public class TcpServer extends Service {
             game.put(JSON_ONLY_SERVER_SETTINGS, Globals.getInstance().mOnlyServerSettings);
             game.put(JSON_TOURNAMENT_MODE, Globals.getInstance().mTournamentMode);
             game.put(JSON_BOSS_MODE, Globals.getInstance().mBossMode);
+            game.put(JSON_CTF_MODE, Globals.getInstance().mCaptureTheFlag);
+            game.put(JSON_INFECTION_MODE, Globals.getInstance().mInfectionMode);
             synchronized (mServerStateLock) {
                 if (mScheduledStart >= 0 && (mStartAnnounced
                         || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)) {
@@ -1771,6 +1918,8 @@ public class TcpServer extends Service {
             game.put(JSON_ONLY_SERVER_SETTINGS, Globals.getInstance().mOnlyServerSettings);
             game.put(JSON_TOURNAMENT_MODE, Globals.getInstance().mTournamentMode);
             game.put(JSON_BOSS_MODE, Globals.getInstance().mBossMode);
+            game.put(JSON_CTF_MODE, Globals.getInstance().mCaptureTheFlag);
+            game.put(JSON_INFECTION_MODE, Globals.getInstance().mInfectionMode);
             return TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
         } catch (JSONException e) {
             e.printStackTrace();
@@ -1787,6 +1936,8 @@ public class TcpServer extends Service {
         Globals globals = Globals.getInstance();
         enabled = Globals.TOURNAMENT_RULES_REQUIRED || enabled;
         globals.mTournamentMode = enabled;
+        globals.mCaptureTheFlag = false;
+        globals.mInfectionMode = false;
         if (enabled) {
             globals.applyTournamentRules();
             globals.mGameMode = Globals.GAME_MODE_2TEAMS;
@@ -1841,11 +1992,57 @@ public class TcpServer extends Service {
                     || mStartAnnounced)
                 return false;
             globals.mBossMode = enabled;
+            globals.mCaptureTheFlag = false;
+            globals.mInfectionMode = false;
             globals.mBossHunterCount = -1;
             mBossHunterCount = -1;
             globals.mBalancedRandom = false;
             globals.clearBalancedAssignments();
             globals.applyTournamentRules();
+        }
+        sendAllGameInfo(SEND_ALL);
+        sendPlayerSettingsUpdate(SEND_ALL, false);
+        return true;
+    }
+
+    /** Switch an idle lobby to the locked two-team QR capture-the-flag mode. */
+    public boolean setCaptureTheFlagMode() {
+        Globals globals = Globals.getInstance();
+        synchronized (mServerStateLock) {
+            if (globals.mGameState != Globals.GAME_STATE_NONE || mStartingGame
+                    || mStartAnnounced)
+                return false;
+            globals.mBossMode = false;
+            globals.mCaptureTheFlag = true;
+            globals.mInfectionMode = false;
+            globals.mBossHunterCount = -1;
+            mBossHunterCount = -1;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.applyTournamentRules();
+        }
+        sendAllGameInfo(SEND_ALL);
+        sendPlayerSettingsUpdate(SEND_ALL, false);
+        return true;
+    }
+
+    /** Switch an idle lobby to one-way survivor-to-zombie conversion rules. */
+    public boolean setInfectionMode() {
+        Globals globals = Globals.getInstance();
+        synchronized (mServerStateLock) {
+            if (globals.mGameState != Globals.GAME_STATE_NONE || mStartingGame
+                    || mStartAnnounced)
+                return false;
+            globals.mBossMode = false;
+            globals.mCaptureTheFlag = false;
+            globals.mInfectionMode = true;
+            globals.mBossHunterCount = -1;
+            mBossHunterCount = -1;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.resetInfectedPlayers();
+            globals.applyTournamentRules();
+            globals.applyInfectionGameLimits();
         }
         sendAllGameInfo(SEND_ALL);
         sendPlayerSettingsUpdate(SEND_ALL, false);
@@ -2037,7 +2234,9 @@ public class TcpServer extends Service {
 
     private boolean hasReachedScoreLimit(ClientData scoringPlayer) {
         Globals globals = Globals.getInstance();
-        if (!mIsDedicated || (globals.mGameLimit & Globals.GAME_LIMIT_SCORE) == 0 || globals.mScoreLimit <= 0)
+        if (!mIsDedicated || globals.mCaptureTheFlag || globals.mInfectionMode
+                || (globals.mGameLimit & Globals.GAME_LIMIT_SCORE) == 0
+                || globals.mScoreLimit <= 0)
             return false;
         long score = scoringPlayer.points;
         if (globals.mGameMode != Globals.GAME_MODE_FFA) {
@@ -2076,6 +2275,9 @@ public class TcpServer extends Service {
         private volatile DataOutputStream out = null;
         private volatile boolean connectionFailed;
         private volatile boolean clockSynchronized;
+        private volatile boolean lobbyReady = true;
+        private volatile boolean lobbyBenched;
+        private InetAddress lobbyAddress;
         // A ready acknowledgement is meaningful only after this connection has
         // received the exchanges used to calculate its clock offset.
         private int clockSamples;
@@ -2273,6 +2475,7 @@ public class TcpServer extends Service {
                                                 // Tournament clients can exit, but never use a
                                                 // departure packet to end the host's round.
                                                 boolean endsRoundWhenLastPlayer = message.equals(NetMsg.NETMSG_LEAVE)
+                                                        && !entry.getValue().lobbyBenched
                                                         && !Globals.getInstance().mTournamentMode;
                                                 removeClient(entry.getValue(), entry.getKey(), true,
                                                         endsRoundWhenLastPlayer ? NetMsg.NETMSG_LEAVE : NetMsg.NETMSG_QUIT);
@@ -2280,6 +2483,8 @@ public class TcpServer extends Service {
                                                         && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
                                                     endGame();
                                                 break;
+                                            } else if (entry.getValue().lobbyBenched) {
+                                                continue;
                                             } else if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
                                                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
                                                         || !hasRoundStarted()
@@ -2303,7 +2508,8 @@ public class TcpServer extends Service {
                                                 }
                                                 byte id = (byte) rawPlayerID;
                                                 ClientData scoringPlayer = mClientData.get(clientIDFromPlayerID(id));
-                                                if (scoringPlayer == null || id == entry.getValue().mPlayerID
+                                                if (scoringPlayer == null || scoringPlayer.lobbyBenched
+                                                        || id == entry.getValue().mPlayerID
                                                         || (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
                                                         && scoringPlayer.getNetworkTeam() == entry.getValue().getNetworkTeam())) {
                                                     Log.w(TAG, "Ignoring invalid elimination report from player " + entry.getValue().mPlayerID);
@@ -2384,22 +2590,10 @@ public class TcpServer extends Service {
                                                                 + NetMsg.NETMSG_CLOCKSYNCWAITING);
                                                 }
                                             } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
-                                                if (Globals.getInstance().mTournamentMode) {
-                                                    // The dedicated host is the sole tournament
-                                                    // authority. Treat any client end request as
-                                                    // a voluntary exit instead of ending the match.
-                                                    removeClient(entry.getValue(), entry.getKey(), true,
-                                                            NetMsg.NETMSG_QUIT);
-                                                    break;
-                                                }
-                                                if (Globals.getInstance().mOnlyServerSettings) {
-                                                    // If server settings only is enabled, then we treat this as if the client is leaving rather than ending the game
-                                                    removeClient(entry.getValue(), entry.getKey(), true);
-                                                    if (mClientData.size() <= 1 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
-                                                        endGame();
-                                                    break;
-                                                }
-                                                endGame();
+                                                // Manual requests must carry this round's nonce and
+                                                // pass the two-distinct-player vote path. Timers and
+                                                // scoring are ended by the host's own rules.
+                                                Log.w(TAG, "Ignoring unscoped player ENDGAME request");
                                             }
                                         } else {
                                             Log.d(TAG, "unknown tcp message received");
@@ -2486,6 +2680,24 @@ public class TcpServer extends Service {
                 e.printStackTrace();
                 return;
             }
+            if (player.has(JSON_END_VOTE)) {
+                Object approve = player.opt(JSON_END_VOTE);
+                Object token = player.opt(JSON_ROUND_TOKEN);
+                if (approve instanceof Boolean && token instanceof String)
+                    updateEndGameVote(client, (String) token, (Boolean) approve);
+                return;
+            }
+            if (player.has(JSON_LOBBY_READY) && !player.has(JSON_PLAYERNAME)) {
+                if (client.mPlayerID > 0 && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                        && !mStartingGame && !mStartAnnounced) {
+                    Object value = player.opt(JSON_LOBBY_READY);
+                    if (value instanceof Boolean) {
+                        client.lobbyReady = (Boolean) value;
+                        sendAllGameInfo(SEND_ALL);
+                    }
+                }
+                return;
+            }
             if (player.has(JSON_CLOCK_REQUEST) || player.has(JSON_CLOCK_READY)) {
                 if (client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)
                         || client.clientSocket == null)
@@ -2516,9 +2728,12 @@ public class TcpServer extends Service {
                             client.clockSamples = Math.min(GameClock.SAMPLES_PER_SYNC,
                                     client.clockSamples + 1);
                     } else if (Boolean.TRUE.equals(player.get(JSON_CLOCK_READY))) {
-                        if (client.clockSamples >= GameClock.SAMPLES_PER_SYNC)
+                        if (client.clockSamples >= GameClock.SAMPLES_PER_SYNC) {
+                            boolean changed = !client.clockSynchronized;
                             client.clockSynchronized = true;
-                        else
+                            if (changed && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
+                                sendAllGameInfo(SEND_ALL);
+                        } else
                             Log.w(TAG, "Ignoring clock-ready acknowledgement before sampling completed");
                     }
                 } catch (JSONException e) {
@@ -2527,6 +2742,7 @@ public class TcpServer extends Service {
                 return;
             }
             if (player.has(JSON_TELEMETRY)) {
+                if (client.lobbyBenched) return;
                 // Telemetry is intentionally best-effort. It feeds hosted-game
                 // scoreboards and visualizers, but never decides who was killed
                 // or whether a respawn is allowed.
@@ -2605,6 +2821,7 @@ public class TcpServer extends Service {
                 return;
             }
             if (player.has(JSON_GPSLONGITUDE)) {
+                if (client.lobbyBenched) return;
                 if (client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)) {
                     Log.w(TAG, "Ignoring GPS data from an unregistered client");
                     return;
@@ -2830,6 +3047,10 @@ public class TcpServer extends Service {
             if (rejoin && newRegistration)
                 Log.d(TAG, "rejoined client " + client.clientID + " not present so adding as a new player");
             client.mPlayerID = id;
+            client.lobbyReady = player.optBoolean(JSON_LOBBY_READY, true);
+            if (newRegistration)
+                client.lobbyBenched = player.optBoolean(JSON_LOBBY_BENCHED, false);
+            client.lobbyAddress = inetAddress;
             client.priorKills = priorKills;
             client.priorDeaths = priorDeaths;
             if (newRegistration && Globals.getInstance().mBalancedRandom) {
@@ -2864,6 +3085,10 @@ public class TcpServer extends Service {
                                   String departureAction) {
             if (mClientData.get(clientID) != client)
                 return;
+            synchronized (mServerStateLock) {
+                mEndVotes &= ~EndGameVotes.playerBit(client.mPlayerID);
+                Globals.getInstance().mEndGameVotes = mEndVotes;
+            }
             if (client.mPlayerID != 0) {
                 synchronized (mServerStateLock) {
                     clearEnemyGPSRevealsForPlayerLocked(client.mPlayerID);
@@ -2932,6 +3157,7 @@ public class TcpServer extends Service {
                 client.close();
                 mClientData.remove(clientID);
             }
+            if (Globals.getInstance().mEndGameVoteRequested) publishEndGameVotes();
             sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
         }
     }

@@ -16,7 +16,8 @@ public class PeerStatePacketTest {
                     id, id + 100L, PeerStatePacket.EVENT_HIT, id == 32 ? 1 : id + 1,
                     Globals.GAME_STATE_RUNNING, id % Globals.MAX_GRENADE_IDS,
                     10_000 + id, 500 + id, 1000, 250, 255, 30,
-                    37.77491 + id / 100_000.0, -122.41942 - id / 100_000.0);
+                    37.77491 + id / 100_000.0, -122.41942 - id / 100_000.0,
+                    id == 32 ? 1 : 0, id == 32 ? 7 : 0);
         }
 
         byte[] encoded = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
@@ -32,6 +33,8 @@ public class PeerStatePacketTest {
         assertEquals(37.77523, decoded.players[32].latitude, 0.0000051);
         assertEquals(-122.41974, decoded.players[32].longitude, 0.0000051);
         assertEquals(255, decoded.players[32].shotsRemaining);
+        assertEquals(1, decoded.players[32].carriedFlagTeam);
+        assertEquals(7, decoded.players[32].ctfCaptures);
     }
 
     @Test
@@ -63,5 +66,21 @@ public class PeerStatePacketTest {
         assertNotNull(decoded);
         assertEquals(0, decoded.senderID);
         assertEquals(12, decoded.players[7].ownerSequence);
+    }
+
+    @Test
+    public void infectionFlagRoundTripsWithoutGrowingPacket() {
+        PeerStatePacket.PlayerState[] players = new PeerStatePacket.PlayerState[33];
+        players[2] = new PeerStatePacket.PlayerState(2,
+                PeerStatePacket.FLAG_PRESENT | PeerStatePacket.FLAG_INFECTED,
+                3, 0, PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_RUNNING,
+                0, 0, 0, 5, 10, 30, 0, 0, 0);
+        byte[] encoded = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                UUID.randomUUID(), 1, 2, Globals.GAME_MODE_2TEAMS, players);
+        PeerStatePacket.Decoded decoded = PeerStatePacket.decode(encoded, 0, encoded.length);
+        assertNotNull(decoded);
+        assertEquals(PeerStatePacket.FLAG_PRESENT | PeerStatePacket.FLAG_INFECTED,
+                decoded.players[2].flags);
+        assertEquals(1312, encoded.length);
     }
 }

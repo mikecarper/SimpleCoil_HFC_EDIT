@@ -96,6 +96,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private boolean mPreviousAllowPlayerSettings;
     private boolean mPreviousTournamentMode;
     private boolean mPreviousBossMode;
+    private boolean mPreviousCaptureTheFlag;
+    private boolean mPreviousInfectionMode;
     private int mPreviousBossHunterCount;
     private boolean mTournamentPolicySaved;
     private boolean mTournamentPreviousAllowPlayerSettings;
@@ -267,6 +269,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mPreviousAllowPlayerSettings = globals.mAllowPlayerSettings;
         mPreviousTournamentMode = globals.mTournamentMode;
         mPreviousBossMode = globals.mBossMode;
+        mPreviousCaptureTheFlag = globals.mCaptureTheFlag;
+        mPreviousInfectionMode = globals.mInfectionMode;
         mPreviousBossHunterCount = globals.mBossHunterCount;
         mPreviousServerIP = globals.mServerIP;
         globals.mPlayerID = 0;
@@ -318,17 +322,31 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     mNetworkPlayerCountTV.setText(R.string.network_player_1count);
                     return;
                 }
+                if (Globals.getInstance().mInfectionMode && !infectionRosterReady()) {
+                    Toast.makeText(getApplicationContext(), R.string.infection_requires_player_one,
+                            Toast.LENGTH_SHORT).show();
+                    return;
+                }
                 startGame();
             }));
         }
         sharedPreferences = getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
         globals.mBossMode = FullscreenActivity.readBooleanPreference(sharedPreferences,
                 FullscreenActivity.PREF_BOSS_MODE, false);
+        globals.mCaptureTheFlag = !globals.mBossMode
+                && FullscreenActivity.readBooleanPreference(sharedPreferences,
+                FullscreenActivity.PREF_CTF_MODE, false);
+        globals.mInfectionMode = !globals.mBossMode && !globals.mCaptureTheFlag
+                && FullscreenActivity.readBooleanPreference(sharedPreferences,
+                FullscreenActivity.PREF_INFECTION_MODE, false);
+        globals.resetInfectedPlayers();
         globals.mBossHunterCount = -1;
         globals.applyTournamentRules();
         globals.mBalancedRandom = false;
         globals.clearBalancedAssignments();
         mGameModeButton.setText(globals.mBossMode ? R.string.game_mode_boss
+                : globals.mCaptureTheFlag ? R.string.game_mode_ctf
+                : globals.mInfectionMode ? R.string.game_mode_infection
                 : R.string.game_mode_tournament_2teams);
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
         int savedTimeLimit = FullscreenActivity.readIntPreference(sharedPreferences,
@@ -346,6 +364,9 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         Globals.getInstance().mScoreLimit = Globals.isValidGameLimit(savedScoreLimit) ? savedScoreLimit : 0;
         if (Globals.getInstance().mScoreLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
+        if (globals.mInfectionMode) {
+            globals.applyInfectionGameLimits();
+        }
         setGameLimit();
         int savedGPSMode = FullscreenActivity.readIntPreference(sharedPreferences, PREF_GPS_MODE,
                 Globals.GPS_TEAMMATE);
@@ -461,6 +482,9 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         globals.mAllowPlayerSettings = mPreviousAllowPlayerSettings;
         globals.mTournamentMode = mPreviousTournamentMode;
         globals.mBossMode = mPreviousBossMode;
+        globals.mCaptureTheFlag = mPreviousCaptureTheFlag;
+        globals.mInfectionMode = mPreviousInfectionMode;
+        globals.resetInfectedPlayers();
         globals.mBossHunterCount = mPreviousBossHunterCount;
         globals.mServerIP = mPreviousServerIP;
         globals.applyTournamentRules();
@@ -489,6 +513,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS).apply();
         if (mGameModeButton != null) {
             mGameModeButton.setText(globals.mBossMode ? R.string.game_mode_boss
+                    : globals.mCaptureTheFlag ? R.string.game_mode_ctf
+                    : globals.mInfectionMode ? R.string.game_mode_infection
                     : R.string.game_mode_tournament_2teams);
             mGameModeButton.setEnabled(globals.mGameState == Globals.GAME_STATE_NONE);
         }
@@ -523,17 +549,81 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             }
         } else {
             globals.mBossMode = enabled;
+            globals.mCaptureTheFlag = false;
+            globals.mInfectionMode = false;
             globals.mBossHunterCount = -1;
             globals.mBalancedRandom = false;
             globals.clearBalancedAssignments();
             globals.applyTournamentRules();
         }
         sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_BOSS_MODE, enabled)
+                .putBoolean(FullscreenActivity.PREF_CTF_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_INFECTION_MODE, false)
                 .putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, true)
                 .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
                 .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).apply();
         mGameModeButton.setText(enabled ? R.string.game_mode_boss
                 : R.string.game_mode_tournament_2teams);
+        getPlayerDisplayData();
+    }
+
+    private void setCaptureTheFlagMode() {
+        Globals globals = Globals.getInstance();
+        if (globals.mGameState != Globals.GAME_STATE_NONE) {
+            Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (mTcpServer != null) {
+            if (!mTcpServer.setCaptureTheFlagMode()) {
+                Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.mBossMode = false;
+            globals.mCaptureTheFlag = true;
+            globals.mInfectionMode = false;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.applyTournamentRules();
+        }
+        sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_BOSS_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_CTF_MODE, true)
+                .putBoolean(FullscreenActivity.PREF_INFECTION_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, true)
+                .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
+                .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).apply();
+        mGameModeButton.setText(R.string.game_mode_ctf);
+        getPlayerDisplayData();
+    }
+
+    private void setInfectionMode() {
+        Globals globals = Globals.getInstance();
+        if (globals.mGameState != Globals.GAME_STATE_NONE) {
+            Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (mTcpServer != null) {
+            if (!mTcpServer.setInfectionMode()) {
+                Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.mBossMode = false;
+            globals.mCaptureTheFlag = false;
+            globals.mInfectionMode = true;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.resetInfectedPlayers();
+            globals.applyTournamentRules();
+            globals.applyInfectionGameLimits();
+        }
+        sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_BOSS_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_CTF_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_INFECTION_MODE, true)
+                .putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, true)
+                .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
+                .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).apply();
+        mGameModeButton.setText(R.string.game_mode_infection);
         getPlayerDisplayData();
     }
 
@@ -556,6 +646,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         }
         sharedPreferences.edit().putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, false)
                 .putBoolean(FullscreenActivity.PREF_BOSS_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_CTF_MODE, false)
+                .putBoolean(FullscreenActivity.PREF_INFECTION_MODE, false)
                 .putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false)
                 .putInt(FullscreenActivity.PREF_GAME_MODE, gameMode).apply();
         mGameModeButton.setText(gameMode == Globals.GAME_MODE_FFA ? R.string.game_mode_ffa
@@ -584,6 +676,19 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         }
     }
 
+    private boolean infectionRosterReady() {
+        Globals globals = Globals.getInstance();
+        if (!globals.mInfectionMode)
+            return true;
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            return globals.mTeamIPMap.containsKey((byte) 1)
+                    && globals.mTeamIPMap.size() >= 2;
+        } finally {
+            globals.mTeamIPMapSemaphore.release();
+        }
+    }
+
     @Override
     public boolean onMenuItemClick(MenuItem item) {
         int id = item.getItemId();
@@ -592,6 +697,12 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             return true;
         } else if (id == R.id.game_mode_boss_item) {
             setBossMode(true);
+            return true;
+        } else if (id == R.id.game_mode_ctf_item) {
+            setCaptureTheFlagMode();
+            return true;
+        } else if (id == R.id.game_mode_infection_item) {
+            setInfectionMode();
             return true;
         } else if (id == R.id.game_mode_2teams_item
                 || id == R.id.game_mode_4teams_item
@@ -903,15 +1014,16 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private void requestEndGame() {
         if (isFinishing() || isDestroyed())
             return;
-        if (mTcpServer != null) {
-            mTcpServer.endGame();
-        } else {
-            // No service remains to send the ENDGAME broadcast that resets the UI.
-            endGame();
-        }
+        new AlertDialog.Builder(this).setTitle(R.string.end_game_dialog_title)
+                .setMessage(R.string.end_game_vote_host)
+                .setPositiveButton(R.string.yes, (dialog, which) -> {
+                    if (mTcpServer != null) mTcpServer.requestEndGameVote();
+                }).setNegativeButton(R.string.cancel, null).show();
     }
 
     private void endGame() {
+        Globals.getInstance().mEndGameVotes = 0;
+        Globals.getInstance().mEndGameVoteRequested = false;
         // TcpServer ends the current dedicated session by notifying and closing every
         // client before this broadcast reaches the UI.  Do not leave a stale lobby
         // count on screen: Start would otherwise appear possible even though there
@@ -1030,6 +1142,13 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 getPlayerDisplayData();
             } else if (NetMsg.NETMSG_BALANCEDLOBBY.equals(action)) {
                 updateBalancedLobbyStatus();
+            } else if (NetMsg.NETMSG_INFECTIONSTATE.equals(action)) {
+                int total = intent.getIntExtra(NetMsg.INTENT_INFECTION_TOTAL, 0);
+                int infected = intent.getIntExtra(NetMsg.INTENT_INFECTION_INFECTED, 0);
+                if (Globals.getInstance().mInfectionMode
+                        && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                        && total >= 2 && infected >= total && mTcpServer != null)
+                    mTcpServer.endGame();
             }
         }
     };
@@ -1049,6 +1168,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         intentFilter.addAction(NetMsg.NETMSG_TCPSERVERFAILED);
         intentFilter.addAction(NetMsg.NETMSG_PLAYERDATAUPDATE);
         intentFilter.addAction(NetMsg.NETMSG_BALANCEDLOBBY);
+        intentFilter.addAction(NetMsg.NETMSG_INFECTIONSTATE);
         return intentFilter;
     }
 
@@ -1197,7 +1317,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 mGameCountdownTimer = null;
                 Log.d(TAG, "Game time ended!");
                 Toast.makeText(getApplicationContext(), getString(R.string.dialog_game_time_expired), Toast.LENGTH_SHORT).show();
-                requestEndGame();
+                if (mTcpServer != null) mTcpServer.endGame();
+                else endGame();
                 Globals.getInstance().mServerGameTimeRemaining = 0;
             }
         };

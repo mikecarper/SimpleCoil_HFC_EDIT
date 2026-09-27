@@ -120,6 +120,7 @@ public class PlayerSettingsRegressionTest {
     public void localMaximumSettingsAreResetByTournamentRules() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
+            globals.mTournamentMode = true;
             globals.mFullHealth = 1000;
             globals.mRespawnTime = 1000;
             globals.mDamage = -1000;
@@ -163,6 +164,7 @@ public class PlayerSettingsRegressionTest {
 
     @Test
     public void allFourFieldsAreResetByTournamentRules() {
+        scenario.onActivity(activity -> Globals.getInstance().mTournamentMode = true);
         show(false);
         scenario.onActivity(activity -> {
             field(R.id.health_et).setText("1000");
@@ -212,7 +214,7 @@ public class PlayerSettingsRegressionTest {
         });
         click(DialogInterface.BUTTON_POSITIVE);
         scenario.onActivity(activity -> {
-            assertEquals(Globals.MAX_HEALTH, Globals.getInstance().mFullHealth);
+            assertEquals(77, Globals.getInstance().mFullHealth);
             assertTrue(Globals.getInstance().mAllowSingleShotMode);
             assertFalse(Globals.getInstance().mAllowBurst3ShotMode);
             assertFalse(Globals.getInstance().mAllowAutoShotMode);

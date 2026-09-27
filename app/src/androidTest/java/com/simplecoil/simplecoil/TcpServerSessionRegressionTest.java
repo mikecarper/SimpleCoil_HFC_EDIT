@@ -109,6 +109,32 @@ public class TcpServerSessionRegressionTest {
     }
 
     @Test
+    public void gunReadinessIsSharedAndPreventsAnUnreadyStart() throws Exception {
+        connect();
+        DataOutputStream out = new DataOutputStream(peer.getOutputStream());
+        out.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + new JSONObject().put(TcpServer.JSON_PLAYERID, 2)
+                .put(TcpServer.JSON_PLAYERNAME, "Needs gun")
+                .put(TcpServer.JSON_LOBBY_READY, false));
+        out.flush();
+        long deadline = SystemClock.elapsedRealtime() + 3_000;
+        while (!server.getLobbyReadySnapshot().containsKey((byte) 2)
+                && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        assertEquals(Boolean.FALSE, server.getLobbyReadySnapshot().get((byte) 2));
+        assertFalse(server.areLobbyPlayersReady());
+        assertFalse("Host accepted a start without the player's gun", server.startGame());
+        out.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + new JSONObject().put(TcpServer.JSON_LOBBY_READY, true));
+        out.flush();
+        deadline = SystemClock.elapsedRealtime() + 3_000;
+        while (!server.areLobbyPlayersReady() && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        assertEquals(Boolean.TRUE, server.getLobbyReadySnapshot().get((byte) 2));
+        assertTrue(server.areLobbyPlayersReady());
+    }
+
+    @Test
     public void hostCancellationRetiresItsAnnouncedCountdown() throws Exception {
         connect();
         set(server, "mStartAnnounced", true);
@@ -119,6 +145,49 @@ public class TcpServerSessionRegressionTest {
         assertTrue("Cancelled host retained its workers", awaitStopped(server, 2000));
         assertNull("A cancelled server must not restore its old countdown on the next bind",
                 server.getScheduledGameStart());
+    }
+
+    @Test
+    public void hostCanBenchUnreadyPhoneWithoutRemovingItFromLobby() throws Exception {
+        connect();
+        DataOutputStream out = new DataOutputStream(peer.getOutputStream());
+        out.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + new JSONObject().put(TcpServer.JSON_PLAYERID, 2)
+                .put(TcpServer.JSON_PLAYERNAME, "Spare")
+                .put(TcpServer.JSON_LOBBY_READY, false));
+        out.flush();
+        long deadline = SystemClock.elapsedRealtime() + 3000;
+        while (!server.getLobbyPlayersSnapshot().containsKey((byte) 2)
+                && SystemClock.elapsedRealtime() < deadline) Thread.sleep(10);
+        assertFalse(server.areLobbyPlayersReady());
+        assertFalse(server.arePlayerClocksSynchronized());
+        assertTrue(server.setLobbyPlayerBenched((byte) 2, true));
+        deadline = SystemClock.elapsedRealtime() + 3000;
+        while (!server.getLobbyPlayersSnapshot().get((byte) 2).benched
+                && SystemClock.elapsedRealtime() < deadline) Thread.sleep(10);
+        assertEquals(LobbyPlayer.Status.BENCHED, server.getLobbyPlayersSnapshot().get((byte) 2).status());
+        assertTrue(server.areLobbyPlayersReady());
+        assertTrue(server.arePlayerClocksSynchronized());
+        assertFalse("Cannot start with everyone sitting out", server.startGame());
+        out.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + new JSONObject().put(TcpServer.JSON_LOBBY_BENCHED, false));
+        out.flush();
+        server.sendTCPMessageAll("bench-barrier");
+        DataInputStream in = new DataInputStream(peer.getInputStream());
+        boolean advertised = false;
+        String frame;
+        do {
+            frame = in.readUTF();
+            if (frame.contains("\"lobbybenched\":true")) advertised = true;
+        } while (!"bench-barrier".equals(frame));
+        assertTrue("Sitting-out status was not published", advertised);
+        assertTrue("Client unbenched itself", server.getLobbyPlayersSnapshot().get((byte) 2).benched);
+        assertTrue(server.setLobbyPlayerBenched((byte) 2, false));
+        deadline = SystemClock.elapsedRealtime() + 3000;
+        while (server.getLobbyPlayersSnapshot().get((byte) 2).benched
+                && SystemClock.elapsedRealtime() < deadline) Thread.sleep(10);
+        assertFalse(server.areLobbyPlayersReady());
+        assertFalse(server.arePlayerClocksSynchronized());
     }
 
     @Test

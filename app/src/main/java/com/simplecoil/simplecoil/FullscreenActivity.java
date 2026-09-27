@@ -39,11 +39,15 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.drawable.AnimationDrawable;
+import android.location.Location;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
+import android.media.MediaPlayer;
+import android.media.RingtoneManager;
 import android.media.SoundPool;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
+import android.net.wifi.WifiManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -53,12 +57,14 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.os.Vibrator;
+import android.provider.Settings;
 import android.speech.tts.TextToSpeech;
 import android.util.Log;
 import android.util.SparseBooleanArray;
 import android.util.SparseIntArray;
 import android.util.TypedValue;
 import android.view.LayoutInflater;
+import android.view.Gravity;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
@@ -69,8 +75,10 @@ import android.webkit.WebView;
 import android.widget.Button;
 import android.widget.Chronometer;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.ListView;
+import android.widget.LinearLayout;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
@@ -105,6 +113,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.TreeMap;
 import java.util.Locale;
 import java.util.Random;
 import java.util.UUID;
@@ -165,6 +176,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private TextView mShotsRemainingLabelTV = null;
     private TextView mShotsRemainingTV = null;
     private float mLobbyShotsTextSizePx;
+    private RelativeLayout.LayoutParams mLobbyShotsLabelLayoutParams;
+    private RelativeLayout.LayoutParams mLobbyShotsLayoutParams;
+    private RelativeLayout.LayoutParams mLobbyReloadLayoutParams;
+    private RelativeLayout.LayoutParams mLobbyHealthLabelLayoutParams;
+    private RelativeLayout.LayoutParams mLobbyRecoilLabelLayoutParams;
+    private RelativeLayout.LayoutParams mLobbyRecoilLayoutParams;
+    private View mRecoilLabelTV = null;
     private TextView mRecoilModeTV = null;
     private TextView mHitsTakenTV = null;
     private TextView mTeamLabelTV = null;
@@ -222,32 +240,40 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private CountDownTimer mGameCountdownTimer = null;
     private CountDownTimer mConnectFailTimer = null;
     private CountDownTimer mGameInviteTimer = null;
-    private CountDownTimer mQuitGameTimer = null;
+    private AlertDialog mGameExitDialog;
+    private long mGameControlGeneration;
+    private boolean mEndVotePrompted;
     private AlertDialog mGameInviteDialog = null;
     private AlertDialog mStartWizardDialog = null;
     private boolean mStartWizardShown;
     private boolean mWizardUsesHub = true;
+    private boolean mWizardStartsPhoneHub;
     private boolean mWizardIndoor;
     private boolean mWizardBoss;
     private boolean mUseHubAutoJoin = true;
+    private boolean mPhoneHubMode;
     private String mPendingGameInviteID;
     private String mDismissedGameInviteID;
     private long mDismissedGameInviteUntil;
     private boolean mGameTimerRunning = false;
-    private boolean mPlayerQuitWindowOpen;
-    private long mPlayerQuitWindowEndsAt;
     private static final long GAME_INVITE_AUTO_JOIN_DELAY_MS = 10_000;
     private static final long GAME_INVITE_DECLINE_SUPPRESSION_MS = 30_000;
-    private static final long PLAYER_QUIT_WINDOW_MS = 30_000;
     // A team checkpoint stays associated with one eliminated player until they
     // either use it, receive a Game Master grant, or complete the wait.
     private int mRespawnQrTeam;
     private boolean mRespawnQrScannerActive;
     private boolean mTeamAssignmentQrScannerActive;
+    private boolean mCtfQrScannerActive;
     private boolean mRespawnQrRequestPending;
     private boolean mActivityResumed;
     private boolean mRespawnQrOpenWhenResumed;
     private boolean mTeamAssignmentQrOpenWhenResumed;
+    private boolean mCtfQrOpenWhenResumed;
+    private int mCarriedFlagTeam;
+    private int mCtfCaptures;
+    private final int[] mKnownFlagCarriers = new int[3];
+    private final int[] mKnownCtfScores = new int[3];
+    private MediaPlayer mFlagSiren;
     private RecoilWifiAutoJoiner mRecoilWifiAutoJoiner;
     private static final long NETWORK_OPTIONS_WIFI_WAIT_MS = 10_000L;
     // Checking Android's already-known connection state is cheap; run this
@@ -408,20 +434,34 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private volatile int mLastSpokenGameStartSecond = Integer.MAX_VALUE;
     private final ArrayDeque<Integer> mPendingVoicePrompts = new ArrayDeque<>();
     private final KillStreakVoice mKillStreakVoice = new KillStreakVoice(new Random());
+    private final InactivityVoice mInactivityVoice = new InactivityVoice(new Random());
     private long mNextGameStartAllowedAt;
     private volatile boolean mRespawnQrVoiceReminderActive;
     private static final int GAME_START_VOICE_COUNTDOWN_SECONDS = 10;
     private static final long SYNCHRONIZED_COUNTDOWN_TICK_MS = 100;
     private static final String GAME_START_COUNTDOWN_UTTERANCE_ID = "simplecoil-game-start";
     private static final String ROUND_START_UTTERANCE_ID = "simplecoil-round-start";
+    static final long ROUND_START_VOICE_DELAY_MS = 1_000;
+    private static final String ROUND_START_PAUSE_UTTERANCE_ID = "simplecoil-round-start-pause";
     private static final String ROUND_END_UTTERANCE_ID = "simplecoil-round-end";
     private static final String KILL_STREAK_UTTERANCE_ID = "simplecoil-kill-streak";
+    static final long KILL_STREAK_FOLLOWUP_DELAY_MS = 1_000;
+    private static final String KILL_STREAK_PAUSE_UTTERANCE_ID =
+            "simplecoil-kill-streak-pause";
     private static final String ENEMY_DESTROYED_UTTERANCE_ID = "simplecoil-enemy-destroyed";
     private static final long RESPAWN_QR_VOICE_REMINDER_INTERVAL_MS = 5_000;
     private static final String RESPAWN_QR_VOICE_REMINDER_UTTERANCE_ID = "simplecoil-respawn-qr";
     private static final long RELOAD_VOICE_REMINDER_INTERVAL_MS = 3_000;
     private static final String RELOAD_VOICE_REMINDER_UTTERANCE_ID = "simplecoil-reload";
     private volatile boolean mReloadVoiceReminderActive;
+    static final long INACTIVITY_FIRST_REMINDER_MS = 40_000;
+    static final long INACTIVITY_REPEAT_REMINDER_MS = 10_000;
+    private static final float INACTIVITY_GPS_MOVEMENT_METERS = 3.0f;
+    private static final String INACTIVITY_REMINDER_UTTERANCE_ID = "simplecoil-inactivity";
+    private boolean mInactivityReminderActive;
+    private long mNextInactivityReminderAt;
+    private double mInactivityGpsLatitude = Double.NaN;
+    private double mInactivityGpsLongitude = Double.NaN;
     private final Runnable mRespawnQrVoiceReminder = new Runnable() {
         @Override
         public void run() {
@@ -444,6 +484,23 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             scheduleReloadVoiceReminder(RELOAD_VOICE_REMINDER_INTERVAL_MS);
         }
     };
+    private final Runnable mInactivityVoiceReminder = new Runnable() {
+        @Override
+        public void run() {
+            if (!shouldAnnounceInactivityReminder()) {
+                stopInactivityVoiceReminder();
+                return;
+            }
+            long now = SystemClock.elapsedRealtime();
+            if (now < mNextInactivityReminderAt) {
+                scheduleInactivityVoiceReminder(mNextInactivityReminderAt - now);
+                return;
+            }
+            announceInactivityReminder();
+            mNextInactivityReminderAt = now + INACTIVITY_REPEAT_REMINDER_MS;
+            scheduleInactivityVoiceReminder(INACTIVITY_REPEAT_REMINDER_MS);
+        }
+    };
 
     private static final int REQUEST_CODE_LOCATION_PERMISSIONS = 1022;
     private static final int REQUEST_CODE_BLUETOOTH_PERMISSIONS = 1023;
@@ -462,6 +519,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final int RELOADING_STATE_STARTED = 1;
     private static final int RELOADING_STATE_FINISHING = 2;
     private static final int RELOADING_STATE_ELIMINATED = 3;
+    /** The original zombie becomes vulnerable after earning this many kills. */
+    private static final int ORIGINAL_ZOMBIE_PROTECTED_KILLS = 2;
     private int mReloading = RELOADING_STATE_ELIMINATED;
     private byte[] mPendingReloadCommand;
 
@@ -481,13 +540,22 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     public final static int RECOIL_OFFSET_BATTERY_LEVEL = 7;
     public final static int RECOIL_OFFSET_HIT_BY1_SHOTID = 8;
     public final static int RECOIL_OFFSET_HIT_BY1 = 9;
+    public final static int RECOIL_OFFSET_HIT_BY1_SENSOR = 10;
     public final static int RECOIL_OFFSET_HIT_BY2_SHOTID = 11;
     public final static int RECOIL_OFFSET_HIT_BY2 = 12;
+    public final static int RECOIL_OFFSET_HIT_BY2_SENSOR = 13;
     public final static int RECOIL_OFFSET_TEAM = 1;
     public final static int RECOIL_OFFSET_SHOTS_REMAINING = 14;
     public final static int RECOIL_OFFSET_STATUS = 15;
 
     public final static int RECOIL_TRIGGER_BIT = 0x01;
+    static final int HIT_SENSOR_EXTERNAL = 0x08;
+    static final int HIT_SENSOR_CENTER = 0x04;
+    static final int HIT_SENSOR_LEFT = 0x02;
+    static final int HIT_SENSOR_RIGHT = 0x01;
+    static final int INCOMING_HIT_DIRECTION_CENTER = 0;
+    static final int INCOMING_HIT_DIRECTION_LEFT = 1;
+    static final int INCOMING_HIT_DIRECTION_RIGHT = 2;
     public final static int RECOIL_RELOAD_BIT = 0x02;
     public final static int RECOIL_THUMB_BIT = 0x04;
     public final static int RECOIL_POWER_BIT = 0x10;
@@ -582,6 +650,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     public static final String PREF_BALANCED_MODE = "BalancedRandomMode";
     public static final String PREF_BALANCED_QR = "BalancedRandomRequireQr";
     public static final String PREF_BOSS_MODE = "BossMode";
+    public static final String PREF_CTF_MODE = "CaptureTheFlagMode";
+    public static final String PREF_INFECTION_MODE = "InfectionMode";
     public static final String PREF_POWERUP_QR_REQUIRED = "PowerupQrRequired";
     public static final String PREF_LIMIT_TIME = "TimeLimit";
     public static final String PREF_LIMIT_LIVES = "LivesLimit";
@@ -852,6 +922,534 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     // A standalone laptop has announced that it is replacing this idle peer
     // lobby. SERVERREPLY completes UDP discovery before TCP is restarted.
     private boolean mLobbyTakeoverPending;
+    private final SharedLobby mSharedLobby = new SharedLobby();
+    private final Handler mLobbyHandler = new Handler(Looper.getMainLooper());
+    private long mLobbySearchStartedAt;
+    private long mLobbyNextDiscoveryAt;
+    private boolean mLobbyJoined;
+    private String mLobbyNetworkAddress;
+    private String mLobbyRosterSignature;
+    private String mLobbyNotice;
+    private final Runnable mLobbyPulse = new Runnable() {
+        @Override public void run() {
+            if (!mActivityResumed || isFinishing() || isDestroyed())
+                return;
+            updateSharedLobby();
+            renderLobby();
+            mLobbyHandler.postDelayed(this, 1_000);
+        }
+    };
+
+    private void initializeLobbyScreen() {
+        if (getSupportActionBar() != null)
+            getSupportActionBar().hide();
+        // The shared lobby replaces the old gun-first setup wizard.
+        mStartWizardShown = true;
+        findViewById(R.id.lobby_action_bar).addOnLayoutChangeListener(
+                (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) ->
+                        updateLobbyContentInset());
+        findViewById(R.id.lobby_wifi_button).setOnClickListener(v -> showLobbyWifiOptions());
+        findViewById(R.id.lobby_name_button).setOnClickListener(v -> requestPlayerName());
+        findViewById(R.id.lobby_gun_button).setOnClickListener(v -> {
+            if (mCommunicating) showLobbyEquipment();
+            else toggleLobbyPairing();
+        });
+        findViewById(R.id.lobby_team_button).setOnClickListener(v -> showLobbyTeams());
+        findViewById(R.id.lobby_scan_button).setOnClickListener(v -> openTeamAssignmentQrScanner());
+        findViewById(R.id.lobby_mode_button).setOnClickListener(this::showGameModeMenu);
+        findViewById(R.id.lobby_rules_button).setOnClickListener(v -> showLobbyMatchOptions());
+        findViewById(R.id.lobby_more_button).setOnClickListener(v -> showLobbyAdvanced());
+        findViewById(R.id.lobby_primary_button).setOnClickListener(v -> {
+            if (mUseNetwork && ((!mIsServer && Globals.getInstance().mLocalLobbyBenched)
+                    || Globals.getInstance().mLobbyRoundActive)) {
+                return;
+            } else if (mUseNetwork && !isGameNetworkAvailable()) {
+                showLobbyWifiOptions();
+            } else if (!mCommunicating) {
+                toggleLobbyPairing();
+            } else if (!mUseNetwork || mIsServer) {
+                mStartGameButton.performClick();
+            }
+            renderLobby();
+        });
+        if (Globals.getInstance().mPlayerID <= 0) {
+            Globals.getInstance().mPlayerID = 1;
+            setTeam();
+        }
+        renderLobby();
+    }
+
+    private boolean isLobbyPairingBusy() {
+        return !mCommunicating && (mScanning || mConnected || mTriggerPairingActive
+                || mCollectingNewWeaponCandidates);
+    }
+
+    private void toggleLobbyPairing() {
+        if (isLobbyPairingBusy()) {
+            cancelNewWeaponPairing();
+            returnFromNewWeaponPairing();
+        } else {
+            (mDeviceAddress.isEmpty() ? mConnectButton : mReconnectButton).performClick();
+        }
+        renderLobby();
+    }
+
+    private CharSequence lobbyGunStatus() {
+        if (mCommunicating) return getString(R.string.lobby_gun_ready);
+        if (mTriggerPairingActive || mWeaponSyncTriggerHintShown)
+            return getString(R.string.connect_status_hold_trigger);
+        TextView detailed = findViewById(R.id.connect_status_tv);
+        if (detailed != null && !android.text.TextUtils.isEmpty(detailed.getText()))
+            return detailed.getText();
+        return getString(R.string.lobby_gun_missing);
+    }
+
+    private void showLobbyWifiOptions() {
+        new AlertDialog.Builder(this).setTitle(R.string.lobby_connection_label)
+                .setItems(new String[]{getString(R.string.lobby_wifi_settings),
+                        getString(R.string.lobby_phone_hotspot), getString(R.string.lobby_retry)},
+                        (dialog, which) -> {
+                            mUseNetwork = true;
+                            mUseHubAutoJoin = which != 1;
+                            mPhoneHubMode = which == 1;
+                            mLobbyNotice = null;
+                            if (which == 0)
+                                startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS));
+                            else if (which == 1)
+                                openPhoneHotspotSettings();
+                            else if (mRecoilWifiAutoJoiner != null)
+                                mRecoilWifiAutoJoiner.scanAndJoinNow();
+                            startGameInviteListening();
+                        }).setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void showLobbyEquipment() {
+        new AlertDialog.Builder(this).setTitle(R.string.lobby_change_gun)
+                .setItems(new String[]{getString(R.string.connect_weapon_button),
+                        getString(R.string.reconnect_weapon_button),
+                        getString(R.string.connect_qr_weapon_button),
+                        getString(R.string.second_gun_button)}, (dialog, which) -> {
+                    if (which == 0) mConnectButton.performClick();
+                    else if (which == 1) mReconnectButton.performClick();
+                    else if (which == 2) mQRConnectButton.performClick();
+                    else beginSecondGunScan();
+                }).setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void showLobbyTeams() {
+        if (!isTeamAssignmentScanAvailable())
+            return;
+        String[] teams = new String[getCurrentNetworkTeamCount()];
+        for (int i = 0; i < teams.length; i++)
+            teams[i] = getString(R.string.lobby_team_format, i + 1);
+        new AlertDialog.Builder(this).setTitle(R.string.lobby_team_action)
+                .setItems(teams, (dialog, which) -> assignTeamFromQrCode(
+                        "SIMPLECOIL:RESPAWN:" + (which + 1)))
+                .setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void showLobbyMatchOptions() {
+        if (!canChangeGameModeInLobby())
+            return;
+        new AlertDialog.Builder(this).setTitle(R.string.lobby_match_options)
+                .setItems(new String[]{getString(R.string.game_limit_button),
+                        mPowerupSettingsButton.getText().toString(),
+                        getString(R.string.lobby_range)}, (dialog, which) -> {
+                    if (which == 0) requestGameLimit();
+                    else if (which == 1) showPowerupSettingsMenu(findViewById(R.id.lobby_rules_button));
+                    else {
+                        PopupMenu popup = new PopupMenu(this, findViewById(R.id.lobby_rules_button));
+                        popup.inflate(R.menu.firing_mode_menu);
+                        popup.getMenu().findItem(R.id.firing_mode_outdoor_with_cone_item)
+                                .setVisible(isLocalBoss());
+                        popup.setOnMenuItemClickListener(this);
+                        popup.show();
+                    }
+                }).setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void showLobbyAdvanced() {
+        new AlertDialog.Builder(this).setTitle(R.string.lobby_more)
+                .setItems(new String[]{getString(R.string.lobby_change_gun),
+                        getString(R.string.lobby_manual_ip),
+                        getString(mUseNetwork ? R.string.lobby_practice : R.string.lobby_auto_network),
+                        getString(R.string.dedicated_server_button)}, (dialog, which) -> {
+                    if (which == 0) showLobbyEquipment();
+                    else if (which == 1) requestServerIP();
+                    else if (which == 2) {
+                        boolean enable = !mUseNetwork;
+                        leaveSharedLobby();
+                        mUseNetwork = enable;
+                        mUseHubAutoJoin = enable;
+                        if (enable) startGameInviteListening();
+                        renderLobby();
+                    } else {
+                        leaveSharedLobby();
+                        mDedicatedServerButton.performClick();
+                    }
+                }).setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void leaveSharedLobby() {
+        if ((mIsServer || mPeerHostCreationPending) && mTcpServer != null)
+            mTcpServer.cancelServer();
+        else if (mTcpClient != null) {
+            mTcpClient.leaveServer();
+            mTcpClient.stopTcpClient();
+        }
+        if (mUDPListenerService != null) mUDPListenerService.stopListen();
+        mReady = false;
+        mIsServer = false;
+        mLobbyJoined = false;
+        mPeerHostCreationPending = false;
+        mPeerUdpServerStarting = false;
+        mLobbyTakeoverPending = false;
+        mSharedLobby.clear();
+        mLobbySearchStartedAt = SystemClock.elapsedRealtime();
+        Globals.getInstance().mLobbyPlayerReady = Collections.emptyMap();
+        Globals.getInstance().mLobbyPlayers = Collections.emptyMap();
+        Globals.getInstance().mLobbyRoundActive = false;
+    }
+
+    private void updateSharedLobby() {
+        Globals globals = Globals.getInstance();
+        if (globals.mGameState != Globals.GAME_STATE_NONE)
+            return;
+        boolean gunReady = mCommunicating && mCommandCharacteristic != null;
+        if (globals.mLocalLobbyReady != gunReady) {
+            globals.mLocalLobbyReady = gunReady;
+            if (mReady && mIsServer && mTcpServer != null)
+                mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+            else if (mLobbyJoined && mTcpClient != null)
+                mTcpClient.sendLobbyReady();
+        }
+        if (!mUseNetwork || !networkServicesReady())
+            return;
+        if (mReady && !mIsServer && !mLobbyJoined && !mLobbyTakeoverPending
+                && mTcpClient.hasLobbyConnection()) {
+            mLobbyJoined = true;
+            mLobbyNotice = null;
+            mTcpClient.sendLobbyReady();
+            setTeam();
+        }
+        InetAddress local = isGameNetworkAvailable() ? Globals.getIPAddress(this) : null;
+        String address = local == null ? null : local.getHostAddress();
+        if (address != null && isWifiConnected()) {
+            try {
+                WifiManager manager = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+                if (manager != null && manager.getConnectionInfo() != null)
+                    address += "/" + manager.getConnectionInfo().getNetworkId();
+            } catch (SecurityException ignored) { }
+        }
+        if (!android.text.TextUtils.equals(address, mLobbyNetworkAddress)) {
+            if (mLobbyNetworkAddress != null)
+                leaveSharedLobby();
+            mSharedLobby.clear();
+            mLobbyNetworkAddress = address;
+            mLobbySearchStartedAt = SystemClock.elapsedRealtime();
+            mLobbyNextDiscoveryAt = 0;
+        }
+        if (local == null)
+            return;
+        if (globals.mPlayerID <= 0) {
+            globals.mPlayerID = 1;
+            setTeam();
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (mIsServer)
+            mSharedLobby.observe(new SharedLobby.Host(local, false, false, now));
+        if (!mReady && !mPeerHostCreationPending)
+            startGameInviteListening();
+        if (now >= mLobbyNextDiscoveryAt) {
+            mUDPListenerService.discoverSharedLobby();
+            mLobbyNextDiscoveryAt = now + 2_000;
+        }
+        SharedLobby.Host host = mSharedLobby.best(now);
+        if (host != null) {
+            globals.mLobbyRoundActive = host.playing;
+            mLobbySearchStartedAt = now;
+            if (host.playing) {
+                if (!host.address.equals(globals.mServerIP) || !mLobbyJoined) {
+                    // Do not leave a second idle lobby open alongside the match.
+                    // Keep listening for its invites / next OPEN beacon.
+                    if (mIsServer || mPeerHostCreationPending) {
+                        leaveSharedLobby();
+                        mSharedLobby.observe(host);
+                        startGameInviteListening();
+                    }
+                    mLobbyNotice = getString(R.string.lobby_playing_elsewhere);
+                }
+                return;
+            }
+            if (mLobbyTakeoverPending || (mReady && host.address.equals(globals.mServerIP)))
+                return;
+            if (!mReady && !mPeerHostCreationPending) {
+                joinNearbyLobby(new Intent().putExtra(UDPListenerService.INTENT_SERVERIP,
+                        host.address.getHostAddress()));
+            } else if (!host.address.equals(local)) {
+                mReady = true;
+                joinLobbyTakeover(new Intent().putExtra(UDPListenerService.INTENT_SERVERIP,
+                        host.address.getHostAddress()));
+            }
+            return;
+        }
+        globals.mLobbyRoundActive = false;
+        if (!mReady && !mPeerHostCreationPending && now - mLobbySearchStartedAt
+                >= SharedLobby.DISCOVERY_MS + (local.getAddress()[3] & 255) * 8L)
+            createPeerLobbyIfNeeded();
+    }
+
+    private void lobbyText(int id, CharSequence value) {
+        TextView view = findViewById(id);
+        if (!android.text.TextUtils.equals(view.getText(), value))
+            view.setText(value);
+    }
+
+    private void updateLobbyContentInset() {
+        View dock = findViewById(R.id.lobby_action_bar);
+        View scroll = findViewById(R.id.scrollView);
+        int inset = dock.getVisibility() == View.VISIBLE ? dock.getHeight() : 0;
+        if (scroll.getPaddingBottom() != inset)
+            scroll.setPadding(scroll.getPaddingLeft(), scroll.getPaddingTop(),
+                    scroll.getPaddingRight(), inset);
+    }
+
+    private void renderLobby() {
+        View panel = findViewById(R.id.lobby_panel);
+        if (panel == null || mGameModeTV == null)
+            return;
+        Globals globals = Globals.getInstance();
+        boolean inGame = globals.mGameState != Globals.GAME_STATE_NONE;
+        panel.setVisibility(inGame ? View.GONE : View.VISIBLE);
+        findViewById(R.id.lobby_action_bar).setVisibility(inGame ? View.GONE : View.VISIBLE);
+        updateLobbyContentInset();
+        findViewById(R.id.connect_layout).setVisibility(View.GONE);
+        findViewById(R.id.play_layout).setVisibility(inGame ? View.VISIBLE : View.GONE);
+        if (inGame)
+            return;
+        boolean wifi = isGameNetworkAvailable();
+        String wifiName = getString(R.string.lobby_wifi_needed);
+        if (wifi) {
+            wifiName = getString(R.string.lobby_wifi_connected);
+            WifiManager manager = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            try {
+                if (manager != null && manager.getConnectionInfo() != null) {
+                    String ssid = manager.getConnectionInfo().getSSID();
+                    if (ssid != null && !"<unknown ssid>".equals(ssid))
+                        wifiName = ssid.replace("\"", "");
+                }
+            } catch (SecurityException ignored) { }
+        }
+        lobbyText(R.id.lobby_wifi, mUseNetwork ? wifiName : getString(R.string.lobby_practice));
+        lobbyText(R.id.lobby_host, mIsServer ? getString(R.string.lobby_you_host)
+                : mLobbyJoined && globals.mServerIP != null ? getString(R.string.lobby_other_host,
+                globals.mServerIP.getHostAddress()) : getString(R.string.lobby_same_wifi));
+        lobbyText(R.id.lobby_status, !mUseNetwork ? getString(R.string.lobby_practice)
+                : mLobbyNotice != null ? mLobbyNotice : mLobbyJoined
+                ? getString(R.string.lobby_connected) : getString(mReady || mPeerHostCreationPending
+                ? R.string.lobby_joining : R.string.lobby_searching));
+        lobbyText(R.id.lobby_name, globals.mPlayerName);
+        lobbyText(R.id.lobby_gun_status, lobbyGunStatus());
+        lobbyText(R.id.lobby_gun_button, getString(mCommunicating ? R.string.lobby_change_gun
+                : isLobbyPairingBusy() ? R.string.cancel : R.string.lobby_gun_action));
+        lobbyText(R.id.lobby_team_button, lobbyTeamLabel(globals.mPlayerID));
+        findViewById(R.id.lobby_team_button).setEnabled(isTeamAssignmentScanAvailable());
+        findViewById(R.id.lobby_scan_button).setEnabled(isTeamAssignmentScanAvailable());
+        lobbyText(R.id.lobby_mode_button, getString(globals.mInfectionMode ? R.string.game_mode_infection
+                : globals.mCaptureTheFlag ? R.string.game_mode_ctf : globals.mBossMode ? R.string.game_mode_boss
+                : globals.mTournamentMode ? R.string.game_mode_tournament_2teams
+                : globals.mGameMode == 4 ? R.string.game_mode_4teams
+                : globals.mGameMode == 2 ? R.string.game_mode_2teams : R.string.game_mode_ffa));
+        findViewById(R.id.lobby_mode_button).setEnabled(canChangeGameModeInLobby());
+        findViewById(R.id.lobby_rules_button).setVisibility(canChangeGameModeInLobby() ? View.VISIBLE : View.GONE);
+        lobbyText(R.id.lobby_rules, lobbyMatchSummary());
+        Map<Byte, LobbyPlayer> players = new TreeMap<>();
+        if (mLobbyJoined)
+            players.putAll(mIsServer && mTcpServer != null
+                    ? mTcpServer.getLobbyPlayersSnapshot() : globals.mLobbyPlayers);
+        boolean localClockReady = !mUseNetwork || mIsServer
+                || mTcpClient != null && mTcpClient.isClockSynchronized();
+        players.put(globals.mPlayerID, new LobbyPlayer(globals.mPlayerID, globals.mPlayerName,
+                !mUseNetwork || mLobbyJoined, mCommunicating && mCommandCharacteristic != null,
+                localClockReady, mUseNetwork && globals.mLocalLobbyBenched && !mIsServer, mIsServer));
+        int readyCount = 0, activeCount = 0;
+        StringBuilder blockers = new StringBuilder();
+        StringBuilder roster = new StringBuilder().append(mIsServer).append(globals.mGameMode)
+                .append(globals.mBossMode).append(globals.mInfectionMode).append(globals.mLobbyRoundActive);
+        for (LobbyPlayer player : players.values()) {
+            if (!player.benched) {
+                activeCount++;
+                if (player.ready()) readyCount++;
+                else if (player.id != globals.mPlayerID) {
+                    if (blockers.length() > 0) blockers.append(", ");
+                    blockers.append(lobbyPlayerName(player)).append(": ").append(lobbyPlayerStatus(player));
+                }
+            }
+            roster.append('|').append(player.id).append(':').append(player.name).append(':')
+                    .append(player.status()).append(':').append(player.host).append(':')
+                    .append(globals.calcNetworkTeam(player.id));
+        }
+        String signature = roster.toString();
+        if (!signature.equals(mLobbyRosterSignature)) {
+            mLobbyRosterSignature = signature;
+            LinearLayout container = findViewById(R.id.lobby_roster);
+            container.removeAllViews();
+            renderLobbyRoster(container, players);
+        }
+        lobbyText(R.id.lobby_roster_title, getString(R.string.lobby_roster_count, readyCount, activeCount)
+                + (players.size() > activeCount ? getString(R.string.lobby_bench_count,
+                players.size() - activeCount) : ""));
+        lobbyText(R.id.lobby_blockers, blockers.toString());
+        findViewById(R.id.lobby_blockers).setVisibility(mIsServer && blockers.length() > 0
+                ? View.VISIBLE : View.GONE);
+        int label;
+        int hint;
+        boolean enabled = false;
+        if (mUseNetwork && globals.mLobbyRoundActive) {
+            label = R.string.lobby_round_running; hint = R.string.lobby_playing_elsewhere;
+        } else if (mUseNetwork && globals.mLocalLobbyBenched && !mIsServer) {
+            label = R.string.lobby_benched; hint = R.string.lobby_bench_hint;
+        } else if (mUseNetwork && !wifi) {
+            label = R.string.lobby_wifi_needed; hint = R.string.lobby_same_wifi; enabled = true;
+        } else if (!mCommunicating) {
+            label = isLobbyPairingBusy() ? R.string.cancel : R.string.lobby_gun_action;
+            hint = R.string.lobby_gun_missing;
+            enabled = true;
+        } else if (!mUseNetwork) {
+            label = R.string.lobby_start; hint = R.string.lobby_practice; enabled = true;
+        } else if (!mLobbyJoined) {
+            label = R.string.lobby_joining; hint = R.string.lobby_same_wifi;
+        } else if (!mIsServer) {
+            label = R.string.lobby_wait_host; hint = R.string.lobby_host_starts;
+        } else if (activeCount < 2) {
+            label = R.string.lobby_wait_players; hint = R.string.lobby_invite_players;
+        } else if (readyCount < activeCount) {
+            label = R.string.lobby_wait_ready; hint = R.string.lobby_check_roster;
+        } else if ((globals.mBossMode || globals.mInfectionMode)
+                && (!players.containsKey((byte) 1) || players.get((byte) 1).benched)) {
+            label = R.string.lobby_need_leader; hint = R.string.lobby_choose_leader;
+        } else if (mTcpServer == null || !mTcpServer.arePlayerClocksSynchronized()) {
+            label = R.string.lobby_syncing; hint = R.string.lobby_host_starts;
+        } else {
+            label = R.string.lobby_start; hint = R.string.lobby_all_ready; enabled = true;
+        }
+        lobbyText(R.id.lobby_primary_button, getString(label));
+        findViewById(R.id.lobby_primary_button).setEnabled(enabled);
+        lobbyText(R.id.lobby_next_step, getString(hint));
+        if (!mCommunicating && !globals.mLocalLobbyBenched && !globals.mLobbyRoundActive
+                && (!mUseNetwork || wifi))
+            lobbyText(R.id.lobby_next_step, lobbyGunStatus());
+    }
+
+    private String lobbyPlayerName(LobbyPlayer player) {
+        String name = player.name.trim();
+        return name.isEmpty() || "Player".equalsIgnoreCase(name)
+                ? getString(R.string.lobby_default_name, (int) player.id) : name;
+    }
+
+    private String lobbyPlayerStatus(LobbyPlayer player) {
+        switch (player.status()) {
+            case BENCHED: return getString(R.string.lobby_benched);
+            case RECONNECTING: return getString(R.string.lobby_reconnecting);
+            case NEEDS_GUN: return getString(R.string.lobby_not_ready);
+            case SYNCING: return getString(R.string.lobby_syncing_short);
+            default: return getString(R.string.lobby_ready);
+        }
+    }
+
+    private int lobbyDp(int dp) { return Math.round(dp * getResources().getDisplayMetrics().density); }
+
+    private void renderLobbyRoster(LinearLayout container, Map<Byte, LobbyPlayer> players) {
+        Map<Integer, List<LobbyPlayer>> groups = new TreeMap<>();
+        for (LobbyPlayer player : players.values()) {
+            int group = player.benched ? 5 : Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                    ? 0 : Globals.getInstance().calcNetworkTeam(player.id);
+            if (!groups.containsKey(group)) groups.put(group, new ArrayList<>());
+            groups.get(group).add(player);
+        }
+        int[] colors = {0xFFDDE8F5, 0xFFFF9B91, 0xFF91C9FF, 0xFFBCE698, 0xFFD6B0FF, 0xFF9FB1C7};
+        for (Map.Entry<Integer, List<LobbyPlayer>> group : groups.entrySet()) {
+            int team = group.getKey();
+            TextView heading = new TextView(this);
+            heading.setText((team == 5 ? getString(R.string.lobby_benched)
+                    : lobbyTeamLabel(group.getValue().get(0).id)) + " / " + group.getValue().size());
+            heading.setTextSize(13);
+            heading.setTypeface(null, android.graphics.Typeface.BOLD);
+            heading.setTextColor(colors[Math.max(0, Math.min(5, team))]);
+            heading.setPadding(0, lobbyDp(8), 0, lobbyDp(2));
+            container.addView(heading);
+            for (LobbyPlayer player : group.getValue()) {
+                LinearLayout row = new LinearLayout(this);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setMinimumHeight(lobbyDp(48));
+                TextView name = new TextView(this);
+                String title = lobbyPlayerName(player)
+                        + (player.id == Globals.getInstance().mPlayerID ? " " + getString(R.string.lobby_you).trim() : "")
+                        + (player.host ? " / " + getString(R.string.lobby_host_badge) : "");
+                name.setText(title + "\n" + lobbyPlayerStatus(player));
+                name.setTextSize(14);
+                name.setTextColor(player.ready() ? 0xFFBCE698 : 0xFFDDE8F5);
+                row.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+                if (mIsServer && player.id != Globals.getInstance().mPlayerID
+                        && !Globals.getInstance().mLobbyRoundActive) {
+                    Button bench = new Button(this, null, android.R.attr.borderlessButtonStyle);
+                    bench.setText(player.benched ? R.string.lobby_play : R.string.lobby_bench);
+                    bench.setTextColor(0xFFFFBA6A);
+                    bench.setTextSize(13);
+                    bench.setAllCaps(false);
+                    bench.setMinWidth(lobbyDp(64));
+                    bench.setMinimumHeight(lobbyDp(48));
+                    bench.setContentDescription(getString(player.benched
+                            ? R.string.lobby_play_named : R.string.lobby_bench_named, lobbyPlayerName(player)));
+                    bench.setOnClickListener(v -> {
+                        if (mIsServer && mTcpServer != null
+                                && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
+                            bench.setEnabled(false);
+                            mTcpServer.setLobbyPlayerBenched(player.id, !player.benched);
+                            mLobbyRosterSignature = null;
+                        }
+                    });
+                    row.addView(bench);
+                }
+                container.addView(row);
+            }
+        }
+    }
+
+    private String lobbyMatchSummary() {
+        Globals g = Globals.getInstance();
+        String duration = (g.mGameLimit & Globals.GAME_LIMIT_TIME) != 0
+                ? getString(R.string.lobby_minutes, g.mTimeLimit) : getString(R.string.lobby_no_timer);
+        String limits = duration;
+        if ((g.mGameLimit & Globals.GAME_LIMIT_LIVES) != 0)
+            limits += " / " + getString(R.string.lobby_lives, g.mLivesLimit);
+        if ((g.mGameLimit & Globals.GAME_LIMIT_SCORE) != 0)
+            limits += " / " + getString(g.mCaptureTheFlag ? R.string.lobby_capture_target
+                    : R.string.lobby_kill_target, g.mScoreLimit);
+        String fire = isLocalBoss() ? getString(R.string.lobby_boss_fire)
+                : g.mTournamentMode ? getString(R.string.shot_mode_single)
+                : getString(R.string.lobby_selectable_fire);
+        long reload = g.mInfectionMode && g.mPlayerID == 1 ? g.mReloadTime / 5 : g.mReloadTime;
+        String weapon = getString(R.string.lobby_weapon_summary, fire,
+                String.format(java.util.Locale.getDefault(), "%.1f", reload / 1000.0),
+                getString(mRecoilEnabled || g.mTournamentMode ? R.string.recoil_enabled : R.string.recoil_disabled));
+        String objective = getString(g.mInfectionMode ? R.string.lobby_goal_infection
+                : g.mCaptureTheFlag ? R.string.lobby_goal_ctf
+                : g.mBossMode ? R.string.lobby_goal_boss : R.string.lobby_goal_kills);
+        return limits + "\n" + getString(R.string.lobby_vitals_summary, g.mFullHealth,
+                g.mFullShields, g.mFullReload & 255) + "\n" + weapon + "\n" + objective;
+    }
+
+    private String lobbyTeamLabel(byte playerID) {
+        Globals globals = Globals.getInstance();
+        if (globals.mGameMode == Globals.GAME_MODE_FFA)
+            return getString(R.string.lobby_no_teams);
+        if (globals.mBossMode)
+            return getString(playerID == Globals.BOSS_PLAYER_ID ? R.string.lobby_role_boss : R.string.lobby_role_hunters);
+        if (globals.mInfectionMode)
+            return getString(playerID == 1 ? R.string.lobby_role_zombie : R.string.lobby_role_survivors);
+        return getString(R.string.lobby_team_format, globals.calcNetworkTeam(playerID));
+    }
 
     private void startPeerUdpServerIfTcpReady() {
         if (!mPeerHostCreationPending || mPeerUdpServerStarting || mTcpServer == null
@@ -870,6 +1468,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mReady || mPeerHostCreationPending || mPeerUdpServerStarting)
             return;
         mPeerHostCreationPending = true;
+        Globals.getInstance().mLocalLobbyBenched = false;
+        Globals.getInstance().mLobbyRoundActive = false;
         mPeerUdpServerStarting = false;
         mTcpServer.startTcpServer();
         startPeerUdpServerIfTcpReady();
@@ -1037,12 +1637,45 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return wifi != null && wifi.isConnected();
     }
 
+    private boolean isPhoneHotspotActive() {
+        return Globals.getWifiInterfaceAddress() != null && !isWifiConnected();
+    }
+
+    private boolean isGameNetworkAvailable() {
+        return isWifiConnected() || mPhoneHubMode && isPhoneHotspotActive();
+    }
+
+    private void openPhoneHotspotSettings() {
+        Intent tetherSettings = new Intent("android.settings.TETHER_SETTINGS");
+        Intent fallback = new Intent(Settings.ACTION_WIRELESS_SETTINGS);
+        try {
+            if (tetherSettings.resolveActivity(getPackageManager()) != null)
+                startActivity(tetherSettings);
+            else
+                startActivity(fallback);
+            Toast.makeText(getApplicationContext(), R.string.phone_hub_enable_instruction,
+                    Toast.LENGTH_LONG).show();
+        } catch (ActivityNotFoundException | SecurityException e) {
+            Log.w(TAG, "Unable to open hotspot settings", e);
+            Toast.makeText(getApplicationContext(), R.string.phone_hub_settings_unavailable,
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
     /**
      * A Network Options tap is an explicit request to join a field hub. Start
      * a fresh Recoil scan/association, then open the normal menu as soon as
      * Android reports Wi-Fi connected instead of requiring another tap.
      */
     private void requestNetworkOptions() {
+        if (mPhoneHubMode) {
+            mUseHubAutoJoin = false;
+            if (isGameNetworkAvailable())
+                showNetworkOptionsPopup();
+            else
+                openPhoneHotspotSettings();
+            return;
+        }
         mUseHubAutoJoin = true;
         if (isWifiConnected()) {
             cancelNetworkOptionsWifiWait();
@@ -1095,7 +1728,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void showNetworkOptionsPopup() {
-        if (!isWifiConnected() || mUseNetworkingButton == null)
+        if (!isGameNetworkAvailable() || mUseNetworkingButton == null)
             return;
         if (mNetworkPopup == null) {
             mNetworkPopup = new PopupMenu(this, mUseNetworkingButton);
@@ -1114,7 +1747,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void showGameInvite(Intent invite) {
-        if (invite == null || !mUseNetwork || !mActivityResumed || mReady || mIsServer
+        if (invite == null || !mUseNetwork || !mActivityResumed || !mCommunicating || mReady || mIsServer
                 || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             return;
         String serverAddress = invite.getStringExtra(UDPListenerService.INTENT_SERVERIP);
@@ -1174,7 +1807,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (serverAddress == null || serverAddress.trim().isEmpty()
                 || Globals.getInstance().mPlayerID <= 0
                 || !Globals.isValidPlayerID(Globals.getInstance().mPlayerID)
-                || !isWifiConnected() || !networkServicesReady())
+                || !isGameNetworkAvailable() || !networkServicesReady())
             return;
         final InetAddress host;
         try {
@@ -1199,9 +1832,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     /** Move an idle phone-hosted lobby to the standalone host that announced it. */
     private void joinLobbyTakeover(Intent takeover) {
         if (takeover == null || !mActivityResumed || !mUseNetwork || !mReady
-                || mLobbyTakeoverPending || isDedicatedServerConnection()
+                || mLobbyTakeoverPending
                 || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
-                || !networkServicesReady() || !isWifiConnected())
+                || !networkServicesReady() || !isGameNetworkAvailable())
             return;
         String serverAddress = takeover.getStringExtra(UDPListenerService.INTENT_SERVERIP);
         if (serverAddress == null || serverAddress.trim().isEmpty())
@@ -1218,9 +1851,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         // clients without resetting their UDP handoff state.
         mPeerHostCreationPending = false;
         mPeerUdpServerStarting = false;
-        if (mIsServer && mTcpServer != null)
+        if (mTcpServer != null)
             mTcpServer.stopTcpServer();
         mIsServer = false;
+        mLobbyJoined = false;
+        mLobbyNotice = getString(R.string.lobby_updating);
         mLobbyTakeoverPending = mUDPListenerService.joinServerAfterHostTakeover(host);
         if (!mLobbyTakeoverPending) {
             mReady = false;
@@ -1349,7 +1984,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 : Math.max(0, mEliminationCount);
     }
 
-    /** Refresh the local row carried by every protocol-19 redundant snapshot. */
+    /** Refresh the local row carried by every protocol-21 redundant snapshot. */
     private void publishPeerRuntimeState() {
         int shots = (mLastShotCount & 0xff)
                 + (isLocalBoss() && mSecondaryCommunicating
@@ -1358,6 +1993,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mUDPListenerService.updatePeerRuntimeState(mScore, currentDeathCount(), mHealth,
                     mShield + mRespawnShieldBonus, Math.min(255, shots),
                     Globals.getInstance().mGameState);
+    }
+
+    private void publishCtfState() {
+        if (mUDPListenerService != null && mUseNetwork)
+            mUDPListenerService.updatePeerCtfState(mCarriedFlagTeam, mCtfCaptures);
     }
 
     private void endUDPGame() {
@@ -1459,7 +2099,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         mTeamQrScanButton = findViewById(R.id.team_qr_scan_button);
         if (mTeamQrScanButton != null)
-            mTeamQrScanButton.setOnClickListener(v -> openTeamAssignmentQrScanner());
+            mTeamQrScanButton.setOnClickListener(v -> {
+                if (isCtfScanAvailable())
+                    openCtfQrScanner();
+                else
+                    openTeamAssignmentQrScanner();
+            });
         mPowerupScanButton = findViewById(R.id.powerup_scan_button);
         if (mPowerupScanButton != null)
             mPowerupScanButton.setOnClickListener(v -> {
@@ -1511,6 +2156,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                 Toast.LENGTH_SHORT).show();
                         return;
                     }
+                    if (Globals.getInstance().mInfectionMode && !infectionRosterReady()) {
+                        Toast.makeText(getApplicationContext(), R.string.infection_requires_player_one,
+                                Toast.LENGTH_SHORT).show();
+                        return;
+                    }
                     if (mIsServer ? !mTcpServer.arePlayerClocksSynchronized() : !mTcpClient.isClockSynchronized()) {
                         Toast.makeText(getApplicationContext(), R.string.clock_sync_waiting, Toast.LENGTH_SHORT).show();
                         return;
@@ -1553,12 +2203,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         mEndNetworkGameButton = findViewById(R.id.end_network_game_button);
         if (mEndNetworkGameButton != null) {
-            mEndNetworkGameButton.setOnClickListener((v -> {
-                if (isPlayerQuitOnlyGame())
-                    confirmQuitGame();
-                else
-                    confirmEndGame();
-            }));
+            mEndNetworkGameButton.setOnClickListener(v -> confirmEndGame());
         }
         mShotsRemainingLabelTV = findViewById(R.id.shots_label_tv);
         mShotsRemainingTV = findViewById(R.id.shots_remaining_tv);
@@ -1572,6 +2217,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mHitsTakenTV = findViewById(R.id.hits_taken_tv);
         mTeamLabelTV = findViewById(R.id.team_label_tv);
         mTeamTV = findViewById(R.id.team_tv);
+        mRecoilLabelTV = findViewById(R.id.recoil_label_tv);
         mRecoilModeTV = findViewById(R.id.recoil_tv);
         mShotModeTV = findViewById(R.id.shot_mode_tv);
         mHealthLabelTV = findViewById(R.id.health_label_tv);
@@ -1579,6 +2225,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mShieldBar = findViewById(R.id.shield_pb);
         resetVitalStatBars();
         mReloadBar = findViewById(R.id.reload_pb);
+        mLobbyShotsLabelLayoutParams = copyRelativeLayoutParams(mShotsRemainingLabelTV);
+        mLobbyShotsLayoutParams = copyRelativeLayoutParams(mShotsRemainingTV);
+        mLobbyReloadLayoutParams = copyRelativeLayoutParams(mReloadBar);
+        mLobbyHealthLabelLayoutParams = copyRelativeLayoutParams(mHealthLabelTV);
+        mLobbyRecoilLabelLayoutParams = copyRelativeLayoutParams(mRecoilLabelTV);
+        mLobbyRecoilLayoutParams = copyRelativeLayoutParams(mRecoilModeTV);
         mEliminatedTV = findViewById(R.id.eliminated_tv);
         mEliminatedByTV = findViewById(R.id.eliminated_by_tv);
         mSpawnInTV = findViewById(R.id.spawn_countdown_tv);
@@ -1643,6 +2295,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 PREF_TOURNAMENT_MODE, true);
         globals.mBossMode = globals.mTournamentMode
                 && readBooleanPreference(sharedPreferences, PREF_BOSS_MODE, false);
+        globals.mCaptureTheFlag = globals.mTournamentMode && !globals.mBossMode
+                && readBooleanPreference(sharedPreferences, PREF_CTF_MODE, false);
+        globals.mInfectionMode = globals.mTournamentMode && !globals.mBossMode
+                && !globals.mCaptureTheFlag
+                && readBooleanPreference(sharedPreferences, PREF_INFECTION_MODE, false);
+        globals.resetInfectedPlayers();
         globals.mBossHunterCount = -1;
         if (globals.mTournamentMode)
             globals.applyTournamentRules();
@@ -1672,6 +2330,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Globals.getInstance().mScoreLimit = Globals.isValidGameLimit(savedScoreLimit) ? savedScoreLimit : 0;
         if (Globals.getInstance().mScoreLimit != 0)
             Globals.getInstance().mGameLimit += Globals.GAME_LIMIT_SCORE;
+        if (globals.mInfectionMode)
+            globals.applyInfectionGameLimits();
         if (mDeviceAddress != null && !mDeviceAddress.isEmpty()) {
             mReconnectButton.setVisibility(View.VISIBLE);
         } else {
@@ -1743,6 +2403,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         loadFragment();
         updatePlayerSettings();
         updateTeamAssignmentScanButton();
+        initializeLobbyScreen();
     }
 
     private static final int NETWORK_TYPE_ENABLED = 1;
@@ -1878,6 +2539,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }else if (id == R.id.game_mode_boss_item) {
                 setBossMode(true);
                 return true;
+            }else if (id == R.id.game_mode_ctf_item) {
+                setCaptureTheFlagMode();
+                return true;
+            }else if (id == R.id.game_mode_infection_item) {
+                setInfectionMode();
+                return true;
             }else if (id == R.id.game_mode_2teams_item
                     || id == R.id.game_mode_4teams_item
                     || id == R.id.game_mode_ffa_item) {
@@ -1897,6 +2564,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private boolean canChangeGameModeInLobby() {
         return Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                && !Globals.getInstance().mLobbyRoundActive
                 && (!mReady || mIsServer);
     }
 
@@ -1951,6 +2619,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         inflater.inflate(R.menu.game_mode_menu, popup.getMenu());
         Globals globals = Globals.getInstance();
         int selectedMode = globals.mBossMode ? R.id.game_mode_boss_item
+                : globals.mCaptureTheFlag ? R.id.game_mode_ctf_item
+                : globals.mInfectionMode ? R.id.game_mode_infection_item
                 : globals.mTournamentMode ? R.id.game_mode_tournament_item
                 : globals.mGameMode == Globals.GAME_MODE_FFA ? R.id.game_mode_ffa_item
                 : globals.mGameMode == Globals.GAME_MODE_4TEAMS ? R.id.game_mode_4teams_item
@@ -1990,28 +2660,47 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
     }
 
+    private boolean infectionRosterReady() {
+        Globals globals = Globals.getInstance();
+        if (!globals.mInfectionMode)
+            return true;
+        if (globals.mPlayerID == 1)
+            return Globals.getPlayerCount() >= 2;
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            return globals.mTeamIPMap.containsKey((byte) 1)
+                    && !globals.mTeamIPMap.isEmpty();
+        } finally {
+            globals.mTeamIPMapSemaphore.release();
+        }
+    }
+
     private boolean isLocalBoss() {
         Globals globals = Globals.getInstance();
         return globals.mBossMode && globals.mPlayerID == Globals.BOSS_PLAYER_ID;
     }
 
+    private boolean isDualGunMode() {
+        return isLocalBoss() && !mSecondaryDeviceAddress.isEmpty();
+    }
+
     private void updateSecondGunControls() {
         boolean localBoss = isLocalBoss();
+        boolean dualGunMode = isDualGunMode();
         if (mBossAmmoRow != null)
-            mBossAmmoRow.setVisibility(localBoss ? View.VISIBLE : View.GONE);
-        int standardVisibility = localBoss ? View.INVISIBLE : View.VISIBLE;
+            mBossAmmoRow.setVisibility(dualGunMode ? View.VISIBLE : View.GONE);
+        int standardVisibility = dualGunMode ? View.INVISIBLE : View.VISIBLE;
         if (mShotsRemainingLabelTV != null)
             mShotsRemainingLabelTV.setVisibility(standardVisibility);
         if (mShotsRemainingTV != null)
-            mShotsRemainingTV.setVisibility(localBoss ? View.INVISIBLE
+            mShotsRemainingTV.setVisibility(dualGunMode ? View.INVISIBLE
                     : mReloading == RELOADING_STATE_STARTED
                     || mReloading == RELOADING_STATE_FINISHING ? View.INVISIBLE : View.VISIBLE);
         if (mReloadBar != null)
-            mReloadBar.setVisibility(!localBoss && (mReloading == RELOADING_STATE_STARTED
+            mReloadBar.setVisibility(!dualGunMode && (mReloading == RELOADING_STATE_STARTED
                     || mReloading == RELOADING_STATE_FINISHING) ? View.VISIBLE : View.GONE);
-        View recoilLabel = findViewById(R.id.recoil_label_tv);
-        if (recoilLabel != null)
-            recoilLabel.setVisibility(standardVisibility);
+        if (mRecoilLabelTV != null)
+            mRecoilLabelTV.setVisibility(standardVisibility);
         if (mRecoilModeTV != null)
             mRecoilModeTV.setVisibility(standardVisibility);
         View shotModeLabel = findViewById(R.id.shot_mode_label_tv);
@@ -2037,6 +2726,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     || mSecondaryReloading == RELOADING_STATE_FINISHING ? "..."
                     : String.valueOf(mSecondaryLastShotCount & 0xff));
         }
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            updatePlayingHudLayout(true);
     }
 
     /** Apply the locked hunter weapon or initialize a newly selected boss in automatic mode. */
@@ -2069,7 +2760,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 || isFinishing() || isDestroyed())
             return;
         mStartWizardShown = true;
-        mWizardUsesHub = mUseNetwork;
+        // Both explicit wizard paths use networking. "Skip setup" remains
+        // the way to retain the existing local/offline configuration.
+        mWizardUsesHub = true;
+        mWizardStartsPhoneHub = false;
         mWizardIndoor = Globals.getInstance().mCurrentFiringMode
                 == Globals.FIRING_MODE_INDOOR_NO_CONE;
         mWizardBoss = Globals.getInstance().mBossMode;
@@ -2086,7 +2780,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             title = R.string.start_wizard_hub_title;
             choices = new CharSequence[] {getString(R.string.start_wizard_hub_yes),
                     getString(R.string.start_wizard_hub_no)};
-            selected = mWizardUsesHub ? 0 : 1;
+            selected = mWizardStartsPhoneHub ? 0 : 1;
         } else if (step == 1) {
             title = R.string.start_wizard_range_title;
             choices = new CharSequence[] {getString(R.string.start_wizard_outdoor),
@@ -2105,7 +2799,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 R.style.Theme_AppCompat_DayNight_Dialog_Alert)
                 .setTitle(title)
                 .setSingleChoiceItems(choices, selected, (dialog, which) -> {
-                    if (step == 0) mWizardUsesHub = which == 0;
+                    if (step == 0) {
+                        mWizardUsesHub = true;
+                        mWizardStartsPhoneHub = which == 0;
+                    }
                     else if (step == 1) mWizardIndoor = which == 1;
                     else mWizardBoss = which == 1;
                 })
@@ -2134,7 +2831,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mReady || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             return;
         mUseNetwork = mWizardUsesHub;
-        mUseHubAutoJoin = mWizardUsesHub;
+        mPhoneHubMode = mUseNetwork && mWizardStartsPhoneHub;
+        mUseHubAutoJoin = mUseNetwork && !mPhoneHubMode;
         if (!mUseNetwork) {
             if (mGameInviteDialog != null)
                 dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
@@ -2158,9 +2856,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         AlertDialog dialog = new AlertDialog.Builder(this,
                 R.style.Theme_AppCompat_DayNight_Dialog_Alert)
                 .setTitle(R.string.start_wizard_ready_title)
-                .setMessage(mUseNetwork ? R.string.start_wizard_ready_hub
+                .setMessage(mPhoneHubMode ? R.string.start_wizard_ready_phone_hub
+                        : mUseNetwork ? R.string.start_wizard_ready_hub
                         : R.string.start_wizard_ready_local)
-                .setPositiveButton(R.string.ok, null)
+                .setPositiveButton(mPhoneHubMode ? R.string.open_hotspot_settings
+                        : R.string.ok, mPhoneHubMode
+                        ? (ignored, which) -> openPhoneHotspotSettings() : null)
                 .create();
         mStartWizardDialog = dialog;
         dialog.setOnDismissListener(ignored -> {
@@ -2185,17 +2886,86 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
         } else {
             globals.mBossMode = enabled;
+            globals.mCaptureTheFlag = false;
+            globals.mInfectionMode = false;
             globals.mBossHunterCount = -1;
             globals.mBalancedRandom = false;
             globals.clearBalancedAssignments();
             globals.applyTournamentRules();
         }
         sharedPreferences.edit().putBoolean(PREF_BOSS_MODE, enabled)
+                .putBoolean(PREF_CTF_MODE, false)
+                .putBoolean(PREF_INFECTION_MODE, false)
                 .putBoolean(PREF_TOURNAMENT_MODE, true)
                 .putInt(PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
                 .putBoolean(PREF_BALANCED_MODE, false).apply();
         mBossWeaponInitialized = false;
         applyBossWeaponRole();
+        updateGameModeDisplay();
+        displayCurrentTeam();
+        updatePlayerSettings();
+    }
+
+    private void setCaptureTheFlagMode() {
+        Globals globals = Globals.getInstance();
+        if (!canChangeGameModeInLobby()) {
+            Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (mReady && mIsServer) {
+            if (mTcpServer == null || !mTcpServer.setCaptureTheFlagMode()) {
+                Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.mBossMode = false;
+            globals.mCaptureTheFlag = true;
+            globals.mInfectionMode = false;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.applyTournamentRules();
+        }
+        sharedPreferences.edit().putBoolean(PREF_BOSS_MODE, false)
+                .putBoolean(PREF_CTF_MODE, true)
+                .putBoolean(PREF_INFECTION_MODE, false)
+                .putBoolean(PREF_TOURNAMENT_MODE, true)
+                .putInt(PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
+                .putBoolean(PREF_BALANCED_MODE, false).apply();
+        mBossWeaponInitialized = false;
+        applyBossWeaponRole();
+        updateGameModeDisplay();
+        displayCurrentTeam();
+        updatePlayerSettings();
+    }
+
+    private void setInfectionMode() {
+        Globals globals = Globals.getInstance();
+        if (!canChangeGameModeInLobby()) {
+            Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (mReady && mIsServer) {
+            if (mTcpServer == null || !mTcpServer.setInfectionMode()) {
+                Toast.makeText(this, R.string.tournament_rules_locked, Toast.LENGTH_SHORT).show();
+                return;
+            }
+        } else {
+            globals.mBossMode = false;
+            globals.mCaptureTheFlag = false;
+            globals.mInfectionMode = true;
+            globals.mBalancedRandom = false;
+            globals.clearBalancedAssignments();
+            globals.resetInfectedPlayers();
+            globals.applyTournamentRules();
+        }
+        globals.applyInfectionGameLimits();
+        sharedPreferences.edit().putBoolean(PREF_BOSS_MODE, false)
+                .putBoolean(PREF_CTF_MODE, false)
+                .putBoolean(PREF_INFECTION_MODE, true)
+                .putBoolean(PREF_TOURNAMENT_MODE, true)
+                .putInt(PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS)
+                .putBoolean(PREF_BALANCED_MODE, false).apply();
+        mBossWeaponInitialized = false;
         updateGameModeDisplay();
         displayCurrentTeam();
         updatePlayerSettings();
@@ -2219,6 +2989,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         sharedPreferences.edit().putBoolean(PREF_TOURNAMENT_MODE, false)
                 .putBoolean(PREF_BOSS_MODE, false)
+                .putBoolean(PREF_CTF_MODE, false)
+                .putBoolean(PREF_INFECTION_MODE, false)
                 .putBoolean(PREF_BALANCED_MODE, false)
                 .putInt(PREF_GAME_MODE, gameMode).apply();
         mBossWeaponInitialized = false;
@@ -2323,6 +3095,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                 dialog.dismiss();
                                 return;
                             }
+                            leaveSharedLobby();
+                            mUseNetwork = true;
                             mIsServer = true; // This tricks the setReady function into not searching for a server
                             mReady = true;
                             setReady();
@@ -2461,7 +3235,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         eliminationLabel.setText(mHasLivesLimit ? R.string.lives_count_label : R.string.eliminations_count_label);
         int displayedCount = !roundInProgress && mHasLivesLimit ? mLives : mEliminationCount;
         mEliminationCountTV.setText(getString(R.string.integer, displayedCount));
-        if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_SCORE) != 0) {
+        if (Globals.getInstance().mCaptureTheFlag) {
+            mScoreLabelTV.setText(R.string.score_label);
+            mTeamScoreLabelTV.setText((Globals.getInstance().mGameLimit
+                    & Globals.GAME_LIMIT_SCORE) != 0
+                    ? getString(R.string.ctf_capture_limit_label,
+                    Globals.getInstance().mScoreLimit)
+                    : getString(R.string.ctf_captures_label));
+        } else if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_SCORE) != 0) {
             mScoreLabelTV.setText(getString(R.string.score_limit_label, Globals.getInstance().mScoreLimit));
             mTeamScoreLabelTV.setText(getString(R.string.team_score_limit_label, Globals.getInstance().mScoreLimit));
         } else {
@@ -2516,6 +3297,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 || globals.mGameMode == Globals.GAME_MODE_4TEAMS)) {
             int[] teamCounts = globals.getNetworkTeamPlayerCounts();
             mGameModeLabelTV.setText(globals.mBossMode ? R.string.game_mode_boss
+                    : globals.mCaptureTheFlag ? R.string.game_mode_ctf
+                    : globals.mInfectionMode ? R.string.game_mode_infection
                     : R.string.team_player_count_label);
             mGameModeTV.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEAM_ROSTER_TEXT_SIZE_SP);
             if (teamCounts.length == 4) {
@@ -2536,6 +3319,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     : R.string.game_mode_balanced_no_qr);
         } else if (globals.mBossMode) {
             mGameModeTV.setText(R.string.game_mode_boss);
+        } else if (globals.mCaptureTheFlag) {
+            mGameModeTV.setText(R.string.game_mode_ctf);
+        } else if (globals.mInfectionMode) {
+            mGameModeTV.setText(R.string.game_mode_infection);
         } else if (globals.mTournamentMode) {
             mGameModeTV.setText(R.string.game_mode_tournament_2teams);
         } else if (globals.mGameMode == Globals.GAME_MODE_2TEAMS) {
@@ -2561,6 +3348,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mGameLimitButton.setVisibility(View.GONE);
         } else {
             mJoinedFromGameInvite = false;
+            mLobbyJoined = false;
+            mLobbySearchStartedAt = SystemClock.elapsedRealtime();
             mLobbyTakeoverPending = false;
             Globals globals = Globals.getInstance();
             int savedMode = readIntPreference(sharedPreferences, PREF_GAME_MODE,
@@ -2571,6 +3360,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     PREF_TOURNAMENT_MODE, true);
             globals.mBossMode = globals.mTournamentMode
                     && readBooleanPreference(sharedPreferences, PREF_BOSS_MODE, false);
+            globals.mCaptureTheFlag = globals.mTournamentMode && !globals.mBossMode
+                    && readBooleanPreference(sharedPreferences, PREF_CTF_MODE, false);
+            globals.mInfectionMode = globals.mTournamentMode && !globals.mBossMode
+                    && !globals.mCaptureTheFlag
+                    && readBooleanPreference(sharedPreferences, PREF_INFECTION_MODE, false);
+            globals.resetInfectedPlayers();
             globals.mBossHunterCount = -1;
             if (globals.mTournamentMode)
                 globals.applyTournamentRules();
@@ -2584,7 +3379,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     ? savedPowerupCount : 0;
             mBossWeaponInitialized = false;
             applyBossWeaponRole();
-            cancelPlayerQuitWindow();
+            dismissGameControlDialog();
             mFiringModeButton.setVisibility(View.VISIBLE);
             mStartGameButton.setVisibility(View.VISIBLE);
             mPlayerSettingsButton.setVisibility(View.VISIBLE);
@@ -2747,9 +3542,80 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         hideFeedbackView(mHitConfirmationTV, View.GONE);
     }
 
-    private void showIncomingHitFeedback(byte hitByPlayerID) {
+    static int hitSensorMask(byte rawSensorData) {
+        return (rawSensorData >>> 4) & 0x0f;
+    }
+
+    static int resolveIncomingHitDirection(int sensorMask) {
+        boolean left = (sensorMask & HIT_SENSOR_LEFT) != 0;
+        boolean right = (sensorMask & HIT_SENSOR_RIGHT) != 0;
+        if (left && !right)
+            return INCOMING_HIT_DIRECTION_LEFT;
+        if (right && !left)
+            return INCOMING_HIT_DIRECTION_RIGHT;
+        // Front/center, external, both side sensors, and old packets without a
+        // sensor mask retain the unmistakable full-screen warning. A single
+        // side sensor wins when it is reported together with front/center.
+        return INCOMING_HIT_DIRECTION_CENTER;
+    }
+
+    private void positionIncomingHitFeedback(int sensorMask) {
+        int direction = resolveIncomingHitDirection(sensorMask);
+        if (mIncomingHitFlashView != null
+                && mIncomingHitFlashView.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            int width = FrameLayout.LayoutParams.MATCH_PARENT;
+            int gravity = Gravity.FILL;
+            if (direction != INCOMING_HIT_DIRECTION_CENTER) {
+                View parent = (View) mIncomingHitFlashView.getParent();
+                int parentWidth = parent == null ? 0 : parent.getWidth();
+                if (parentWidth <= 0)
+                    parentWidth = getResources().getDisplayMetrics().widthPixels;
+                width = Math.max(1, parentWidth / 2);
+                gravity = direction == INCOMING_HIT_DIRECTION_LEFT
+                        ? Gravity.START : Gravity.END;
+            }
+            FrameLayout.LayoutParams flash = new FrameLayout.LayoutParams(width,
+                    FrameLayout.LayoutParams.MATCH_PARENT, gravity);
+            mIncomingHitFlashView.setLayoutParams(flash);
+        }
+        if (mHitIV != null && mHitIV.getLayoutParams() instanceof RelativeLayout.LayoutParams) {
+            RelativeLayout.LayoutParams current =
+                    (RelativeLayout.LayoutParams) mHitIV.getLayoutParams();
+            RelativeLayout.LayoutParams icon = new RelativeLayout.LayoutParams(
+                    current.width, current.height);
+            boolean centerAndOneSide = (sensorMask & HIT_SENSOR_CENTER) != 0
+                    && ((sensorMask & HIT_SENSOR_LEFT) != 0
+                    ^ (sensorMask & HIT_SENSOR_RIGHT) != 0);
+            mHitIV.setTranslationX(0);
+            if (centerAndOneSide) {
+                icon.addRule(RelativeLayout.CENTER_IN_PARENT, RelativeLayout.TRUE);
+                View parent = (View) mHitIV.getParent();
+                int parentWidth = parent == null ? 0 : parent.getWidth();
+                if (parentWidth <= 0)
+                    parentWidth = getResources().getDisplayMetrics().widthPixels;
+                mHitIV.setTranslationX(direction == INCOMING_HIT_DIRECTION_LEFT
+                        ? -parentWidth / 4f : parentWidth / 4f);
+            } else if (direction == INCOMING_HIT_DIRECTION_LEFT) {
+                icon.addRule(RelativeLayout.ALIGN_PARENT_START, RelativeLayout.TRUE);
+                icon.addRule(RelativeLayout.CENTER_VERTICAL, RelativeLayout.TRUE);
+                icon.setMarginStart((int) (24 * getResources().getDisplayMetrics().density));
+            } else if (direction == INCOMING_HIT_DIRECTION_RIGHT) {
+                icon.addRule(RelativeLayout.ALIGN_PARENT_END, RelativeLayout.TRUE);
+                icon.addRule(RelativeLayout.CENTER_VERTICAL, RelativeLayout.TRUE);
+                icon.setMarginEnd((int) (24 * getResources().getDisplayMetrics().density));
+            } else {
+                icon.addRule(RelativeLayout.CENTER_IN_PARENT, RelativeLayout.TRUE);
+            }
+            mHitIV.setLayoutParams(icon);
+        }
+    }
+
+    private void showIncomingHitFeedback(byte hitByPlayerID, int sensorMask) {
         // Coalesce the visual flash, but buzz for every damaging hit.
         vibrateOnHit();
+        // A rapid second hit may come from another side. Reposition the active
+        // effect immediately without restarting its fade animation.
+        positionIncomingHitFeedback(sensorMask);
         // A new hit does not need to restart an effect that is still bright on
         // screen. This keeps rapid-fire damage readable instead of flickering.
         if (mIncomingHitCleanup != null)
@@ -2897,7 +3763,22 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private boolean survivesDamage(int damage) {
+        if (isOriginalZombieProtected())
+            return true;
         return mHealth + mShield + mRespawnShieldBonus + damage > 0;
+    }
+
+    private boolean isOriginalZombie() {
+        Globals globals = Globals.getInstance();
+        return globals.mInfectionMode && globals.mPlayerID == 1;
+    }
+
+    private boolean isOriginalZombieProtected() {
+        return isOriginalZombie() && mScore < ORIGINAL_ZOMBIE_PROTECTED_KILLS;
+    }
+
+    private boolean hasOriginalZombieFastReload() {
+        return isOriginalZombie() && currentDeathCount() == 0;
     }
 
     private void takeDamage(int damage) {
@@ -2942,6 +3823,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void startGame() { startGame(null); }
 
     private void startGame(Intent start) {
+        if (mUseNetwork && Globals.getInstance().mLocalLobbyBenched && !mIsServer)
+            return;
         long waitRemaining = Math.max(0, mNextGameStartAllowedAt - SystemClock.elapsedRealtime());
         long scheduledStart = start == null ? 0 : start.getLongExtra(NetMsg.INTENT_START_AT, 0);
         if (waitRemaining > 0 && scheduledStart < mNextGameStartAllowedAt) {
@@ -2954,6 +3837,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         if (Globals.getInstance().mTournamentMode)
             Globals.getInstance().applyTournamentRules();
+        if (Globals.getInstance().mInfectionMode) {
+            Globals.getInstance().resetInfectedPlayers();
+            Globals.getInstance().applyInfectionGameLimits();
+        }
         applyBossWeaponRole();
         if (Globals.getInstance().mTournamentMode)
             setRecoil(true);
@@ -2987,6 +3874,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         // Refresh the local team before any score or friendly-fire path uses it.
         displayCurrentTeam();
         resetRoundTelemetryState();
+        mGameControlGeneration++;
+        mEndVotePrompted = false;
+        if (peerGame || !mUseNetwork) {
+            Globals.getInstance().mEndGameVotes = 0;
+            Globals.getInstance().mEndGameVoteRequested = false;
+        }
         mDualGunHitDeduper.reset();
         mKillStreakVoice.resetStreak();
         clearCombatFeedback();
@@ -2997,6 +3890,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mScoreTV.setText("0");
         mTeamScore = 0;
         mTeamScoreTV.setText("0");
+        mCarriedFlagTeam = 0;
+        mCtfCaptures = 0;
+        Arrays.fill(mKnownFlagCarriers, 0);
+        Arrays.fill(mKnownCtfScores, 0);
+        stopFlagSiren();
         if (mHasLivesLimit)
             mEliminationCount = mLives;
         else
@@ -3012,13 +3910,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mGameLimitButton.setVisibility(View.GONE);
         mPlayerSettingsButton.setVisibility(View.GONE);
         if (mUseNetwork) {
+            Globals.getInstance().removeBenchedPlayersFromGameRoster();
             displayInGameNetworkingOptions();
-            cancelPlayerQuitWindow();
+            dismissGameControlDialog();
             updateInGameEndControl();
             // Install the UI-side token immediately before changing the
             // listener's round. This keeps the two checks adjacent while
             // still allowing the first accepted current-round event through.
-            // Protocol 19 uses the round token for both peer and dedicated
+            // Protocol 21 uses the round token for both peer and dedicated
             // UDP state ticks. Keep it so tokened recovery updates from a
             // dedicated host are not mistaken for stale peer-round events.
             mActivePeerRoundToken = TcpServer.isValidRoundToken(peerRoundToken)
@@ -3076,56 +3975,84 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void confirmEndGame() {
-        // Tournament clients (and automatically invited players) never own a
-        // global end-game action, even if a delayed tap reaches this method.
-        if (isPlayerQuitOnlyGame()) {
-            confirmQuitGame();
-            return;
+        if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                || (mGameExitDialog != null && mGameExitDialog.isShowing())) return;
+        final long generation = mGameControlGeneration;
+        final String roundToken = mActivePeerRoundToken;
+        final boolean network = mUseNetwork;
+        final boolean voted = (Globals.getInstance().mEndGameVotes
+                & EndGameVotes.playerBit(Globals.getInstance().mPlayerID)) != 0;
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle(R.string.end_game_dialog_title);
+        if (network) {
+            builder.setMessage(getString(R.string.end_game_vote_message,
+                    Long.bitCount(Globals.getInstance().mEndGameVotes)))
+                    .setPositiveButton(voted ? R.string.end_game_vote_withdraw : R.string.end_game_vote_agree,
+                            (dialog, which) -> {
+                                if (generation == mGameControlGeneration)
+                                    submitEndGameVote(roundToken, !voted);
+                            })
+                    .setNeutralButton(R.string.quit_game_button, (dialog, which) -> {
+                        if (generation == mGameControlGeneration) confirmQuitGame();
+                    });
+        } else {
+            builder.setMessage(R.string.end_game_dialog_message)
+                    .setPositiveButton(R.string.yes, (dialog, which) -> {
+                        if (generation == mGameControlGeneration) endGame();
+                    });
         }
-        AlertDialog.Builder builder = new AlertDialog.Builder(this);
-
-        builder.setTitle(R.string.end_game_dialog_title);
-        builder.setMessage(R.string.end_game_dialog_message);
-
-        builder.setPositiveButton(R.string.yes, (dialog, which) -> {
-            if (mUseNetwork) {
-                if (mTcpClient != null && mTcpClient.isDedicatedServer())
-                    mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME);
-                else if (mUDPListenerService != null)
-                    mUDPListenerService.endGame();
-            }
-            endGame();
-        });
-
-        builder.setNegativeButton(R.string.no, (dialog, which) -> dialog.dismiss());
-
-        AlertDialog alert = builder.create();
-        alert.show();
+        builder.setNegativeButton(R.string.cancel, null);
+        showGameControlDialog(builder);
     }
 
-    /** A non-host player leaves only their own dedicated-server session. */
-    private void confirmQuitGame() {
-        if (!isPlayerQuitWindowOpen())
-            return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle(R.string.quit_game_dialog_title);
-        builder.setMessage(R.string.quit_game_dialog_message);
-        builder.setPositiveButton(R.string.quit_game_button, (dialog, which) -> {
-            if (isPlayerQuitWindowOpen())
-                quitGame();
+    private void submitEndGameVote(String roundToken, boolean approve) {
+        if (!mUseNetwork || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                || roundToken == null || !roundToken.equals(mActivePeerRoundToken)) return;
+        boolean sent = isDedicatedServerConnection()
+                ? mTcpClient.voteToEndGame(roundToken, approve)
+                : mUDPListenerService != null && mUDPListenerService.voteToEndGame(roundToken, approve);
+        if (!sent)
+            Toast.makeText(this, R.string.end_game_vote_failed, Toast.LENGTH_SHORT).show();
+    }
+
+    private void showGameControlDialog(AlertDialog.Builder builder) {
+        dismissGameControlDialog();
+        AlertDialog dialog = builder.create();
+        mGameExitDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (mGameExitDialog == dialog) mGameExitDialog = null;
         });
-        builder.setNegativeButton(R.string.cancel, (dialog, which) -> dialog.dismiss());
-        builder.create().show();
+        dialog.show();
+    }
+
+    private void dismissGameControlDialog() {
+        AlertDialog dialog = mGameExitDialog;
+        mGameExitDialog = null;
+        if (dialog != null) dialog.dismiss();
+    }
+
+    /** Leave remains available during countdown, play, and respawn. */
+    private void confirmQuitGame() {
+        if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) return;
+        final long generation = mGameControlGeneration;
+        showGameControlDialog(new AlertDialog.Builder(this)
+                .setTitle(R.string.quit_game_dialog_title)
+                .setMessage(R.string.quit_game_dialog_message)
+                .setPositiveButton(R.string.quit_game_button, (dialog, which) -> {
+                    if (generation == mGameControlGeneration
+                            && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) quitGame();
+                })
+                .setNegativeButton(R.string.cancel, null));
     }
 
     private void quitGame() {
-        if (mTcpClient != null && mTcpClient.isDedicatedServer()) {
+        if (mUseNetwork && isDedicatedServerConnection()) {
             mTcpClient.quitGame();
-        } else if (mUDPListenerService != null) {
-            // Invitations currently use dedicated hosts. Keep the fallback a
-            // leave-only peer packet if that ever changes; never send ENDGAME.
-            mUDPListenerService.announcePeerLeave();
+        } else if (mUseNetwork && mUDPListenerService != null) {
+            mUDPListenerService.announcePeerQuit();
         }
+        // Do not auto-accept another invitation into the round just left.
+        Globals.getInstance().mLocalLobbyBenched = mUseNetwork;
         mJoinedFromGameInvite = false;
         endGame();
     }
@@ -3134,89 +4061,25 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return mUseNetwork && !mIsServer && Globals.getInstance().mTournamentMode;
     }
 
-    /** True when this phone may leave itself but must never end the shared round. */
-    private boolean isPlayerQuitOnlyGame() {
-        return mUseNetwork && !mIsServer && (mJoinedFromGameInvite || isTournamentClient());
-    }
-
-    /**
-     * A tournament participant may only leave their own game, but its host
-     * retains the authoritative End Game control. Keep that distinction here
-     * rather than allowing a later UI refresh to turn a host into a Quit-only
-     * player.
-     */
     private void updateInGameEndControl() {
-        if (mEndNetworkGameButton == null)
-            return;
-        if (isPlayerQuitOnlyGame()) {
-            // A player can opt out only after the synchronized round has
-            // actually begun; finishSpawn opens the 30-second grace window.
-            mEndNetworkGameButton.setText(R.string.quit_game_button);
-            mEndNetworkGameButton.setVisibility(View.GONE);
-            return;
-        }
-        mEndNetworkGameButton.setText(R.string.end_game_button);
+        if (mEndNetworkGameButton == null) return;
+        Globals globals = Globals.getInstance();
+        mEndNetworkGameButton.setText(globals.mEndGameVoteRequested
+                ? getString(R.string.end_game_vote_progress, Long.bitCount(globals.mEndGameVotes))
+                : getString(R.string.game_controls_button));
         mEndNetworkGameButton.setVisibility(View.VISIBLE);
     }
 
-    private void startPlayerQuitWindow() {
-        cancelPlayerQuitWindow();
-        if (!isPlayerQuitOnlyGame()
-                || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
-            return;
-        final long now = SystemClock.elapsedRealtime();
-        // A late join does not get a fresh 30-second escape period: the grace
-        // window belongs to the host's actual round start, not TCP arrival.
-        long deadline = mHasSynchronizedStart && mSynchronizedStartAt > 0
-                ? mSynchronizedStartAt + PLAYER_QUIT_WINDOW_MS
-                : now + PLAYER_QUIT_WINDOW_MS;
-        final long remaining = deadline - now;
-        if (remaining <= 0)
-            return;
-        mPlayerQuitWindowOpen = true;
-        mPlayerQuitWindowEndsAt = deadline;
-        if (mEndNetworkGameButton != null) {
-            mEndNetworkGameButton.setText(getString(R.string.quit_game_button_countdown,
-                    (remaining + 999) / 1_000));
-            mEndNetworkGameButton.setVisibility(View.VISIBLE);
+    private void showEndGameVoteRequest() {
+        if (!mUseNetwork || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) return;
+        updateInGameEndControl();
+        long votes = Globals.getInstance().mEndGameVotes;
+        if (mActivityResumed && Globals.getInstance().mEndGameVoteRequested
+                && !mEndVotePrompted && !EndGameVotes.hasQuorum(votes)
+                && (votes & EndGameVotes.playerBit(Globals.getInstance().mPlayerID)) == 0) {
+            mEndVotePrompted = true;
+            confirmEndGame();
         }
-        mQuitGameTimer = new CountDownTimer(remaining, 1_000) {
-            @Override public void onTick(long millisUntilFinished) {
-                if (mQuitGameTimer != this || !isPlayerQuitWindowOpen())
-                    return;
-                if (mEndNetworkGameButton != null) {
-                    long seconds = (millisUntilFinished + 999) / 1000;
-                    mEndNetworkGameButton.setText(getString(
-                            R.string.quit_game_button_countdown, seconds));
-                }
-            }
-
-            @Override public void onFinish() {
-                if (mQuitGameTimer != this)
-                    return;
-                mQuitGameTimer = null;
-                mPlayerQuitWindowOpen = false;
-                mPlayerQuitWindowEndsAt = 0;
-                if (mEndNetworkGameButton != null) {
-                    mEndNetworkGameButton.setText(R.string.end_game_button);
-                    mEndNetworkGameButton.setVisibility(View.GONE);
-                }
-            }
-        };
-        mQuitGameTimer.start();
-    }
-
-    private void cancelPlayerQuitWindow() {
-        if (mQuitGameTimer != null) {
-            mQuitGameTimer.cancel();
-            mQuitGameTimer = null;
-        }
-        mPlayerQuitWindowOpen = false;
-        mPlayerQuitWindowEndsAt = 0;
-    }
-
-    private boolean isPlayerQuitWindowOpen() {
-        return mPlayerQuitWindowOpen && mPlayerQuitWindowEndsAt > SystemClock.elapsedRealtime();
     }
 
     private void enableGameLock() {
@@ -3258,6 +4121,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (Globals.isValidCoordinates(longitude, latitude)) {
             mLastGpsLatitude = latitude;
             mLastGpsLongitude = longitude;
+            recordGpsPlayerActivity(longitude, latitude);
         }
         updateGpsCoordinatesDisplay();
     }
@@ -3275,6 +4139,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mHasLivesLimit && mEliminationCount <= 0)
             return GameOutcome.Result.LOST;
         Globals globals = Globals.getInstance();
+        if (globals.mInfectionMode)
+            return !globals.isPlayerInfected(globals.mPlayerID) && mHealth > 0
+                    ? GameOutcome.Result.WON : GameOutcome.Result.LOST;
+        if (globals.mCaptureTheFlag) {
+            int localTeam = globals.calcNetworkTeam(globals.mPlayerID);
+            int otherTeam = localTeam == 1 ? 2 : 1;
+            if (localTeam >= 1 && localTeam <= 2) {
+                if (mKnownCtfScores[localTeam] > mKnownCtfScores[otherTeam])
+                    return GameOutcome.Result.WON;
+                if (mKnownCtfScores[localTeam] < mKnownCtfScores[otherTeam])
+                    return GameOutcome.Result.LOST;
+                return GameOutcome.Result.TIED;
+            }
+        }
         if (mUseNetwork && mUDPListenerService != null) {
             GameOutcome.Result result = GameOutcome.result(globals, globals.mPlayerID, mScore, mTeamScore,
                     mUDPListenerService.getRoundScoresSnapshot());
@@ -3289,6 +4167,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void endGame() {
+        mGameControlGeneration++;
+        dismissGameControlDialog();
+        mEndVotePrompted = false;
+        Globals.getInstance().mEndGameVotes = 0;
+        Globals.getInstance().mEndGameVoteRequested = false;
         boolean completedRound = Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
                 && !mStartGameTimer;
         GameOutcome.Result roundOutcome = completedRound ? completedRoundOutcome()
@@ -3307,12 +4190,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         updatePowerupScanButton();
         updateGpsCoordinatesDisplay();
         stopReloadVoiceReminder();
+        stopInactivityVoiceReminder();
+        stopFlagSiren();
         setPlayingShotsCounter(false);
         Globals.getInstance().clearBalancedAssignments();
         Globals.getInstance().mBalancedRandom = false;
         updateTeamAssignmentScanButton();
         mJoinedFromGameInvite = false;
-        cancelPlayerQuitWindow();
         clearCombatFeedback();
         resetTeamRespawnQrState();
         // A peer host owns a TCP listener only while it is serving this lobby or
@@ -3395,6 +4279,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         setNetworkMenu(NETWORK_TYPE_ENABLED);
         if (completedRound)
             announceRoundEnd(roundOutcome);
+        renderLobby();
     }
 
     private void finishOutOfLives() {
@@ -3465,6 +4350,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mTeamTV.setText(R.string.no_team);
         } else if (mUseNetwork && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
             mNetworkTeam = Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
+            if (Globals.getInstance().mInfectionMode) {
+                mTeamLabelTV.setText(Globals.getInstance().isPlayerInfected(
+                        Globals.getInstance().mPlayerID) ? R.string.infection_zombie_label
+                        : R.string.infection_survivor_label);
+                mTeamTV.setText(getString(R.string.network_team,
+                        Globals.getInstance().mPlayerID));
+                mTeamScoreLabelTV.setVisibility(View.VISIBLE);
+                mTeamScoreTV.setVisibility(View.VISIBLE);
+                updateTeamAssignmentScanButton();
+                return;
+            }
             if (Globals.getInstance().mBossMode) {
                 mTeamLabelTV.setText(mNetworkTeam == 1 ? R.string.boss_team_label
                         : R.string.hunter_team_label);
@@ -3527,9 +4423,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Globals globals = Globals.getInstance();
         if (isBalancedQrCheckInPending())
             return true;
-        return mUseNetwork && !mReady && !mIsServer
+        return mUseNetwork && !mLobbyTakeoverPending
+                && !globals.mLobbyRoundActive
                 && !globals.mBalancedRandom && globals.mGameState == Globals.GAME_STATE_NONE
                 && getCurrentNetworkTeamCount() > 0;
+    }
+
+    private boolean isCtfScanAvailable() {
+        Globals globals = Globals.getInstance();
+        return mUseNetwork && globals.mCaptureTheFlag && !mStartGameTimer
+                && globals.mGameState == Globals.GAME_STATE_RUNNING;
     }
 
     private boolean isBalancedQrCheckInPending() {
@@ -3552,17 +4455,23 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void updateTeamAssignmentScanButton() {
         if (mTeamQrScanButton == null)
             return;
-        boolean available = isTeamAssignmentScanAvailable();
+        boolean ctfScan = isCtfScanAvailable();
+        boolean available = ctfScan || isTeamAssignmentScanAvailable();
         // A connected lobby shows the server address beside Network. Put its
         // check-in control beside the cone setting, or below Network when
         // a dedicated host hides player-controlled settings.
-        boolean balancedCheckIn = available && mReady && Globals.getInstance().mBalancedRandom;
+        boolean balancedCheckIn = !ctfScan && available && mReady
+                && Globals.getInstance().mBalancedRandom;
         RelativeLayout.LayoutParams params = (RelativeLayout.LayoutParams) mTeamQrScanButton.getLayoutParams();
         params.removeRule(RelativeLayout.END_OF);
         params.removeRule(RelativeLayout.ALIGN_BASELINE);
         params.removeRule(RelativeLayout.BELOW);
         params.removeRule(RelativeLayout.ALIGN_PARENT_START);
-        if (balancedCheckIn && mFiringModeButton.getVisibility() != View.VISIBLE) {
+        params.removeRule(RelativeLayout.CENTER_HORIZONTAL);
+        if (ctfScan) {
+            params.addRule(RelativeLayout.BELOW, R.id.health_pb);
+            params.addRule(RelativeLayout.CENTER_HORIZONTAL);
+        } else if (balancedCheckIn && mFiringModeButton.getVisibility() != View.VISIBLE) {
             params.addRule(RelativeLayout.BELOW, R.id.use_network_button);
             params.addRule(RelativeLayout.ALIGN_PARENT_START);
         } else {
@@ -3571,7 +4480,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             params.addRule(RelativeLayout.ALIGN_BASELINE, anchor);
         }
         mTeamQrScanButton.setLayoutParams(params);
-        mTeamQrScanButton.setText(balancedCheckIn
+        mTeamQrScanButton.setText(ctfScan ? getString(R.string.ctf_scan_button) : balancedCheckIn
                 ? getString(R.string.balanced_check_in_button, Globals.getInstance().calcNetworkTeam(
                 Globals.getInstance().mPlayerID)) : getString(R.string.team_qr_scan_button));
         mTeamQrScanButton.setVisibility(available ? View.VISIBLE : View.GONE);
@@ -3596,7 +4505,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         int playersPerTeam = (Globals.MAX_PLAYER_ID + 1) / teamCount;
         int firstPlayerID = (requestedTeam - 1) * playersPerTeam + 1;
         int lastPlayerID = Math.min(Globals.MAX_PLAYER_ID, firstPlayerID + playersPerTeam - 1);
-        if (globals.mBossMode) {
+        if (globals.mBossMode || globals.mInfectionMode) {
             firstPlayerID = requestedTeam == 1 ? Globals.BOSS_PLAYER_ID : Globals.BOSS_PLAYER_ID + 1;
             lastPlayerID = requestedTeam == 1 ? Globals.BOSS_PLAYER_ID : Globals.MAX_PLAYER_ID;
         }
@@ -3605,7 +4514,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         try {
             if (globals.mTeamIPMap != null) {
                 for (Byte playerID : globals.mTeamIPMap.keySet()) {
-                    if (playerID != null && playerID > 0 && Globals.isValidPlayerID(playerID))
+                    if (playerID != null && playerID != globals.mPlayerID && playerID > 0 && Globals.isValidPlayerID(playerID))
                         occupiedPlayerIDs[playerID] = true;
                 }
             }
@@ -3668,8 +4577,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return false;
         }
 
+        InetAddress lobbyHost = mReady ? globals.mServerIP : null;
+        boolean rejoin = mReady && !mIsServer && assignedPlayerID != globals.mPlayerID;
+        if (rejoin && mTcpClient != null) {
+            mTcpClient.leaveServer();
+            mTcpClient.stopTcpClient();
+        }
+        globals.mLobbyAutoAssign = false;
         Globals.getInstance().mPlayerID = assignedPlayerID;
         setTeam();
+        if (mIsServer && mTcpServer != null)
+            mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+        else if (rejoin && lobbyHost != null)
+            joinLobbyTakeover(new Intent().putExtra(UDPListenerService.INTENT_SERVERIP,
+                    lobbyHost.getHostAddress()));
         hideQrScanner();
         Toast.makeText(getApplicationContext(), getString(R.string.team_qr_assigned, checkpointTeam,
                 assignedPlayerID), Toast.LENGTH_SHORT).show();
@@ -3682,8 +4603,86 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mReloadBar != null)
             mReloadBar.setVisibility(View.GONE);
         if (mShotsRemainingTV != null)
-            mShotsRemainingTV.setVisibility(isLocalBoss() ? View.INVISIBLE : View.VISIBLE);
+            mShotsRemainingTV.setVisibility(isDualGunMode() ? View.INVISIBLE : View.VISIBLE);
         updateSecondGunControls();
+    }
+
+    private static RelativeLayout.LayoutParams copyRelativeLayoutParams(View view) {
+        if (view == null || !(view.getLayoutParams() instanceof RelativeLayout.LayoutParams))
+            return null;
+        return new RelativeLayout.LayoutParams(
+                (RelativeLayout.LayoutParams) view.getLayoutParams());
+    }
+
+    private static void restoreRelativeLayoutParams(View view,
+                                                    RelativeLayout.LayoutParams original) {
+        if (view != null && original != null)
+            view.setLayoutParams(new RelativeLayout.LayoutParams(original));
+    }
+
+    private void updatePlayingHudLayout(boolean playing) {
+        if (!playing) {
+            restoreRelativeLayoutParams(mShotsRemainingLabelTV, mLobbyShotsLabelLayoutParams);
+            restoreRelativeLayoutParams(mShotsRemainingTV, mLobbyShotsLayoutParams);
+            restoreRelativeLayoutParams(mReloadBar, mLobbyReloadLayoutParams);
+            restoreRelativeLayoutParams(mHealthLabelTV, mLobbyHealthLabelLayoutParams);
+            restoreRelativeLayoutParams(mRecoilLabelTV, mLobbyRecoilLabelLayoutParams);
+            restoreRelativeLayoutParams(mRecoilModeTV, mLobbyRecoilLayoutParams);
+            return;
+        }
+
+        boolean dualGunMode = isDualGunMode();
+        if (dualGunMode) {
+            restoreRelativeLayoutParams(mShotsRemainingLabelTV, mLobbyShotsLabelLayoutParams);
+            restoreRelativeLayoutParams(mShotsRemainingTV, mLobbyShotsLayoutParams);
+            restoreRelativeLayoutParams(mReloadBar, mLobbyReloadLayoutParams);
+            restoreRelativeLayoutParams(mRecoilLabelTV, mLobbyRecoilLabelLayoutParams);
+            restoreRelativeLayoutParams(mRecoilModeTV, mLobbyRecoilLayoutParams);
+        } else {
+            RelativeLayout.LayoutParams label = new RelativeLayout.LayoutParams(
+                    mLobbyShotsLabelLayoutParams);
+            label.addRule(RelativeLayout.CENTER_HORIZONTAL, RelativeLayout.TRUE);
+            label.setMarginStart(0);
+            label.leftMargin = 0;
+            mShotsRemainingLabelTV.setLayoutParams(label);
+
+            RelativeLayout.LayoutParams shots = new RelativeLayout.LayoutParams(
+                    mLobbyShotsLayoutParams);
+            shots.addRule(RelativeLayout.CENTER_HORIZONTAL, RelativeLayout.TRUE);
+            shots.setMarginStart(0);
+            shots.leftMargin = 0;
+            mShotsRemainingTV.setLayoutParams(shots);
+
+            RelativeLayout.LayoutParams reload = new RelativeLayout.LayoutParams(
+                    mLobbyReloadLayoutParams);
+            reload.addRule(RelativeLayout.CENTER_HORIZONTAL, RelativeLayout.TRUE);
+            reload.setMarginStart(0);
+            reload.leftMargin = 0;
+            mReloadBar.setLayoutParams(reload);
+
+            RelativeLayout.LayoutParams recoilLabel = new RelativeLayout.LayoutParams(
+                    mLobbyRecoilLabelLayoutParams);
+            recoilLabel.removeRule(RelativeLayout.CENTER_HORIZONTAL);
+            recoilLabel.addRule(RelativeLayout.ALIGN_PARENT_START, RelativeLayout.TRUE);
+            recoilLabel.setMarginStart(mLobbyShotsLabelLayoutParams.getMarginStart());
+            recoilLabel.leftMargin = mLobbyShotsLabelLayoutParams.leftMargin;
+            mRecoilLabelTV.setLayoutParams(recoilLabel);
+
+            RelativeLayout.LayoutParams recoil = new RelativeLayout.LayoutParams(
+                    mLobbyRecoilLayoutParams);
+            recoil.removeRule(RelativeLayout.CENTER_HORIZONTAL);
+            recoil.addRule(RelativeLayout.ALIGN_PARENT_START, RelativeLayout.TRUE);
+            recoil.setMarginStart(mLobbyShotsLayoutParams.getMarginStart());
+            recoil.leftMargin = mLobbyShotsLayoutParams.leftMargin;
+            mRecoilModeTV.setLayoutParams(recoil);
+        }
+
+        RelativeLayout.LayoutParams health = new RelativeLayout.LayoutParams(
+                mLobbyHealthLabelLayoutParams);
+        health.removeRule(RelativeLayout.BELOW);
+        health.addRule(RelativeLayout.BELOW,
+                dualGunMode ? R.id.boss_ammo_row : R.id.shots_remaining_tv);
+        mHealthLabelTV.setLayoutParams(health);
     }
 
     private void setPlayingShotsCounter(boolean playing) {
@@ -3693,6 +4692,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mShotsRemainingTV.setTextSize(TypedValue.COMPLEX_UNIT_SP, PLAYING_SHOTS_TEXT_SIZE_SP);
         else if (mLobbyShotsTextSizePx > 0)
             mShotsRemainingTV.setTextSize(TypedValue.COMPLEX_UNIT_PX, mLobbyShotsTextSizePx);
+        updatePlayingHudLayout(playing);
     }
 
     /* Initial reload command that tells the tagger not to shoot anymore (or maybe it just sets the
@@ -3720,7 +4720,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         mReloading = reloadStatus;
         mShotsRemainingTV.setVisibility(View.INVISIBLE);
-        mReloadBar.setVisibility(isLocalBoss() ? View.GONE : View.VISIBLE);
+        mReloadBar.setVisibility(isDualGunMode() ? View.GONE : View.VISIBLE);
         updateSecondGunControls();
         byte[] command = new byte[20];
         command[0] = mCommandID;
@@ -3752,6 +4752,30 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
         mPendingReloadCommand = command.clone();
         mBluetoothLeService.writeCharacteristic(mCommandCharacteristic, command);
+    }
+
+    /** Before its second kill, damage to Infection's original zombie drains ammunition. */
+    private void drainOriginalZombieAmmo(int damagePoints) {
+        if (!isOriginalZombieProtected() || damagePoints <= 0)
+            return;
+        int remaining = Math.max(0, (mLastShotCount & 0xff) - damagePoints);
+        setShotsRemaining((byte) remaining);
+        if (mCommandCharacteristic == null || mBluetoothLeService == null)
+            return;
+        byte[] command = new byte[20];
+        command[0] = mCommandID;
+        mCommandID += COMMAND_ID_INCREMENT;
+        command[2] = (byte) 0x04;
+        command[4] = Globals.getInstance().mPlayerID;
+        command[5] = WEAPON_PROFILE;
+        command[6] = (byte) remaining;
+        mCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        mBluetoothLeService.writeCharacteristic(mCommandCharacteristic, command);
+    }
+
+    private long activeReloadTime() {
+        long reloadTime = Math.max(0L, Globals.getInstance().mReloadTime);
+        return hasOriginalZombieFastReload() ? reloadTime / 5L : reloadTime;
     }
 
     private void setShotsRemaining(byte shotsRemaining) {
@@ -3804,6 +4828,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 return;
             if (mTeamAssignmentQrScannerActive)
                 assignTeamFromQrCode(result.getText());
+            else if (mCtfQrScannerActive)
+                handleCtfQrCode(result.getText());
             else if (mRespawnQrScannerActive)
                 handleRespawnQrCode(result.getText());
         }
@@ -3815,7 +4841,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     };
 
     private boolean isQrScannerActive() {
-        return mRespawnQrScannerActive || mTeamAssignmentQrScannerActive;
+        return mRespawnQrScannerActive || mTeamAssignmentQrScannerActive || mCtfQrScannerActive;
     }
 
     private boolean isPowerupScanAvailable() {
@@ -4037,6 +5063,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     mRespawnQrTeam));
         mRespawnQrOpenWhenResumed = false;
         mTeamAssignmentQrScannerActive = false;
+        mCtfQrScannerActive = false;
         mTeamAssignmentQrOpenWhenResumed = false;
         if (mQrScannerCancelButton != null)
             mQrScannerCancelButton.setVisibility(View.GONE);
@@ -4080,14 +5107,52 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mQrScannerCancelButton.setVisibility(View.VISIBLE);
         mRespawnQrScannerOverlay.setVisibility(View.VISIBLE);
         mTeamAssignmentQrScannerActive = true;
+        mCtfQrScannerActive = false;
+        resumeQrScanner();
+    }
+
+    private void openCtfQrScanner() {
+        if (!isCtfScanAvailable() || isFinishing() || isDestroyed())
+            return;
+        if (!mActivityResumed) {
+            mCtfQrOpenWhenResumed = true;
+            return;
+        }
+        if (!getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
+            Toast.makeText(this, R.string.error_camera_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            mCtfQrOpenWhenResumed = true;
+            requestPermissions(new String[]{Manifest.permission.CAMERA},
+                    REQUEST_CODE_QR_CAMERA_PERMISSION);
+            return;
+        }
+        if (mRespawnQrScannerOverlay == null || mRespawnQrScanner == null)
+            return;
+        hidePowerupQrScanner();
+        mRespawnQrScannerPrompt.setText(R.string.ctf_qr_prompt);
+        mRespawnQrOpenWhenResumed = false;
+        mTeamAssignmentQrOpenWhenResumed = false;
+        mCtfQrOpenWhenResumed = false;
+        mRespawnQrScannerActive = false;
+        mTeamAssignmentQrScannerActive = false;
+        mCtfQrScannerActive = true;
+        if (mQrScannerCancelButton != null)
+            mQrScannerCancelButton.setVisibility(View.VISIBLE);
+        mRespawnQrScannerOverlay.setVisibility(View.VISIBLE);
         resumeQrScanner();
     }
 
     private void hideQrScanner() {
         mRespawnQrScannerActive = false;
         mTeamAssignmentQrScannerActive = false;
+        mCtfQrScannerActive = false;
         mRespawnQrOpenWhenResumed = false;
         mTeamAssignmentQrOpenWhenResumed = false;
+        mCtfQrOpenWhenResumed = false;
         if (mRespawnQrScanner != null) {
             try {
                 mRespawnQrScanner.pause();
@@ -4120,7 +5185,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return;
         }
         if (checkpointTeam != mRespawnQrTeam) {
-            Toast.makeText(getApplicationContext(), R.string.respawn_qr_wrong_team,
+            Toast.makeText(getApplicationContext(), Globals.getInstance().mInfectionMode
+                            ? R.string.infection_wrong_base : R.string.respawn_qr_wrong_team,
                     Toast.LENGTH_SHORT).show();
             scheduleQrDecoder();
             return;
@@ -4128,6 +5194,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
         stopRespawnQrVoiceReminder();
         hideQrScanner();
+        if (Globals.getInstance().mInfectionMode) {
+            Globals.getInstance().setPlayerInfected(Globals.getInstance().mPlayerID, true);
+            if (mUDPListenerService != null)
+                mUDPListenerService.updatePeerInfectionState(true);
+            displayCurrentTeam();
+            Toast.makeText(getApplicationContext(), R.string.infection_converted,
+                    Toast.LENGTH_LONG).show();
+        }
         if (isDedicatedServerConnection()) {
             mRespawnQrRequestPending = true;
             mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG
@@ -4137,6 +5211,69 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } else {
             finishSpawn(false);
         }
+    }
+
+    private void handleCtfQrCode(String contents) {
+        if (!isCtfScanAvailable()) {
+            hideQrScanner();
+            return;
+        }
+        int localTeam = Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
+        int flagTeam = Globals.getFlagTeamFromQrCode(contents);
+        if (flagTeam != 0) {
+            if (mCarriedFlagTeam != 0) {
+                Toast.makeText(this, R.string.ctf_flag_unavailable, Toast.LENGTH_SHORT).show();
+                scheduleQrDecoder();
+                return;
+            }
+            if (flagTeam == localTeam) {
+                Toast.makeText(this, R.string.ctf_wrong_flag, Toast.LENGTH_SHORT).show();
+                scheduleQrDecoder();
+                return;
+            }
+            if (mKnownFlagCarriers[flagTeam] != 0) {
+                Toast.makeText(this, R.string.ctf_flag_unavailable, Toast.LENGTH_SHORT).show();
+                scheduleQrDecoder();
+                return;
+            }
+            hideQrScanner();
+            mCarriedFlagTeam = flagTeam;
+            publishCtfState();
+            startFlagSiren();
+            Toast.makeText(this, getString(R.string.ctf_flag_taken, flagTeam),
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        int baseTeam = Globals.getRespawnTeamFromQrCode(contents);
+        if (baseTeam != 0) {
+            if (mCarriedFlagTeam == 0) {
+                Toast.makeText(this, R.string.ctf_no_flag, Toast.LENGTH_SHORT).show();
+                scheduleQrDecoder();
+                return;
+            }
+            if (baseTeam != localTeam) {
+                Toast.makeText(this, getString(R.string.ctf_wrong_base, localTeam),
+                        Toast.LENGTH_SHORT).show();
+                scheduleQrDecoder();
+                return;
+            }
+            hideQrScanner();
+            if (mUDPListenerService != null)
+                mCtfCaptures = Math.max(mCtfCaptures,
+                        mUDPListenerService.getLocalCtfCaptures());
+            mCtfCaptures = Math.min(0xff, mCtfCaptures + 1);
+            mCarriedFlagTeam = 0;
+            mKnownCtfScores[localTeam] = Math.min(Globals.MAX_TEAM_SCOREBOARD_VALUE,
+                    mKnownCtfScores[localTeam] + 1);
+            mTeamScore = mKnownCtfScores[localTeam];
+            mTeamScoreTV.setText(String.valueOf(mTeamScore));
+            stopFlagSiren();
+            publishCtfState();
+            Toast.makeText(this, R.string.ctf_flag_captured, Toast.LENGTH_LONG).show();
+            return;
+        }
+        Toast.makeText(this, R.string.ctf_invalid_qr, Toast.LENGTH_SHORT).show();
+        scheduleQrDecoder();
     }
 
     /**
@@ -4189,6 +5326,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void startSpawn(String eliminatedBy) {
         clearIncomingHitFeedback();
+        stopInactivityVoiceReminder();
         mPowerupQrProgress.reset();
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
@@ -4202,6 +5340,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         cancelHealthRegeneration();
         cancelRespawnShieldBoost();
         Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+        if (mCarriedFlagTeam != 0) {
+            mCarriedFlagTeam = 0;
+            stopFlagSiren();
+            Toast.makeText(this, R.string.ctf_flag_lost, Toast.LENGTH_LONG).show();
+            publishCtfState();
+        }
         updateSecondGunControls();
         updatePowerupScanButton();
         publishPeerRuntimeState();
@@ -4217,7 +5361,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (synchronizedCountdown)
             resetGameStartCountdownSpeech();
         if (teamQrRespawn)
-            mRespawnQrTeam = Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
+            mRespawnQrTeam = Globals.getInstance().mInfectionMode ? 1
+                    : Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
         final long spawnDelay = synchronizedCountdown
                 ? synchronizedStartRemaining()
                 : teamQrRespawn ? Globals.TEAM_QR_RESPAWN_WAIT_SECONDS * 1000
@@ -4251,6 +5396,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             startRespawnQrVoiceReminder();
             openRespawnQrScanner();
         }
+        renderLobby();
     }
 
     private void finishSpawn(boolean notifyDedicatedHost) {
@@ -4269,7 +5415,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mSpawnInTV.setVisibility(View.GONE);
         resetVitalStatBars();
         Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        displayCurrentTeam();
         updateSecondGunControls();
+        updateTeamAssignmentScanButton();
         if (!startingGame)
             startRespawnShieldBoost();
         publishPeerRuntimeState();
@@ -4283,7 +5431,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         if (startingGame) {
             mStartGameTimer = false;
-            startPlayerQuitWindow();
+            updateInGameEndControl();
             if (mHasSynchronizedStart ? mSynchronizedEndAt > 0
                     : (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0) {
                 if (!mGameTimerRunning) {
@@ -4298,6 +5446,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
             announceRoundStart();
         }
+        startInactivityVoiceReminder();
         updatePowerupScanButton();
     }
 
@@ -4340,9 +5489,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Log.d(TAG, "Game time ended!");
         Toast.makeText(getApplicationContext(), getString(R.string.dialog_game_time_expired), Toast.LENGTH_SHORT).show();
         playSound(R.raw.eliminated);
-        if (isDedicatedServerConnection())
-            mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME);
-        else if (mUseNetwork)
+        if (mUseNetwork && !isDedicatedServerConnection())
             // A peer game's timers are local.  Notify the other phones before
             // stopping this listener, otherwise a peer host looks like it was
             // cancelled and its teammates can continue the finished round.
@@ -4515,6 +5662,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         setupTcpServerServiceConnection();
         startPeerUdpServerIfTcpReady();
         consumePendingServerEvent();
+        if (mUseNetwork && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+            if (!isDedicatedServerConnection() && mUDPListenerService != null)
+                mIsServer = mUDPListenerService.isPeerStateAuthority();
+            showEndGameVoteRequest();
+        }
         startGameInviteListening();
         // The TCP service can receive a lobby snapshot while this activity is paused.  Reapply
         // device-side tournament rules before the player can use a reconnected blaster.
@@ -4525,6 +5677,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } else if (mTeamAssignmentQrOpenWhenResumed) {
             mTeamAssignmentQrOpenWhenResumed = false;
             openTeamAssignmentQrScanner();
+        } else if (mCtfQrOpenWhenResumed) {
+            mCtfQrOpenWhenResumed = false;
+            openCtfQrScanner();
         } else {
             resumeQrScanner();
         }
@@ -4538,6 +5693,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             resumePowerupQrScanner();
         }
         startRespawnQrVoiceReminder();
+        if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                && !mStartGameTimer)
+            startInactivityVoiceReminder();
+        mLobbyHandler.removeCallbacks(mLobbyPulse);
+        mLobbyHandler.post(mLobbyPulse);
     }
 
     @Override
@@ -4551,6 +5711,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onPause() {
+        dismissGameControlDialog();
+        mLobbyHandler.removeCallbacks(mLobbyPulse);
         if (mScanningSecondary)
             stopBLEScan();
         if (mGameInviteDialog != null)
@@ -4568,6 +5730,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mRecoilWifiAutoJoiner != null)
             mRecoilWifiAutoJoiner.stop();
         stopRespawnQrVoiceReminder();
+        stopInactivityVoiceReminder();
         if (isQrScannerActive() && mRespawnQrScanner != null) {
             try {
                 mRespawnQrScanner.pause();
@@ -4599,6 +5762,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        dismissGameControlDialog();
+        mLobbyHandler.removeCallbacksAndMessages(null);
         if (mStartWizardDialog != null) {
             mStartWizardDialog.dismiss();
             mStartWizardDialog = null;
@@ -4609,6 +5774,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         cancelNewWeaponPairing();
         clearCombatFeedback();
         resetTeamRespawnQrState();
+        stopFlagSiren();
         hidePowerupQrScanner();
         hideWeaponDisconnect();
         stopBLEScan();
@@ -4655,10 +5821,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     @Override
     public void onBackPressed()
     {
-        // Respawn scanning cannot be dismissed: the countdown keeps running
-        // behind the camera until a valid checkpoint or timeout completes it.
-        if (mRespawnQrScannerActive && isTeamQrRespawnActive())
+        // Back cannot bypass respawn, but a player may confirm leaving the round.
+        if (mRespawnQrScannerActive && isTeamQrRespawnActive()) {
+            confirmQuitGame();
             return;
+        }
         if (isQrScannerActive()) {
             hideQrScanner();
             return;
@@ -4670,6 +5837,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Fragment f = getSupportFragmentManager().findFragmentById(R.id.map_fragment);
         if (f != null && mFragmentMgr.getBackStackEntryCount() > 0) {
             mFragmentMgr.popBackStack();
+            return;
+        }
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+            confirmQuitGame();
             return;
         }
         super.onBackPressed();
@@ -5159,12 +6330,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
             mRespawnQrOpenWhenResumed = granted && isTeamQrRespawnActive();
             mTeamAssignmentQrOpenWhenResumed = granted && isTeamAssignmentScanAvailable();
+            mCtfQrOpenWhenResumed = granted && isCtfScanAvailable();
             if (mRespawnQrOpenWhenResumed && mActivityResumed) {
                 mRespawnQrOpenWhenResumed = false;
                 openRespawnQrScanner();
             } else if (mTeamAssignmentQrOpenWhenResumed && mActivityResumed) {
                 mTeamAssignmentQrOpenWhenResumed = false;
                 openTeamAssignmentQrScanner();
+            } else if (mCtfQrOpenWhenResumed && mActivityResumed) {
+                mCtfQrOpenWhenResumed = false;
+                openCtfQrScanner();
             } else if (!granted) {
                 Toast.makeText(this, R.string.error_camera_permission_required, Toast.LENGTH_SHORT).show();
             }
@@ -5466,7 +6641,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         TextView connectStatusTV = findViewById(R.id.connect_status_tv);
         if (connectStatusTV != null) connectStatusTV.setText(R.string.connect_status_not_connected);
         mLastShotCount = 0;
-        endGame();
+        // A failed gun scan must not remove a player from the shared lobby.
+        updateSharedLobby();
+        renderLobby();
         initBatteryQueue();
         playSound(R.raw.eliminated);
     }
@@ -5789,7 +6966,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     // Using a timer here so we can cancel it if the player is eliminated while waiting to reload
                     if (mReloadTimer != null)
                         mReloadTimer.cancel();
-                    mReloadTimer = new CountDownTimer(Globals.getInstance().mReloadTime, Math.max(1L, Globals.getInstance().mReloadTime)) {
+                    long reloadTime = activeReloadTime();
+                    mReloadTimer = new CountDownTimer(reloadTime, Math.max(1L, reloadTime)) {
                         public void onTick(long millisUntilFinished) { /* do nothing */ }
                         public void onFinish() {
                             if (mReloadTimer != this)
@@ -5901,10 +7079,52 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             int maximum = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
             if (maximum > 0)
                 audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maximum, 0);
+            int alarmMaximum = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM);
+            if (alarmMaximum > 0)
+                audioManager.setStreamVolume(AudioManager.STREAM_ALARM, alarmMaximum, 0);
         } catch (RuntimeException e) {
             // Audio controls must never prevent the round itself from starting.
             Log.w(TAG, "Unable to raise game media volume", e);
         }
+    }
+
+    /** The carrier stays unmistakably audible until the flag is scored or dropped. */
+    private void startFlagSiren() {
+        if (mFlagSiren != null && mFlagSiren.isPlaying())
+            return;
+        stopFlagSiren();
+        setGameVolumeToMaximum();
+        Uri alarm = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+        if (alarm == null)
+            alarm = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+        if (alarm == null)
+            return;
+        MediaPlayer player = new MediaPlayer();
+        try {
+            player.setAudioStreamType(AudioManager.STREAM_ALARM);
+            player.setDataSource(this, alarm);
+            player.setLooping(true);
+            player.setVolume(1.0f, 1.0f);
+            player.prepare();
+            player.start();
+            mFlagSiren = player;
+        } catch (Exception e) {
+            player.release();
+            Log.w(TAG, "Unable to play the flag-carrier siren", e);
+        }
+    }
+
+    private void stopFlagSiren() {
+        MediaPlayer player = mFlagSiren;
+        mFlagSiren = null;
+        if (player == null)
+            return;
+        try {
+            player.stop();
+        } catch (RuntimeException ignored) {
+            // Releasing below is sufficient if Android already stopped it.
+        }
+        player.release();
     }
 
     private void releaseSoundPool() {
@@ -5980,6 +7200,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void shutdownCountdownSpeech() {
         stopRespawnQrVoiceReminder();
         stopReloadVoiceReminder();
+        stopInactivityVoiceReminder();
         TextToSpeech speech;
         synchronized (mPendingVoicePrompts) {
             speech = mCountdownSpeech;
@@ -6054,12 +7275,27 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         || prompt == R.string.game_end_lost_voice_prompt
                         || prompt == R.string.game_end_tied_voice_prompt;
                 boolean killCue = prompt == R.string.enemy_destroyed_voice_prompt;
+                boolean killStreakPrompt = KillStreakVoice.isStreakPrompt(prompt);
+                boolean roundStartPrompt = prompt == R.string.game_start_voice_prompt;
                 speech.setSpeechRate(killCue ? 1.5f : 1.0f);
+                if (killStreakPrompt) {
+                    // The kill cue is queued immediately before this line. Queue
+                    // silence after that utterance so the joke does not run into
+                    // "Enemy Destroyed", regardless of its actual speech length.
+                    speech.playSilentUtterance(KILL_STREAK_FOLLOWUP_DELAY_MS,
+                            TextToSpeech.QUEUE_ADD, KILL_STREAK_PAUSE_UTTERANCE_ID);
+                }
+                if (roundStartPrompt) {
+                    // Let the final countdown number finish, then leave a clear
+                    // beat before the round-opening phrase.
+                    speech.playSilentUtterance(ROUND_START_VOICE_DELAY_MS,
+                            TextToSpeech.QUEUE_ADD, ROUND_START_PAUSE_UTTERANCE_ID);
+                }
                 speech.speak(getString(prompt), endPrompt ? TextToSpeech.QUEUE_FLUSH
                                 : TextToSpeech.QUEUE_ADD,
                         null, endPrompt ? ROUND_END_UTTERANCE_ID
                                 : killCue ? ENEMY_DESTROYED_UTTERANCE_ID
-                                : prompt == R.string.game_start_voice_prompt ? ROUND_START_UTTERANCE_ID
+                                : roundStartPrompt ? ROUND_START_UTTERANCE_ID
                                 : KILL_STREAK_UTTERANCE_ID);
             } catch (RuntimeException e) {
                 Log.w(TAG, "Unable to speak round announcement", e);
@@ -6114,8 +7350,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             boolean respawning = isTeamQrRespawnActive();
             int team = respawning ? mRespawnQrTeam
                     : Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
-            speech.speak(getString(respawning ? R.string.respawn_qr_voice_prompt
-                            : R.string.balanced_check_in_voice_prompt, team), TextToSpeech.QUEUE_FLUSH,
+            String prompt = respawning && Globals.getInstance().mInfectionMode
+                    ? getString(R.string.infection_scan_zombie_base)
+                    : getString(respawning ? R.string.respawn_qr_voice_prompt
+                            : R.string.balanced_check_in_voice_prompt, team);
+            speech.speak(prompt, TextToSpeech.QUEUE_FLUSH,
                     null, RESPAWN_QR_VOICE_REMINDER_UTTERANCE_ID);
         } catch (RuntimeException e) {
             // Speech is purely a prompt; a broken system engine must not
@@ -6165,6 +7404,82 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     null, RELOAD_VOICE_REMINDER_UTTERANCE_ID);
         } catch (RuntimeException e) {
             Log.w(TAG, "Unable to speak reload reminder", e);
+        }
+    }
+
+    private boolean shouldAnnounceInactivityReminder() {
+        return mInactivityReminderActive && mActivityResumed && !mStartGameTimer
+                && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                && mHealth > 0;
+    }
+
+    private void startInactivityVoiceReminder() {
+        if (mStartGameTimer || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                || mHealth <= 0)
+            return;
+        mInactivityReminderActive = true;
+        mNextInactivityReminderAt = SystemClock.elapsedRealtime() + INACTIVITY_FIRST_REMINDER_MS;
+        mInactivityGpsLatitude = mLastGpsLatitude;
+        mInactivityGpsLongitude = mLastGpsLongitude;
+        scheduleInactivityVoiceReminder(INACTIVITY_FIRST_REMINDER_MS);
+    }
+
+    private void recordPlayerActivity() {
+        if (!mInactivityReminderActive
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
+            return;
+        mNextInactivityReminderAt = SystemClock.elapsedRealtime() + INACTIVITY_FIRST_REMINDER_MS;
+        scheduleInactivityVoiceReminder(INACTIVITY_FIRST_REMINDER_MS);
+    }
+
+    private void recordGpsPlayerActivity(double longitude, double latitude) {
+        if (!mInactivityReminderActive)
+            return;
+        if (!Globals.isValidCoordinates(mInactivityGpsLongitude, mInactivityGpsLatitude)) {
+            mInactivityGpsLongitude = longitude;
+            mInactivityGpsLatitude = latitude;
+            return;
+        }
+        float[] distance = new float[1];
+        Location.distanceBetween(mInactivityGpsLatitude, mInactivityGpsLongitude,
+                latitude, longitude, distance);
+        if (distance[0] < INACTIVITY_GPS_MOVEMENT_METERS)
+            return;
+        mInactivityGpsLongitude = longitude;
+        mInactivityGpsLatitude = latitude;
+        recordPlayerActivity();
+    }
+
+    private void scheduleInactivityVoiceReminder(long delayMillis) {
+        if (!shouldAnnounceInactivityReminder())
+            return;
+        mCombatFeedbackHandler.removeCallbacks(mInactivityVoiceReminder);
+        mCombatFeedbackHandler.postDelayed(mInactivityVoiceReminder, Math.max(0, delayMillis));
+    }
+
+    private void stopInactivityVoiceReminder() {
+        mInactivityReminderActive = false;
+        mCombatFeedbackHandler.removeCallbacks(mInactivityVoiceReminder);
+        mInactivityGpsLatitude = Double.NaN;
+        mInactivityGpsLongitude = Double.NaN;
+    }
+
+    private void announceInactivityReminder() {
+        // Reload and checkpoint instructions are time-sensitive; do not bury
+        // either one beneath optional inactivity chatter.
+        if (mReloadVoiceReminderActive || mRespawnQrVoiceReminderActive)
+            return;
+        if (mCountdownSpeech == null)
+            initializeCountdownSpeech();
+        TextToSpeech speech = mCountdownSpeech;
+        if (!mCountdownSpeechReady || speech == null)
+            return;
+        try {
+            speech.setSpeechRate(1.0f);
+            speech.speak(getString(mInactivityVoice.nextPrompt()), TextToSpeech.QUEUE_ADD,
+                    null, INACTIVITY_REMINDER_UTTERANCE_ID);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to speak inactivity reminder", e);
         }
     }
 
@@ -6262,6 +7577,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 && Globals.getInstance().calcNetworkTeam(playerID) == mNetworkTeam;
     }
 
+    private boolean isBenchedHit(byte playerID) {
+        LobbyPlayer player = Globals.getInstance().mLobbyPlayers.get(playerID);
+        return mUseNetwork && player != null && player.benched;
+    }
+
     private boolean isDamageHit(int hitSource, byte hitData) {
         return hitSource != 0 && (hitSource != Globals.GRENADE_PLAYER_ID
                 || (hitData & 0x0F) == GRENADE_DAMAGE);
@@ -6292,10 +7612,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
        07 battery level - 10 is brand new alkalines, 0E for fully charged rechargeables with 0D showing up pretty quick, drops significantly when shooting
        08 00 related to being hit by ID 1, usually around 3* so 3D or 3E but somewhat random
        09 hit by player ID 1, player 1 seems to be 0x04 and player 2 is 0x08, 0x0C, 0x10, 0x14, 0x18
-       10 related to being hit by ID 1 but fairly random in the 6* and 7* range
+       10 upper nibble is hit sensors for ID 1: 8 external, 4 front/center, 2 left, 1 right; lower nibble is a hit counter
        11 related to being hit by ID 2, usually around 3* so 3D or 3E but somewhat random
        12 hit by player ID 2, player 1 seems to be 0x04 and player 2 is 0x08, sometimes this is the same as ID 1 but sometimes different if being shot by 2 people at once
-       13 related to being hit by ID 2 but fairly random in the 6* and 7* range
+       13 upper nibble is hit sensors for ID 2: 8 external, 4 front/center, 2 left, 1 right; lower nibble is a hit counter
        14 how many shots you have left, starts out at 0x1e which would be 30 in decimal and decreases when you pull the trigger
        15 usually 02 but I have seen 03 during reload wait... some kind of status?
        16 starts as 02 but changes to 00 after player ID is set
@@ -6380,7 +7700,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     setRecoil(true);
                 else if (!mRecoilEnabled)
                     setRecoil(false);
-                maybeShowStartWizard();
+                updateSharedLobby();
+                renderLobby();
                 if (isLocalBoss() && !mSecondaryDeviceAddress.isEmpty())
                     setupSecondaryBLEServiceConnection();
                 updateSecondGunControls();
@@ -6391,6 +7712,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     mSecondaryLastTriggerCount = trigger_counter;
                 else
                     mLastTriggerCount = trigger_counter;
+                // Either boss gun counts as participation, including a pull on
+                // an empty magazine while the player is still alive.
+                recordPlayerActivity();
                 if (shotsRemaining == 0 || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING) {
                     playSound(R.raw.empty);
                     int emptyPulls = secondary ? ++mSecondaryEmptyTriggerCount : ++mEmptyTriggerCount;
@@ -6481,6 +7805,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }*/
             if (hit_by_player1 != 0 || hit_by_player2 != 0) {
                 int healthRemoved = 0;
+                int incomingHitSensorMask = 0;
                 byte hit_by_id = 0;
                 // Only the right-most 3 bits make up a normal shot ID. Grenades
                 // instead use the complete byte for a grenade ID and command, so
@@ -6511,7 +7836,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 final boolean playerWasAlreadyEliminated = Globals.getInstance().mGameState
                         == Globals.GAME_STATE_ELIMINATED;
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
-                    if (hit_by_player1 != 0) {
+                    if (hit_by_player1 != 0 && !isBenchedHit(hitByPlayer1ID)) {
                     if ((mLastHitData1.playerID == hit_by_player1 && mLastHitData1.shotID == shot_id1) || (mLastHitData2.playerID == hit_by_player1 && mLastHitData2.shotID == shot_id1)) {
                         //Log.e(TAG, "Hit by 1 is using same shot ID from a previous hit, filter!" + hit_by_player1 + " " + data[RECOIL_OFFSET_HIT_BY1_SHOTID]);
                     } else {
@@ -6546,13 +7871,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                     }
                                 }
                             }
+                            if (healthRemoved != 0)
+                                incomingHitSensorMask |= hitSensorMask(
+                                        data[RECOIL_OFFSET_HIT_BY1_SENSOR]);
                         }
                     }
                     }
                     boolean duplicateInPacket = hit_by_player2 == hit_by_player1 && shot_id2 == shot_id1;
                     if (duplicateInPacket || (mLastHitData1.playerID == hit_by_player2 && mLastHitData1.shotID == shot_id2) || (mLastHitData2.playerID == hit_by_player2 && mLastHitData2.shotID == shot_id2)) {
                         //Log.e(TAG, "Hit by 2 is using same shot ID from a previous hit, filter!");
-                    } else if (hit_by_player2 != 0
+                    } else if (hit_by_player2 != 0 && !isBenchedHit(hitByPlayer2ID)
                             && (playerWasAlreadyEliminated || survivesDamage(healthRemoved))) {
                         if (playerWasAlreadyEliminated) {
                             if (!mStartGameTimer && isDamageHit(hit_by_player2,
@@ -6581,6 +7909,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                     }
                                 }
                             }
+                            if (secondHitDamage != 0)
+                                incomingHitSensorMask |= hitSensorMask(
+                                        data[RECOIL_OFFSET_HIT_BY2_SENSOR]);
                             healthRemoved += secondHitDamage;
                         }
                     }
@@ -6599,9 +7930,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     //TODO hit conformation for the other player vibration toogle
                     if (healthRemoved != 0) {
                         if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
-                            takeDamage(healthRemoved);
+                            if (isOriginalZombieProtected()) {
+                                drainOriginalZombieAmmo(Math.max(1, -healthRemoved));
+                                showIncomingHitFeedback(hit_by_id, incomingHitSensorMask);
+                            } else {
+                                takeDamage(healthRemoved);
                             if (mHealth > 0) {
-                                showIncomingHitFeedback(hit_by_id);
+                                showIncomingHitFeedback(hit_by_id, incomingHitSensorMask);
                             } else {
                                 mKillStreakVoice.resetStreak();
                                 // Drop any queued kill chatter before the team QR
@@ -6634,6 +7969,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                 }
                                 if (outOfLives)
                                     finishOutOfLives();
+                            }
                             }
                         }
                     }
@@ -6755,7 +8091,46 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 receiveLocalGpsLocation(intent);
                 return;
             }
+            if (NetMsg.NETMSG_ENDVOTE.equals(action) || NetMsg.NETMSG_PEERHOSTCHANGED.equals(action)) {
+                String token = intent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+                if (!mUseNetwork || token == null || !token.equals(mActivePeerRoundToken)
+                        || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) return;
+                if (NetMsg.NETMSG_PEERHOSTCHANGED.equals(action) && mUDPListenerService != null)
+                    mIsServer = mUDPListenerService.isPeerStateAuthority();
+                else
+                    showEndGameVoteRequest();
+                return;
+            }
+            if (NetMsg.NETMSG_LOBBYWAIT.equals(action)) {
+                if (!mUseNetwork || mIsServer) return;
+                Globals.getInstance().mLocalLobbyBenched = true;
+                Globals.getInstance().mLobbyRoundActive = true;
+                mLobbyNotice = getString(R.string.lobby_playing_elsewhere);
+                if (Globals.getInstance().mServerIP != null)
+                    mSharedLobby.observe(new SharedLobby.Host(Globals.getInstance().mServerIP,
+                            isDedicatedServerConnection(), true, SystemClock.elapsedRealtime()));
+                if (mTcpClient != null && !mTcpClient.isDedicatedServer()) {
+                    mTcpClient.stopTcpClient();
+                    mReady = false;
+                    mLobbyJoined = false;
+                    startGameInviteListening();
+                }
+                renderLobby();
+                return;
+            }
+            if (NetMsg.NETMSG_SHAREDLOBBY.equals(action)) {
+                try {
+                    String address = intent.getStringExtra(UDPListenerService.INTENT_SERVERIP);
+                    if (address != null)
+                        mSharedLobby.observe(new SharedLobby.Host(InetAddress.getByName(address),
+                                intent.getBooleanExtra(NetMsg.INTENT_LOBBY_DEDICATED, false),
+                                intent.getBooleanExtra(NetMsg.INTENT_LOBBY_PLAYING, false),
+                                SystemClock.elapsedRealtime()));
+                } catch (UnknownHostException ignored) { }
+                return;
+            }
             if (NetMsg.NETMSG_GAMEINVITE.equals(action)) {
+                if (Globals.getInstance().mLocalLobbyBenched) return;
                 showGameInvite(intent);
                 return;
             }
@@ -6783,7 +8158,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     || NetMsg.NETMSG_ALREADYDEAD.equals(action)
                     || NetMsg.NETMSG_ELIMINATED.equals(action)
                     || NetMsg.NETMSG_TEAMELIMINATED.equals(action)
-                    || NetMsg.NETMSG_TEAMSCORESTATE.equals(action);
+                    || NetMsg.NETMSG_TEAMSCORESTATE.equals(action)
+                    || NetMsg.NETMSG_CTFSTATE.equals(action)
+                    || NetMsg.NETMSG_INFECTIONSTATE.equals(action);
             if (gameplayEvent && (!mUseNetwork || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE))
                 return; // Messages already in flight must not change a completed round.
             if (gameplayEvent && mHasSynchronizedStart && mStartGameTimer)
@@ -6851,14 +8228,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     announceKillStreak();
                 }
                 publishPeerRuntimeState();
-                if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
+                if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
+                        && !Globals.getInstance().mCaptureTheFlag) {
                     mTeamScore = incrementCounter(mTeamScore, Globals.MAX_TEAM_SCOREBOARD_VALUE);
                     score = "" + mTeamScore;
                     mTeamScoreTV.setText(score);
                 }
                 checkPeerScoreLimit();
             } else if (NetMsg.NETMSG_TEAMELIMINATED.equals(action)) {
-                if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA)
+                if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                        || Globals.getInstance().mCaptureTheFlag)
                     return;
                 // Increase team score in team games
                 mTeamScore = incrementCounter(mTeamScore, Globals.MAX_TEAM_SCOREBOARD_VALUE);
@@ -6866,12 +8245,70 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mTeamScoreTV.setText(score);
                 checkPeerScoreLimit();
             } else if (NetMsg.NETMSG_TEAMSCORESTATE.equals(action)) {
-                if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA)
+                if (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                        || Globals.getInstance().mCaptureTheFlag)
                     return;
                 mTeamScore = boundedCounter(intent.getIntExtra(NetMsg.INTENT_TEAMSCORE, 0),
                         Globals.MAX_TEAM_SCOREBOARD_VALUE);
                 mTeamScoreTV.setText(String.valueOf(mTeamScore));
                 checkPeerScoreLimit();
+            } else if (NetMsg.NETMSG_CTFSTATE.equals(action)) {
+                if (!Globals.getInstance().mCaptureTheFlag)
+                    return;
+                int[] carriers = {0,
+                        intent.getIntExtra(NetMsg.INTENT_CTF_TEAM1_CARRIER, 0),
+                        intent.getIntExtra(NetMsg.INTENT_CTF_TEAM2_CARRIER, 0)};
+                int localTeam = Globals.getInstance().calcNetworkTeam(
+                        Globals.getInstance().mPlayerID);
+                int localPlayerID = Globals.getInstance().mPlayerID & 0xff;
+                int authoritativeLocalFlag = 0;
+                for (int flagTeam = 1; flagTeam <= Globals.GAME_MODE_2TEAMS; flagTeam++) {
+                    if (mKnownFlagCarriers[flagTeam] != carriers[flagTeam]
+                            && carriers[flagTeam] != 0
+                            && localTeam == flagTeam) {
+                        setGameVolumeToMaximum();
+                        speakRoundVoicePrompt(R.string.ctf_your_flag_stolen_voice);
+                    }
+                    if (carriers[flagTeam] == localPlayerID)
+                        authoritativeLocalFlag = flagTeam;
+                    mKnownFlagCarriers[flagTeam] = carriers[flagTeam];
+                }
+                if (authoritativeLocalFlag != 0) {
+                    mCarriedFlagTeam = authoritativeLocalFlag;
+                    if (mUDPListenerService != null)
+                        mCtfCaptures = Math.max(mCtfCaptures,
+                                mUDPListenerService.getLocalCtfCaptures());
+                    startFlagSiren();
+                }
+                if (mCarriedFlagTeam != 0
+                        && carriers[mCarriedFlagTeam] != 0
+                        && carriers[mCarriedFlagTeam] != localPlayerID) {
+                    mCarriedFlagTeam = 0;
+                    stopFlagSiren();
+                    Toast.makeText(FullscreenActivity.this, R.string.ctf_flag_lost,
+                            Toast.LENGTH_LONG).show();
+                    publishCtfState();
+                }
+                int score1 = intent.getIntExtra(NetMsg.INTENT_CTF_TEAM1_SCORE, 0);
+                int score2 = intent.getIntExtra(NetMsg.INTENT_CTF_TEAM2_SCORE, 0);
+                mKnownCtfScores[1] = score1;
+                mKnownCtfScores[2] = score2;
+                int teamScore = localTeam == 1 ? score1 : score2;
+                mTeamScore = boundedCounter(teamScore, Globals.MAX_TEAM_SCOREBOARD_VALUE);
+                mTeamScoreTV.setText(String.valueOf(mTeamScore));
+                checkCtfCaptureLimit(score1, score2);
+            } else if (NetMsg.NETMSG_INFECTIONSTATE.equals(action)) {
+                if (!Globals.getInstance().mInfectionMode)
+                    return;
+                displayCurrentTeam();
+                updateNetworkRosterDisplay();
+                int total = intent.getIntExtra(NetMsg.INTENT_INFECTION_TOTAL, 0);
+                int infected = intent.getIntExtra(NetMsg.INTENT_INFECTION_INFECTED, 0);
+                if (mIsServer && !isDedicatedServerConnection()
+                        && Globals.infectionRoundShouldEnd(total, infected)) {
+                    endUDPGame();
+                    endGame();
+                }
             } else if (NetMsg.NETMSG_JOIN.equals(action) || NetMsg.NETMSG_LEAVE.equals(action)
                     || NetMsg.NETMSG_QUIT.equals(action)) {
                 updateNetworkRosterDisplay();
@@ -6879,6 +8316,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     endGame(); // Everyone else is out so game is over - this only works in FFA because we don't keep track of who and how many people are on each team
             } else if (NetMsg.NETMSG_LISTPLAYERS.equals(action)) {
                 if (mReady) {
+                    if (!mLobbyJoined && !mIsServer && mTcpClient != null)
+                        mTcpClient.sendLobbyReady();
+                    mLobbyJoined = true;
+                    mLobbyNotice = null;
                     endUDPScanning();
                     updateNetworkRosterDisplay();
                     setTeam();
@@ -6920,6 +8361,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             endGame();
                         } else if (serverGameState == Globals.GAME_STATE_RUNNING
                                 && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                                && !Globals.getInstance().mLocalLobbyBenched
                                 && !outOfLives && !roundExpired) {
                             // Initialize the round first; startGame resets the local score counters.
                             startGame(intent);
@@ -7011,7 +8453,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mReady = false;
                 setReady();
             } else if (NetMsg.NETMSG_FAILEDTOJOIN.equals(action)) {
-                Toast.makeText(getApplicationContext(), getString(R.string.error_join), Toast.LENGTH_SHORT).show();
+                mLobbyNotice = getString(R.string.lobby_searching);
                 boolean failedPeerHostCreation = mPeerHostCreationPending;
                 mPeerHostCreationPending = false;
                 mPeerUdpServerStarting = false;
@@ -7054,6 +8496,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mPeerUdpServerStarting = false;
                 mReady = true;
                 mIsServer = true;
+                mLobbyJoined = true;
+                mLobbyNotice = null;
                 setReady();
                 updateNetworkRosterDisplay();
                 if (mUDPListenerService != null)
@@ -7089,6 +8533,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mNetworkStatusIV.setImageResource(R.drawable.ic_network_connected_24dp);
             } else if (NetMsg.NETMSG_NETWORKDISCONNECTED.equals(action)) {
                 mNetworkStatusIV.setImageResource(R.drawable.ic_network_disconnected_24dp);
+                mLobbyJoined = false;
             } else if (NetMsg.NETMSG_PLAYERSETTINGSUPDATE.equals(action)) {
                 updatePlayerSettings();
             } else if (NetMsg.NETMSG_BALANCEDLOBBY.equals(action)) {
@@ -7102,6 +8547,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return NetMsg.NETMSG_ELIMINATED.equals(action)
                 || NetMsg.NETMSG_TEAMELIMINATED.equals(action)
                 || NetMsg.NETMSG_TEAMSCORESTATE.equals(action)
+                || NetMsg.NETMSG_CTFSTATE.equals(action)
+                || NetMsg.NETMSG_INFECTIONSTATE.equals(action)
                 || NetMsg.NETMSG_LEAVE.equals(action)
                 || NetMsg.NETMSG_ENDGAME.equals(action);
     }
@@ -7115,7 +8562,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Globals globals = Globals.getInstance();
         // Dedicated games use the server's authoritative totals. Sending ENDGAME
         // here can be interpreted as LEAVE when server-only settings are enabled.
-        if (isDedicatedServerConnection() || (globals.mGameLimit & Globals.GAME_LIMIT_SCORE) == 0
+        if (isDedicatedServerConnection() || globals.mInfectionMode
+                || (globals.mGameLimit & Globals.GAME_LIMIT_SCORE) == 0
                 || globals.mScoreLimit <= 0)
             return;
         int winningScore = globals.mGameMode == Globals.GAME_MODE_FFA ? mScore : mTeamScore;
@@ -7123,6 +8571,17 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             endUDPGame();
             endGame();
         }
+    }
+
+    private void checkCtfCaptureLimit(int team1Score, int team2Score) {
+        Globals globals = Globals.getInstance();
+        if (!globals.mCaptureTheFlag || !mIsServer || isDedicatedServerConnection()
+                || (globals.mGameLimit & Globals.GAME_LIMIT_SCORE) == 0
+                || globals.mScoreLimit <= 0
+                || Math.max(team1Score, team2Score) < globals.mScoreLimit)
+            return;
+        endUDPGame();
+        endGame();
     }
 
     private static IntentFilter makeUDPUpdateIntentFilter() {
@@ -7139,11 +8598,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         intentFilter.addAction(NetMsg.NETMSG_LISTPLAYERS);
         intentFilter.addAction(NetMsg.NETMSG_PLAYERDATAUPDATE);
         intentFilter.addAction(NetMsg.NETMSG_GAMEINVITE);
+        intentFilter.addAction(NetMsg.NETMSG_SHAREDLOBBY);
+        intentFilter.addAction(NetMsg.NETMSG_LOBBYWAIT);
         intentFilter.addAction(NetMsg.NETMSG_LOBBYINVITE);
         intentFilter.addAction(NetMsg.NETMSG_HOSTTAKEOVER);
         intentFilter.addAction(NetMsg.NETMSG_STARTGAME);
         intentFilter.addAction(NetMsg.NETMSG_CLOCKSYNCWAITING);
         intentFilter.addAction(NetMsg.NETMSG_ENDGAME);
+        intentFilter.addAction(NetMsg.NETMSG_ENDVOTE);
+        intentFilter.addAction(NetMsg.NETMSG_PEERHOSTCHANGED);
         intentFilter.addAction(NetMsg.NETMSG_ERROR);
         intentFilter.addAction(NetMsg.NETMSG_VERSIONERROR);
         intentFilter.addAction(NetMsg.NETMSG_SAMETEAM);
@@ -7154,6 +8617,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         intentFilter.addAction(NetMsg.NETMSG_SERVERREPLY);
         intentFilter.addAction(NetMsg.NETMSG_TEAMELIMINATED);
         intentFilter.addAction(NetMsg.NETMSG_TEAMSCORESTATE);
+        intentFilter.addAction(NetMsg.NETMSG_CTFSTATE);
+        intentFilter.addAction(NetMsg.NETMSG_INFECTIONSTATE);
         intentFilter.addAction(NetMsg.NETMSG_RESPAWNGRANTED);
         intentFilter.addAction(NetMsg.NETMSG_NETWORKCONNECTED);
         intentFilter.addAction(NetMsg.NETMSG_NETWORKDISCONNECTED);

@@ -4,7 +4,7 @@
 keeps the game authority and live display on a laptop; players still use the
 Android app and their BLE laser-tag hardware.
 
-It speaks the protocol-19 TCP lobby, clock synchronization, GPS,
+It speaks the protocol-24 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
 
@@ -58,12 +58,48 @@ automatic fire. Health and shields do not regenerate in this mode. In normal
 tournament games, health starts returning one point per second after 30 seconds
 without another damaging hit.
 
-The launcher prints each usable laptop IPv4 address. On every phone, use
-**Join Game** and enter that address. The app's normal UDP join step and TCP
-lobby connection happen automatically. Allow the laptop through its firewall
+For Capture the Flag, run `./laptop-host/run.sh --ctf`. Print flag QRs with
+`SIMPLECOIL:FLAG:1` and `SIMPLECOIL:FLAG:2`; the number is the owning team.
+Players take the opposing flag and score by scanning their own existing
+`SIMPLECOIL:RESPAWN:1` or `SIMPLECOIL:RESPAWN:2` base QR.
+
+For Infection, run `./laptop-host/run.sh --infection`. Player 1 is the original
+zombie. Killed survivors scan the Team 1 respawn QR to join the zombie team;
+recruited zombies use the same QR after later deaths. Hits drain the original
+zombie's ammunition until that player earns two kills. After the second kill,
+the original zombie can die and must scan Team 1 to return. That player's reload
+takes 20% of normal only until the original zombie's first death, then returns
+to normal speed. The host ends the round when all connected survivors have
+converted, or when conversions leave one final uninfected player. Infection is
+always a five-minute round; players still alive and uninfected at the deadline
+win.
+
+Phones running 1.23 automatically discover and join this host on the same
+Wi-Fi/AP, even before their guns are paired. The laptop announces its lobby
+every two seconds and takes priority over idle phone hosts. Automatic player
+assignment uses free IDs and balances ordinary teams. The host waits until
+all participating players have a connected gun and synchronized clock before
+starting. The map's lobby roster shows each player's readiness and has a
+**Sit out / Play** control. Spare phones can stay in the lobby without blocking
+the round; they receive no start command and do not affect scoring, teams, or
+Boss health. Change participation before starting, with no extra Ready button
+needed on the phones.
+
+The map's **End game** button asks participating players to approve an early
+end. Two different players must agree; the non-playing laptop operator and
+sitting-out phones do not count. The button shows the approval count. Players
+can withdraw approval or confirm **Leave game** on their phone at any time;
+leaving does not end the shared round. Timer and victory-condition endings
+remain automatic. Use protocol-24 phones (app 1.23) with this host.
+
+The launcher also prints each usable laptop IPv4 address. If automatic
+discovery is blocked, open **Equipment and advanced options > Advanced: enter
+host address** on the phone. The app's UDP join step and TCP lobby connection
+then happen automatically. Disable AP client isolation and allow the laptop through its firewall
 on TCP port `17510` and UDP port `17500` if prompted.
 
-To replace a lobby that was created on a phone, start the laptop host with
+Idle phone lobbies now migrate automatically to the laptop. For an explicit
+takeover announcement, start the laptop host with
 `--takeover` before the game starts. Updated phones in that idle lobby
 automatically reconnect to the laptop, which then becomes the game authority:
 

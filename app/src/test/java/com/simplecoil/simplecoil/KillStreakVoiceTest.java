@@ -62,6 +62,16 @@ public class KillStreakVoiceTest {
         assertEquals(allRandomLines(), heard);
     }
 
+    @Test public void everyStreakLineIsRecognizedAsAFollowupButTheKillCueIsNot() {
+        assertTrue(KillStreakVoice.isStreakPrompt(R.string.kill_streak_2_voice_prompt));
+        assertTrue(KillStreakVoice.isStreakPrompt(R.string.kill_streak_3_voice_prompt));
+        assertTrue(KillStreakVoice.isStreakPrompt(R.string.kill_streak_4_voice_prompt));
+        for (int prompt : allRandomLines())
+            assertTrue(KillStreakVoice.isStreakPrompt(prompt));
+        assertEquals(false,
+                KillStreakVoice.isStreakPrompt(R.string.enemy_destroyed_voice_prompt));
+    }
+
     private static Set<Integer> allRandomLines() {
         Set<Integer> lines = new HashSet<>();
         lines.add(R.string.kill_streak_5_voice_prompt);

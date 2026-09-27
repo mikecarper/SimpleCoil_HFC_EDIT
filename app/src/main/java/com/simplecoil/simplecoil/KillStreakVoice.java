@@ -49,6 +49,18 @@ final class KillStreakVoice {
         }
     }
 
+    static boolean isStreakPrompt(int prompt) {
+        if (prompt == R.string.kill_streak_2_voice_prompt
+                || prompt == R.string.kill_streak_3_voice_prompt
+                || prompt == R.string.kill_streak_4_voice_prompt)
+            return true;
+        for (int randomPrompt : RANDOM_LINES) {
+            if (prompt == randomPrompt)
+                return true;
+        }
+        return false;
+    }
+
     private int nextRandomLine() {
         if (nextRandom == shuffledLines.length) {
             for (int i = shuffledLines.length - 1; i > 0; i--) {

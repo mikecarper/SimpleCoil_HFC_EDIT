@@ -18,6 +18,7 @@ import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.core.content.ContextCompat;
@@ -47,6 +48,7 @@ final class RecoilWifiAutoJoiner {
     private String mLastRequestedSsid;
     private String mLastRequestedBssid;
     private long mLastRequestAt;
+    private long mLastScanAt = -1;
 
     private final Runnable mRetryRunnable = new Runnable() {
         @Override
@@ -159,14 +161,21 @@ final class RecoilWifiAutoJoiner {
             if (candidate != null)
                 requestConnection(candidate, userInitiated);
 
-            // Scan results may be stale when a hub was just switched on.  Keep looking until
-            // association succeeds, but do not scan continuously once connected.
-            try {
-                mWifiManager.startScan();
-            } catch (SecurityException e) {
-                Log.w(TAG, "Wi-Fi scan was denied", e);
+            // Consume result broadcasts immediately, without starting a new scan for
+            // every completed scan. Otherwise the broadcast bypasses the retry delay
+            // and leaves older phones scanning continuously (about twice a second).
+            long now = SystemClock.elapsedRealtime();
+            if (userInitiated || scanRetryDelay(now, mLastScanAt) == 0) {
+                mLastScanAt = now;
+                try {
+                    mWifiManager.startScan();
+                } catch (SecurityException e) {
+                    Log.w(TAG, "Wi-Fi scan was denied", e);
+                }
             }
-            scheduleRetry(candidate == null ? SCAN_RETRY_MS : CONNECT_RETRY_MS);
+            scheduleRetry(candidate == null
+                    ? Math.max(1, scanRetryDelay(SystemClock.elapsedRealtime(), mLastScanAt))
+                    : CONNECT_RETRY_MS);
         } catch (SecurityException e) {
             Log.w(TAG, "Unable to inspect Wi-Fi state", e);
         }
@@ -174,7 +183,7 @@ final class RecoilWifiAutoJoiner {
 
     @SuppressLint("MissingPermission")
     private void requestConnection(ScanResult candidate, boolean force) {
-        long now = System.currentTimeMillis();
+        long now = SystemClock.elapsedRealtime();
         if (!force && sameAccessPoint(candidate, mLastRequestedSsid, mLastRequestedBssid)
                 && now - mLastRequestAt < CONNECT_RETRY_MS) {
             return;
@@ -262,6 +271,10 @@ final class RecoilWifiAutoJoiner {
 
     static boolean isEligibleNetwork(String ssid, String capabilities) {
         return isRecoilSsid(ssid) && isOpenNetwork(capabilities);
+    }
+
+    static long scanRetryDelay(long now, long lastScanAt) {
+        return lastScanAt < 0 ? 0 : Math.max(0, SCAN_RETRY_MS - Math.max(0, now - lastScanAt));
     }
 
     static boolean isRecoilSsid(String ssid) {

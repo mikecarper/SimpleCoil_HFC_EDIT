@@ -14,6 +14,63 @@ and retains the project's Apache-2.0 license.
 
 ## Multiplayer and synchronized starts
 
+### Shared lobby (1.23)
+
+Open the app on every phone connected to the same Wi-Fi/AP. The new lobby
+automatically discovers the host, joins it, and assigns an unused player ID.
+You no longer need to pair a gun or separately choose Create/Join first.
+If no host exists, a phone creates one after a short discovery period.
+Simultaneous phone hosts converge on the lowest IPv4 address; a laptop or
+dedicated host takes priority while the lobby is idle. An already running
+match is never migrated to another host.
+
+The screen separates Wi-Fi, your player, match rules, and the shared roster.
+The bottom action always stays visible and tells you the next step. Connect
+your gun, edit your name, and optionally use Team or Scan QR to choose your
+team. Automatic assignment balances ordinary team games. Every player sees
+who still needs a gun. Only the host changes the mode or starts the shared
+countdown, after all participating players have guns ready and synchronized clocks.
+There is no extra Ready button: gun pairing and clock sync happen in parallel.
+Scanning, trigger-hold instructions, and Cancel appear directly in the lobby.
+The host can tap **Sit out** beside a spare phone and **Play** to add it back
+before starting. Sitting-out phones remain on the same hub without holding up
+the countdown, entering combat, or affecting Boss health and victory counts.
+They wait for the next round; only the host changes participation. A phone
+promoted to host participates, and therefore needs a gun, or can instead use
+the dedicated-host option. The laptop map has the same participation controls.
+The compact roster is grouped by team and shows the host, gun status, clock
+sync, and reconnecting players. Unnamed phones display their player ID.
+Match summaries include limits, health/shields, ammo, reload, fire mode, and
+the objective. All these changes preserve automatic lobby join and the single
+host Start action.
+Equipment, phone hotspot setup, solo practice, and manual host entry remain
+available in the options.
+
+### Ending or leaving a round (1.23)
+
+During countdown, play, or respawn, **End / Leave game** offers two separate
+actions. **Agree to end** asks for an early end; the round ends only after two
+different participating players approve. Duplicate taps and sitting-out phones
+do not count. Approval lasts for the current round and can be withdrawn while
+waiting for a second player. Leaving also removes that player's approval.
+A dedicated or laptop game master can request the vote but does not count as
+a participating player. Timers, score limits, and other victory conditions
+still finish the round automatically.
+
+**Leave game** asks for confirmation and exits only your phone, without ending
+everyone else's round. It is available throughout the round, including via
+Back, and is no longer limited to the first 30 seconds. If the playing phone
+host leaves, the remaining phone with the lowest player ID takes over the
+game-state broadcasts. You sit out until the host adds you to a later round.
+
+Lobby discovery uses a small UDP beacon/query every two seconds, not a scan
+of every address. While looking for Wi-Fi, fresh radio scans are limited to
+once every three seconds; scan results can still trigger an immediate join,
+and tapping Wi-Fi requests an immediate scan. The AP must allow client-to-client traffic and subnet
+broadcasts; turn off guest/client isolation. All phones and the laptop host
+must run this protocol-24 build. A phone arriving during a locked active game
+waits for the next round instead of creating a separate lobby.
+
 Network games use TCP for the lobby and an NTP-style exchange of monotonic-clock
 timestamps to synchronize a start deadline. The app never changes a phone's
 system clock and does not use a public NTP server.
@@ -28,12 +85,12 @@ system clock and does not use a public NTP server.
 - The network-offset target is below 50 ms on a healthy local network. Wi-Fi
   congestion, device suspension, and normal UI scheduling can still affect the
   moment a device visibly reacts.
-- All participants must use network protocol 19 (this build). Older protocol
+- All participants must use network protocol 24 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
 During every network game, each phone sends one subnet-directed IPv4 state
 broadcast per second instead of one unicast packet per player. The fixed
-1,312-byte protocol-19 snapshot fits 32 player records below the 1,472-byte UDP
+1,312-byte protocol-24 snapshot fits 32 player records below the 1,472-byte UDP
 payload ceiling and avoids normal IPv4 fragmentation. Each record carries
 cumulative score/deaths,
 health, shield, shots, player state, grenade pairing, a deduplicated important
@@ -42,8 +99,9 @@ the newer player rows they hear. The host still publishes an authoritative tick
 every second; after a missing tick's 20% grace window (200 ms), a phone fills
 only newer portions of that tick from its overheard cache. Late or stale data
 cannot roll state back. Names, addresses, and other bulky mappings remain in
-TCP lobby setup. Android holds Wi-Fi performance and multicast locks only while
-gameplay is active.
+TCP lobby setup. Android holds the high-performance Wi-Fi lock during gameplay;
+the multicast lock also stays active during lobby discovery so idle phones can
+hear the shared host.
 
 QR power-ups are off by default. Before starting a game, the lobby host can
 choose Off or 4 through 8 different codes with the Power-ups control. All phones
@@ -76,6 +134,7 @@ included dedicated host, so no phone is consumed as the host.
 | --- | --- |
 | Two teams | Team 1: 1-16; Team 2: 17-32 |
 | Boss Mode | Boss: Player 1; Hunters: Players 2-32 |
+| Infection | Original zombie: Player 1; Survivors: Players 2-32 |
 
 Every game uses the same server-authoritative tournament profile: 5 health, 10 shields,
 30-shot magazines, a 1.5-second reload, one damage per hit, recoil enabled,
@@ -98,6 +157,29 @@ it was previously paired. The boss HUD shows gun 2's ammo on the left and gun
 1's on the right; "--" means disconnected and "..." means reloading. Pairing a
 second gun is unavailable to hunters.
 
+Capture the Flag is a locked two-team tournament variant. Print two flag QR
+codes containing `SIMPLECOIL:FLAG:1` and `SIMPLECOIL:FLAG:2`; the number is the
+team that owns that flag. A live player scans the opposing flag, then scans
+their own existing `SIMPLECOIL:RESPAWN:1` or `SIMPLECOIL:RESPAWN:2` base QR to
+score. The robbed team hears "Your flag is stolen" once. The carrier's phone
+loops its alarm sound at maximum alarm volume until the carrier scores or dies.
+Death immediately returns the flag so another player can scan it. The plain
+text forms `TEAM 1 FLAG` and `TEAM 2 FLAG` are also accepted. For the laptop
+host, start the mode with `./laptop-host/run.sh --ctf`.
+
+Infection starts Player 1 as the original zombie and everyone else as a
+survivor. A killed survivor runs to the zombie base and scans the existing
+Team 1 respawn QR before returning as a zombie. Recruited zombies can be killed
+and must scan that same base again. Until the original zombie earns two kills,
+incoming damage removes ammunition instead of health. After the second kill,
+the original zombie can be killed normally and must scan the Team 1 base to
+return. Its reload takes 20% of the normal time only until its first death;
+after respawning, reload speed is normal. The round ends when every survivor
+has converted, or awards the win to the final uninfected player after another
+survivor converts. Any survivor still alive and uninfected at the fixed
+five-minute deadline also wins. Score and lives limits are disabled for this mode. On a laptop host, use
+`./laptop-host/run.sh --infection`.
+
 Balanced Random is an optional two-team assignment method on the laptop host.
 Everyone joins the lobby, then the host presses **Start** to assign teams using
 the kills and deaths saved on each player's phone from previous network games.
@@ -116,7 +198,7 @@ While a QR check-in is pending, the phone repeats the assigned team number in
 its spoken scan reminder. Respawn QR reminders also say the player's team.
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-19 host automatically
+team before starting. If an ID conflicts, a protocol-24 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and
@@ -144,7 +226,9 @@ Run it on the same Wi-Fi network as the phones:
 ./laptop-host/run.sh
 ```
 
-Use the printed laptop IP in the app's **Join Game** flow, then open the local
+Phones discover the laptop automatically on the same Wi-Fi. If broadcasts are
+unavailable, use **Equipment and advanced options > Advanced: enter host address**
+with the printed laptop IP. Open the local
 dashboard's **map** and **leaderboard** display windows. GPS updates are
 change-driven and forwarded at up to four times per second in hosted games.
 The laptop host broadcasts the same nearby-game invitation as a phone host,

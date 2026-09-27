@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
+import java.util.Locale;
 
 public class Globals {
     private static Globals mInstance= null;
@@ -126,6 +127,37 @@ public class Globals {
     public volatile int mGameMode = GAME_MODE_2TEAMS;
     /** Player 1 is the boss; every other valid player ID is on the hunter team. */
     public volatile boolean mBossMode = false;
+    /** Two-team QR capture-the-flag rules layered on the tournament profile. */
+    public volatile boolean mCaptureTheFlag = false;
+    /** Player 1 starts infected; eliminated survivors join after scanning Team 1 base. */
+    public volatile boolean mInfectionMode = false;
+    public volatile boolean mLocalLobbyReady;
+    public volatile boolean mLobbyAutoAssign = true;
+    public volatile Map<Byte, Boolean> mLobbyPlayerReady = Collections.emptyMap();
+    public volatile Map<Byte, LobbyPlayer> mLobbyPlayers = Collections.emptyMap();
+    public volatile boolean mLocalLobbyBenched;
+    public volatile boolean mLobbyRoundActive;
+    public volatile long mEndGameVotes;
+    public volatile boolean mEndGameVoteRequested;
+
+    /** Benched phones stay in the lobby, not in combat, scaling, or victory counts. */
+    public void removeBenchedPlayersFromGameRoster() {
+        Map<Byte, LobbyPlayer> lobby = mLobbyPlayers;
+        getmTeamIPMapSemaphore();
+        try {
+            for (LobbyPlayer player : lobby.values())
+                if (player.benched) mTeamIPMap.remove(player.id);
+        } finally { mTeamIPMapSemaphore.release(); }
+        getmIPTeamMapSemaphore();
+        try {
+            java.util.Iterator<Map.Entry<InetAddress, Byte>> entries = mIPTeamMap.entrySet().iterator();
+            while (entries.hasNext()) {
+                LobbyPlayer player = lobby.get(entries.next().getValue());
+                if (player != null && player.benched) entries.remove();
+            }
+        } finally { mIPTeamMapSemaphore.release(); }
+    }
+    public volatile Set<Byte> mInfectedPlayers = Collections.emptySet();
     // -1 means derive the lobby preview from the currently visible roster.
     // Once a host commits a round, the advertised value is retained so a
     // disconnect cannot reduce the boss's maximum health or shields.
@@ -144,6 +176,31 @@ public class Globals {
         mBalancedCheckedIn = Collections.emptySet();
     }
 
+    public synchronized void resetInfectedPlayers() {
+        if (!mInfectionMode) {
+            mInfectedPlayers = Collections.emptySet();
+            return;
+        }
+        Set<Byte> infected = new HashSet<>();
+        infected.add((byte) 1);
+        mInfectedPlayers = Collections.unmodifiableSet(infected);
+    }
+
+    public synchronized void setPlayerInfected(byte playerID, boolean infected) {
+        if (playerID <= 0 || !isValidPlayerID(playerID))
+            return;
+        Set<Byte> update = new HashSet<>(mInfectedPlayers);
+        if (infected || playerID == 1 && mInfectionMode)
+            update.add(playerID);
+        else if (!mInfectionMode)
+            update.remove(playerID);
+        mInfectedPlayers = Collections.unmodifiableSet(update);
+    }
+
+    public boolean isPlayerInfected(byte playerID) {
+        return mInfectionMode && (playerID == 1 || mInfectedPlayers.contains(playerID));
+    }
+
     public void setBalancedAssignments(Map<Byte, Integer> teams, Set<Byte> checkedIn) {
         mBalancedTeams = Collections.unmodifiableMap(new HashMap<>(teams));
         mBalancedCheckedIn = Collections.unmodifiableSet(new HashSet<>(checkedIn));
@@ -157,6 +214,7 @@ public class Globals {
     public static final int GAME_LIMIT_TIME = 1;
     public static final int GAME_LIMIT_LIVES = 2;
     public static final int GAME_LIMIT_SCORE = 4;
+    public static final int INFECTION_TIME_LIMIT_MINUTES = 5;
     public static final long NEXT_GAME_WAIT_MILLISECONDS = 30_000L;
     public volatile int mGameLimit = GAME_LIMIT_NONE;
     public volatile int mTimeLimit = 0;
@@ -166,6 +224,23 @@ public class Globals {
 
     public static boolean isValidGameLimit(int limit) {
         return limit >= 0 && limit <= MAX_GAME_LIMIT;
+    }
+
+    public void applyInfectionGameLimits() {
+        mTimeLimit = INFECTION_TIME_LIMIT_MINUTES;
+        mLivesLimit = 0;
+        mScoreLimit = 0;
+        mGameLimit = GAME_LIMIT_TIME;
+    }
+
+    public static boolean infectionRoundShouldEnd(int totalPlayers, int infectedPlayers) {
+        if (totalPlayers < 2 || infectedPlayers < 1)
+            return false;
+        if (infectedPlayers >= totalPlayers)
+            return true;
+        // Do not instantly award a two-player match to its sole starting survivor.
+        return totalPlayers >= 3 && infectedPlayers >= 2
+                && totalPlayers - infectedPlayers == 1;
     }
 
     /**
@@ -331,6 +406,9 @@ public class Globals {
             gameMode = GAME_MODE_2TEAMS;
         mTournamentMode = false;
         mBossMode = false;
+        mCaptureTheFlag = false;
+        mInfectionMode = false;
+        mInfectedPlayers = Collections.emptySet();
         mBossHunterCount = -1;
         mBalancedRandom = false;
         clearBalancedAssignments();
@@ -413,6 +491,8 @@ public class Globals {
             return INVALID_PLAYER_ID;
         if (mBossMode)
             return player_id == BOSS_PLAYER_ID ? 1 : 2;
+        if (mInfectionMode)
+            return isPlayerInfected(player_id) ? 1 : 2;
         if (mBalancedRandom && mGameMode == GAME_MODE_2TEAMS) {
             Integer assigned = mBalancedTeams.get(player_id);
             if (assigned != null)
@@ -455,6 +535,33 @@ public class Globals {
                 && "RESPAWN".equalsIgnoreCase(parts[2]))
             return parseRespawnTeam(parts[1]);
         return 0;
+    }
+
+    /**
+     * Decode a printed flag QR. Accepted forms are SIMPLECOIL:FLAG:1 and
+     * TEAM 1 FLAG. The number identifies the team that owns the flag.
+     */
+    public static int getFlagTeamFromQrCode(String contents) {
+        if (contents == null || contents.length() > 64)
+            return 0;
+        String value = contents.trim();
+        final String prefix = "SIMPLECOIL:FLAG:";
+        if (value.regionMatches(true, 0, prefix, 0, prefix.length()))
+            return parseFlagTeam(value.substring(prefix.length()));
+        String[] parts = value.split("\\s+");
+        if (parts.length == 3 && "TEAM".equalsIgnoreCase(parts[0])
+                && "FLAG".equalsIgnoreCase(parts[2]))
+            return parseFlagTeam(parts[1]);
+        return 0;
+    }
+
+    private static int parseFlagTeam(String teamValue) {
+        try {
+            int team = Integer.parseInt(teamValue);
+            return team >= 1 && team <= GAME_MODE_2TEAMS ? team : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     private static int parseRespawnTeam(String teamValue) {
@@ -533,7 +640,37 @@ public class Globals {
                 // ACCESS_WIFI_STATE can be unavailable on a modified device. Fall back below.
             }
         }
+        InetAddress wifiInterfaceAddress = getWifiInterfaceAddress();
+        if (wifiInterfaceAddress != null)
+            return wifiInterfaceAddress;
         return getIPAddress();
+    }
+
+    /** Return a Wi-Fi station or SoftAP IPv4 address without falling back to cellular. */
+    static InetAddress getWifiInterfaceAddress() {
+        try {
+            for (NetworkInterface intf : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!isWifiInterfaceName(intf.getName()))
+                    continue;
+                for (InetAddress address : Collections.list(intf.getInetAddresses())) {
+                    if (!address.isLoopbackAddress() && !address.isLinkLocalAddress()
+                            && address.getHostAddress().indexOf(':') < 0)
+                        return address;
+                }
+            }
+        } catch (Exception ignored) {
+            // A missing or changing interface simply means Wi-Fi is not ready yet.
+        }
+        return null;
+    }
+
+    static boolean isWifiInterfaceName(String name) {
+        if (name == null)
+            return false;
+        String lower = name.toLowerCase(Locale.US);
+        return lower.startsWith("wlan") || lower.startsWith("wifi")
+                || lower.startsWith("ap") || lower.contains("softap")
+                || lower.startsWith("swlan");
     }
 
     public static String getIPAddressStr(Context context) {

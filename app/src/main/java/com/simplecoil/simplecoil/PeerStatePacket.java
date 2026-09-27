@@ -29,6 +29,8 @@ final class PeerStatePacket {
     static final int FLAG_PRESENT = 1;
     static final int FLAG_LEFT = 1 << 1;
     static final int FLAG_GPS_VALID = 1 << 2;
+    static final int FLAG_INFECTED = 1 << 3;
+    static final int FLAG_END_VOTE = 1 << 4;
 
     static final int EVENT_NONE = 0;
     static final int EVENT_SHOT_FIRED = 1;
@@ -38,9 +40,10 @@ final class PeerStatePacket {
     static final int EVENT_ELIMINATED = 5;
     static final int EVENT_LEAVE = 6;
     static final int EVENT_END_GAME = 7;
+    static final int EVENT_QUIT = 8;
 
     private static final int MAGIC = 0x53434F49; // "SCOI"
-    private static final int FORMAT_VERSION = 1;
+    private static final int FORMAT_VERSION = 2;
     private static final double GPS_SCALE = 100_000.0;
 
     static {
@@ -80,7 +83,8 @@ final class PeerStatePacket {
             buffer.put((byte) (state == null ? 0 : state.grenadeID));
             buffer.put((byte) (state == null ? EVENT_NONE : state.eventType));
             buffer.put((byte) (state == null ? 0 : state.eventTargetID));
-            buffer.putShort((short) 0);
+            buffer.put((byte) (state == null ? 0 : state.carriedFlagTeam));
+            buffer.put((byte) (state == null ? 0 : state.ctfCaptures));
             buffer.putInt((int) (state == null ? 0 : state.ownerSequence));
             buffer.putInt((int) (state == null ? 0 : state.eventSequence));
             buffer.putInt(state == null ? 0 : state.score);
@@ -119,7 +123,8 @@ final class PeerStatePacket {
             int grenadeID = unsigned(buffer.get());
             int eventType = unsigned(buffer.get());
             int eventTargetID = unsigned(buffer.get());
-            buffer.getShort();
+            int carriedFlagTeam = unsigned(buffer.get());
+            int ctfCaptures = unsigned(buffer.get());
             long ownerSequence = unsigned(buffer.getInt());
             long eventSequence = unsigned(buffer.getInt());
             int score = buffer.getInt();
@@ -135,9 +140,10 @@ final class PeerStatePacket {
                 return null;
             if ((flags & FLAG_PRESENT) == 0)
                 continue;
-            if ((flags & ~(FLAG_PRESENT | FLAG_LEFT | FLAG_GPS_VALID)) != 0
-                    || ownerSequence <= 0 || eventType > EVENT_END_GAME
+            if ((flags & ~(FLAG_PRESENT | FLAG_LEFT | FLAG_GPS_VALID | FLAG_INFECTED | FLAG_END_VOTE)) != 0
+                    || ownerSequence <= 0 || eventType > EVENT_QUIT
                     || eventTargetID > PLAYER_CAPACITY || gameState > Globals.GAME_STATE_ELIMINATED
+                    || carriedFlagTeam > Globals.GAME_MODE_2TEAMS
                     || !Globals.isValidGrenadeID(grenadeID) || score < 0
                     || score > Globals.MAX_SCOREBOARD_VALUE || deaths < 0
                     || deaths > Globals.MAX_SCOREBOARD_VALUE)
@@ -147,7 +153,8 @@ final class PeerStatePacket {
                 return null;
             players[playerID] = new PlayerState(playerID, flags, ownerSequence, eventSequence,
                     eventType, eventTargetID, gameState, grenadeID, score, deaths, health, shield,
-                    shotsRemaining, gpsAgeSeconds, latitude, longitude);
+                    shotsRemaining, gpsAgeSeconds, latitude, longitude,
+                    carriedFlagTeam, ctfCaptures);
         }
         return new Decoded(networkVersion, roundToken, snapshotSequence, senderID, gameMode, players);
     }
@@ -220,11 +227,22 @@ final class PeerStatePacket {
         final int gpsAgeSeconds;
         final double latitude;
         final double longitude;
+        final int carriedFlagTeam;
+        final int ctfCaptures;
 
         PlayerState(int playerID, int flags, long ownerSequence, long eventSequence, int eventType,
                     int eventTargetID, int gameState, int grenadeID, int score, int deaths,
                     int health, int shield, int shotsRemaining, int gpsAgeSeconds,
                     double latitude, double longitude) {
+            this(playerID, flags, ownerSequence, eventSequence, eventType, eventTargetID,
+                    gameState, grenadeID, score, deaths, health, shield, shotsRemaining,
+                    gpsAgeSeconds, latitude, longitude, 0, 0);
+        }
+
+        PlayerState(int playerID, int flags, long ownerSequence, long eventSequence, int eventType,
+                    int eventTargetID, int gameState, int grenadeID, int score, int deaths,
+                    int health, int shield, int shotsRemaining, int gpsAgeSeconds,
+                    double latitude, double longitude, int carriedFlagTeam, int ctfCaptures) {
             this.playerID = playerID;
             this.flags = flags;
             this.ownerSequence = ownerSequence;
@@ -241,12 +259,15 @@ final class PeerStatePacket {
             this.gpsAgeSeconds = gpsAgeSeconds;
             this.latitude = latitude;
             this.longitude = longitude;
+            this.carriedFlagTeam = carriedFlagTeam;
+            this.ctfCaptures = ctfCaptures;
         }
 
         PlayerState withOwnerSequence(long sequence) {
             return new PlayerState(playerID, flags, sequence, eventSequence, eventType,
                     eventTargetID, gameState, grenadeID, score, deaths, health, shield,
-                    shotsRemaining, gpsAgeSeconds, latitude, longitude);
+                    shotsRemaining, gpsAgeSeconds, latitude, longitude,
+                    carriedFlagTeam, ctfCaptures);
         }
     }
 }

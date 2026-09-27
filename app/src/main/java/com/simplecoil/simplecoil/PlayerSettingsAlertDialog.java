@@ -348,6 +348,10 @@ public class PlayerSettingsAlertDialog extends AlertDialog implements PopupMenu.
         View.OnClickListener saveSettings =
                 button -> {
                     if (Globals.getInstance().mTournamentMode) {
+                        Globals.getInstance().applyTournamentRules();
+                        if (!isServer && mTcpClient != null)
+                            mTcpClient.sendPlayerSettings();
+                        mContext.sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
                         Toast.makeText(getContext(), R.string.tournament_rules_locked,
                                 Toast.LENGTH_SHORT).show();
                         dismiss();

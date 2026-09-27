@@ -20,11 +20,13 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    // Protocol 19 adds all-player state gossip, sender-zero authority ticks,
-    // and missed-tick reconstruction. Older clients must not interpret those
-    // binary snapshots as the protocol-18 peer-only stream.
-    public static final int NETWORK_VERSION_NUMBER = 19;
-    public static final String NETWORK_VERSION = "19";
+    // Protocol 24 adds two-player end votes and non-terminal peer exits.
+    public static final int NETWORK_VERSION_NUMBER = 24;
+    public static final String NETWORK_VERSION = "24";
+    public static final String NETMSG_LOBBYWAIT = "com.simplecoil.simplecoil.LOBBYWAIT";
+    public static final String NETMSG_SHAREDLOBBY = "SHAREDLOBBY";
+    public static final String INTENT_LOBBY_DEDICATED = "LOBBY_DEDICATED";
+    public static final String INTENT_LOBBY_PLAYING = "LOBBY_PLAYING";
 
     // Most of these messages are straightforward and contain no extra data.
     public static final String NETMSG_SHOTFIRED = "SHOTFIRED";
@@ -48,6 +50,8 @@ public class NetMsg {
     public static final String NETMSG_STARTGAME = "STARTGAME";
     public static final String NETMSG_CLOCKSYNCWAITING = "CLOCKSYNCWAITING";
     public static final String NETMSG_ENDGAME = "ENDGAME";
+    public static final String NETMSG_ENDVOTE = "ENDVOTE";
+    public static final String NETMSG_PEERHOSTCHANGED = "PEERHOSTCHANGED";
     public static final String NETMSG_ERROR = "ERROR";
     public static final String NETMSG_FAILEDTOJOIN = "FAILEDTOJOIN";
     public static final String NETMSG_VERSIONERROR = "VERSIONERROR";
@@ -60,6 +64,15 @@ public class NetMsg {
     // Internal app broadcast carrying an absolute team total reconstructed
     // from peer state snapshots. It is not a text UDP wire message.
     public static final String NETMSG_TEAMSCORESTATE = "TEAMSCORESTATE";
+    // Internal broadcast reconstructed from the cumulative peer-state rows.
+    public static final String NETMSG_CTFSTATE = "CTFSTATE";
+    public static final String NETMSG_INFECTIONSTATE = "INFECTIONSTATE";
+    public static final String INTENT_INFECTION_TOTAL = "INFECTION_TOTAL";
+    public static final String INTENT_INFECTION_INFECTED = "INFECTION_INFECTED";
+    public static final String INTENT_CTF_TEAM1_CARRIER = "CTF_TEAM1_CARRIER";
+    public static final String INTENT_CTF_TEAM2_CARRIER = "CTF_TEAM2_CARRIER";
+    public static final String INTENT_CTF_TEAM1_SCORE = "CTF_TEAM1_SCORE";
+    public static final String INTENT_CTF_TEAM2_SCORE = "CTF_TEAM2_SCORE";
     public static final String NETMSG_SERVERREPLY = "SERVERREPLY";
     // A host appends ":<player ID>" to SERVERREPLY only when it moved a
     // conflicting joining player to an available slot on the same team.

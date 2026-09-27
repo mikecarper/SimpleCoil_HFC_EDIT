@@ -1,0 +1,83 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/lobby_panel"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="#0D141D">
+
+    <TextView
+        android:id="@+id/lobby_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/lobby_title"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF" />
+    <TextView
+        android:id="@+id/lobby_status"
+        style="@style/LobbyBody"
+        android:layout_marginTop="4dp"
+        android:text="@string/lobby_searching" />
+
+    <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical">
+            <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:orientation="vertical">
+                <TextView android:id="@+id/lobby_wifi" style="@style/LobbyBody" />
+                <TextView android:id="@+id/lobby_host" style="@style/LobbyEyebrow" />
+            </LinearLayout>
+            <Button android:id="@+id/lobby_wifi_button" style="@style/LobbyTextButton"
+                android:text="@string/lobby_wifi_action" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical">
+            <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:orientation="vertical">
+                <TextView android:id="@+id/lobby_name" style="@style/LobbyHeading" />
+            </LinearLayout>
+            <Button android:id="@+id/lobby_name_button" style="@style/LobbyTextButton"
+                android:text="@string/lobby_edit_name" />
+        </LinearLayout>
+        <TextView android:id="@+id/lobby_gun_status" style="@style/LobbyBody" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <Button android:id="@+id/lobby_gun_button" style="@style/LobbyTextButton"
+                android:layout_width="0dp" android:layout_weight="1"
+                android:text="@string/lobby_gun_action" />
+            <Button android:id="@+id/lobby_team_button" style="@style/LobbyTextButton"
+                android:layout_width="0dp" android:layout_weight="1"
+                android:text="@string/lobby_team_action" />
+            <Button android:id="@+id/lobby_scan_button" style="@style/LobbyTextButton"
+                android:layout_width="0dp" android:layout_weight="1"
+                android:text="@string/lobby_scan_action" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
+        <Button android:id="@+id/lobby_mode_button" style="@style/LobbyTextButton"
+            android:layout_width="match_parent" android:gravity="start|center_vertical"
+            android:paddingStart="0dp" android:paddingEnd="0dp" android:textSize="19sp"
+            android:textStyle="bold" android:text="@string/game_mode_tournament_2teams" />
+        <TextView android:id="@+id/lobby_rules" style="@style/LobbyBody" android:textSize="13sp" />
+        <Button android:id="@+id/lobby_rules_button" style="@style/LobbyTextButton"
+            android:text="@string/lobby_match_options" />
+    </LinearLayout>
+
+    <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
+        <TextView android:id="@+id/lobby_roster_title" style="@style/LobbyEyebrow"
+            android:text="@string/lobby_players_label" />
+        <TextView android:id="@+id/lobby_blockers" style="@style/LobbyBody"
+            android:textColor="#FFBA6A" android:layout_marginTop="4dp"
+            android:textSize="13sp" android:visibility="gone" />
+        <LinearLayout android:id="@+id/lobby_roster" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:orientation="vertical" />
+    </LinearLayout>
+
+    <Button android:id="@+id/lobby_more_button" style="@style/LobbyTextButton"
+        android:layout_width="match_parent" android:text="@string/lobby_more" />
+</LinearLayout>

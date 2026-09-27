@@ -49,6 +49,8 @@ public class TcpGameInfoRegressionTest {
     private int originalBossHunterCount;
     private int originalPowerupQrRequired;
     private int originalMapTilePort;
+    private long originalEndVotes;
+    private boolean originalEndVoteRequested;
     private int[] originalPairings;
     private InetAddress originalPeer;
     private Map<Byte, Globals.PlayerSettings> originalSettings;
@@ -78,6 +80,10 @@ public class TcpGameInfoRegressionTest {
         originalBossHunterCount = globals.mBossHunterCount;
         originalPowerupQrRequired = globals.mPowerupQrRequired;
         originalMapTilePort = globals.mMapTilePort;
+        originalEndVotes = globals.mEndGameVotes;
+        originalEndVoteRequested = globals.mEndGameVoteRequested;
+        globals.mEndGameVotes = 0;
+        globals.mEndGameVoteRequested = false;
         originalPairings = globals.mGrenadePairings.clone();
         originalLocalSettings = localSettings();
         Globals.getmPlayerSettingsSemaphore();
@@ -127,6 +133,8 @@ public class TcpGameInfoRegressionTest {
         globals.mBossHunterCount = originalBossHunterCount;
         globals.mPowerupQrRequired = originalPowerupQrRequired;
         globals.mMapTilePort = originalMapTilePort;
+        globals.mEndGameVotes = originalEndVotes;
+        globals.mEndGameVoteRequested = originalEndVoteRequested;
         System.arraycopy(originalPairings, 0, globals.mGrenadePairings, 0, originalPairings.length);
         Globals.getmPlayerSettingsSemaphore();
         try {
@@ -142,6 +150,42 @@ public class TcpGameInfoRegressionTest {
     @Test
     public void deeplyNestedArraysCannotCrashClientParsing() throws Exception {
         assertDeepMessageIgnored(true);
+    }
+
+    @Test
+    public void benchedPhonesStayVisibleButAreNotCombatPeersOrBossHunters() throws Exception {
+        boolean oldBench = globals.mLocalLobbyBenched;
+        Map<Byte, LobbyPlayer> oldLobby = globals.mLobbyPlayers;
+        try {
+            parse(roster(new JSONArray().put(player(1)).put(player(2))
+                    .put(player(3).put(TcpServer.JSON_LOBBY_BENCHED, true)))
+                    .put(TcpServer.JSON_TOURNAMENT_MODE, true).put(TcpServer.JSON_BOSS_MODE, true));
+            assertEquals(3, globals.mLobbyPlayers.size());
+            assertEquals(LobbyPlayer.Status.BENCHED, globals.mLobbyPlayers.get((byte) 3).status());
+            assertFalse(globals.mTeamIPMap.containsKey((byte) 3));
+            assertFalse(globals.mIPTeamMap.containsValue((byte) 3));
+            assertTrue(globals.mTeamIPMap.containsKey((byte) 2));
+            assertEquals(1, globals.mBossHunterCount);
+        } finally {
+            globals.mLocalLobbyBenched = oldBench;
+            globals.mLobbyPlayers = oldLobby;
+        }
+    }
+
+    @Test
+    public void benchWaitMessageDoesNotQueueAStart() throws Exception {
+        boolean oldBench = globals.mLocalLobbyBenched;
+        boolean oldPlaying = globals.mLobbyRoundActive;
+        try {
+            parse(new JSONObject().put(TcpServer.JSON_LOBBY_WAIT, true));
+            assertTrue(globals.mLocalLobbyBenched);
+            assertTrue(globals.mLobbyRoundActive);
+            assertEquals(NetMsg.NETMSG_LOBBYWAIT, client.events.get(0).getAction());
+            assertNull(client.consumePendingGameStart(0));
+        } finally {
+            globals.mLocalLobbyBenched = oldBench;
+            globals.mLobbyRoundActive = oldPlaying;
+        }
     }
 
     @Test
@@ -1085,6 +1129,31 @@ public class TcpGameInfoRegressionTest {
         assertEquals(originalPeer, globals.mTeamIPMap.get((byte) 2));
         assertEquals(Byte.valueOf((byte) 2), globals.mIPTeamMap.get(originalPeer));
         assertEquals("Original peer", globals.mTeamPlayerNameMap.get((byte) 2));
+    }
+
+    @Test
+    public void endVoteUpdatesRequireTheCurrentDedicatedRoundAndValidPlayerBits() throws Exception {
+        String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        java.lang.reflect.Field dedicated = TcpClient.class.getDeclaredField("mIsDedicatedServer");
+        dedicated.setAccessible(true);
+        dedicated.set(client, true);
+        java.lang.reflect.Field activeToken = TcpClient.class.getDeclaredField("mActiveStartToken");
+        activeToken.setAccessible(true);
+        activeToken.set(client, token);
+        JSONObject votes = new JSONObject().put(TcpServer.JSON_END_VOTES, 1L)
+                .put(TcpServer.JSON_ROUND_TOKEN, token);
+        parse(votes);
+        assertEquals(1L, globals.mEndGameVotes);
+        assertTrue(globals.mEndGameVoteRequested);
+        assertEquals(NetMsg.NETMSG_ENDVOTE, client.events.get(0).getAction());
+        parse(new JSONObject().put(TcpServer.JSON_END_VOTES, 3L)
+                .put(TcpServer.JSON_ROUND_TOKEN, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+        parse(new JSONObject().put(TcpServer.JSON_END_VOTES, 1L << 32)
+                .put(TcpServer.JSON_ROUND_TOKEN, token));
+        assertEquals(1L, globals.mEndGameVotes);
+        assertEquals(1, client.events.size());
+        parse(votes.put(TcpServer.JSON_END_VOTES, 0));
+        assertEquals(0L, globals.mEndGameVotes);
     }
 
     private void parse(JSONObject json) throws Exception { parse(json.toString()); }

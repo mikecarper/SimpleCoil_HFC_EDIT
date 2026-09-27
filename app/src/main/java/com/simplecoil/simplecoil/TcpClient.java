@@ -45,6 +45,7 @@ import java.net.Socket;
 import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
@@ -88,6 +89,7 @@ public class TcpClient extends Service {
     private volatile boolean keepListening = false;
     private volatile boolean isListening = false;
     private volatile boolean mIsDedicatedServer = false;
+    private boolean mLobbyRegistered;
     private boolean mDestroyed;
     private long mSessionGeneration;
     // A takeover receives the new UDP endpoint before it is safe to start a
@@ -342,6 +344,7 @@ public class TcpClient extends Service {
     }
 
     private void resetClockSyncLocked() {
+        mLobbyRegistered = false;
         mGameClock.reset();
         mClockSynchronized = false;
         mClockRequestQueued = false;
@@ -546,6 +549,10 @@ public class TcpClient extends Service {
         mActiveStartDuration = duration;
         mActiveLocalStartAt = startAt;
         mActiveStartRound = roundID;
+        if (!roundToken.equals(mActiveStartToken)) {
+            Globals.getInstance().mEndGameVotes = 0;
+            Globals.getInstance().mEndGameVoteRequested = false;
+        }
         mActiveStartToken = roundToken;
         intent.putExtra(NetMsg.INTENT_START_AT, startAt)
                 .putExtra(NetMsg.INTENT_END_AT, duration == 0 ? 0 : startAt + duration)
@@ -914,6 +921,8 @@ public class TcpClient extends Service {
             JSONObject playerInfo = new JSONObject();
             playerInfo.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
             playerInfo.put(TcpServer.JSON_PLAYERNAME, Globals.getInstance().mPlayerName);
+            playerInfo.put(TcpServer.JSON_LOBBY_READY, Globals.getInstance().mLocalLobbyReady);
+            playerInfo.put(TcpServer.JSON_LOBBY_BENCHED, Globals.getInstance().mLocalLobbyBenched);
             playerInfo.put(TcpServer.JSON_PRIOR_KILLS, PlayerHistory.kills(this));
             playerInfo.put(TcpServer.JSON_PRIOR_DEATHS, PlayerHistory.deaths(this));
             if (rejoin) {
@@ -936,6 +945,34 @@ public class TcpClient extends Service {
         sendPlayerGrenade(true);
     }
 //TODO player presets
+    public void sendLobbyReady() {
+        try {
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(TcpServer.JSON_LOBBY_READY,
+                    Globals.getInstance().mLocalLobbyReady), false);
+        } catch (JSONException e) {
+            Log.w(TAG, "Unable to publish lobby readiness", e);
+        }
+    }
+
+    public boolean voteToEndGame(String roundToken, boolean approve) {
+        synchronized (this) {
+            if (!isDedicatedServer() || !TcpServer.isValidRoundToken(roundToken)
+                    || !roundToken.equals(mActiveStartToken) || !keepListening) return false;
+        }
+        try {
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(TcpServer.JSON_END_VOTE, approve)
+                    .put(TcpServer.JSON_ROUND_TOKEN, roundToken), true);
+            return true;
+        } catch (JSONException e) { return false; }
+    }
+
+    /** A lobby snapshot may arrive while its activity is paused for gun pairing. */
+    public synchronized boolean hasLobbyConnection() {
+        return !mDestroyed && keepListening && out != null && mLobbyRegistered;
+    }
+
     public void sendPlayerSettings() {
         sendPlayerSettings(false);
     }
@@ -1130,12 +1167,36 @@ public class TcpClient extends Service {
         }
         try {
             JSONObject game = TcpJson.parseObject(message);
+            if (game.has(TcpServer.JSON_END_VOTES)) {
+                long votes = TcpJson.getLong(game, TcpServer.JSON_END_VOTES);
+                String token = game.getString(TcpServer.JSON_ROUND_TOKEN);
+                synchronized (this) {
+                    if (!isCurrentSession(generation) || !mIsDedicatedServer
+                            || !token.equals(mActiveStartToken) || votes < 0
+                            || (votes & ~EndGameVotes.VALID_MASK) != 0) return;
+                    Globals.getInstance().mEndGameVotes = votes;
+                    Globals.getInstance().mEndGameVoteRequested = true;
+                }
+                broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_ENDVOTE)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+                return;
+            }
+            if (Boolean.TRUE.equals(game.opt(TcpServer.JSON_LOBBY_WAIT))) {
+                synchronized (this) {
+                    if (!isCurrentSession(generation)) return;
+                    Globals.getInstance().mLobbyRoundActive = true;
+                    Globals.getInstance().mLocalLobbyBenched = true;
+                }
+                broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_LOBBYWAIT));
+                return;
+            }
             if (game.has(TcpServer.JSON_CLOCK_REQUEST)) {
                 receiveClockSync(game, receivedAt, generation);
                 return;
             }
             JSONObject startInfo = game.has(TcpServer.JSON_GAMESTART) ? readStartInfo(game) : null;
             if (startInfo != null && !game.has(TcpServer.JSON_PLAYERS)) {
+                if (Globals.getInstance().mLocalLobbyBenched) return;
                 queueSynchronizedStart(generation, startInfo, new Intent(NetMsg.NETMSG_STARTGAME));
                 return;
             }
@@ -1276,8 +1337,16 @@ public class TcpClient extends Service {
                 throw new JSONException("Server does not enforce the required tournament rules");
             final boolean bossMode = game.has(TcpServer.JSON_BOSS_MODE)
                     && TcpJson.getBoolean(game, TcpServer.JSON_BOSS_MODE);
+            final boolean ctfMode = game.has(TcpServer.JSON_CTF_MODE)
+                    && TcpJson.getBoolean(game, TcpServer.JSON_CTF_MODE);
+            final boolean infectionMode = game.has(TcpServer.JSON_INFECTION_MODE)
+                    && TcpJson.getBoolean(game, TcpServer.JSON_INFECTION_MODE);
             if (bossMode && !tournamentMode)
                 throw new JSONException("Boss mode requires tournament weapon rules");
+            if (ctfMode && (!tournamentMode || bossMode))
+                throw new JSONException("Capture the flag requires two-team tournament rules");
+            if (infectionMode && (!tournamentMode || bossMode || ctfMode))
+                throw new JSONException("Infection requires two-team tournament rules");
             final Boolean onlyServerSettingsUpdate = game.has(TcpServer.JSON_ONLY_SERVER_SETTINGS)
                     ? TcpJson.getBoolean(game, TcpServer.JSON_ONLY_SERVER_SETTINGS) : null;
             if (game.has(TcpServer.JSON_PLAYERSETTINGS)) {
@@ -1330,6 +1399,8 @@ public class TcpClient extends Service {
                 Map<Byte, InetAddress> teamIPs = new HashMap<>();
                 Map<InetAddress, Byte> ipTeams = new HashMap<>();
                 Map<Byte, String> playerNames = new HashMap<>();
+                Map<Byte, LobbyPlayer> lobbyPlayers = new HashMap<>();
+                Set<InetAddress> rosterAddresses = new HashSet<>();
                 Map<Byte, Integer> balancedTeams = new HashMap<>();
                 Set<Byte> balancedCheckedIn = new HashSet<>();
                 boolean balancedMode = game.has(TcpServer.JSON_BALANCED_MODE)
@@ -1355,7 +1426,14 @@ public class TcpClient extends Service {
                         throw new JSONException("Conflicting player roster snapshot");
                     seenPlayers[rawPlayerID] = true;
                     byte playerID = (byte) rawPlayerID;
-                    if (bossMode && playerID != Globals.BOSS_PLAYER_ID)
+                    boolean benched = player.optBoolean(TcpServer.JSON_LOBBY_BENCHED, false);
+                    lobbyPlayers.put(playerID, new LobbyPlayer(playerID,
+                            TcpJson.getPlayerName(player, TcpServer.JSON_PLAYERNAME),
+                            player.optBoolean(TcpServer.JSON_LOBBY_CONNECTED, true),
+                            player.optBoolean(TcpServer.JSON_LOBBY_READY, true),
+                            player.optBoolean(TcpServer.JSON_CLOCK_READY, false), benched,
+                            player.optBoolean(TcpServer.JSON_LOBBY_HOST, false)));
+                    if (bossMode && playerID != Globals.BOSS_PLAYER_ID && !benched)
                         rosterBossHunterCount++;
                     if (player.has(TcpServer.JSON_TEAM)) {
                         int assignedTeam = TcpJson.getInt(player, TcpServer.JSON_TEAM);
@@ -1377,15 +1455,23 @@ public class TcpClient extends Service {
                         } catch (UnknownHostException e) {
                             throw new JSONException("Invalid player address " + ip);
                         }
-                        if (teamIPs.containsKey(playerID) || ipTeams.containsKey(playerIP))
+                        if (!rosterAddresses.add(playerIP))
                             throw new JSONException("Conflicting player IDs or addresses in roster");
                         String playerName = TcpJson.getPlayerName(player, TcpServer.JSON_PLAYERNAME);
-                        teamIPs.put(playerID, playerIP);
-                        ipTeams.put(playerIP, playerID);
+                        if (!benched) {
+                            teamIPs.put(playerID, playerIP);
+                            ipTeams.put(playerIP, playerID);
+                        }
                         playerNames.put(playerID, playerName);
                     }
                 }
                 // Validate all metadata before replacing the live roster or limits.
+                Map<Byte, Boolean> lobbyReadiness = new HashMap<>();
+                for (int index = 0; index < players.length(); index++) {
+                    JSONObject player = players.getJSONObject(index);
+                    lobbyReadiness.put((byte) TcpJson.getInt(player, TcpServer.JSON_PLAYERID),
+                            player.optBoolean(TcpServer.JSON_LOBBY_READY, true));
+                }
                 Globals globals = Globals.getInstance();
                 int gameLimit = Globals.GAME_LIMIT_NONE;
                 int timeLimit = globals.mTimeLimit;
@@ -1428,7 +1514,14 @@ public class TcpClient extends Service {
                     throw new JSONException("Balanced random requires two teams");
                 if (bossMode && balancedMode)
                     throw new JSONException("Boss mode cannot use balanced team assignment");
-                if (!balancedTeams.isEmpty() && balancedTeams.size() != players.length())
+                if (ctfMode && (gameMode != Globals.GAME_MODE_2TEAMS || balancedMode))
+                    throw new JSONException("Capture the flag requires ordinary two-team assignment");
+                if (infectionMode && (gameMode != Globals.GAME_MODE_2TEAMS || balancedMode))
+                    throw new JSONException("Infection requires ordinary two-team assignment");
+                int participants = 0;
+                for (LobbyPlayer player : lobbyPlayers.values())
+                    if (!player.benched) participants++;
+                if (!balancedTeams.isEmpty() && balancedTeams.size() != participants)
                     throw new JSONException("Incomplete balanced team assignment");
                 boolean useGPS = game.has(TcpServer.JSON_USEGPS);
                 int gpsMode = globals.mGPSMode;
@@ -1513,6 +1606,15 @@ public class TcpClient extends Service {
                                         return;
                                     globals.mTournamentMode = tournamentMode;
                                     globals.mBossMode = bossMode;
+                                    globals.mCaptureTheFlag = ctfMode;
+                                    globals.mInfectionMode = infectionMode;
+                                    // A roster refresh can arrive during a live round when
+                                    // someone joins or leaves. Preserve conversions already
+                                    // learned from state gossip instead of briefly turning
+                                    // every recruit back into a survivor.
+                                    if (!infectionMode
+                                            || globals.mGameState == Globals.GAME_STATE_NONE)
+                                        globals.resetInfectedPlayers();
                                     // We already hold the team/IP roster locks here. Seed Boss
                                     // scaling from the validated snapshot so applyTournamentRules()
                                     // never tries to reacquire the non-reentrant team-map semaphore.
@@ -1529,10 +1631,19 @@ public class TcpClient extends Service {
                                     globals.mIPTeamMap.putAll(ipTeams);
                                     globals.mTeamPlayerNameMap.clear();
                                     globals.mTeamPlayerNameMap.putAll(playerNames);
+                                    globals.mLobbyPlayerReady = Collections.unmodifiableMap(lobbyReadiness);
+                                    globals.mLobbyPlayers = Collections.unmodifiableMap(lobbyPlayers);
+                                    LobbyPlayer localPresence = lobbyPlayers.get(globals.mPlayerID);
+                                    globals.mLocalLobbyBenched = localPresence != null && localPresence.benched;
+                                    globals.mLobbyRoundActive = game.optBoolean(TcpServer.JSON_LOBBY_PLAYING, false);
+                                    mLobbyRegistered = true;
                                     globals.mGameLimit = gameLimit;
                                     globals.mTimeLimit = timeLimit;
                                     globals.mLivesLimit = livesLimit;
                                     globals.mScoreLimit = scoreLimit;
+                                    if (infectionMode) {
+                                        globals.applyInfectionGameLimits();
+                                    }
                                     globals.mGameMode = gameMode;
                                     globals.mBalancedRandom = balancedMode;
                                     globals.mBalancedRequireQr = balancedQr;
@@ -1591,7 +1702,7 @@ public class TcpClient extends Service {
             if (settingsUpdate != null)
                 broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_PLAYERSETTINGSUPDATE));
             if (rosterIntent != null) {
-                if (startInfo != null)
+                if (startInfo != null && !Globals.getInstance().mLocalLobbyBenched)
                     queueSynchronizedStart(generation, startInfo, rosterIntent);
                 else
                     broadcastIfCurrentSession(generation, rosterIntent);

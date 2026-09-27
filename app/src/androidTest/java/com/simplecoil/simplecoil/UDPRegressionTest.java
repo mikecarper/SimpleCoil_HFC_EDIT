@@ -47,6 +47,8 @@ public class UDPRegressionTest {
     private byte originalPlayerID;
     private InetAddress originalServer;
     private boolean originalTournamentMode;
+    private long originalEndVotes;
+    private boolean originalEndVoteRequested;
 
     @Before
     public void setUp() throws Exception {
@@ -61,6 +63,10 @@ public class UDPRegressionTest {
         originalPlayerID = globals.mPlayerID;
         originalServer = globals.mServerIP;
         originalTournamentMode = globals.mTournamentMode;
+        originalEndVotes = globals.mEndGameVotes;
+        originalEndVoteRequested = globals.mEndGameVoteRequested;
+        globals.mEndGameVotes = 0;
+        globals.mEndGameVoteRequested = false;
         globals.mGameState = Globals.GAME_STATE_RUNNING;
         globals.mGameMode = Globals.GAME_MODE_2TEAMS;
         globals.mPlayerID = 1;
@@ -84,7 +90,94 @@ public class UDPRegressionTest {
         globals.mPlayerID = originalPlayerID;
         globals.mServerIP = originalServer;
         globals.mTournamentMode = originalTournamentMode;
+        globals.mEndGameVotes = originalEndVotes;
+        globals.mEndGameVoteRequested = originalEndVoteRequested;
         clearPlayers();
+    }
+
+    @Test
+    public void endVotesNeedTwoDifferentCurrentPlayersAndCanBeWithdrawn() throws Exception {
+        register(enemy, 17);
+        startPeerGame();
+        assertFalse(service.voteToEndGame("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", true));
+        assertTrue(service.voteToEndGame(PEER_ROUND_TOKEN, true));
+        assertTrue(service.voteToEndGame(PEER_ROUND_TOKEN, true));
+        assertEquals(1L, Globals.getInstance().mEndGameVotes);
+        assertFalse(flag("mPeerVoteEndCommitted"));
+        assertTrue(service.voteToEndGame(PEER_ROUND_TOKEN, false));
+        assertEquals(0L, Globals.getInstance().mEndGameVotes);
+        assertTrue(service.voteToEndGame(PEER_ROUND_TOKEN, true));
+        receiveState(stranger, votePacket(17, 1, voteRow(17, 2, true)));
+        assertFalse(flag("mPeerVoteEndCommitted"));
+        receiveState(enemy, votePacket(17, 1, voteRow(17, 2, true)));
+        assertTrue(flag("mPeerVoteEndCommitted"));
+        assertEquals(0x10001L, Globals.getInstance().mEndGameVotes);
+        Thread.sleep(180);
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        int endings = 0;
+        for (Intent event : service.events)
+            if (NetMsg.NETMSG_ENDGAME.equals(event.getAction())) endings++;
+        assertEquals(1, endings);
+    }
+
+    @Test
+    public void phoneHostCanRecoverTwoApprovalsFromAnotherPlayersSnapshot() throws Exception {
+        register(teammate, 2);
+        register(enemy, 17);
+        Globals.getInstance().mServerIP = InetAddress.getByName("127.0.0.1");
+        service.startGame(true, PEER_ROUND_TOKEN, true);
+        receiveState(teammate, votePacket(2, 1, voteRow(2, 5, true), voteRow(17, 4, true)));
+        assertTrue(flag("mPeerVoteEndCommitted"));
+        assertEquals(0x10002L, Globals.getInstance().mEndGameVotes);
+        assertFalse(service.peerStatePackets.isEmpty());
+        byte[] packet = service.peerStatePackets.get(service.peerStatePackets.size() - 1);
+        PeerStatePacket.Decoded decoded = PeerStatePacket.decode(packet, 0, packet.length);
+        assertNotNull(decoded);
+        assertNotNull(decoded.players[17]);
+        assertTrue((decoded.players[17].flags & PeerStatePacket.FLAG_END_VOTE) != 0);
+    }
+
+    @Test
+    public void voluntaryHostExitTransfersAuthorityWithoutEndingTheRound() throws Exception {
+        Globals.getInstance().mPlayerID = 17;
+        Globals.getInstance().mServerIP = enemy;
+        register(enemy, 1);
+        register(teammate, 2);
+        startPeerGame();
+        receiveState(enemy, votePacket(1, 1, quitRow(1)));
+        assertEquals(teammate, Globals.getInstance().mServerIP);
+        assertFalse(service.isPeerStateAuthority());
+        receiveState(teammate, votePacket(2, 1, quitRow(2)));
+        assertEquals(InetAddress.getByName("127.0.0.1"), Globals.getInstance().mServerIP);
+        assertTrue(service.isPeerStateAuthority());
+        int departures = 0;
+        for (Intent event : service.events) {
+            assertFalse("Voluntary leave ended the round", NetMsg.NETMSG_ENDGAME.equals(event.getAction()));
+            if (NetMsg.NETMSG_QUIT.equals(event.getAction())) departures++;
+        }
+        assertEquals(2, departures);
+    }
+
+    private static PeerStatePacket.PlayerState voteRow(int id, long sequence, boolean approve) {
+        return new PeerStatePacket.PlayerState(id, PeerStatePacket.FLAG_PRESENT
+                | (approve ? PeerStatePacket.FLAG_END_VOTE : 0), sequence, 0,
+                PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_RUNNING,
+                0, 0, 0, 5, 10, 30, 0, 0, 0);
+    }
+
+    private static PeerStatePacket.PlayerState quitRow(int id) {
+        return new PeerStatePacket.PlayerState(id,
+                PeerStatePacket.FLAG_PRESENT | PeerStatePacket.FLAG_LEFT, 2, 1,
+                PeerStatePacket.EVENT_QUIT, 0, Globals.GAME_STATE_RUNNING,
+                0, 0, 0, 5, 10, 30, 0, 0, 0);
+    }
+
+    private static byte[] votePacket(int source, long sequence, PeerStatePacket.PlayerState... rows) {
+        PeerStatePacket.PlayerState[] players = new PeerStatePacket.PlayerState[33];
+        for (PeerStatePacket.PlayerState row : rows) players[row.playerID] = row;
+        return PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), sequence, source,
+                Globals.GAME_MODE_2TEAMS, players);
     }
 
     @Test
@@ -287,6 +380,63 @@ public class UDPRegressionTest {
                 Globals.getInstance().mIPTeamMap.isEmpty());
         assertTrue("UDP discovery created an unauthenticated endpoint entry",
                 Globals.getInstance().mTeamIPMap.isEmpty());
+    }
+
+    @Test
+    public void automaticJoinBalancesAndReservesAllThirtyTwoSlots() throws Exception {
+        set(service, "mIsListService", true);
+        Globals globals = Globals.getInstance();
+        boolean boss = globals.mBossMode, infection = globals.mInfectionMode;
+        boolean balanced = globals.mBalancedRandom;
+        try {
+            globals.mBossMode = false;
+            globals.mInfectionMode = false;
+            globals.mBalancedRandom = false;
+            java.util.Set<Integer> slots = new java.util.HashSet<>();
+            slots.add(1); // This phone is the host.
+            for (int i = 2; i <= 32; i++) {
+                InetAddress address = InetAddress.getByName("127.0.1." + i);
+                receive(address, NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "0");
+                String response = service.endpointMessages.get(service.endpointMessages.size() - 1);
+                int slot = Integer.parseInt(response.substring(response.lastIndexOf(':') + 1));
+                assertTrue("Duplicate automatic ID " + slot, slots.add(slot));
+                if (i == 2) assertEquals("First guest balances the host's team", 17, slot);
+                receive(address, NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "0");
+                assertEquals("Retry changed a reserved ID", response,
+                        service.endpointMessages.get(service.endpointMessages.size() - 1));
+            }
+            assertEquals(32, slots.size());
+            receive(InetAddress.getByName("127.0.1.33"),
+                    NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "0");
+            assertEquals(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SAMETEAM,
+                    service.endpointMessages.get(service.endpointMessages.size() - 1));
+        } finally {
+            globals.mBossMode = boss;
+            globals.mInfectionMode = infection;
+            globals.mBalancedRandom = balanced;
+        }
+    }
+
+    @Test
+    public void sharedLobbyBeaconsReachAnAlreadyHostingPhone() throws Exception {
+        set(service, "mIsListService", true);
+        receive(teammate, SharedLobby.announcement(true, false));
+        assertEquals(1, service.events.size());
+        Intent event = service.events.get(0);
+        assertEquals(NetMsg.NETMSG_SHAREDLOBBY, event.getAction());
+        assertTrue(event.getBooleanExtra(NetMsg.INTENT_LOBBY_DEDICATED, false));
+        assertEquals(teammate.getHostAddress(), event.getStringExtra(UDPListenerService.INTENT_SERVERIP));
+    }
+
+    @Test
+    public void playingPeerHostStillAnswersLobbyDiscoveryForSittingOutPhones() throws Exception {
+        set(service, "mIsListService", false);
+        set(service, "mGameRunning", true);
+        set(service, "mStateAuthority", true);
+        receive(teammate, SharedLobby.QUERY + NetMsg.NETWORK_VERSION);
+        assertTrue(service.endpointMessages.get(service.endpointMessages.size() - 1)
+                .contains(SharedLobby.announcement(false, true)));
+        assertTrue(service.events.isEmpty());
     }
 
     @Test
@@ -691,12 +841,15 @@ public class UDPRegressionTest {
         assertEquals(PeerStatePacket.EVENT_LEAVE, service.peerPacket(0).players[1].eventType);
         assertEquals(3, (int) service.peerRepeatCounts.get(0));
 
+        service.peerStatePackets.clear();
+        service.peerRepeatCounts.clear();
+        service.combatPackets.clear();
         service.startGame(false);
         service.publishPeerElimination((byte) 17);
         service.publishPeerTeamElimination((byte) 17, 2, (byte) 2);
         service.announcePeerLeave();
-        assertEquals(1, service.peerStatePackets.size());
-        assertEquals(1, service.combatPackets.size());
+        assertEquals(0, service.peerStatePackets.size());
+        assertEquals(0, service.combatPackets.size());
     }
 
     @Test
@@ -753,11 +906,15 @@ public class UDPRegressionTest {
                 event.eventType, 17, 1, event.eventSequence);
 
         receiveCombat(enemy, ack);
+        int packetsAtAcknowledgement = service.combatPackets.size();
+        Object[] pending = (Object[]) get(service, "mPendingCombatEvents");
+        assertNull("The acknowledged combat event remained queued",
+                pending[(int) (event.eventSequence % pending.length)]);
         Thread.sleep(90);
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
 
-        assertEquals("An ACKed combat event was still retried", 1,
-                service.combatPackets.size());
+        assertEquals("An ACKed combat event was retried after acknowledgement",
+                packetsAtAcknowledgement, service.combatPackets.size());
     }
 
     @Test
@@ -999,6 +1156,16 @@ public class UDPRegressionTest {
     }
 
     @Test
+    public void phoneHotspotBroadcastCanBeDerivedWithoutADhcpLease() throws Exception {
+        assertEquals("192.168.43.255", UDPListenerService.broadcastAddressForPrefix(
+                InetAddress.getByName("192.168.43.1"), (short) 24).getHostAddress());
+        assertEquals("172.20.15.255", UDPListenerService.broadcastAddressForPrefix(
+                InetAddress.getByName("172.20.8.1"), (short) 21).getHostAddress());
+        assertNull(UDPListenerService.broadcastAddressForPrefix(
+                InetAddress.getByName("192.168.43.1"), (short) 33));
+    }
+
+    @Test
     public void failedHostCreationCancelsAnOlderJoinBeforeItCanSucceed() throws Exception {
         // A user can select Create Server while a previous discovery request is
         // still shutting down. Reporting that failure alone leaves the old scan
@@ -1134,7 +1301,8 @@ public class UDPRegressionTest {
             service.joinServer(teammate, host.getLocalPort());
             DatagramPacket request = new DatagramPacket(new byte[100], 100);
             host.receive(request);
-            assertEquals(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION + "1",
+            assertEquals(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_JOIN + NetMsg.NETWORK_VERSION
+                            + (Globals.getInstance().mLobbyAutoAssign ? "0" : "1"),
                     new String(request.getData(), request.getOffset(), request.getLength(), StandardCharsets.UTF_8));
             long deadline = SystemClock.elapsedRealtime() + 2000;
             while (get(service, "mSocket") == null && SystemClock.elapsedRealtime() < deadline)

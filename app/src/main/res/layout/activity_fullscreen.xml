@@ -23,6 +23,8 @@
     <!-- This FrameLayout insets its children based on system windows using
          android:fitsSystemWindows. -->
 
+    <include layout="@layout/lobby_panel" />
+
     <RelativeLayout
         android:id="@+id/connect_layout"
         android:layout_width="match_parent"
@@ -759,6 +761,27 @@
 
     </LinearLayout>
     </ScrollView>
+
+    <LinearLayout
+        android:id="@+id/lobby_action_bar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:paddingTop="8dp"
+        android:paddingBottom="8dp"
+        android:background="#0D141D">
+        <TextView android:id="@+id/lobby_next_step" style="@style/LobbyBody"
+            android:gravity="center" />
+        <Button android:id="@+id/lobby_primary_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="56dp" android:layout_marginTop="4dp"
+            android:textAllCaps="false" android:textSize="18sp"
+            android:text="@string/lobby_gun_action" />
+    </LinearLayout>
 
     <!-- This stays above gameplay but below the QR scanner. It deliberately
          does not consume input, so a hit flash never blocks a player action. -->

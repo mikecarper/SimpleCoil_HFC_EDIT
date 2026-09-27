@@ -62,6 +62,8 @@ public class TcpServerDispatchRegressionTest {
     private int originalGameState;
     private int originalGameLimit;
     private boolean originalUseGPS;
+    private long originalEndVotes;
+    private boolean originalEndVoteRequested;
 
     @Before
     public void setUp() throws Exception {
@@ -70,6 +72,10 @@ public class TcpServerDispatchRegressionTest {
         originalGameState = globals.mGameState;
         originalGameLimit = globals.mGameLimit;
         originalUseGPS = globals.mUseGPS;
+        originalEndVotes = globals.mEndGameVotes;
+        originalEndVoteRequested = globals.mEndGameVoteRequested;
+        globals.mEndGameVotes = 0;
+        globals.mEndGameVoteRequested = false;
         originalAddresses = copyAndClear(globals.mTeamIPMap, globals.mTeamIPMapSemaphore);
         originalPlayers = copyAndClear(globals.mIPTeamMap, globals.mIPTeamMapSemaphore);
         originalNames = copyAndClear(globals.mTeamPlayerNameMap, globals.mTeamPlayerNameSemaphore);
@@ -110,6 +116,8 @@ public class TcpServerDispatchRegressionTest {
         globals.mGameState = originalGameState;
         globals.mGameLimit = originalGameLimit;
         globals.mUseGPS = originalUseGPS;
+        globals.mEndGameVotes = originalEndVotes;
+        globals.mEndGameVoteRequested = originalEndVoteRequested;
         for (Thread worker : workers) assertFalse("Dispatch task survived cleanup", worker.isAlive());
         assertTrue("Dispatch task crashed: " + failures, failures.isEmpty());
     }
@@ -488,6 +496,29 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void benchedUnreadyPhoneGetsWaitInsteadOfCountdownAndIsNotACombatPeer() throws Exception {
+        MemorySocket bench = new MemorySocket();
+        addClient(2, bench);
+        set(clients.get(2), "lobbyBenched", true);
+        set(clients.get(2), "lobbyReady", false);
+        set(clients.get(2), "clockSynchronized", false);
+        Map<Byte, LobbyPlayer> oldLobby = Globals.getInstance().mLobbyPlayers;
+        try {
+            assertTrue(server.areLobbyPlayersReady());
+            assertTrue(server.arePlayerClocksSynchronized());
+            dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+            assertStartFrame(new DataInputStream(new ByteArrayInputStream(
+                    sockets.get(0).bytes.toByteArray())).readUTF());
+            JSONObject wait = readJson(bench);
+            assertTrue(wait.getBoolean(TcpServer.JSON_LOBBY_WAIT));
+            assertFalse(wait.has(TcpServer.JSON_GAMESTART));
+            assertFalse(Globals.getInstance().mTeamIPMap.containsKey((byte) 2));
+            assertFalse(Globals.getInstance().mIPTeamMap.containsValue((byte) 2));
+            assertTrue(Globals.getInstance().mLobbyPlayers.get((byte) 2).benched);
+        } finally { Globals.getInstance().mLobbyPlayers = oldLobby; }
+    }
+
+    @Test
     public void interruptedStartReleasesItsReservationForRetry() throws Exception {
         assertInterruptedSend(() -> assertTrue(server.startGame()));
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
@@ -598,6 +629,34 @@ public class TcpServerDispatchRegressionTest {
             captureClientTasks();
             assertFalse("A new start overtook pending round cleanup", accepted);
         } finally { clientsLock.release(); }
+    }
+
+    @Test
+    public void dedicatedEndNeedsTwoDistinctCurrentUnbenchedApprovals() throws Exception {
+        addClient(2, new MemorySocket());
+        addClient(32, new MemorySocket());
+        set(clients.get(32), "lobbyBenched", true);
+        String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        set(server, "mRoundToken", token);
+        set(server, "mStartAnnounced", true);
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        Method vote = TcpServer.class.getDeclaredMethod("updateEndGameVote",
+                clients.get(1).getClass(), String.class, boolean.class);
+        vote.setAccessible(true);
+        vote.invoke(server, null, null, false);
+        assertEquals(0L, Globals.getInstance().mEndGameVotes);
+        vote.invoke(server, clients.get(1), token, true);
+        vote.invoke(server, clients.get(1), token, true);
+        vote.invoke(server, clients.get(32), token, true);
+        vote.invoke(server, clients.get(2), "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", true);
+        assertEquals(1L, Globals.getInstance().mEndGameVotes);
+        assertFalse(server.events.contains(NetMsg.NETMSG_ENDGAME));
+        vote.invoke(server, clients.get(1), token, false);
+        assertEquals(0L, Globals.getInstance().mEndGameVotes);
+        vote.invoke(server, clients.get(1), token, true);
+        vote.invoke(server, clients.get(2), token, true);
+        for (Thread worker : captureClientTasks()) worker.join(2000);
+        assertTrue(server.events.contains(NetMsg.NETMSG_ENDGAME));
     }
 
     @Test

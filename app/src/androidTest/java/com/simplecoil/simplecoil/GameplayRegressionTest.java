@@ -15,9 +15,12 @@ import android.os.SystemClock;
 import android.widget.Chronometer;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
+import android.widget.RelativeLayout;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Gravity;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import androidx.core.content.ContextCompat;
@@ -52,6 +55,7 @@ import static org.junit.Assert.assertTrue;
 @RunWith(AndroidJUnit4.class)
 public class GameplayRegressionTest {
     private ActivityScenario<FullscreenActivity> scenario;
+    private FullscreenActivity testActivity;
     private RecordingBluetoothService bluetooth;
     private RecordingUDPService udp;
     private BluetoothLeService originalBluetooth;
@@ -61,16 +65,22 @@ public class GameplayRegressionTest {
     private RecordingTcpClient tcp;
     private byte originalPairedGrenade;
     private int originalPowerupQrRequired;
+    private boolean originalLobbyBenched;
 
     @Before
     public void setUp() {
         originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
         originalPowerupQrRequired = Globals.getInstance().mPowerupQrRequired;
+        originalLobbyBenched = Globals.getInstance().mLocalLobbyBenched;
+        Globals.getInstance().mLocalLobbyBenched = false;
         Globals.getInstance().mPairedGrenadeID = 0;
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        Globals.getInstance().mEndGameVotes = 0;
+        Globals.getInstance().mEndGameVoteRequested = false;
         Globals.getInstance().mUseGPS = false;
         scenario = ActivityScenario.launch(FullscreenActivity.class);
         scenario.onActivity(activity -> {
+            testActivity = activity;
             originalBluetooth = (BluetoothLeService) get(activity, "mBluetoothLeService");
             originalUDP = (UDPListenerService) get(activity, "mUDPListenerService");
             originalTcpClient = (TcpClient) get(activity, "mTcpClient");
@@ -126,7 +136,11 @@ public class GameplayRegressionTest {
     @After
     public void tearDown() {
         if (scenario == null) return;
-        scenario.onActivity(activity -> {
+        // A live game's rendering/confirmation dialog can keep Android 5's
+        // idle handler pending. Stop it on the main thread before waiting for
+        // ActivityScenario's lifecycle cleanup to become idle.
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            FullscreenActivity activity = testActivity;
             set(activity, "mUseNetwork", false);
             invoke(activity, "endGame");
             set(activity, "mBluetoothLeService", originalBluetooth);
@@ -137,6 +151,8 @@ public class GameplayRegressionTest {
             Globals.getInstance().mFullHealth = Globals.MAX_HEALTH;
             Globals.getInstance().mFullReload = Globals.RELOAD_COUNT;
             Globals.getInstance().mBossMode = false;
+            Globals.getInstance().mInfectionMode = false;
+            Globals.getInstance().resetInfectedPlayers();
             Globals.getInstance().mReloadTime = Globals.RELOAD_TIME_MILLISECONDS;
             Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
             Globals.getInstance().mOverrideLives = false;
@@ -147,6 +163,7 @@ public class GameplayRegressionTest {
             udp.onDestroy();
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
         Globals.getInstance().mPowerupQrRequired = originalPowerupQrRequired;
+        Globals.getInstance().mLocalLobbyBenched = originalLobbyBenched;
     }
 
     @Test
@@ -271,22 +288,35 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void tournamentPlayerQuitControlExpiresAfterThirtySeconds() {
+    public void tournamentPlayerCanLeaveEvenAfterThirtySeconds() {
+        final FullscreenActivity[] current = new FullscreenActivity[1];
         scenario.onActivity(activity -> {
+            current[0] = activity;
             tcp.dedicated = true;
             Globals.getInstance().mTournamentMode = true;
             Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
 
-            invoke(activity, "startPlayerQuitWindow");
-
-            assertEquals(true, get(activity, "mPlayerQuitWindowOpen"));
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() - 60_000);
+            invoke(activity, "updateInGameEndControl");
             assertEquals(View.VISIBLE, activity.findViewById(R.id.end_network_game_button)
                     .getVisibility());
-            CountDownTimer timer = (CountDownTimer) get(activity, "mQuitGameTimer");
-            timer.onFinish();
-            assertEquals(false, get(activity, "mPlayerQuitWindowOpen"));
-            assertEquals(View.GONE, activity.findViewById(R.id.end_network_game_button)
-                    .getVisibility());
+            invoke(activity, "confirmQuitGame");
+            androidx.appcompat.app.AlertDialog dialog =
+                    (androidx.appcompat.app.AlertDialog) get(activity, "mGameExitDialog");
+            assertTrue(dialog.isShowing());
+            dialog.getButton(android.content.DialogInterface.BUTTON_NEGATIVE).performClick();
+        });
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            FullscreenActivity activity = current[0];
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            invoke(activity, "confirmQuitGame");
+            androidx.appcompat.app.AlertDialog dialog =
+                    (androidx.appcompat.app.AlertDialog) get(activity, "mGameExitDialog");
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
+        });
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+            assertEquals(0, udp.endRequests);
         });
     }
 
@@ -301,22 +331,64 @@ public class GameplayRegressionTest {
 
             TextView endControl = activity.findViewById(R.id.end_network_game_button);
             assertEquals(View.VISIBLE, endControl.getVisibility());
-            assertEquals(activity.getString(R.string.end_game_button), endControl.getText().toString());
+            assertEquals(activity.getString(R.string.game_controls_button), endControl.getText().toString());
         });
     }
 
     @Test
-    public void lateInvitedPlayerDoesNotReceiveANewQuitWindow() {
+    public void firstEndApprovalDoesNotStopThePhoneAndBackRequiresConfirmation() {
+        final FullscreenActivity[] current = new FullscreenActivity[1];
+        scenario.onActivity(activity -> {
+            current[0] = activity;
+            set(activity, "mActivePeerRoundToken", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+            invoke(activity, "confirmEndGame");
+            androidx.appcompat.app.AlertDialog dialog =
+                    (androidx.appcompat.app.AlertDialog) get(activity, "mGameExitDialog");
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
+        });
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            FullscreenActivity activity = current[0];
+            assertEquals(1, udp.endVoteRequests);
+            assertEquals(0, udp.endRequests);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            activity.onBackPressed();
+            androidx.appcompat.app.AlertDialog dialog =
+                    (androidx.appcompat.app.AlertDialog) get(activity, "mGameExitDialog");
+            assertTrue(dialog.isShowing());
+            dialog.getButton(android.content.DialogInterface.BUTTON_NEGATIVE).performClick();
+        });
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+    }
+
+    @Test
+    public void peerHostCanConfirmLeavingWithoutEndingOtherPhones() {
+        scenario.onActivity(activity -> {
+            set(activity, "mIsServer", true);
+            invoke(activity, "confirmQuitGame");
+            androidx.appcompat.app.AlertDialog dialog =
+                    (androidx.appcompat.app.AlertDialog) get(activity, "mGameExitDialog");
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick();
+        });
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertEquals(1, udp.peerQuitAnnouncements);
+            assertEquals(0, udp.endRequests);
+            assertEquals(0, udp.peerLeaveAnnouncements);
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+        });
+    }
+
+    @Test
+    public void lateInvitedPlayerCanStillLeave() {
         scenario.onActivity(activity -> {
             set(activity, "mJoinedFromGameInvite", true);
             set(activity, "mHasSynchronizedStart", true);
             set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() - 30_001);
             Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
 
-            invoke(activity, "startPlayerQuitWindow");
-
-            assertEquals(false, get(activity, "mPlayerQuitWindowOpen"));
-            assertNull(get(activity, "mQuitGameTimer"));
+            invoke(activity, "updateInGameEndControl");
+            assertEquals(View.VISIBLE, activity.findViewById(R.id.end_network_game_button).getVisibility());
         });
     }
 
@@ -614,6 +686,89 @@ public class GameplayRegressionTest {
 
             assertEquals("A confirmed incoming hit must flash the whole background", View.VISIBLE,
                     ((View) get(activity, "mIncomingHitFlashView")).getVisibility());
+            FrameLayout.LayoutParams flash = (FrameLayout.LayoutParams)
+                    ((View) get(activity, "mIncomingHitFlashView")).getLayoutParams();
+            RelativeLayout.LayoutParams icon = (RelativeLayout.LayoutParams)
+                    ((View) get(activity, "mHitIV")).getLayoutParams();
+            assertEquals(FrameLayout.LayoutParams.MATCH_PARENT, flash.width);
+            assertEquals(RelativeLayout.TRUE,
+                    icon.getRules()[RelativeLayout.CENTER_IN_PARENT]);
+        });
+    }
+
+    @Test
+    public void incomingHitUsesTheSensorSideForTheRedFlashAndIcon() {
+        scenario.onActivity(activity -> {
+            byte[] left = telemetryPacket(17, 1, 0, 0);
+            left[FullscreenActivity.RECOIL_OFFSET_HIT_BY1_SENSOR] =
+                    (byte) (FullscreenActivity.HIT_SENSOR_LEFT << 4);
+            receiveTelemetry(activity, left);
+
+            FrameLayout.LayoutParams flash = (FrameLayout.LayoutParams)
+                    ((View) get(activity, "mIncomingHitFlashView")).getLayoutParams();
+            RelativeLayout.LayoutParams icon = (RelativeLayout.LayoutParams)
+                    ((View) get(activity, "mHitIV")).getLayoutParams();
+            assertEquals(Gravity.START, flash.gravity);
+            assertEquals(RelativeLayout.TRUE,
+                    icon.getRules()[RelativeLayout.ALIGN_PARENT_START]);
+
+            invoke(activity, "clearIncomingHitFeedback");
+            byte[] right = telemetryPacket(17, 2, 0, 0);
+            right[FullscreenActivity.RECOIL_OFFSET_HIT_BY1_SENSOR] =
+                    (byte) (FullscreenActivity.HIT_SENSOR_RIGHT << 4);
+            receiveTelemetry(activity, right);
+
+            flash = (FrameLayout.LayoutParams)
+                    ((View) get(activity, "mIncomingHitFlashView")).getLayoutParams();
+            icon = (RelativeLayout.LayoutParams) ((View) get(activity, "mHitIV")).getLayoutParams();
+            assertEquals(Gravity.END, flash.gravity);
+            assertEquals(RelativeLayout.TRUE,
+                    icon.getRules()[RelativeLayout.ALIGN_PARENT_END]);
+        });
+    }
+
+    @Test
+    public void sensorMaskDecodingFallsBackToCenterForAmbiguousHits() {
+        assertEquals(FullscreenActivity.HIT_SENSOR_LEFT,
+                FullscreenActivity.hitSensorMask((byte) 0x2f));
+        assertEquals(FullscreenActivity.INCOMING_HIT_DIRECTION_LEFT,
+                FullscreenActivity.resolveIncomingHitDirection(FullscreenActivity.HIT_SENSOR_LEFT));
+        assertEquals(FullscreenActivity.INCOMING_HIT_DIRECTION_RIGHT,
+                FullscreenActivity.resolveIncomingHitDirection(FullscreenActivity.HIT_SENSOR_RIGHT));
+        assertEquals(FullscreenActivity.INCOMING_HIT_DIRECTION_LEFT,
+                FullscreenActivity.resolveIncomingHitDirection(
+                        FullscreenActivity.HIT_SENSOR_CENTER | FullscreenActivity.HIT_SENSOR_LEFT));
+        assertEquals(FullscreenActivity.INCOMING_HIT_DIRECTION_RIGHT,
+                FullscreenActivity.resolveIncomingHitDirection(
+                        FullscreenActivity.HIT_SENSOR_CENTER | FullscreenActivity.HIT_SENSOR_RIGHT));
+        assertEquals(FullscreenActivity.INCOMING_HIT_DIRECTION_CENTER,
+                FullscreenActivity.resolveIncomingHitDirection(FullscreenActivity.HIT_SENSOR_CENTER));
+        assertEquals(FullscreenActivity.INCOMING_HIT_DIRECTION_CENTER,
+                FullscreenActivity.resolveIncomingHitDirection(
+                        FullscreenActivity.HIT_SENSOR_LEFT | FullscreenActivity.HIT_SENSOR_RIGHT));
+        assertEquals(FullscreenActivity.INCOMING_HIT_DIRECTION_CENTER,
+                FullscreenActivity.resolveIncomingHitDirection(0));
+    }
+
+    @Test
+    public void centerAndSideHitPlacesTheMarkerBetweenThem() {
+        scenario.onActivity(activity -> {
+            byte[] centerRight = telemetryPacket(17, 1, 0, 0);
+            centerRight[FullscreenActivity.RECOIL_OFFSET_HIT_BY1_SENSOR] = (byte) ((
+                    FullscreenActivity.HIT_SENSOR_CENTER
+                            | FullscreenActivity.HIT_SENSOR_RIGHT) << 4);
+            receiveTelemetry(activity, centerRight);
+
+            View marker = (View) get(activity, "mHitIV");
+            RelativeLayout.LayoutParams markerLayout =
+                    (RelativeLayout.LayoutParams) marker.getLayoutParams();
+            FrameLayout.LayoutParams flashLayout = (FrameLayout.LayoutParams)
+                    ((View) get(activity, "mIncomingHitFlashView")).getLayoutParams();
+            assertEquals(RelativeLayout.TRUE,
+                    markerLayout.getRules()[RelativeLayout.CENTER_IN_PARENT]);
+            assertTrue("Center/right marker was not shifted toward the right",
+                    marker.getTranslationX() > 0);
+            assertEquals(Gravity.END, flashLayout.gravity);
         });
     }
 
@@ -842,8 +997,70 @@ public class GameplayRegressionTest {
             invoke(activity, "setShotsRemaining", new Class<?>[]{byte.class}, (byte) 0);
             assertEquals(true, get(activity, "mReloadVoiceReminderActive"));
 
+            invoke(activity, "startInactivityVoiceReminder");
+            assertEquals(true, get(activity, "mInactivityReminderActive"));
+
             invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
             assertEquals(false, get(activity, "mReloadVoiceReminderActive"));
+            assertEquals(false, get(activity, "mInactivityReminderActive"));
+        });
+    }
+
+    @Test
+    public void inactivityReminderStartsAtFortySecondsAndRepeatsAtTenSeconds() {
+        scenario.onActivity(activity -> {
+            long before = SystemClock.elapsedRealtime();
+            invoke(activity, "startInactivityVoiceReminder");
+
+            assertEquals(true, get(activity, "mInactivityReminderActive"));
+            assertEquals(40_000L, get(activity, "INACTIVITY_FIRST_REMINDER_MS"));
+            assertEquals(10_000L, get(activity, "INACTIVITY_REPEAT_REMINDER_MS"));
+            long deadline = (long) get(activity, "mNextInactivityReminderAt");
+            assertTrue(deadline >= before + 40_000L);
+        });
+    }
+
+    @Test
+    public void roundStartVoiceWaitsOneSecondAfterTheCountdown() {
+        scenario.onActivity(activity ->
+                assertEquals(1_000L, get(activity, "ROUND_START_VOICE_DELAY_MS")));
+    }
+
+    @Test
+    public void triggerPullRestartsTheInactivityDelay() {
+        scenario.onActivity(activity -> {
+            invoke(activity, "startInactivityVoiceReminder");
+            set(activity, "mNextInactivityReminderAt", 1L);
+            byte[] packet = telemetryPacket(0, 0, 0, 0);
+            packet[FullscreenActivity.RECOIL_OFFSET_RELOAD_TRIGGER_COUNTER] = 1;
+            long before = SystemClock.elapsedRealtime();
+
+            receiveTelemetry(activity, packet);
+
+            assertTrue((long) get(activity, "mNextInactivityReminderAt")
+                    >= before + 40_000L);
+        });
+    }
+
+    @Test
+    public void gpsJitterDoesNotCountAsMovementButThreeMetersDoes() {
+        scenario.onActivity(activity -> {
+            set(activity, "mLastGpsLongitude", -122.0);
+            set(activity, "mLastGpsLatitude", 47.0);
+            invoke(activity, "startInactivityVoiceReminder");
+            set(activity, "mNextInactivityReminderAt", 123L);
+
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class},
+                    new Intent().putExtra(NetMsg.INTENT_LONGITUDE, -122.0)
+                            .putExtra(NetMsg.INTENT_LATITUDE, 47.000005));
+            assertEquals(123L, get(activity, "mNextInactivityReminderAt"));
+
+            long before = SystemClock.elapsedRealtime();
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class},
+                    new Intent().putExtra(NetMsg.INTENT_LONGITUDE, -122.0)
+                            .putExtra(NetMsg.INTENT_LATITUDE, 47.00005));
+            assertTrue((long) get(activity, "mNextInactivityReminderAt")
+                    >= before + 40_000L);
         });
     }
 
@@ -858,6 +1075,70 @@ public class GameplayRegressionTest {
 
             invoke(activity, "setPlayingShotsCounter", new Class<?>[]{boolean.class}, false);
             assertEquals(lobbySize, shots.getTextSize(), 0.01f);
+        });
+    }
+
+    @Test
+    public void singleGunPlayCentersAmmoAndMovesHealthBelowIt() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mBossMode = true;
+            globals.mPlayerID = Globals.BOSS_PLAYER_ID;
+            set(activity, "mSecondaryDeviceAddress", "");
+
+            invoke(activity, "setPlayingShotsCounter", new Class<?>[]{boolean.class}, true);
+            TextView shots = activity.findViewById(R.id.shots_remaining_tv);
+            TextView health = activity.findViewById(R.id.health_label_tv);
+            TextView recoil = activity.findViewById(R.id.recoil_tv);
+            RelativeLayout.LayoutParams shotsLayout =
+                    (RelativeLayout.LayoutParams) shots.getLayoutParams();
+            RelativeLayout.LayoutParams healthLayout =
+                    (RelativeLayout.LayoutParams) health.getLayoutParams();
+            RelativeLayout.LayoutParams recoilLayout =
+                    (RelativeLayout.LayoutParams) recoil.getLayoutParams();
+            assertEquals(RelativeLayout.TRUE,
+                    shotsLayout.getRules()[RelativeLayout.CENTER_HORIZONTAL]);
+            assertEquals(0, recoilLayout.getRules()[RelativeLayout.CENTER_HORIZONTAL]);
+            assertEquals(RelativeLayout.TRUE,
+                    recoilLayout.getRules()[RelativeLayout.ALIGN_PARENT_START]);
+            assertEquals(R.id.shots_remaining_tv,
+                    healthLayout.getRules()[RelativeLayout.BELOW]);
+
+            invoke(activity, "setPlayingShotsCounter", new Class<?>[]{boolean.class}, false);
+            shotsLayout = (RelativeLayout.LayoutParams) shots.getLayoutParams();
+            healthLayout = (RelativeLayout.LayoutParams) health.getLayoutParams();
+            recoilLayout = (RelativeLayout.LayoutParams) recoil.getLayoutParams();
+            assertEquals(0, shotsLayout.getRules()[RelativeLayout.CENTER_HORIZONTAL]);
+            assertEquals(RelativeLayout.TRUE,
+                    recoilLayout.getRules()[RelativeLayout.CENTER_HORIZONTAL]);
+            assertEquals(R.id.shot_mode_tv, healthLayout.getRules()[RelativeLayout.BELOW]);
+        });
+    }
+
+    @Test
+    public void dualGunPlayKeepsTheAmmoRowAndMovesHealthBelowIt() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mBossMode = true;
+            globals.mPlayerID = Globals.BOSS_PLAYER_ID;
+            set(activity, "mSecondaryDeviceAddress", "AA:BB:CC:DD:EE:FF");
+
+            invoke(activity, "updateSecondGunControls");
+            invoke(activity, "setPlayingShotsCounter", new Class<?>[]{boolean.class}, true);
+            View ammoRow = activity.findViewById(R.id.boss_ammo_row);
+            TextView shots = activity.findViewById(R.id.shots_remaining_tv);
+            TextView health = activity.findViewById(R.id.health_label_tv);
+            RelativeLayout.LayoutParams shotsLayout =
+                    (RelativeLayout.LayoutParams) shots.getLayoutParams();
+            RelativeLayout.LayoutParams healthLayout =
+                    (RelativeLayout.LayoutParams) health.getLayoutParams();
+            assertEquals(View.VISIBLE, ammoRow.getVisibility());
+            assertEquals(View.INVISIBLE, shots.getVisibility());
+            assertEquals(0, shotsLayout.getRules()[RelativeLayout.CENTER_HORIZONTAL]);
+            assertEquals(R.id.boss_ammo_row, healthLayout.getRules()[RelativeLayout.BELOW]);
+
+            set(activity, "mSecondaryDeviceAddress", "");
+            invoke(activity, "setPlayingShotsCounter", new Class<?>[]{boolean.class}, false);
         });
     }
 
@@ -1275,7 +1556,7 @@ public class GameplayRegressionTest {
             invoke(activity, "startGameCountdown", new Class<?>[]{long.class}, 0L);
             assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
             assertNull(get(activity, "mSpawnTimer"));
-            assertTrue(tcp.messages.contains(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME));
+            assertEquals(false, tcp.messages.contains(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME));
         });
     }
 
@@ -1857,6 +2138,39 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void originalZombieBecomesVulnerableAfterTwoKills() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mInfectionMode = true;
+            globals.mPlayerID = 1;
+
+            set(activity, "mScore", 0);
+            assertEquals(true, invokeResult(activity, "isOriginalZombieProtected"));
+            set(activity, "mScore", 1);
+            assertEquals(true, invokeResult(activity, "isOriginalZombieProtected"));
+            set(activity, "mScore", 2);
+            assertEquals(false, invokeResult(activity, "isOriginalZombieProtected"));
+
+            globals.mReloadTime = 5_000;
+            set(activity, "mEliminationCount", 0);
+            assertEquals(1_000L, invokeResult(activity, "activeReloadTime"));
+            set(activity, "mEliminationCount", 1);
+            assertEquals(5_000L, invokeResult(activity, "activeReloadTime"));
+
+            // Recruited zombies never receive the original zombie's protection.
+            globals.mPlayerID = 2;
+            set(activity, "mScore", 0);
+            assertEquals(false, invokeResult(activity, "isOriginalZombieProtected"));
+            set(activity, "mHealth", 1);
+            assertEquals(GameOutcome.Result.WON,
+                    invokeResult(activity, "completedRoundOutcome"));
+            globals.setPlayerInfected((byte) 2, true);
+            assertEquals(GameOutcome.Result.LOST,
+                    invokeResult(activity, "completedRoundOutcome"));
+        });
+    }
+
+    @Test
     public void hitInSecondSlotUsesConfiguredDamageOnce() {
         scenario.onActivity(activity -> {
             telemetry(activity, 0, 0, 17, 1);
@@ -1869,6 +2183,35 @@ public class GameplayRegressionTest {
         scenario.onActivity(activity -> {
             telemetry(activity, 17, 1, 18, 1);
             assertEquals(8, get(activity, "mHealth"));
+        });
+    }
+
+    @Test
+    public void benchedBlasterCannotDamagePlayersInEitherHitSlot() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            Map<Byte, LobbyPlayer> originalRoster = globals.mLobbyPlayers;
+            int originalDamage = globals.mDamage;
+            globals.mLobbyPlayers = Collections.singletonMap((byte) 17,
+                    new LobbyPlayer((byte) 17, "Spare", true, true, true, true, false));
+            try {
+                telemetry(activity, 17, 1, 18, 1);
+                assertEquals(13, get(activity, "mHealth"));
+                assertEquals(1, get(activity, "mHitsTaken"));
+                telemetry(activity, 18, 2, 17, 2);
+                assertEquals(6, get(activity, "mHealth"));
+                assertEquals(2, get(activity, "mHitsTaken"));
+
+                // Sitting out a network round must not disable solo practice.
+                set(activity, "mUseNetwork", false);
+                globals.mDamage = -1;
+                telemetry(activity, 17, 3, 0, 0);
+                assertEquals(5, get(activity, "mHealth"));
+            } finally {
+                globals.mLobbyPlayers = originalRoster;
+                globals.mDamage = originalDamage;
+                set(activity, "mUseNetwork", true);
+            }
         });
     }
 
@@ -2213,6 +2556,10 @@ public class GameplayRegressionTest {
                 assertEquals("Back must not dismiss the respawn camera", View.VISIBLE,
                         scanner.getVisibility());
                 assertSame(timeout, get(activity, "mSpawnTimer"));
+                androidx.appcompat.app.AlertDialog leave =
+                        (androidx.appcompat.app.AlertDialog) get(activity, "mGameExitDialog");
+                assertTrue("Back must offer a confirmed exit while respawning", leave.isShowing());
+                leave.dismiss();
             }
 
             timeout.onFinish();
@@ -2711,6 +3058,8 @@ public class GameplayRegressionTest {
     private static final class RecordingUDPService extends UDPListenerService {
         final List<String> messages = new ArrayList<>();
         int endRequests;
+        int endVoteRequests;
+        int peerQuitAnnouncements;
         int serverCreates;
         int serverCancellations;
         int peerGrenadePairingPublishes;
@@ -2731,6 +3080,15 @@ public class GameplayRegressionTest {
 
         @Override
         public void endGame() { endRequests++; }
+
+        @Override
+        public boolean voteToEndGame(String token, boolean approve) {
+            endVoteRequests++;
+            return true;
+        }
+
+        @Override
+        public void announcePeerQuit() { peerQuitAnnouncements++; }
 
         @Override
         public void createServer() { serverCreates++; }

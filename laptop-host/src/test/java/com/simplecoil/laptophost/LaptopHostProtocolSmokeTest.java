@@ -29,8 +29,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static final int UDP_PORT = 19_500;
     private static final int DASHBOARD_PORT = 19_511;
     private static final int TILE_PORT = 19_512;
-    private static final String JSON_PREFIX = "SimpleCoil:19JSON";
-    private static final String MESSAGE_PREFIX = "SimpleCoil:19MESG";
+    private static final String JSON_PREFIX = "SimpleCoil:24JSON";
+    private static final String MESSAGE_PREFIX = "SimpleCoil:24MESG";
     private static final long GPS_UTC_BASE = 1_800_000_000_000L;
 
     public static void main(String[] args) throws Exception {
@@ -67,10 +67,12 @@ public final class LaptopHostProtocolSmokeTest {
                     "invalid tile coordinates were accepted");
             require(get("/leaderboard").contains("Leaderboard"), "leaderboard display was unavailable");
             verifyUdpDiscovery();
+            verifySharedLobbyDiscovery();
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
                  FakePhone blueTeammate = new FakePhone("127.0.0.5", 2, "Blue Two");
                  FakePhone second = new FakePhone("127.0.0.2", 17, "Red");
-                 FakePhone redTeammate = new FakePhone("127.0.0.6", 18, "Red Two")) {
+                 FakePhone redTeammate = new FakePhone("127.0.0.6", 18, "Red Two");
+                 FakePhone spare = new FakePhone("127.0.0.7", 3, "Spare")) {
                 require(first.readUntil(frame -> frame.startsWith(JSON_PREFIX + "{\"players\"")
                                 && frame.contains("\"powerupqrrequired\":4")) != null,
                         "laptop host did not advertise the power-up QR requirement");
@@ -78,9 +80,37 @@ public final class LaptopHostProtocolSmokeTest {
                 blueTeammate.synchronizeClock();
                 second.synchronizeClock();
                 redTeammate.synchronizeClock();
+                first.send(JSON_PREFIX + "{\"lobbyready\":false}");
+                require(first.readUntil(frame -> frame.contains("\"lobbyready\":false")) != null,
+                        "gun readiness was not shared with the lobby");
+                require(post("/api/start").contains("connect a gun"),
+                        "host started with an unready player");
+                first.send(JSON_PREFIX + "{\"lobbyready\":true}");
+                require(first.readUntil(frame -> frame.contains("\"lobbyready\":true")
+                                && !frame.contains("\"lobbyready\":false")) != null,
+                        "gun readiness did not recover after connection");
+                spare.send(JSON_PREFIX + "{\"lobbyready\":false}");
+                require(first.readUntil(frame -> frame.contains("\"lobbyready\":false")) != null,
+                        "spare phone did not publish its missing gun");
+                require(post("/api/bench?id=3&benched=true").contains("\"ok\":true"),
+                        "host could not sit out the spare phone");
+                require(first.readUntil(frame -> frame.contains("\"lobbybenched\":true")) != null,
+                        "bench status was not shared with players");
+                require(get("/api/state").contains("\"benchedCount\":1"),
+                        "spare phone was not retained in the lobby");
+                spare.send(JSON_PREFIX + "{\"lobbybenched\":false}");
+                require(get("/api/state").contains("\"playerCount\":4"),
+                        "spare phone counted as an active player or unbenched itself");
                 first.send(JSON_PREFIX + "{\"gpslongitude\":-122.1,\"gpslatitude\":47.6}");
                 second.send(JSON_PREFIX + "{\"gpslongitude\":-122.2,\"gpslatitude\":47.7}");
                 require(post("/api/start").contains("\"ok\":true"), "host did not start the round");
+                require(spare.readUntil(frame -> frame.contains("\"lobbywait\":true")) != null,
+                        "spare phone did not stay in the lobby at round start");
+                require(!spare.receivesFor(frame -> frame.contains("\"gamestart\"")
+                                && !frame.contains("\"players\""), 150),
+                        "spare phone received a direct game start");
+                require(post("/api/bench?id=3&benched=false").contains("\"ok\":false"),
+                        "host changed participation mid-round");
                 String startFrame = first.readUntil(frame -> frame.contains("\"gpsstarttime\""));
                 require(startFrame != null,
                         "GPS-calibrated start time was not delivered to the phone");
@@ -125,7 +155,34 @@ public final class LaptopHostProtocolSmokeTest {
                         "game-master respawn was not accepted");
                 require(second.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "RESPAWNGRANTED")) != null,
                         "respawning player did not receive the grant");
-                require(post("/api/end").contains("\"ok\":true"), "host did not end the round");
+                require(post("/api/end").contains("\"ok\":true"), "host did not request approval");
+                require(first.readUntil(frame -> frame.contains("\"endvotes\":0")) != null,
+                        "the operator incorrectly counted as a player approval");
+                String activeToken = roundToken;
+                first.send(MESSAGE_PREFIX + "ENDGAME");
+                require(!first.receivesFor(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME"), 100),
+                        "an unscoped single-player ENDGAME bypassed approval");
+                first.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + activeToken + "\"}");
+                require(second.readUntil(frame -> frame.contains("\"endvotes\":1")) != null,
+                        "first approval was not shared");
+                first.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + activeToken + "\"}");
+                spare.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + activeToken + "\"}");
+                second.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"stale\"}");
+                require(!first.receivesFor(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME"), 100),
+                        "duplicate, benched, or stale votes ended the round");
+                first.send(JSON_PREFIX + "{\"endvote\":false,\"roundtoken\":\"" + activeToken + "\"}");
+                require(second.readUntil(frame -> frame.contains("\"endvotes\":0")) != null,
+                        "withdrawing approval did not clear the vote");
+                blueTeammate.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + activeToken + "\"}");
+                require(first.readUntil(frame -> frame.contains("\"endvotes\":2")) != null,
+                        "teammate approval was not recorded");
+                blueTeammate.send(MESSAGE_PREFIX + "QUIT");
+                require(first.readUntil(frame -> frame.contains("\"endvotes\":0")) != null,
+                        "leaving player retained a vote");
+                first.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + activeToken + "\"}");
+                second.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + activeToken + "\"}");
+                require(first.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME")) != null,
+                        "two different approvals did not end the game");
                 String finishedState = get("/api/state");
                 require(finishedState.contains("\"canStart\":false"),
                         "dashboard allowed another round during the cooldown");
@@ -144,6 +201,10 @@ public final class LaptopHostProtocolSmokeTest {
         System.out.println("LaptopHost balanced no-QR smoke test passed.");
         verifyBossMode();
         System.out.println("LaptopHost Boss Mode smoke test passed.");
+        verifyCaptureTheFlagMode();
+        System.out.println("LaptopHost Capture the Flag smoke test passed.");
+        verifyInfectionMode();
+        System.out.println("LaptopHost Infection smoke test passed.");
         if (args.length > 0 && "--verify-timeout".equals(args[0])) {
             verifyBalancedQrTimeout();
             System.out.println("LaptopHost 90-second QR timeout smoke test passed.");
@@ -193,7 +254,7 @@ public final class LaptopHostProtocolSmokeTest {
                 socket.bind(new InetSocketAddress("127.0.0." + (20 + index), UDP_PORT));
                 socket.setSoTimeout(1_000);
                 pendingJoins.add(socket);
-                byte[] request = "SimpleCoil:JOIN191".getBytes(StandardCharsets.UTF_8);
+                byte[] request = "SimpleCoil:JOIN241".getBytes(StandardCharsets.UTF_8);
                 socket.send(new DatagramPacket(request, request.length,
                         InetAddress.getByName("127.0.0.1"), UDP_PORT));
                 byte[] reply = new byte[128];
@@ -329,6 +390,72 @@ public final class LaptopHostProtocolSmokeTest {
         }
     }
 
+    private static void verifyCaptureTheFlagMode() throws Exception {
+        Path classes = Path.of("laptop-host", "out").toAbsolutePath();
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--ctf",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
+                .redirectErrorStream(true).start();
+        try {
+            waitForHost();
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
+                 FakePhone second = new FakePhone("127.0.0.2", 17, "Red")) {
+                String roster = first.readUntil(frame -> frame.contains("\"capturetheflag\":true")
+                        && frame.contains("\"tournamentmode\":true"));
+                require(roster != null, "Capture the Flag mode was not advertised to phones");
+            }
+        } finally {
+            host.destroy();
+            if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS))
+                host.destroyForcibly();
+        }
+    }
+
+    private static void verifyInfectionMode() throws Exception {
+        Path classes = Path.of("laptop-host", "out").toAbsolutePath();
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+                "--infection", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
+                String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
+                "--start-delay", "1")
+                .redirectErrorStream(true).start();
+        try {
+            waitForHost();
+            try (FakePhone zombie = new FakePhone("127.0.0.3", 1, "Zombie");
+                 FakePhone survivor = new FakePhone("127.0.0.2", 2, "Survivor");
+                 FakePhone lastSurvivor = new FakePhone("127.0.0.4", 3, "Last Survivor")) {
+                String roster = zombie.readUntil(frame -> frame.contains("\"infectionmode\":true")
+                        && frame.contains("\"tournamentmode\":true"));
+                require(roster != null, "Infection mode was not advertised to phones");
+                zombie.synchronizeClock();
+                survivor.synchronizeClock();
+                lastSurvivor.synchronizeClock();
+                require(post("/api/start").contains("\"ok\":true"),
+                        "a valid Infection roster did not start");
+                String start = survivor.readUntil(frame -> frame.contains("\"gamestart\""));
+                require(start != null, "Infection countdown was not delivered");
+                require(start.contains("\"gameduration\":300000"),
+                        "Infection did not force the five-minute survival limit");
+                String token = jsonString(start, "roundtoken");
+                Thread.sleep(1_100);
+                survivor.sendStateGossip(token, 1, 0, 1 << 3);
+                long deadline = System.nanoTime() + 3_000_000_000L;
+                while (!get("/api/state").contains("\"state\":\"finished\"")
+                        && System.nanoTime() < deadline)
+                    Thread.sleep(25);
+                require(get("/api/state").contains("\"state\":\"finished\""),
+                        "host did not award the last uninfected survivor");
+            }
+        } finally {
+            host.destroy();
+            if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS))
+                host.destroyForcibly();
+        }
+    }
+
     private static void waitForHost() throws Exception {
         long deadline = System.nanoTime() + 5_000_000_000L;
         while (System.nanoTime() < deadline) {
@@ -347,7 +474,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.3", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN191".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN241".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -358,12 +485,38 @@ public final class LaptopHostProtocolSmokeTest {
         }
     }
 
+    private static void verifySharedLobbyDiscovery() throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(null)) {
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress("127.0.0.9", UDP_PORT));
+            socket.setSoTimeout(1_000);
+            byte[] query = "SimpleCoil:LOBBYQUERY:24".getBytes(StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(query, query.length, InetAddress.getLoopbackAddress(), UDP_PORT));
+            DatagramPacket reply = new DatagramPacket(new byte[128], 128);
+            socket.receive(reply);
+            require(new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8)
+                            .equals("SimpleCoil:LOBBYSTATE:24:D:OPEN"),
+                    "shared lobby did not advertise a compatible dedicated host");
+            byte[] join = "SimpleCoil:JOIN240".getBytes(StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(join, join.length, InetAddress.getLoopbackAddress(), UDP_PORT));
+            socket.receive(reply);
+            String assignment = new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8);
+            // The preceding explicit discovery reserved blue player 1.
+            require(assignment.equals("SimpleCoil:SERVERREPLY:17"),
+                    "automatic join did not balance teams: " + assignment);
+            socket.send(new DatagramPacket(join, join.length, InetAddress.getLoopbackAddress(), UDP_PORT));
+            socket.receive(reply);
+            require(assignment.equals(new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8)),
+                    "automatic join retry changed the reserved identity");
+        }
+    }
+
     private static void verifyLateJoinBlocked() throws Exception {
         try (DatagramSocket socket = new DatagramSocket(null)) {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.4", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN192".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN242".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -484,7 +637,8 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setSoTimeout(2_000);
             input = new DataInputStream(socket.getInputStream());
             output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-            send(JSON_PREFIX + "{\"playerID\":" + playerID + ",\"playername\":\"" + name + "\"}");
+            send(JSON_PREFIX + "{\"playerID\":" + playerID + ",\"playername\":\"" + name
+                    + "\",\"lobbyready\":true}");
             String roster = readUntil(frame -> frame.startsWith(JSON_PREFIX + "{\"players\""));
             require(roster != null && roster.contains("\"maptileport\":"),
                     "laptop host did not advertise its phone map tile service");
@@ -493,11 +647,16 @@ public final class LaptopHostProtocolSmokeTest {
         }
 
         void sendStateGossip(String roundToken, long ownerSequence, int score) throws IOException {
+            sendStateGossip(roundToken, ownerSequence, score, 0);
+        }
+
+        void sendStateGossip(String roundToken, long ownerSequence, int score, int extraFlags)
+                throws IOException {
             ByteBuffer packet = ByteBuffer.allocate(STATE_PACKET_BYTES).order(ByteOrder.BIG_ENDIAN);
             UUID token = UUID.fromString(roundToken);
             packet.putInt(STATE_PACKET_MAGIC);
-            packet.put((byte) 1); // state-packet format
-            packet.put((byte) 19); // network protocol
+            packet.put((byte) 2); // state-packet format
+            packet.put((byte) 24); // network protocol
             packet.put((byte) playerID);
             packet.put((byte) 2); // two-team mode
             packet.putLong(1); // sender packet sequence
@@ -505,7 +664,7 @@ public final class LaptopHostProtocolSmokeTest {
             packet.putLong(token.getLeastSignificantBits());
             for (int id = 1; id <= 32; id++) {
                 boolean present = id == playerID;
-                packet.put((byte) (present ? 1 : 0));
+                packet.put((byte) (present ? 1 | extraFlags : 0));
                 packet.put((byte) id);
                 packet.put((byte) (present ? 1 : 0)); // running
                 packet.put((byte) 0); // grenade
@@ -534,7 +693,7 @@ public final class LaptopHostProtocolSmokeTest {
             UUID token = UUID.fromString(roundToken);
             packet.putInt(0x53434F43); // SCOC
             packet.put((byte) 1); // combat-packet format
-            packet.put((byte) 19); // network protocol
+            packet.put((byte) 24); // network protocol
             packet.put((byte) 1); // event, not ACK
             packet.put((byte) eventType);
             packet.put((byte) playerID);

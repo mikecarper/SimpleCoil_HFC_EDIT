@@ -26,6 +26,15 @@ public class GlobalsTest {
         assertNull(Globals.fromWifiIPv4Address(0));
     }
 
+    @Test public void hotspotInterfaceNamesAreAcceptedWithoutAcceptingCellularInterfaces() {
+        assertTrue(Globals.isWifiInterfaceName("wlan0"));
+        assertTrue(Globals.isWifiInterfaceName("ap0"));
+        assertTrue(Globals.isWifiInterfaceName("softap0"));
+        assertTrue(Globals.isWifiInterfaceName("swlan0"));
+        assertFalse(Globals.isWifiInterfaceName("rmnet0"));
+        assertFalse(Globals.isWifiInterfaceName("lo"));
+    }
+
     @Test public void tournamentProfileMakesEveryWeaponSingleShotAndIdentical() {
         Globals.PlayerSettings settings = new Globals.PlayerSettings();
         settings.health = 400;
@@ -196,5 +205,70 @@ public class GlobalsTest {
         assertEquals(0, Globals.getRespawnTeamFromQrCode("SIMPLECOIL:RESPAWN:5"));
         assertEquals(0, Globals.getRespawnTeamFromQrCode("TEAM 1 RESPAWN NOW"));
         assertEquals(0, Globals.getRespawnTeamFromQrCode("not a checkpoint"));
+    }
+
+    @Test public void flagQrCodesAcceptStructuredAndHumanReadableTeamCodes() {
+        assertEquals(1, Globals.getFlagTeamFromQrCode("SIMPLECOIL:FLAG:1"));
+        assertEquals(2, Globals.getFlagTeamFromQrCode(" team 2 flag "));
+    }
+
+    @Test public void flagQrCodesRejectInvalidTeamsAndRespawnCodes() {
+        assertEquals(0, Globals.getFlagTeamFromQrCode("SIMPLECOIL:FLAG:3"));
+        assertEquals(0, Globals.getFlagTeamFromQrCode("TEAM 1 RESPAWN"));
+        assertEquals(0, Globals.getFlagTeamFromQrCode("TEAM 2 FLAG NOW"));
+    }
+
+    @Test public void infectionTeamsChangeOnlyAfterConversion() {
+        Globals globals = Globals.getInstance();
+        boolean oldInfection = globals.mInfectionMode;
+        java.util.Set<Byte> oldInfected = globals.mInfectedPlayers;
+        try {
+            globals.mInfectionMode = true;
+            globals.resetInfectedPlayers();
+            assertEquals(1, globals.calcNetworkTeam((byte) 1));
+            assertEquals(2, globals.calcNetworkTeam((byte) 2));
+            globals.setPlayerInfected((byte) 2, true);
+            assertEquals(1, globals.calcNetworkTeam((byte) 2));
+            globals.setPlayerInfected((byte) 2, false);
+            assertEquals(1, globals.calcNetworkTeam((byte) 2));
+        } finally {
+            globals.mInfectionMode = oldInfection;
+            globals.mInfectedPlayers = oldInfected;
+        }
+    }
+
+    @Test public void infectionEndsForFullConversionOrOneRemainingSurvivor() {
+        assertFalse(Globals.infectionRoundShouldEnd(2, 1));
+        assertTrue(Globals.infectionRoundShouldEnd(2, 2));
+        assertFalse(Globals.infectionRoundShouldEnd(4, 1));
+        assertFalse(Globals.infectionRoundShouldEnd(4, 2));
+        assertTrue(Globals.infectionRoundShouldEnd(4, 3));
+        assertTrue(Globals.infectionRoundShouldEnd(4, 4));
+    }
+
+    @Test public void infectionAlwaysUsesFiveMinuteTimeLimit() {
+        Globals globals = Globals.getInstance();
+        int oldGameLimit = globals.mGameLimit;
+        int oldLivesLimit = globals.mLivesLimit;
+        int oldScoreLimit = globals.mScoreLimit;
+        int oldTimeLimit = globals.mTimeLimit;
+        try {
+            globals.mGameLimit = Globals.GAME_LIMIT_LIVES | Globals.GAME_LIMIT_SCORE;
+            globals.mLivesLimit = 9;
+            globals.mScoreLimit = 9;
+            globals.mTimeLimit = 0;
+
+            globals.applyInfectionGameLimits();
+
+            assertEquals(Globals.GAME_LIMIT_TIME, globals.mGameLimit);
+            assertEquals(Globals.INFECTION_TIME_LIMIT_MINUTES, globals.mTimeLimit);
+            assertEquals(0, globals.mLivesLimit);
+            assertEquals(0, globals.mScoreLimit);
+        } finally {
+            globals.mGameLimit = oldGameLimit;
+            globals.mLivesLimit = oldLivesLimit;
+            globals.mScoreLimit = oldScoreLimit;
+            globals.mTimeLimit = oldTimeLimit;
+        }
     }
 }
