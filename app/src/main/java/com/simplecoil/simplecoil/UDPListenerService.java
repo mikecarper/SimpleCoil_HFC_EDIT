@@ -133,9 +133,8 @@ public class UDPListenerService extends Service {
     private volatile boolean doneListening = true;
     private volatile boolean mIsListService = false;
     private volatile boolean mGameRunning;
-    // Dedicated games keep their roster authoritative over TCP.  A peer-hosted
-    // round closes that TCP listener after the start announcement, so a player
-    // leaving mid-round must be reflected by a validated UDP LEAVE instead.
+    // TCP admits players in both modes. Peer games also relay departures over
+    // UDP so host handoff does not depend on the departing phone's TCP link.
     private volatile boolean mPeerGame;
     // A fresh synchronized round gets a nonce from the TCP start announcement.
     // UDP endpoint membership alone cannot distinguish a delayed prior-round
@@ -177,6 +176,7 @@ public class UDPListenerService extends Service {
     static final long GAME_TICK_INTERVAL_MS = 1000;
     static final long GAME_TICK_DRIFT_GRACE_MS = GAME_TICK_INTERVAL_MS / 5;
     private final Object mPeerRuntimeLock = new Object();
+    private final int[] mSeatGenerations = new int[Globals.MAX_PLAYER_ID + 1];
     private final PeerStatePacket.PlayerState[] mPeerStates =
             new PeerStatePacket.PlayerState[PeerStatePacket.PLAYER_CAPACITY + 1];
     // Last cumulative rows accepted from an authoritative host tick, or from
@@ -240,6 +240,24 @@ public class UDPListenerService extends Service {
     // Queued sends may drain after stopListen(), but not into a replacement lobby.
     // Separate from discovery's generation, which changes on a successful reply.
     private long mSendGeneration;
+    private final RoundEndSync mRoundEnds = new RoundEndSync();
+    private Map<InetAddress, Integer> mLastRoundParticipants = new HashMap<>();
+    private String mLastRoundToken;
+    private long mHostStartedAt = -1;
+    private long mNextHostStartedAt = -1;
+    private boolean mManualPhoneHost;
+    private InetAddress mLastRoundHost;
+    private boolean mLastRoundWasPeer;
+    private Intent mPendingRoundComplete;
+    private final Runnable mRoundEndRetry = new Runnable() {
+        @Override public void run() {
+            if (mDestroyed) return;
+            long now = SystemClock.elapsedRealtime();
+            for (RoundEndSync.Delivery delivery : mRoundEnds.due(now))
+                sendRoundEndControl(delivery.message, delivery.destination);
+            if (mRoundEnds.retrying(now)) mMainHandler.postDelayed(this, 100);
+        }
+    };
     private volatile long mJoinGeneration;
     private InetAddress mJoinAddress;
     private boolean mBroadcastScan;
@@ -443,10 +461,14 @@ public class UDPListenerService extends Service {
         }
         if (message.startsWith(NetMsg.MESSAGE_PREFIX)) {
             message = message.substring(NetMsg.MESSAGE_PREFIX.length());
+            if (message.startsWith(RoundEndSync.END) || message.startsWith(RoundEndSync.ACK)) {
+                processRoundEnd(ip, message);
+                return;
+            }
             if (message.equals(SharedLobby.QUERY + NetMsg.NETWORK_VERSION)) {
                 if (mIsListService || (mGameRunning && mStateAuthority))
                     sendUDPMessage(NetMsg.MESSAGE_PREFIX + SharedLobby.announcement(
-                            Globals.getInstance().mPlayerID == 0, mGameRunning), ip, LISTEN_PORT);
+                            lobbyHostKind(), mGameRunning, hostAgeMillis()), ip, LISTEN_PORT);
                 return;
             } else if (message.startsWith(SharedLobby.BEACON)) {
                 SharedLobby.Host host = SharedLobby.parse(ip, message, SystemClock.elapsedRealtime());
@@ -454,6 +476,8 @@ public class UDPListenerService extends Service {
                     intent = new Intent(NetMsg.NETMSG_SHAREDLOBBY)
                             .putExtra(INTENT_SERVERIP, ip.getHostAddress())
                             .putExtra(NetMsg.INTENT_LOBBY_DEDICATED, host.dedicated)
+                            .putExtra(NetMsg.INTENT_LOBBY_HOST_KIND, host.kind.wire)
+                            .putExtra(NetMsg.INTENT_LOBBY_HOST_AGE, host.seenAt - host.startedAt)
                             .putExtra(NetMsg.INTENT_LOBBY_PLAYING, host.playing);
             } else if (message.startsWith(NetMsg.NETMSG_GAMEINVITE_PREFIX)) {
                 String roundToken = parseGameInviteToken(message);
@@ -550,6 +574,11 @@ public class UDPListenerService extends Service {
                     return;
                 }
                 message = message.substring(2);
+                if ("QR".equals(message)) {
+                    // TCP validates the scanned team and reserves the final seat.
+                    sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_SERVERREPLY, ip, LISTEN_PORT);
+                    return;
+                }
                 final int playerID;
                 try {
                     playerID = Integer.parseInt(message);
@@ -668,6 +697,9 @@ public class UDPListenerService extends Service {
         CombatPacket.Decoded decoded = CombatPacket.decode(payload, offset, length);
         if (decoded == null || decoded.networkVersion != NetMsg.NETWORK_VERSION_NUMBER)
             return;
+        if (!LiveJoin.accepts(decoded.senderID, decoded.generation)
+                || decoded.targetID != 0 && !LiveJoin.accepts(decoded.targetID, decoded.targetGeneration))
+            return;
         Byte sourceID = getPlayerID(ip);
         if (sourceID == null || (sourceID & 0xff) != decoded.senderID)
             return;
@@ -701,7 +733,8 @@ public class UDPListenerService extends Service {
                 // retransmitted only because our previous ACK was lost.
                 acknowledgement = CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
                         mStateRoundUuid, CombatPacket.KIND_ACK, decoded.eventType,
-                        localPlayerID, decoded.senderID, decoded.eventSequence);
+                        localPlayerID, decoded.senderID, decoded.eventSequence,
+                        decoded.targetGeneration, decoded.generation);
             }
             synchronized (mPeerRuntimeLock) {
                 boolean firstCopy = markCombatEventSeenLocked(decoded.senderID,
@@ -734,6 +767,7 @@ public class UDPListenerService extends Service {
 
     // Caller holds mPeerRuntimeLock.
     private boolean markCombatEventSeenLocked(int senderID, long sequence) {
+        syncSeatGenerationsLocked();
         if (!Globals.isValidPlayerID(senderID) || sequence <= 0)
             return false;
         long highest = mCombatHighestSequences[senderID];
@@ -766,7 +800,8 @@ public class UDPListenerService extends Service {
                 event.targetID, current.gameState, current.grenadeID, current.score,
                 current.deaths, current.health, current.shield, current.shotsRemaining,
                 current.gpsAgeSeconds, current.latitude, current.longitude,
-                current.carriedFlagTeam, current.ctfCaptures);
+                current.carriedFlagTeam, current.ctfCaptures)
+                .withGeneration(event.generation, event.targetGeneration);
     }
 
     private Intent combatEventIntent(CombatPacket.Decoded event, int localPlayerID,
@@ -817,9 +852,16 @@ public class UDPListenerService extends Service {
             return;
 
         PeerStatePacket.Decoded decoded = PeerStatePacket.decode(payload, offset, length);
-        if (decoded == null || decoded.networkVersion != NetMsg.NETWORK_VERSION_NUMBER
-                || decoded.gameMode != Globals.getInstance().mGameMode)
+        if (decoded == null || decoded.networkVersion != NetMsg.NETWORK_VERSION_NUMBER)
             return;
+        String completedToken = decoded.roundToken.toString();
+        if (isRoundComplete(completedToken)) {
+            RoundEndSync.Delivery repair = mRoundEnds.repair(completedToken, ip,
+                    SystemClock.elapsedRealtime());
+            if (repair != null) sendRoundEndControl(repair.message, repair.destination);
+            return;
+        }
+        if (decoded.gameMode != Globals.getInstance().mGameMode) return;
         // Resolve roster ownership before taking the round lock. Registration
         // paths can hold the roster semaphore while transitioning listener
         // state, so reversing that order here would deadlock under load.
@@ -831,6 +873,12 @@ public class UDPListenerService extends Service {
             knownPlayers[localPlayerID] = true;
 
         String roundToken = decoded.roundToken.toString();
+        if (decoded.senderID != 0 && (decoded.players[decoded.senderID] == null
+                || !LiveJoin.accepts(decoded.senderID, decoded.players[decoded.senderID].generation))) return;
+        for (int id = 1; id < decoded.players.length; id++) {
+            PeerStatePacket.PlayerState row = decoded.players[id];
+            if (row != null && !LiveJoin.accepts(id, row.generation)) decoded.players[id] = null;
+        }
         StateMergeResult applied = null;
         StateMergeResult gossipEvents = null;
         synchronized (mListenerStateLock) {
@@ -844,8 +892,12 @@ public class UDPListenerService extends Service {
                 if (sourceID == null || (sourceID & 0xff) != decoded.senderID
                         || decoded.players[decoded.senderID] == null)
                     return;
+                // Dedicated rounds permit late joiners. Retain their endpoints
+                // even if TCP clears the live roster before the end receipt.
+                mLastRoundParticipants.put(ip, decoded.senderID);
             }
             synchronized (mPeerRuntimeLock) {
+                syncSeatGenerationsLocked();
                 if (decoded.snapshotSequence <= mLastPeerSnapshotSequences[decoded.senderID])
                     return;
                 mLastPeerSnapshotSequences[decoded.senderID] = decoded.snapshotSequence;
@@ -917,9 +969,10 @@ public class UDPListenerService extends Service {
                         incoming.score, incoming.deaths, incoming.health, incoming.shield,
                         incoming.shotsRemaining, incoming.gpsAgeSeconds,
                         incoming.latitude, incoming.longitude, incoming.carriedFlagTeam,
-                        incoming.ctfCaptures);
+                        incoming.ctfCaptures).withGeneration(incoming.generation, incoming.targetGeneration);
             if (current == null || incoming.ownerSequence > current.ownerSequence)
                 mPeerStates[playerID] = incoming;
+            rememberMemberState(incoming);
             if (dispatchPeerEvents && markCombatEventSeenLocked(playerID,
                     incoming.eventSequence)) {
                 Intent event = peerEventIntent(getPlayerEndpoint((byte) playerID), incoming,
@@ -936,9 +989,11 @@ public class UDPListenerService extends Service {
                                                         boolean dispatchPeerEvents,
                                                         String roundToken) {
         StateMergeResult result = new StateMergeResult();
+        syncSeatGenerationsLocked();
         for (int playerID = 1; playerID <= PeerStatePacket.PLAYER_CAPACITY; playerID++) {
             PeerStatePacket.PlayerState incoming = rows[playerID];
-            if (incoming == null || !knownPlayers[playerID])
+            if (incoming == null || !knownPlayers[playerID]
+                    || !LiveJoin.accepts(playerID, incoming.generation))
                 continue;
             PeerStatePacket.PlayerState current = mAppliedPeerStates[playerID];
             if (current != null && incoming.ownerSequence < current.ownerSequence)
@@ -1000,6 +1055,9 @@ public class UDPListenerService extends Service {
         int[] carriers = {0, 0, 0};
         int[] scores = {0, 0, 0};
         Globals globals = Globals.getInstance();
+        if (globals.mRoundRoster != null)
+            for (int team = 1; team <= 2; team++) scores[team] = Math.min(0xffff,
+                    globals.mRoundRoster.archivedScore(team, true));
         for (int playerID = 1; playerID <= Globals.MAX_PLAYER_ID; playerID++) {
             PeerStatePacket.PlayerState state = mAppliedPeerStates[playerID];
             if (state == null)
@@ -1064,8 +1122,9 @@ public class UDPListenerService extends Service {
                     .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken));
         }
         if (result.voteQuorum) {
-            // Relay both approvals before stopping. The vote bits persist in
-            // subsequent snapshots, so a missed request can be repaired by peers.
+            // The committed decision must survive stopping gameplay and moving
+            // to another lobby. A short gossip burst alone is not reliable.
+            commitRoundEnd(roundToken, mPublishedEndVotes);
             broadcastPeerState(3);
             mMainHandler.postDelayed(() -> {
                 synchronized (mListenerStateLock) {
@@ -1096,6 +1155,111 @@ public class UDPListenerService extends Service {
                     .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken));
         for (Intent gameplayIntent : result.gameplayIntents)
             sendBroadcast(gameplayIntent);
+    }
+
+    public boolean isRoundComplete(String token) {
+        return token != null && mRoundEnds.contains(token, SystemClock.elapsedRealtime());
+    }
+
+    Intent consumePendingRoundComplete() {
+        synchronized (mListenerStateLock) {
+            Intent pending = mPendingRoundComplete;
+            mPendingRoundComplete = null;
+            return pending;
+        }
+    }
+
+    private Map<InetAddress, Integer> roundParticipants() {
+        Map<InetAddress, Integer> participants = new HashMap<>();
+        Globals globals = Globals.getInstance();
+        Globals.getmIPTeamMapSemaphore();
+        try {
+            for (Map.Entry<InetAddress, Byte> entry : globals.mIPTeamMap.entrySet())
+                participants.put(entry.getKey(), entry.getValue() & 0xff);
+        } finally { globals.mIPTeamMapSemaphore.release(); }
+        if (mMyIP != null) participants.put(mMyIP, globals.mPlayerID & 0xff);
+        if (globals.mServerIP != null && !participants.containsKey(globals.mServerIP))
+            participants.put(globals.mServerIP, 0);
+        return participants;
+    }
+
+    private void commitRoundEnd(String token, long votes) {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || token == null || !token.equals(mStateRoundToken)) return;
+            if (!mStateAuthority && (!mPeerGame || Globals.getInstance().mTournamentMode)
+                    && !EndGameVotes.hasQuorum(votes)) return;
+            if (!mRoundEnds.remember(token, votes, mLastRoundParticipants, mMyIP,
+                    SystemClock.elapsedRealtime(), true)) return;
+            mMainHandler.removeCallbacks(mRoundEndRetry);
+            mMainHandler.post(mRoundEndRetry);
+        }
+    }
+
+    private void processRoundEnd(InetAddress source, String message) {
+        RoundEndSync.Packet packet = RoundEndSync.parse(message);
+        if (packet == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (packet.acknowledgement) {
+            mRoundEnds.acknowledge(packet.token, source, now);
+            return;
+        }
+        boolean alreadyComplete = mRoundEnds.knows(packet.token, source, now);
+        Intent notification = null;
+        synchronized (mListenerStateLock) {
+            if (mDestroyed) return;
+            if (!alreadyComplete) {
+                // A receipt may also arrive after this player chose Leave game.
+                // Validate against the frozen old roster, never a replacement lobby.
+                if (!packet.token.equals(mLastRoundToken)
+                        || !mLastRoundParticipants.containsKey(source)) return;
+                boolean active = packet.token.equals(mStateRoundToken);
+                boolean waiting = packet.token.equals(Globals.getInstance().mSittingOutRoundToken);
+                if (!active && !waiting) return;
+                long participants = 0;
+                for (int id : mLastRoundParticipants.values()) participants |= EndGameVotes.playerBit(id);
+                participants |= EndGameVotes.playerBit(Globals.getInstance().mPlayerID & 0xff);
+                boolean quorum = mLastRoundWasPeer && EndGameVotes.hasQuorum(packet.votes)
+                        && (packet.votes & ~participants) == 0;
+                InetAddress host = active ? Globals.getInstance().mServerIP : mLastRoundHost;
+                // Like the existing relayed vote rows, quorum receipts are
+                // trusted only from a participant in this nonce-scoped round.
+                if (!quorum && (packet.votes != 0 || !source.equals(host)
+                        && (Globals.getInstance().mTournamentMode || !mLastRoundWasPeer))) return;
+                mRoundEnds.remember(packet.token, packet.votes, mLastRoundParticipants,
+                        mMyIP, now, false);
+                notification = new Intent(NetMsg.NETMSG_ROUNDCOMPLETE)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, packet.token);
+                mPendingRoundComplete = new Intent(notification);
+                mPeerVoteEndCommitted = true;
+                if (active && mPeerGame)
+                    mPendingPeerEndGame = new Intent(NetMsg.NETMSG_ENDGAME)
+                            .putExtra(NetMsg.INTENT_ROUND_TOKEN, packet.token);
+            }
+        }
+        // ACK duplicates too: the previous ACK may have been the dropped packet.
+        mRoundEnds.acknowledge(packet.token, source, now);
+        sendRoundEndControl(RoundEndSync.ack(packet.token), source);
+        if (notification != null) sendBroadcast(notification);
+    }
+
+    /** Control traffic survives gameplay sender-generation changes, but is nonce-scoped. */
+    void sendRoundEndControl(String message, InetAddress destination) {
+        if (mDestroyed || destination == null || message == null) return;
+        if (mQueuedCombatSends.incrementAndGet() > MAX_PENDING_DATAGRAM_SENDS) {
+            mQueuedCombatSends.decrementAndGet();
+            return;
+        }
+        try {
+            mCombatExecutor.execute(() -> {
+                try (DatagramSocket socket = new DatagramSocket()) {
+                    if (mDestroyed) return;
+                    byte[] payload = (NetMsg.MESSAGE_PREFIX + message).getBytes(StandardCharsets.UTF_8);
+                    socket.send(new DatagramPacket(payload, payload.length, destination, LISTEN_PORT));
+                } catch (IOException e) {
+                    Log.d(TAG, "Round-end receipt will retry", e);
+                } finally { mQueuedCombatSends.decrementAndGet(); }
+            });
+        } catch (RuntimeException e) { mQueuedCombatSends.decrementAndGet(); }
     }
 
     private void noteAuthorityTickLocked(long sequence) {
@@ -1141,6 +1305,9 @@ public class UDPListenerService extends Service {
                                    int localPlayerID, String roundToken) {
         if (state.eventSequence <= 0 || ip == null)
             return null;
+        if (!LiveJoin.accepts(state.playerID, state.generation)
+                || state.eventTargetID != 0
+                && !LiveJoin.accepts(state.eventTargetID, state.targetGeneration)) return null;
         boolean targetsLocal = state.eventTargetID == localPlayerID;
         Intent intent;
         switch (state.eventType) {
@@ -1229,7 +1396,8 @@ public class UDPListenerService extends Service {
     private int calculateLocalTeamScoreLocked(int localPlayerID) {
         Globals globals = Globals.getInstance();
         int localTeam = globals.calcNetworkTeam((byte) localPlayerID);
-        long total = 0;
+        long total = globals.mRoundRoster == null ? 0
+                : globals.mRoundRoster.archivedScore(localTeam, false);
         for (int playerID = 1; playerID <= Globals.MAX_PLAYER_ID; playerID++) {
             PeerStatePacket.PlayerState state = mAppliedPeerStates[playerID];
             // A player leaving removes the live roster entry, not points that
@@ -1766,7 +1934,8 @@ public class UDPListenerService extends Service {
         int localID = Globals.getInstance().mPlayerID & 0xff;
         for (int id = 1; id < mPeerStates.length; id++) {
             PeerStatePacket.PlayerState state = mEndVoteRows[id];
-            if (state == null || (state.flags & PeerStatePacket.FLAG_LEFT) != 0
+            if (state == null || !LiveJoin.active(id) || !LiveJoin.accepts(id, state.generation)
+                    || (state.flags & PeerStatePacket.FLAG_LEFT) != 0
                     || (state.flags & PeerStatePacket.FLAG_END_VOTE) == 0) continue;
             if (id == localID || getPlayerEndpoint((byte) id) != null)
                 votes |= EndGameVotes.playerBit(id);
@@ -1820,7 +1989,9 @@ public class UDPListenerService extends Service {
                         current.eventType, current.eventTargetID, current.gameState,
                         current.grenadeID, current.score, current.deaths, current.health,
                         current.shield, current.shotsRemaining, current.gpsAgeSeconds,
-                        current.latitude, current.longitude, carriedFlagTeam, captures);
+                        current.latitude, current.longitude, carriedFlagTeam, captures)
+                        .withGeneration(current.generation, current.targetGeneration);
+                rememberMemberState(mPeerStates[playerID]);
             }
         }
         broadcastPeerState(3);
@@ -1926,7 +2097,7 @@ public class UDPListenerService extends Service {
             payload = CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER, mStateRoundUuid,
                     CombatPacket.KIND_EVENT, eventType, playerID,
                     eventType == PeerStatePacket.EVENT_SHOT_FIRED ? 0 : targetPlayerID,
-                    eventSequence);
+                    eventSequence, LiveJoin.generation(playerID), LiveJoin.generation(targetPlayerID));
             generation = mSendGeneration;
             if (eventType != PeerStatePacket.EVENT_SHOT_FIRED) {
                 int slot = (int) (eventSequence % mPendingCombatEvents.length);
@@ -2080,6 +2251,7 @@ public class UDPListenerService extends Service {
 
     // Caller holds mPeerRuntimeLock.
     private PeerStatePacket.PlayerState localPeerStateLocked(int playerID) {
+        syncSeatGenerationsLocked();
         PeerStatePacket.PlayerState current = mPeerStates[playerID];
         if (current != null)
             return current;
@@ -2091,7 +2263,7 @@ public class UDPListenerService extends Service {
                 Math.max(1, mNextLocalPeerStateSequence), 0, PeerStatePacket.EVENT_NONE, 0,
                 globals.mGameState, globals.mPairedGrenadeID & 0xff, 0, 0,
                 globals.mFullHealth, globals.mFullShields, globals.mFullReload & 0xff,
-                0, 0, 0);
+                0, 0, 0).withGeneration(LiveJoin.generation(playerID), 0);
     }
 
     private PeerStatePacket.PlayerState copyLocalState(PeerStatePacket.PlayerState current,
@@ -2100,11 +2272,49 @@ public class UDPListenerService extends Service {
             int grenadeID, int flags, double latitude, double longitude) {
         int gpsAge = mLocalGpsUpdatedAt == 0 ? 0 : (int) Math.min(0xffff,
                 Math.max(0, (SystemClock.elapsedRealtime() - mLocalGpsUpdatedAt) / 1000));
-        return new PeerStatePacket.PlayerState(current.playerID,
+        PeerStatePacket.PlayerState updated = new PeerStatePacket.PlayerState(current.playerID,
                 flags | PeerStatePacket.FLAG_PRESENT, ownerSequence, eventSequence, eventType,
                 eventTargetID, gameState, grenadeID, score, deaths, health, shield,
                 shotsRemaining, gpsAge, latitude, longitude,
-                current.carriedFlagTeam, current.ctfCaptures);
+                current.carriedFlagTeam, current.ctfCaptures).withGeneration(current.generation,
+                eventSequence == current.eventSequence ? current.targetGeneration
+                        : LiveJoin.generation(eventTargetID));
+        rememberMemberState(updated);
+        return updated;
+    }
+
+    private void rememberMemberState(PeerStatePacket.PlayerState state) {
+        com.simplecoil.protocol.RoundRoster roster = Globals.getInstance().mRoundRoster;
+        if (roster != null && roster.token.equals(mStateRoundToken))
+            roster.update(state.playerID, state.generation, state.score, state.deaths,
+                    state.ctfCaptures, (state.flags & PeerStatePacket.FLAG_INFECTED) != 0);
+    }
+
+    // Caller holds mPeerRuntimeLock. TCP changes ownership, never UDP. Clear
+    // sequence windows before accepting the new occupant's first packet.
+    private void syncSeatGenerationsLocked() {
+        com.simplecoil.protocol.RoundRoster roster = Globals.getInstance().mRoundRoster;
+        if (roster == null || !roster.token.equals(mStateRoundToken)) return;
+        for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+            com.simplecoil.protocol.RoundRoster.Member member = roster.seat(id);
+            int generation = roster.generation(id);
+            if (generation != mSeatGenerations[id] || member == null && mPeerStates[id] != null) {
+                mSeatGenerations[id] = generation;
+                mPeerStates[id] = mAppliedPeerStates[id] = mEndVoteRows[id] = null;
+                mLastPeerSnapshotSequences[id] = mCombatHighestSequences[id] = mCombatSeenMasks[id] = 0;
+            }
+            if (member != null && mPeerStates[id] == null) {
+                int flags = PeerStatePacket.FLAG_PRESENT
+                        | (member.active ? 0 : PeerStatePacket.FLAG_LEFT)
+                        | (member.infected ? PeerStatePacket.FLAG_INFECTED : 0);
+                PeerStatePacket.PlayerState seed = new PeerStatePacket.PlayerState(id, flags,
+                        1, 0, PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_ELIMINATED, 0,
+                        member.kills, member.deaths, 0, 0, 0, 0, 0, 0, 0, member.captures)
+                        .withGeneration(generation, 0);
+                mPeerStates[id] = mAppliedPeerStates[id] = seed;
+                if (id == Globals.getInstance().mPlayerID) mNextLocalPeerStateSequence = Math.max(1, mNextLocalPeerStateSequence);
+            }
+        }
     }
 
     private long nextLocalStateSequenceLocked() {
@@ -2163,6 +2373,7 @@ public class UDPListenerService extends Service {
             }
             for (int playerID = 0; playerID < mPeerStates.length; playerID++) {
                 mPeerStates[playerID] = null;
+                mSeatGenerations[playerID] = 0;
                 mAppliedPeerStates[playerID] = null;
                 mEndVoteRows[playerID] = null;
                 mLastPeerSnapshotSequences[playerID] = 0;
@@ -2211,8 +2422,7 @@ public class UDPListenerService extends Service {
     }
 
     /**
-     * Peer games no longer have a TCP listener after the synchronized start is
-     * announced.  Remove a departing, already-known peer from the local
+     * Remove a departing, already-known peer immediately from the local
      * snapshots so remaining players do not keep waiting for it forever.  This
      * is deliberately disabled for dedicated games, where UDP alone must never
      * alter the TCP-owned roster.
@@ -2235,6 +2445,7 @@ public class UDPListenerService extends Service {
         synchronized (mPeerScoreLock) {
             mDepartedPeerScoreSources.put(ip, playerID);
         }
+        if (globals.mRoundRoster != null) globals.mRoundRoster.leave(playerID);
 
         Globals.getmTeamIPMapSemaphore();
         try {
@@ -2302,6 +2513,7 @@ public class UDPListenerService extends Service {
             if (!mPeerGame) return;
             globals.mServerIP = selected;
             mStateAuthority = selected.equals(local);
+            mIsListService = mStateAuthority;
             mLastPeerSnapshotSequences[0] = 0;
             mNextAuthorityTickSequence = 0;
             mLastAuthorityTickSequence = 0;
@@ -2309,6 +2521,7 @@ public class UDPListenerService extends Service {
             mMainHandler.removeCallbacks(mAuthorityTickHeartbeat);
             mMainHandler.removeCallbacks(mGossipRecovery);
             if (mStateAuthority) {
+                mHostStartedAt = SystemClock.elapsedRealtime();
                 mMainHandler.post(mAuthorityTickHeartbeat);
                 mMainHandler.removeCallbacks(mSharedLobbyBeacon);
                 mMainHandler.post(mSharedLobbyBeacon);
@@ -2567,6 +2780,45 @@ public class UDPListenerService extends Service {
         }
     }
 
+    long hostStartedAt() { synchronized (mListenerStateLock) { return mHostStartedAt; } }
+
+    SharedLobby.Kind lobbyHostKind() {
+        synchronized (mListenerStateLock) {
+            return Globals.getInstance().mPlayerID == 0 ? SharedLobby.Kind.DEDICATED_PHONE
+                    : mManualPhoneHost ? SharedLobby.Kind.MANUAL_PHONE : SharedLobby.Kind.AUTO_PHONE;
+        }
+    }
+
+    boolean isHostingLobby() {
+        synchronized (mListenerStateLock) {
+            return !mDestroyed && keepListening && mIsListService && isListenerReadyLocked();
+        }
+    }
+
+    void setManualPhoneHost(boolean manual, long selectedAt) {
+        synchronized (mListenerStateLock) {
+            mManualPhoneHost = manual;
+            if (manual && selectedAt >= 0) {
+                mNextHostStartedAt = selectedAt;
+                if (mIsListService) mHostStartedAt = selectedAt;
+            }
+            if (isHostingLobby()) {
+                mMainHandler.removeCallbacks(mSharedLobbyBeacon);
+                mMainHandler.post(mSharedLobbyBeacon);
+            }
+        }
+    }
+
+    long hostAgeMillis() {
+        synchronized (mListenerStateLock) {
+            return mHostStartedAt < 0 ? 0 : Math.max(0, SystemClock.elapsedRealtime() - mHostStartedAt);
+        }
+    }
+
+    void resumeHostTenure(long startedAt) {
+        synchronized (mListenerStateLock) { mNextHostStartedAt = startedAt; }
+    }
+
     public void createServer() {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
@@ -2652,6 +2904,8 @@ public class UDPListenerService extends Service {
                 return;
             }
             Globals.getInstance().mServerIP = mMyIP;
+            mHostStartedAt = mNextHostStartedAt >= 0 ? mNextHostStartedAt : SystemClock.elapsedRealtime();
+            mNextHostStartedAt = -1;
             mMainHandler.removeCallbacks(mSharedLobbyBeacon);
             mMainHandler.post(mSharedLobbyBeacon);
             sendBroadcast(new Intent(NetMsg.NETMSG_SERVERCREATED));
@@ -2913,8 +3167,9 @@ public class UDPListenerService extends Service {
                             if (mJoinTimer != this || !mScanRunning || generation != mJoinGeneration)
                                 return;
                             sendUDPMessage(NetMsg.MESSAGE_PREFIX + NetMsg.NETMSG_JOIN
-                                    + NetMsg.NETWORK_VERSION + (Globals.getInstance().mLobbyAutoAssign
-                                    ? 0 : Globals.getInstance().mPlayerID), serverIP, port);
+                                    + NetMsg.NETWORK_VERSION + (Globals.getInstance().mRequestedJoinTeam > 0
+                                    ? "QR" : String.valueOf(Globals.getInstance().mLobbyAutoAssign
+                                    ? 0 : Globals.getInstance().mPlayerID)), serverIP, port);
                         }
                     }
 
@@ -3290,6 +3545,7 @@ public class UDPListenerService extends Service {
 
     @Override
     public void onDestroy() {
+        mMainHandler.removeCallbacks(mRoundEndRetry);
         synchronized (mListenerStateLock) {
             mDestroyed = true;
             stopListen();
@@ -3399,6 +3655,7 @@ public class UDPListenerService extends Service {
     }
 
     public void startGame(boolean peerGame, String roundToken, boolean stateAuthority) {
+        if (isRoundComplete(roundToken)) return;
         if (peerGame && !TcpServer.isValidRoundToken(roundToken)) {
             Log.w(TAG, "Refusing peer game without a valid round token");
             return;
@@ -3408,14 +3665,20 @@ public class UDPListenerService extends Service {
             Log.w(TAG, "Refusing authoritative state ticks without a valid round token");
             return;
         }
+        Map<InetAddress, Integer> participants = stateGossipRound ? roundParticipants() : new HashMap<>();
         synchronized (mListenerStateLock) {
+            if (stateGossipRound) {
+                mLastRoundParticipants = participants;
+                mLastRoundToken = roundToken;
+                mLastRoundHost = Globals.getInstance().mServerIP;
+                mLastRoundWasPeer = peerGame;
+            }
             cancelInviteListenerRequestLocked();
             mPassiveInviteListener = false;
             mInviteTemporarilyAllowsJoin = false;
             mInviteWindowGeneration++;
-            // A dedicated host may intentionally allow late joins while it
-            // also publishes authority ticks. Peer-hosted rounds freeze their roster.
-            if (!stateAuthority || peerGame)
+            // The current host keeps discovery open for team-QR admission.
+            if (!stateAuthority)
                 mIsListService = false;
             clearJoinAssignments();
             boolean peerRoundChanged = mPeerGame != peerGame
@@ -3471,6 +3734,7 @@ public class UDPListenerService extends Service {
 
     /** Stop a dedicated host's completed tick stream without closing its lobby listener. */
     public void finishAuthoritativeStateTicks() {
+        commitRoundEnd(mStateRoundToken, 0);
         synchronized (mListenerStateLock) {
             if (!mStateAuthority)
                 return;
@@ -3485,6 +3749,7 @@ public class UDPListenerService extends Service {
     }
 
     public void endGame() {
+        commitRoundEnd(mStateRoundToken, 0);
         final String message;
         synchronized (mListenerStateLock) {
             if (mPeerGame) {
@@ -3545,7 +3810,7 @@ public class UDPListenerService extends Service {
                 InetAddress broadcast = getBroadcastAddress();
                 if (broadcast != null)
                     sendUDPMessage(NetMsg.MESSAGE_PREFIX + SharedLobby.announcement(
-                            Globals.getInstance().mPlayerID == 0, mGameRunning), broadcast, LISTEN_PORT);
+                            lobbyHostKind(), mGameRunning, hostAgeMillis()), broadcast, LISTEN_PORT);
                 mMainHandler.postDelayed(this, 2_000);
             }
         }

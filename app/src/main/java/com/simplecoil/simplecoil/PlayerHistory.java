@@ -43,4 +43,15 @@ final class PlayerHistory {
                 .putInt(DEATHS, Math.min(MAX_TOTAL, read(context, DEATHS) + Math.max(0, deaths)))
                 .apply();
     }
+
+    static void recordRound(Context context, String token, int kills, int deaths) {
+        if (!TcpServer.isValidRoundToken(token)) { record(context, kills, deaths); return; }
+        SharedPreferences prefs = context.getSharedPreferences(FullscreenActivity.PREF_NAME, 0);
+        boolean same = token.equals(FullscreenActivity.readStringPreference(prefs, "HistoryRound", ""));
+        int priorKills = same ? FullscreenActivity.readIntPreference(prefs, "HistoryRoundKills", 0) : 0;
+        int priorDeaths = same ? FullscreenActivity.readIntPreference(prefs, "HistoryRoundDeaths", 0) : 0;
+        record(context, Math.max(0, kills - priorKills), Math.max(0, deaths - priorDeaths));
+        prefs.edit().putString("HistoryRound", token).putInt("HistoryRoundKills", Math.max(kills, priorKills))
+                .putInt("HistoryRoundDeaths", Math.max(deaths, priorDeaths)).apply();
+    }
 }

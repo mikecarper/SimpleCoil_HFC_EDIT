@@ -16,6 +16,8 @@
 
 package com.simplecoil.simplecoil;
 
+import com.simplecoil.protocol.RoundRoster;
+
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -64,6 +66,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class TcpClient extends Service {
+    private String mQrJoinRoundToken;
     private static final String TAG = "TCPClient";
 
     public static final String TCP_CLIENT_PONG = "pong";
@@ -90,6 +93,11 @@ public class TcpClient extends Service {
     private volatile boolean isListening = false;
     private volatile boolean mIsDedicatedServer = false;
     private boolean mLobbyRegistered;
+    private SharedLobby.Kind mLobbyHostKind = SharedLobby.Kind.AUTO_PHONE;
+    private InetAddress mLobbyHostAddress;
+    private long mLobbyHostStartedAt;
+    private boolean mLobbyHostPlaying;
+    private volatile long mLastServerTrafficAt;
     private boolean mDestroyed;
     private long mSessionGeneration;
     // A takeover receives the new UDP endpoint before it is safe to start a
@@ -110,6 +118,9 @@ public class TcpClient extends Service {
     private Intent mPendingStartIntent;
     private Intent mPendingGameStartEvent;
     private static final long CLOCK_REFRESH_MS = 30000;
+    // Samples delayed beyond 80 ms are unusable, so do not spend five seconds
+    // waiting for a lost probe before trying again on a recovering Wi-Fi link.
+    private static final long CLOCK_REQUEST_TIMEOUT_MS = 500;
     // Once a shared countdown has been announced, take one inexpensive probe
     // per second.  The probe only improves an already-good NTP estimate; it
     // never delays the countdown or floods the dedicated host with a new
@@ -345,6 +356,8 @@ public class TcpClient extends Service {
 
     private void resetClockSyncLocked() {
         mLobbyRegistered = false;
+        mLobbyHostAddress = null;
+        mLastServerTrafficAt = 0;
         mGameClock.reset();
         mClockSynchronized = false;
         mClockRequestQueued = false;
@@ -387,7 +400,7 @@ public class TcpClient extends Service {
         if (mDestroyed || !keepListening || out == null || sendExecutor.isShutdown() || mClockRequestQueued)
             return;
         long now = SystemClock.elapsedRealtime();
-        if (mPendingClockRequest >= 0 && now - mPendingClockRequest < GameClock.MAX_ROUND_TRIP_MS)
+        if (mPendingClockRequest >= 0 && now - mPendingClockRequest < CLOCK_REQUEST_TIMEOUT_MS)
             return;
         if (mGameClock.samples() >= GameClock.SAMPLES_PER_SYNC) {
             boolean countdownActive = hasActiveStartCountdownLocked(now);
@@ -560,12 +573,10 @@ public class TcpClient extends Service {
                 .putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken)
                 .putExtra(NetMsg.INTENT_PEER_GAME, !mIsDedicatedServer)
                 .putExtra(EXTRA_START_EVENT_ID, terminalEventIds.incrementAndGet());
+        if (roundToken.equals(mQrJoinRoundToken)) intent.putExtra(LiveJoin.INTENT, true);
         mPendingGameStartEvent = new Intent(intent);
         broadcastIfCurrentSession(generation, intent);
-        // Peer hosts close TCP after announcing a round. Stop reconnecting here,
-        // even if the activity is paused, and retain the start until it resumes.
-        if (!mIsDedicatedServer)
-            keepListening = false;
+        // TCP remains a low-rate roster/control channel throughout peer rounds.
     }
 
     /**
@@ -652,7 +663,7 @@ public class TcpClient extends Service {
             // the socket loop is entered. Never leave the service marked running.
             if (keepListening) {
                 Log.e(TAG, "TCP client stopped unexpectedly", e);
-                finishServerSession(NetMsg.NETMSG_SERVERCANCEL);
+                finishServerSession(NetMsg.NETMSG_SERVERUNREACHABLE);
             }
         } finally {
             final boolean restart;
@@ -736,6 +747,7 @@ public class TcpClient extends Service {
                     if (message != null) {
                         noReadCount = 0;
                         idleTick = SystemClock.elapsedRealtime();
+                        mLastServerTrafficAt = idleTick;
                         if (message.equals(TcpServer.TCP_SERVER_PING))
                             sendPong();
                         else {
@@ -788,7 +800,10 @@ public class TcpClient extends Service {
                     } else {
                         int readWait = mIsDedicatedServer ? TcpServer.TCP_DEDICATED_READ_WAIT_MS : TcpServer.TCP_READ_WAIT_MS;
                         boolean sampling;
-                        synchronized (this) { sampling = mGameClock.samples() < GameClock.SAMPLES_PER_SYNC; }
+                        synchronized (this) {
+                            sampling = mGameClock.samples() < GameClock.SAMPLES_PER_SYNC
+                                    || mPendingClockRequest >= 0;
+                        }
                         sleep(sampling ? TcpServer.CLOCK_READ_WAIT_MS : readWait);
                         long now = SystemClock.elapsedRealtime();
                         if (now - idleTick >= readWait) {
@@ -827,7 +842,7 @@ public class TcpClient extends Service {
             }
         }
         if (retryCount == 0 && keepListening) {
-            finishServerSession(NetMsg.NETMSG_SERVERCANCEL);
+            finishServerSession(NetMsg.NETMSG_SERVERUNREACHABLE);
         }
         Log.d(TAG, "Client stopping");
     }
@@ -921,6 +936,9 @@ public class TcpClient extends Service {
             JSONObject playerInfo = new JSONObject();
             playerInfo.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
             playerInfo.put(TcpServer.JSON_PLAYERNAME, Globals.getInstance().mPlayerName);
+            playerInfo.put(LiveJoin.IDENTITY, LiveJoin.identity(this));
+            if (Globals.getInstance().mRequestedJoinTeam > 0)
+                playerInfo.put(LiveJoin.TEAM, Globals.getInstance().mRequestedJoinTeam);
             playerInfo.put(TcpServer.JSON_LOBBY_READY, Globals.getInstance().mLocalLobbyReady);
             playerInfo.put(TcpServer.JSON_LOBBY_BENCHED, Globals.getInstance().mLocalLobbyBenched);
             playerInfo.put(TcpServer.JSON_PRIOR_KILLS, PlayerHistory.kills(this));
@@ -971,6 +989,13 @@ public class TcpClient extends Service {
     /** A lobby snapshot may arrive while its activity is paused for gun pairing. */
     public synchronized boolean hasLobbyConnection() {
         return !mDestroyed && keepListening && out != null && mLobbyRegistered;
+    }
+
+    synchronized SharedLobby.Host lobbyHost(long now) {
+        if (!hasLobbyConnection() || mLobbyHostAddress == null
+                || now - mLastServerTrafficAt >= SharedLobby.EXPIRY_MS) return null;
+        return new SharedLobby.Host(mLobbyHostAddress, mLobbyHostKind, mLobbyHostPlaying,
+                mLastServerTrafficAt, mLastServerTrafficAt - mLobbyHostStartedAt);
     }
 
     public void sendPlayerSettings() {
@@ -1167,6 +1192,31 @@ public class TcpClient extends Service {
         }
         try {
             JSONObject game = TcpJson.parseObject(message);
+            if (Boolean.TRUE.equals(game.opt(LiveJoin.REJECTED))) {
+                synchronized (this) {
+                    if (!isCurrentSession(generation)) return;
+                    Globals.getInstance().mRequestedJoinTeam = 0;
+                    mQrJoinRoundToken = null;
+                }
+                finishServerSession(NetMsg.NETMSG_QRJOINREJECTED);
+                return;
+            }
+            if (game.has(LiveJoin.ASSIGNED)) {
+                int id = TcpJson.getInt(game, LiveJoin.ASSIGNED);
+                String token = game.getString(TcpServer.JSON_ROUND_TOKEN);
+                synchronized (this) {
+                    if (!isCurrentSession(generation) || Globals.getInstance().mRequestedJoinTeam == 0
+                            || !Globals.isValidPlayerID(id) || !TcpServer.isValidRoundToken(token)) return;
+                    Globals.getInstance().mPlayerID = (byte) id;
+                    Globals.getInstance().mRequestedJoinTeam = 0;
+                    Globals.getInstance().mLocalLobbyBenched = false;
+                    Globals.getInstance().mWaitingForLobbyRoundEnd = false;
+                    mQrJoinRoundToken = token;
+                }
+                return;
+            }
+            RoundRoster roundRoster = game.has(LiveJoin.ROSTER)
+                    ? RoundRoster.decode(game.getString(LiveJoin.ROSTER)) : null;
             if (game.has(TcpServer.JSON_END_VOTES)) {
                 long votes = TcpJson.getLong(game, TcpServer.JSON_END_VOTES);
                 String token = game.getString(TcpServer.JSON_ROUND_TOKEN);
@@ -1186,6 +1236,7 @@ public class TcpClient extends Service {
                     if (!isCurrentSession(generation)) return;
                     Globals.getInstance().mLobbyRoundActive = true;
                     Globals.getInstance().mLocalLobbyBenched = true;
+                    Globals.getInstance().mWaitingForLobbyRoundEnd = true;
                 }
                 broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_LOBBYWAIT));
                 return;
@@ -1197,6 +1248,7 @@ public class TcpClient extends Service {
             JSONObject startInfo = game.has(TcpServer.JSON_GAMESTART) ? readStartInfo(game) : null;
             if (startInfo != null && !game.has(TcpServer.JSON_PLAYERS)) {
                 if (Globals.getInstance().mLocalLobbyBenched) return;
+                if (roundRoster != null) Globals.getInstance().installRoundRoster(roundRoster);
                 queueSynchronizedStart(generation, startInfo, new Intent(NetMsg.NETMSG_STARTGAME));
                 return;
             }
@@ -1409,6 +1461,8 @@ public class TcpClient extends Service {
                         && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_QR);
                 int powerupQrRequired = game.has(TcpServer.JSON_POWERUP_QR_REQUIRED)
                         ? TcpJson.getInt(game, TcpServer.JSON_POWERUP_QR_REQUIRED) : 0;
+                boolean respawnQrEnabled = !game.has(TcpServer.JSON_RESPAWN_QR_ENABLED)
+                        || TcpJson.getBoolean(game, TcpServer.JSON_RESPAWN_QR_ENABLED);
                 if (powerupQrRequired != 0
                         && !PowerupQrProgress.isValidRequiredCount(powerupQrRequired))
                     throw new JSONException("Invalid power-up QR count");
@@ -1573,6 +1627,14 @@ public class TcpClient extends Service {
                     }
                 }
                 boolean dedicatedServer = game.has(TcpServer.JSON_DEDICATED) && game.getBoolean(TcpServer.JSON_DEDICATED);
+                SharedLobby.Kind hostKind = game.has(TcpServer.JSON_HOST_KIND)
+                        ? SharedLobby.Kind.parse(game.getString(TcpServer.JSON_HOST_KIND))
+                        : dedicatedServer ? SharedLobby.Kind.DEDICATED_PHONE : SharedLobby.Kind.AUTO_PHONE;
+                long hostAge = game.has(TcpServer.JSON_HOST_AGE)
+                        ? TcpJson.getLong(game, TcpServer.JSON_HOST_AGE) : 0;
+                if (hostKind == null || hostKind.dedicated != dedicatedServer
+                        || hostAge < 0 || hostAge > SharedLobby.MAX_HOST_AGE_MS)
+                    throw new JSONException("Invalid lobby host role/age");
                 int mapTilePort = 0;
                 if (game.has(TcpServer.JSON_MAP_TILE_PORT)) {
                     int advertisedPort = TcpJson.getInt(game, TcpServer.JSON_MAP_TILE_PORT);
@@ -1605,6 +1667,12 @@ public class TcpClient extends Service {
                                     if (!isCurrentSession(generation))
                                         return;
                                     globals.mTournamentMode = tournamentMode;
+                                    if (roundRoster != null) {
+                                        if (startInfo == null || !roundRoster.token.equals(
+                                                startInfo.getString(TcpServer.JSON_ROUND_TOKEN)))
+                                            throw new JSONException("Mismatched round roster");
+                                        globals.installRoundRoster(roundRoster);
+                                    }
                                     globals.mBossMode = bossMode;
                                     globals.mCaptureTheFlag = ctfMode;
                                     globals.mInfectionMode = infectionMode;
@@ -1637,6 +1705,10 @@ public class TcpClient extends Service {
                                     globals.mLocalLobbyBenched = localPresence != null && localPresence.benched;
                                     globals.mLobbyRoundActive = game.optBoolean(TcpServer.JSON_LOBBY_PLAYING, false);
                                     mLobbyRegistered = true;
+                                    mLobbyHostKind = hostKind;
+                                    mLobbyHostAddress = globals.mServerIP;
+                                    mLobbyHostStartedAt = SystemClock.elapsedRealtime() - hostAge;
+                                    mLobbyHostPlaying = globals.mLobbyRoundActive;
                                     globals.mGameLimit = gameLimit;
                                     globals.mTimeLimit = timeLimit;
                                     globals.mLivesLimit = livesLimit;
@@ -1648,6 +1720,7 @@ public class TcpClient extends Service {
                                     globals.mBalancedRandom = balancedMode;
                                     globals.mBalancedRequireQr = balancedQr;
                                     globals.mPowerupQrRequired = powerupQrRequired;
+                                    globals.mRespawnQrEnabled = respawnQrEnabled;
                                     globals.setBalancedAssignments(balancedTeams, balancedCheckedIn);
                                     globals.mUseGPS = useGPS;
                                     globals.mGPSMode = gpsMode;

@@ -31,6 +31,7 @@ if (releaseSigningConfigured && !rootProject.file(releaseStoreFilePath).isFile()
 }
 
 android {
+    sourceSets.main.java.srcDir '../shared/src/main/java'
     compileSdk 34
     compileOptions {
         // The QR library uses Java 8 collection APIs (for example List.sort).
@@ -51,8 +52,8 @@ android {
         applicationId "com.simplecoil.simplecoil"
         minSdkVersion 21
         targetSdkVersion 29
-        versionCode 24
-        versionName "1.23"
+        versionCode 33
+        versionName "1.32"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders = [appName: appDisplayName]
     }

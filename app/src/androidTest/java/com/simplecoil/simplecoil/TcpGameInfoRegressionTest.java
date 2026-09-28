@@ -48,6 +48,7 @@ public class TcpGameInfoRegressionTest {
     private boolean originalBossMode;
     private int originalBossHunterCount;
     private int originalPowerupQrRequired;
+    private boolean originalRespawnQrEnabled;
     private int originalMapTilePort;
     private long originalEndVotes;
     private boolean originalEndVoteRequested;
@@ -79,6 +80,7 @@ public class TcpGameInfoRegressionTest {
         originalBossMode = globals.mBossMode;
         originalBossHunterCount = globals.mBossHunterCount;
         originalPowerupQrRequired = globals.mPowerupQrRequired;
+        originalRespawnQrEnabled = globals.mRespawnQrEnabled;
         originalMapTilePort = globals.mMapTilePort;
         originalEndVotes = globals.mEndGameVotes;
         originalEndVoteRequested = globals.mEndGameVoteRequested;
@@ -132,6 +134,7 @@ public class TcpGameInfoRegressionTest {
         globals.mBossMode = originalBossMode;
         globals.mBossHunterCount = originalBossHunterCount;
         globals.mPowerupQrRequired = originalPowerupQrRequired;
+        globals.mRespawnQrEnabled = originalRespawnQrEnabled;
         globals.mMapTilePort = originalMapTilePort;
         globals.mEndGameVotes = originalEndVotes;
         globals.mEndGameVoteRequested = originalEndVoteRequested;
@@ -248,6 +251,24 @@ public class TcpGameInfoRegressionTest {
 
         parse(roster(new JSONArray().put(player(3))));
         assertEquals(0, globals.mPowerupQrRequired);
+    }
+
+    @Test
+    public void respawnModeFollowsTheHostAndMalformedFlagsDoNotChangeIt() throws Exception {
+        parse(roster(new JSONArray().put(player(3)))
+                .put(TcpServer.JSON_RESPAWN_QR_ENABLED, false));
+        assertFalse(globals.mRespawnQrEnabled);
+        for (Object invalid : new Object[]{"true", 1, JSONObject.NULL}) {
+            parse(roster(new JSONArray().put(player(3)))
+                    .put(TcpServer.JSON_RESPAWN_QR_ENABLED, invalid));
+            assertFalse(globals.mRespawnQrEnabled);
+        }
+        parse(roster(new JSONArray().put(player(3)))
+                .put(TcpServer.JSON_RESPAWN_QR_ENABLED, true));
+        assertTrue(globals.mRespawnQrEnabled);
+        globals.mRespawnQrEnabled = false;
+        parse(roster(new JSONArray().put(player(3))));
+        assertTrue(globals.mRespawnQrEnabled);
     }
 
     @Test
@@ -837,6 +858,54 @@ public class TcpGameInfoRegressionTest {
         parse(roster(new JSONArray().put(player(3))).put(TcpServer.JSON_DEDICATED, false));
         assertFalse(client.isDedicatedServer());
         assertEquals(NetMsg.NETMSG_LISTPLAYERS, client.events.get(0).getAction());
+    }
+
+    @Test
+    public void tcpRosterPreservesHostRoleButSilentConnectionDoesNotRenewLease() throws Exception {
+        InetAddress oldServer = globals.mServerIP;
+        boolean oldPlaying = globals.mLobbyRoundActive;
+        try {
+            globals.mServerIP = InetAddress.getByName("127.0.0.20");
+            for (SharedLobby.Kind kind : SharedLobby.Kind.values()) {
+                parse(roster(new JSONArray().put(player(1)).put(player(3)))
+                        .put(TcpServer.JSON_DEDICATED, kind.dedicated)
+                        .put(TcpServer.JSON_GAMESTATE, Globals.GAME_STATE_NONE)
+                        .put(TcpServer.JSON_HOST_KIND, kind.wire).put(TcpServer.JSON_HOST_AGE, 10_000));
+                long now = SystemClock.elapsedRealtime();
+                setClientField("keepListening", true);
+                setClientField("out", new java.io.DataOutputStream(new java.io.ByteArrayOutputStream()));
+                setClientField("mLastServerTrafficAt", now);
+                SharedLobby.Host host = client.lobbyHost(now);
+                assertTrue("Valid role did not complete lobby registration", host != null);
+                assertEquals(kind, host.kind);
+                assertEquals(globals.mServerIP, host.address);
+                assertEquals(10_000, host.seenAt - host.startedAt, 100);
+                assertNull("An open but silent stream renewed the host lease",
+                        client.lobbyHost(now + SharedLobby.EXPIRY_MS));
+                client.stopTcpClient();
+                assertNull(client.lobbyHost(now));
+            }
+        } finally {
+            globals.mServerIP = oldServer;
+            globals.mLobbyRoundActive = oldPlaying;
+        }
+    }
+
+    @Test
+    public void invalidHostRoleOrAgeCannotPartiallyReplaceTheRoster() throws Exception {
+        JSONObject base = roster(new JSONArray().put(player(3))).put(TcpServer.JSON_DEDICATED, false);
+        parse(base.put(TcpServer.JSON_HOST_KIND, "L"));
+        parse(base.put(TcpServer.JSON_HOST_KIND, "unknown"));
+        parse(base.put(TcpServer.JSON_HOST_KIND, "M").put(TcpServer.JSON_HOST_AGE, -1));
+        parse(base.put(TcpServer.JSON_HOST_AGE, SharedLobby.MAX_HOST_AGE_MS + 1));
+        assertOriginalRoster();
+        assertTrue(client.events.isEmpty());
+    }
+
+    private void setClientField(String name, Object value) throws Exception {
+        java.lang.reflect.Field field = TcpClient.class.getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(client, value);
     }
 
     @Test

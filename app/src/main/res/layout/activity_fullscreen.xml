@@ -140,7 +140,7 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="10dp"
             android:layout_marginTop="5dp"
-            app:srcCompat="@drawable/ic_battery_full_green_24dp" />
+            app:srcCompat="@drawable/ic_battery_unknown_24dp" />
 
         <ImageView
             android:id="@+id/network_status_iv"
@@ -174,7 +174,7 @@
             android:padding="3dp"
             android:text="@string/gps_acquiring"
             android:textColor="#FFFFFF"
-            android:textSize="10sp"
+            android:textSize="13sp"
             android:visibility="gone" />
 
         <TextView
@@ -203,7 +203,12 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:layout_centerHorizontal="true"
+            android:layout_toEndOf="@id/battery_iv"
+            android:layout_toStartOf="@id/network_status_iv"
+            android:gravity="center"
             android:text="@string/team_label"
+            android:textSize="32sp"
+            android:textStyle="bold"
             android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
 
         <Button
@@ -241,10 +246,24 @@
             android:id="@+id/team_tv"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="28dp"
+            android:layout_below="@id/team_label_tv"
+            android:layout_marginTop="0dp"
             android:layout_centerHorizontal="true"
             android:text="@string/no_team"
             android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+
+        <TextView
+            android:id="@+id/game_host_badge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/battery_iv"
+            android:layout_marginStart="10dp"
+            android:layout_marginTop="4dp"
+            android:text="@string/lobby_host_badge"
+            android:textColor="#FFBA6A"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/shots_label_tv"
@@ -347,6 +366,15 @@
                     android:layout_height="wrap_content"
                     android:text="--"
                     android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+
+                <TextView
+                    android:id="@+id/boss_secondary_power_tv"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/gun_low_power"
+                    android:textColor="#FFBA6A"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
             </LinearLayout>
 
             <LinearLayout
@@ -389,6 +417,15 @@
                     android:layout_height="wrap_content"
                     android:text="0"
                     android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
+
+                <TextView
+                    android:id="@+id/boss_primary_power_tv"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/gun_low_power"
+                    android:textColor="#FFBA6A"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
             </LinearLayout>
         </LinearLayout>
 

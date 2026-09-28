@@ -13,6 +13,37 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class GlobalsTest {
+    @Test public void gpsFixAgeUsesMonotonicTimeAndRejectsOldOrFutureFixes() {
+        assertTrue(Globals.isFreshGpsFix(10_000, 10_000));
+        assertTrue(Globals.isFreshGpsFix(10_000,
+                10_000 + Globals.GPS_DISPLAY_FIX_MAX_AGE_MS));
+        assertFalse(Globals.isFreshGpsFix(10_000,
+                10_001 + Globals.GPS_DISPLAY_FIX_MAX_AGE_MS));
+        assertFalse(Globals.isFreshGpsFix(10_001, 10_000));
+        assertFalse(Globals.isFreshGpsFix(0, 10_000));
+    }
+
+    @Test public void teamRespawnsKeepThreeMinuteWaitWithoutAQrScanner() {
+        for (int mode : new int[]{Globals.GAME_MODE_2TEAMS, Globals.GAME_MODE_4TEAMS}) {
+            assertEquals(180L, Globals.respawnWaitSeconds(true, false, mode, 10));
+            assertEquals(180L, Globals.respawnWaitSeconds(true, false, mode, 90));
+        }
+    }
+
+    @Test public void respawnWaitDoesNotExtendInitialCountdownSoloOrFfa() {
+        assertEquals(10L, Globals.respawnWaitSeconds(true, true, Globals.GAME_MODE_2TEAMS, 10));
+        assertEquals(10L, Globals.respawnWaitSeconds(false, false, Globals.GAME_MODE_2TEAMS, 10));
+        assertEquals(10L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_FFA, 10));
+        assertEquals(42L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_FFA, 42));
+    }
+
+    @Test public void personalRespawnWaitClampsInvalidDurations() {
+        assertEquals(Globals.MIN_RESPAWN_TIME_SECONDS,
+                Globals.respawnWaitSeconds(false, false, Globals.GAME_MODE_FFA, Long.MIN_VALUE));
+        assertEquals(Globals.MAX_RESPAWN_TIME_SECONDS,
+                Globals.respawnWaitSeconds(false, false, Globals.GAME_MODE_FFA, Long.MAX_VALUE));
+    }
+
     @Test public void defaultGameLengthIsFiveMinutes() {
         assertEquals(5, FullscreenActivity.DEFAULT_TIME_LIMIT_MINUTES);
     }
@@ -91,6 +122,7 @@ public class GlobalsTest {
         assertTrue(boss.allowShotModeSingle);
         assertTrue(boss.allowShotModeBurst3);
         assertTrue(boss.allowShotModeAuto);
+        assertEquals(Globals.FIRING_MODE_OUTDOOR_WITH_CONE, boss.firingMode);
 
         Globals.PlayerSettings hunter = new Globals.PlayerSettings();
         Globals.applyTournamentRules(hunter);
@@ -100,6 +132,40 @@ public class GlobalsTest {
         assertTrue(hunter.allowShotModeSingle);
         assertFalse(hunter.allowShotModeBurst3);
         assertFalse(hunter.allowShotModeAuto);
+        assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE, hunter.firingMode);
+    }
+
+    @Test public void outdoorBossAlwaysGetsTheWideConeIncludingOldSavedDefaults() {
+        for (int mode : new int[]{Globals.FIRING_MODE_OUTDOOR_NO_CONE,
+                Globals.FIRING_MODE_OUTDOOR_WITH_CONE, -1, 99}) {
+            assertEquals(Globals.FIRING_MODE_OUTDOOR_WITH_CONE,
+                    Globals.resolveFiringMode(mode, true, true));
+            assertEquals(Globals.FIRING_MODE_OUTDOOR_WITH_CONE,
+                    Globals.resolveFiringMode(mode, false, true));
+        }
+    }
+
+    @Test public void indoorRangeIsPreservedForBossAndHunters() {
+        for (int playerID : new int[]{Globals.BOSS_PLAYER_ID, 2}) {
+            Globals.PlayerSettings settings = new Globals.PlayerSettings();
+            settings.firingMode = Globals.FIRING_MODE_INDOOR_NO_CONE;
+            Globals.applyBossHealth(settings, playerID, 10);
+            assertEquals(Globals.FIRING_MODE_INDOOR_NO_CONE, settings.firingMode);
+            assertEquals(Globals.FIRING_MODE_INDOOR_NO_CONE,
+                    Globals.resolveFiringMode(settings.firingMode, true,
+                            playerID == Globals.BOSS_PLAYER_ID));
+        }
+    }
+
+    @Test public void hunterCannotKeepBossConeAndClassicSelectionsAreUnchanged() {
+        assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE,
+                Globals.resolveFiringMode(Globals.FIRING_MODE_OUTDOOR_WITH_CONE, true, false));
+        for (int mode : new int[]{Globals.FIRING_MODE_OUTDOOR_NO_CONE,
+                Globals.FIRING_MODE_OUTDOOR_WITH_CONE, Globals.FIRING_MODE_INDOOR_NO_CONE}) {
+            assertEquals(mode, Globals.resolveFiringMode(mode, false, false));
+        }
+        assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE,
+                Globals.resolveFiringMode(99, false, false));
     }
 
     @Test public void classicModesDisableTournamentWithoutChangingTheSelectedTeamMode() {

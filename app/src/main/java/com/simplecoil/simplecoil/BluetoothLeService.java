@@ -31,9 +31,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Binder;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.util.LinkedList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Queue;
 import java.util.UUID;
@@ -46,6 +48,27 @@ import java.util.UUID;
 @SuppressLint("MissingPermission")
 public class BluetoothLeService extends Service {
     private final static String TAG = BluetoothLeService.class.getSimpleName();
+
+    // Diagnostic observation only: never schedule a shot or change a gun's settings.
+    // Capture at the GATT callback, before UI/broadcast delays distort shot intervals.
+    private static volatile boolean sFireTimingCapture;
+
+    static void setFireTimingCapture(boolean enabled) {
+        boolean capture = BuildConfig.DEBUG && enabled;
+        if (sFireTimingCapture == capture)
+            return;
+        sFireTimingCapture = capture;
+        Log.i("GunFire", "ms=" + SystemClock.elapsedRealtime()
+                + " capture=" + (capture ? "enabled" : "disabled"));
+    }
+
+    private void logFireTiming(String event, UUID characteristic, byte[] data, int status) {
+        if (!BuildConfig.DEBUG || !sFireTimingCapture)
+            return;
+        Log.d("GunFire", "ms=" + SystemClock.elapsedRealtime() + " slot=" + weaponSlot()
+                + " event=" + event + " characteristic=" + characteristic
+                + " status=" + status + " data=" + Arrays.toString(data));
+    }
 
     private BluetoothManager mBluetoothManager;
     private BluetoothAdapter mBluetoothAdapter;
@@ -155,6 +178,7 @@ public class BluetoothLeService extends Service {
     }
 
     private void broadcastWriteFinished(CharacteristicWrite write, int status) {
+        logFireTiming("write_finished", write.characteristic.getUuid(), write.value, status);
         Intent intent = new Intent(CHARACTERISTIC_WRITE_FINISHED);
         intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
         intent.putExtra(EXTRA_UUID, write.characteristic.getUuid().toString());
@@ -173,6 +197,7 @@ public class BluetoothLeService extends Service {
 
     private boolean startCharacteristicWrite(BluetoothGatt gatt, CharacteristicWrite write) {
         write.prepare();
+        logFireTiming("write_started", write.characteristic.getUuid(), write.value, -1);
         // Android can dispatch a completion before writeCharacteristic() returns.
         // Mark the transport busy before calling into the framework so that
         // callback cannot be overwritten by a stale false assignment afterward.
@@ -372,6 +397,7 @@ public class BluetoothLeService extends Service {
             byte[] data = characteristic.getValue();
             if (data == null)
                 return;
+            logFireTiming("telemetry", characteristic.getUuid(), data, BluetoothGatt.GATT_SUCCESS);
             final Intent intent = new Intent(TELEMETRY_DATA_AVAILABLE);
             intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
             intent.putExtra(EXTRA_DATA, data.clone());

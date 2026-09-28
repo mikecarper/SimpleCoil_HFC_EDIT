@@ -38,7 +38,17 @@ public class CombatPacketTest {
         assertNotNull(decoded);
         assertEquals(0, decoded.targetID);
         assertNull(CombatPacket.decode(shot, 0, shot.length - 1));
-        shot[10] = 1;
+        shot[4] = 0; // invalid format, not the now-assigned generation byte
         assertNull(CombatPacket.decode(shot, 0, shot.length));
+    }
+
+    @Test public void reusedSeatsCarryBothSourceAndTargetGenerations() {
+        byte[] packet = CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER, UUID.randomUUID(),
+                CombatPacket.KIND_EVENT, PeerStatePacket.EVENT_HIT, 1, 32, 5, 7, 255);
+        CombatPacket.Decoded decoded = CombatPacket.decode(packet, 0, packet.length);
+        assertNotNull(decoded);
+        assertEquals(7, decoded.generation);
+        assertEquals(255, decoded.targetGeneration);
+        assertEquals(32, packet.length);
     }
 }

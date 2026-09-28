@@ -46,7 +46,46 @@ host Start action.
 Equipment, phone hotspot setup, solo practice, and manual host entry remain
 available in the options.
 
-### Ending or leaving a round (1.23)
+The lobby shows a smoothed battery estimate, independently for both guns in
+two-gun Boss mode. The four-AA RK-45 uses a NiMH profile and an approximate
+voltage, for example `~4.8 V / Good`. Full is around 5.4 V or above; 4.8 V is
+normal NiMH operating voltage, not half empty. The indicator says Recharge soon
+at 4.1-4.2 V and Empty - recharge at 4.0 V or below. It does not extrapolate
+precise voltages outside the measured 2.0-6.0 V range. These are coarse
+voltage-based conditions, not a percentage or a per-cell safety monitor.
+The earlier 2.25 V electronics test is not a suitable NiMH empty threshold.
+
+The reading waits for the gun type and 20 real samples. It uses a rolling
+15-second window, discards the lowest 75% of readings, and averages the highest
+25% (rounding the retained sample count up). The display and recoil cutoff use
+the same filtered voltage. Older samples expire by elapsed time, not packet
+count; reconnecting clears the window. The uncalibrated six-cell SR-12
+retains its legacy qualitative indicator without claiming a voltage.
+See [calibration and NiMH thresholds](docs/gun-battery-calibration.md) and the
+[NiMH manufacturer's guide](https://data.energizer.com/pdfs/nickelmetalhydride_appman.pdf).
+At an estimated 4.0 V or below, the four-AA RK-45 automatically enters low-power
+mode and turns recoil off, including in tournament games. Shot mode, firing
+cadence, ammo, reload, and damage stay unchanged. The lobby and game HUD show
+low power; two Boss guns are protected independently. The setting is remembered
+per gun across reconnects and app restarts. Recoil stays off for that connection
+to prevent voltage-rebound cycling; reconnect with a healthy pack (initial
+smoothed reading at least 4.8 V) to restore normal recoil. This saves motor power
+but does not shut down the gun or make an empty pack safe to keep using.
+
+### Kill-streak voice
+
+English kill-streak jokes use bundled recordings of Kokoro's British male
+"George" voice. No voice-pack install, Internet connection, or on-phone neural
+speech processing is needed. "Enemy Destroyed"
+keeps the normal voice at 150% speed, followed by the existing one-second
+pause before the joke. Countdown, reload, respawn, and other announcements
+keep their usual voice. Non-English prompts keep their original language.
+
+All 20 jokes are included in the APK and share the normal speech queue. If a
+recording cannot be registered or queued, the joke falls back to system speech.
+See [voice sources, generation, and checks](docs/british-male-voice.md).
+
+### Ending, leaving, or joining a round (1.27)
 
 During countdown, play, or respawn, **End / Leave game** offers two separate
 actions. **Agree to end** asks for an early end; the round ends only after two
@@ -61,15 +100,71 @@ still finish the round automatically.
 everyone else's round. It is available throughout the round, including via
 Back, and is no longer limited to the first 30 seconds. If the playing phone
 host leaves, the remaining phone with the lowest player ID takes over the
-game-state broadcasts. You sit out until the host adds you to a later round.
+game-state broadcasts and the join service. Leaving sits you out until you
+scan back in, or until the next round opens.
+
+To join a game already running, connect to its Wi-Fi and pair your gun, then
+tap **Scan team QR to join**. Scan the team's existing respawn/base code
+(`SIMPLECOIL:RESPAWN:1` through `SIMPLECOIL:RESPAWN:4`, as appropriate for the
+mode). The host assigns an available slot on that team. New players and
+players who left can join during countdown or play without restarting anyone
+else's timer. A returning app installation keeps its kills, deaths and captures;
+it cannot change teams or recover exhausted limited lives by leaving. Infected
+players return through the zombie team's base. Boss scaling stays fixed at
+the original countdown roster, and joining cannot create a second boss.
+
+Departed slots can be reused in a full 32-player game. Per-seat generations
+reject the former occupant's delayed state, hits and leave packets. Team totals
+retain departed players' contributions. TCP stays open for infrequent roster
+changes; combat still uses the existing fast UDP path. A team QR is required
+for voluntary re-entry; simply waiting in the lobby does not pull you back in.
+
+End decisions are acknowledged and retried per phone for up to 30 seconds,
+independently of gameplay/lobby socket restarts. Completed-round receipts are
+retained for 10 minutes to repair a returning player's stale round. Old end
+messages cannot end a new round. Install 1.32 on every phone for this build.
+
+If a round is stopped before its first 60 seconds of play have elapsed, the
+next round can start without the usual 30-second between-game wait. Canceling
+a countdown also permits an immediate retry. The normal synchronized start
+countdown still runs; rounds lasting 60 seconds or longer retain the wait.
+
+The lobby shows **Your previous game**: your kills, deaths, hits taken, mode,
+team, and team kills (captures in CTF) when applicable. These local stats survive app restarts
+and stay visible while preparing the next game. Leaving early labels them
+**Stats at exit**. A canceled countdown does not replace the previous result.
+Games played before installing this update cannot be recovered retroactively.
+
+In the lobby, tap **Make this phone host** to choose a phone explicitly. Idle
+phones on the same Wi-Fi move to it and suppress automatic phone hosting while
+it remains reachable. The selected phone shows **This phone is the selected host**;
+tap **Return to automatic hosting** to release the selection. Choosing a
+different phone replaces the earlier manual selection. This selection lasts
+for the current app/network session, not permanently across network changes.
+
+Host priority is laptop, manually selected phone (including the non-playing
+phone game-master screen), then automatic phone. A running round always
+finishes first: a laptop appearing during a phone-hosted game takes over only
+after that round ends. Phone hosting controls are disabled while a reachable
+laptop is present. Automatic phones and laptops prefer the oldest host by
+monotonic hosting age, with the lowest IP breaking ties within two seconds.
+Simultaneous manual selections use the same tie-break; otherwise the newest
+selection wins. No shared wall clock is required for host selection.
+
+Host discovery leases expire after 15 seconds without a beacon or live TCP
+traffic. A stalled lobby connection/host startup also times out after 15
+seconds, and its failed endpoint is skipped for 30 seconds before retrying.
+The remaining phones can resume automatic hosting; the manual/laptop choice
+does not lock the lobby forever if its host disappears. Brief Wi-Fi drops
+preserve the existing selection. These lobby timeouts do not interrupt play.
 
 Lobby discovery uses a small UDP beacon/query every two seconds, not a scan
 of every address. While looking for Wi-Fi, fresh radio scans are limited to
 once every three seconds; scan results can still trigger an immediate join,
 and tapping Wi-Fi requests an immediate scan. The AP must allow client-to-client traffic and subnet
 broadcasts; turn off guest/client isolation. All phones and the laptop host
-must run this protocol-24 build. A phone arriving during a locked active game
-waits for the next round instead of creating a separate lobby.
+must run this protocol-28 build. A phone arriving during an active game offers
+team-QR admission or waits for the next round instead of creating a separate lobby.
 
 Network games use TCP for the lobby and an NTP-style exchange of monotonic-clock
 timestamps to synchronize a start deadline. The app never changes a phone's
@@ -85,12 +180,12 @@ system clock and does not use a public NTP server.
 - The network-offset target is below 50 ms on a healthy local network. Wi-Fi
   congestion, device suspension, and normal UI scheduling can still affect the
   moment a device visibly reacts.
-- All participants must use network protocol 24 (this build). Older protocol
+- All participants must use network protocol 28 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
 During every network game, each phone sends one subnet-directed IPv4 state
 broadcast per second instead of one unicast packet per player. The fixed
-1,312-byte protocol-24 snapshot fits 32 player records below the 1,472-byte UDP
+1,376-byte protocol-28 snapshot fits 32 player records below the 1,472-byte UDP
 payload ceiling and avoids normal IPv4 fragmentation. Each record carries
 cumulative score/deaths,
 health, shield, shots, player state, grenade pairing, a deduplicated important
@@ -99,7 +194,7 @@ the newer player rows they hear. The host still publishes an authoritative tick
 every second; after a missing tick's 20% grace window (200 ms), a phone fills
 only newer portions of that tick from its overheard cache. Late or stale data
 cannot roll state back. Names, addresses, and other bulky mappings remain in
-TCP lobby setup. Android holds the high-performance Wi-Fi lock during gameplay;
+the TCP roster channel. Android holds the high-performance Wi-Fi lock during gameplay;
 the multicast lock also stays active during lobby discovery so idle phones can
 hear the shared host.
 
@@ -112,7 +207,7 @@ only once per life; team respawn codes never count. Every configured number of
 different codes grants a random health refill, shield refill, or five-second
 temporary shield boost. Death clears unused progress and allows the codes to
 be collected again. With power-ups off, this gameplay scanner stays closed;
-the full-screen team QR scanner still opens after death for respawn.
+the full-screen team QR scanner still opens after death when QR respawns are enabled.
 
 Combat feedback does not wait for that one-second state cadence. `HIT`, `OUT`,
 `ALREADY DEAD`, and elimination use a 32-byte subnet broadcast that every phone
@@ -149,7 +244,9 @@ magazine, no health or shield regeneration, and forced single-shot fire. The bos
 with 5 health and 10 shields, then gains 1 health and 2 shields per hunter. For
 example, against 10 hunters the boss has 15 health and 30 shields. The boss has
 120 rounds, starts each game in automatic, and may switch among single, burst,
-and automatic fire. The starting roster fixes boss strength for the round.
+and automatic fire. With Outdoor range selected, both boss guns automatically
+use the wide cone. Indoor range keeps its reduced power and no cone; hunters
+do not gain the cone. The starting roster fixes boss strength for the round.
 In the boss lobby, use "Gun 2..." to select another nearby SRG1 blaster.
 The two blasters use the same boss player ID, health, and score, but each has its
 own 120-round magazine and reload. The second gun reconnects automatically if
@@ -168,11 +265,13 @@ text forms `TEAM 1 FLAG` and `TEAM 2 FLAG` are also accepted. For the laptop
 host, start the mode with `./laptop-host/run.sh --ctf`.
 
 Infection starts Player 1 as the original zombie and everyone else as a
-survivor. A killed survivor runs to the zombie base and scans the existing
-Team 1 respawn QR before returning as a zombie. Recruited zombies can be killed
-and must scan that same base again. Until the original zombie earns two kills,
+survivor. A killed survivor can run to the zombie base and scan the existing
+Team 1 respawn QR before returning as a zombie, or wait the three-minute timer.
+In timer-only respawn mode there is no scanner; conversion to a zombie happens
+when the timer expires. Recruited zombies can be killed and use the same respawn
+rule. Until the original zombie earns two kills,
 incoming damage removes ammunition instead of health. After the second kill,
-the original zombie can be killed normally and must scan the Team 1 base to
+the original zombie can be killed normally and uses the same respawn rule to
 return. Its reload takes 20% of the normal time only until its first death;
 after respawning, reload speed is normal. The round ends when every survivor
 has converted, or awards the win to the final uninfected player after another
@@ -198,7 +297,7 @@ While a QR check-in is pending, the phone repeats the assigned team number in
 its spoken scan reminder. Respawn QR reminders also say the player's team.
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-24 host automatically
+team before starting. If an ID conflicts, a protocol-28 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and
@@ -236,15 +335,30 @@ so idle phones can offer to join automatically. See
 [the laptop-host guide](laptop-host/README.md) for ports, firewall guidance,
 display security, and options.
 
-## Checkpoint and Game Master respawns
+## Timer, checkpoint, and Game Master respawns
 
-Network two-team and four-team games use team QR checkpoints after a player is
+The host selects **Match options > Respawn mode** in the lobby:
+
+- **Timer only (no respawn QR)**: team players return automatically after
+  **3:00**. The camera stays closed and there are no "scan your base" reminders.
+- **QR checkpoint or timer** (default): scan the team's base to return early,
+  or wait the same **3:00** timer.
+
+This is a match-wide setting; joined players cannot override the host. Solo
+practice and free-for-all use the configured respawn duration, **10 seconds**
+by default. This setting does not lengthen the initial game-start countdown.
+The dedicated-phone host has the same respawn-mode control; the laptop uses
+`./laptop-host/run.sh --timer-respawn` (or `--qr-respawn` for the default).
+CTF flag/base scans, optional power-ups, and optional QR team check-in remain
+separate features; timer-only disables the respawn scanner, not those objectives.
+
+With QR respawns enabled, network two-team and four-team games use team QR checkpoints after a player is
 eliminated. The first game-start countdown remains unchanged. On later deaths,
 the app opens its built-in phone-camera scanner automatically and gives the
 player a choice:
 
 - Scan their own team's respawn checkpoint to return immediately.
-- Close the scanner and wait the visible three-minute respawn countdown.
+- Wait the visible three-minute respawn countdown; the scanner closes on respawn.
 
 Print one distinct QR code for each team. The preferred payloads are
 `SIMPLECOIL:RESPAWN:1` through `SIMPLECOIL:RESPAWN:4`; the simple forms
@@ -257,7 +371,17 @@ For dedicated-host games, the host verifies the player's recorded elimination
 before honoring a checkpoint request. The dedicated-host screen also has a
 **Game Master Respawn** control. It lists only connected players currently
 waiting to respawn and can return one of them immediately. This manual option
-also works for free-for-all games, where QR checkpoints are not used.
+also works in timer-only mode and free-for-all games.
+
+## Coordinates on the phone
+
+Latitude and longitude appear in the lobby's player card and in the upper-right
+corner during play. The readout shows **GPS Off** when match location sharing
+is disabled, or **GPS acquiring...** until a recent location arrives. A fix
+expires after 30 seconds without an update, including after GPS is disabled and
+re-enabled. The app accepts Android's GPS and network-location providers; the coordinate readout
+can therefore contain a network-based fix, not necessarily a satellite fix.
+Zero latitude or longitude is treated as invalid rather than displayed.
 
 ## Build
 

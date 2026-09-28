@@ -103,6 +103,9 @@ public class MapFragment extends GlobeMapFragment {
     private void sendLocation(Location location, boolean force) {
         Context activity = getActivity();
         if (!isValidLocation(location) || activity == null) return;
+        long fixElapsedMs = location.getElapsedRealtimeNanos() / 1_000_000L;
+        if (fixElapsedMs > 0 && !Globals.isFreshGpsFix(fixElapsedMs, SystemClock.elapsedRealtime()))
+            return;
         if (!force && mLastBroadcastLocation != null) {
             if (location.getLatitude() == mLatitude && location.getLongitude() == mLongitude)
                 return;
@@ -117,6 +120,7 @@ public class MapFragment extends GlobeMapFragment {
         Intent intent = new Intent(NetMsg.NETMSG_GPSLOCUPDATE);
         intent.putExtra(NetMsg.INTENT_LATITUDE, mLatitude);
         intent.putExtra(NetMsg.INTENT_LONGITUDE, mLongitude);
+        intent.putExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS, fixElapsedMs);
         activity.sendBroadcast(intent);
     }
 
@@ -142,7 +146,11 @@ public class MapFragment extends GlobeMapFragment {
     private Location getLastKnownLocation(String provider) {
         try {
             Location location = mLocationManager.getLastKnownLocation(provider);
-            return isValidLocation(location) ? new Location(location) : null;
+            if (!isValidLocation(location)) return null;
+            long fixElapsedMs = location.getElapsedRealtimeNanos() / 1_000_000L;
+            return fixElapsedMs > 0
+                    && Globals.isFreshGpsFix(fixElapsedMs, SystemClock.elapsedRealtime())
+                    ? new Location(location) : null;
         } catch (SecurityException | IllegalArgumentException e) {
             // One missing provider must not discard the other provider's usable fix.
             Log.w(TAG, "Location provider is unavailable: " + provider, e);
@@ -197,6 +205,9 @@ public class MapFragment extends GlobeMapFragment {
      */
     protected boolean isBetterLocation(Location location, Location currentBestLocation) {
         if (!isValidLocation(location))
+            return false;
+        long fixElapsedMs = location.getElapsedRealtimeNanos() / 1_000_000L;
+        if (fixElapsedMs > 0 && !Globals.isFreshGpsFix(fixElapsedMs, SystemClock.elapsedRealtime()))
             return false;
         if (!isValidLocation(currentBestLocation)) {
             // A new location is always better than no location

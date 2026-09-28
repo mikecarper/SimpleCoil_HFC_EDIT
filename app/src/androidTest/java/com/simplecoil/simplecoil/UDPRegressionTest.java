@@ -49,6 +49,7 @@ public class UDPRegressionTest {
     private boolean originalTournamentMode;
     private long originalEndVotes;
     private boolean originalEndVoteRequested;
+    private com.simplecoil.protocol.RoundRoster originalRoundRoster;
 
     @Before
     public void setUp() throws Exception {
@@ -58,6 +59,8 @@ public class UDPRegressionTest {
         stranger = InetAddress.getByName("127.0.0.4");
         set(service, "mMyIP", InetAddress.getByName("127.0.0.1"));
         Globals globals = Globals.getInstance();
+        originalRoundRoster = globals.mRoundRoster;
+        globals.mRoundRoster = null;
         originalGameState = globals.mGameState;
         originalGameMode = globals.mGameMode;
         originalPlayerID = globals.mPlayerID;
@@ -85,6 +88,7 @@ public class UDPRegressionTest {
         }
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
         Globals globals = Globals.getInstance();
+        globals.mRoundRoster = originalRoundRoster;
         globals.mGameState = originalGameState;
         globals.mGameMode = originalGameMode;
         globals.mPlayerID = originalPlayerID;
@@ -93,6 +97,42 @@ public class UDPRegressionTest {
         globals.mEndGameVotes = originalEndVotes;
         globals.mEndGameVoteRequested = originalEndVoteRequested;
         clearPlayers();
+    }
+
+    @Test
+    public void reusedSeatDropsOldCombatAndLeaveButAcceptsNewSequenceOne() throws Exception {
+        register(enemy, 17);
+        com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(PEER_ROUND_TOKEN);
+        roster.restore(new com.simplecoil.protocol.RoundRoster.Member(java.util.UUID.randomUUID().toString(), 1, 1, 0));
+        roster.restore(new com.simplecoil.protocol.RoundRoster.Member(java.util.UUID.randomUUID().toString(), 17, 2, 0));
+        Globals.getInstance().mRoundRoster = roster;
+        startPeerGame();
+        byte[] oldHit = CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), CombatPacket.KIND_EVENT,
+                PeerStatePacket.EVENT_HIT, 17, 1, 999, 0, 0);
+        receiveCombat(enemy, oldHit);
+        roster.leave(17);
+        assertNotNull(roster.join(java.util.UUID.randomUUID().toString(), 2, 2, false, false, 0));
+        service.events.clear();
+        receiveCombat(enemy, oldHit);
+        receiveState(enemy, votePacket(17, 1000,
+                new PeerStatePacket.PlayerState(17, 3, 1000, 1000, PeerStatePacket.EVENT_QUIT,
+                        0, Globals.GAME_STATE_RUNNING, 0, 20, 1, 5, 10, 30, 0, 0, 0)));
+        assertTrue(service.events.isEmpty());
+        assertEquals(enemy, Globals.getInstance().mTeamIPMap.get((byte) 17));
+        receiveCombat(enemy, CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), CombatPacket.KIND_EVENT,
+                PeerStatePacket.EVENT_HIT, 17, 1, 1, 1, 0));
+        assertEquals(1, service.events.size());
+        assertEquals(NetMsg.NETMSG_HIT, service.events.get(0).getAction());
+        // A queued hit addressed to a former occupant must not hit the new one.
+        roster.leave(1);
+        roster.join(java.util.UUID.randomUUID().toString(), 1, 2, false, false, 0);
+        service.events.clear();
+        receiveCombat(enemy, CombatPacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), CombatPacket.KIND_EVENT,
+                PeerStatePacket.EVENT_HIT, 17, 1, 2, 1, 0));
+        assertTrue(service.events.isEmpty());
     }
 
     @Test
@@ -135,6 +175,111 @@ public class UDPRegressionTest {
         assertNotNull(decoded);
         assertNotNull(decoded.players[17]);
         assertTrue((decoded.players[17].flags & PeerStatePacket.FLAG_END_VOTE) != 0);
+    }
+
+    @Test
+    public void committedEndRetriesAfterLobbySocketGenerationChangesUntilAcknowledged() throws Exception {
+        register(enemy, 17);
+        startPeerGame();
+        service.voteToEndGame(PEER_ROUND_TOKEN, true);
+        receiveState(enemy, votePacket(17, 1, voteRow(17, 2, true)));
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        assertFalse(service.roundControls.isEmpty());
+        service.stopListen();
+        set(service, "mSendGeneration", 1000L);
+        service.roundControls.clear();
+        Thread.sleep(220);
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        assertFalse("Returning to the lobby lost the end retry", service.roundControls.isEmpty());
+        receive(enemy, RoundEndSync.ack(PEER_ROUND_TOKEN));
+        RoundEndSync receipts = (RoundEndSync) get(service, "mRoundEnds");
+        assertFalse(receipts.retrying(android.os.SystemClock.elapsedRealtime()));
+    }
+
+    @Test
+    public void endReceiptValidatesQuorumAndAcknowledgesDuplicatesAfterRoundStops() throws Exception {
+        register(enemy, 17);
+        Globals.getInstance().mTournamentMode = true;
+        Globals.getInstance().mServerIP = teammate;
+        startPeerGame();
+        String message = RoundEndSync.END + NetMsg.NETWORK_VERSION + ":" + PEER_ROUND_TOKEN + ":10001";
+        receive(stranger, message);
+        assertFalse(service.isRoundComplete(PEER_ROUND_TOKEN));
+        receive(enemy, RoundEndSync.END + NetMsg.NETWORK_VERSION + ":" + PEER_ROUND_TOKEN + ":1");
+        assertFalse(service.isRoundComplete(PEER_ROUND_TOKEN));
+        receive(enemy, message);
+        assertTrue(service.isRoundComplete(PEER_ROUND_TOKEN));
+        Intent pending = service.consumePendingRoundComplete();
+        assertNotNull(pending);
+        assertEquals(NetMsg.NETMSG_ROUNDCOMPLETE, pending.getAction());
+        assertNull(service.consumePendingRoundComplete());
+        service.stopListen();
+        service.roundControls.clear();
+        receive(enemy, message);
+        assertEquals(Collections.singletonList(RoundEndSync.ack(PEER_ROUND_TOKEN)), service.roundControls);
+        service.startGame(true, PEER_ROUND_TOKEN);
+        assertFalse("A delayed start revived a completed round", flag("mPeerGame"));
+    }
+
+    @Test
+    public void newRoundCannotBeEndedByAnOldReceiptAndRepairsAnOldPlayersState() throws Exception {
+        register(enemy, 17);
+        startPeerGame();
+        String end = RoundEndSync.END + NetMsg.NETWORK_VERSION + ":" + PEER_ROUND_TOKEN + ":10001";
+        receive(enemy, end);
+        service.stopListen();
+        String next = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        service.startGame(true, next);
+        service.events.clear();
+        receive(enemy, end);
+        assertTrue(service.events.isEmpty());
+        assertTrue(flag("mPeerGame"));
+        service.roundControls.clear();
+        Globals.getInstance().mGameMode = Globals.GAME_MODE_FFA;
+        receiveState(enemy, votePacket(17, 3, voteRow(17, 3, false)));
+        assertTrue("Returning old-round player did not get the retained end", service.roundControls.contains(end));
+    }
+
+    @Test
+    public void endReceiptReleasesAPlayerWhoAlreadyLeftTheRound() throws Exception {
+        register(enemy, 17);
+        startPeerGame();
+        service.stopListen();
+        String oldToken = Globals.getInstance().mSittingOutRoundToken;
+        try {
+            Globals.getInstance().mSittingOutRoundToken = PEER_ROUND_TOKEN;
+            receive(enemy, RoundEndSync.END + NetMsg.NETWORK_VERSION + ":" + PEER_ROUND_TOKEN + ":10001");
+            assertNotNull(service.consumePendingRoundComplete());
+            assertTrue(service.isRoundComplete(PEER_ROUND_TOKEN));
+        } finally { Globals.getInstance().mSittingOutRoundToken = oldToken; }
+    }
+
+    @Test
+    public void dedicatedEndReceiptRequiresTheCurrentHost() throws Exception {
+        register(enemy, 17);
+        Globals.getInstance().mServerIP = teammate;
+        service.startGame(false, PEER_ROUND_TOKEN);
+        String end = RoundEndSync.END + NetMsg.NETWORK_VERSION + ":" + PEER_ROUND_TOKEN + ":0";
+        receive(enemy, end);
+        assertFalse(service.isRoundComplete(PEER_ROUND_TOKEN));
+        receive(teammate, end);
+        assertTrue(service.isRoundComplete(PEER_ROUND_TOKEN));
+        assertNotNull(service.consumePendingRoundComplete());
+        assertEquals(Collections.singletonList(RoundEndSync.ack(PEER_ROUND_TOKEN)), service.roundControls);
+    }
+
+    @Test
+    public void dedicatedHostRetainsLateJoinersForEndAfterRosterCleanup() throws Exception {
+        Globals.getInstance().mPlayerID = 0;
+        Globals.getInstance().mServerIP = InetAddress.getByName("127.0.0.1");
+        service.startAuthoritativeStateTicks(PEER_ROUND_TOKEN);
+        register(enemy, 17);
+        receiveState(enemy, votePacket(17, 1, voteRow(17, 1, false)));
+        clearPlayers();
+        service.finishAuthoritativeStateTicks();
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        assertTrue(service.isRoundComplete(PEER_ROUND_TOKEN));
+        assertTrue(service.roundControlRecipients.contains(enemy));
     }
 
     @Test
@@ -1514,6 +1659,8 @@ public class UDPRegressionTest {
         final List<List<InetAddress>> combatRecipients = new CopyOnWriteArrayList<>();
         final List<byte[]> combatAcknowledgements = new CopyOnWriteArrayList<>();
         final List<InetAddress> combatAckRecipients = new CopyOnWriteArrayList<>();
+        final List<String> roundControls = new CopyOnWriteArrayList<>();
+        final List<InetAddress> roundControlRecipients = new CopyOnWriteArrayList<>();
         boolean realListener;
         int listenerStarts;
         boolean blockFirstLookup;
@@ -1528,6 +1675,11 @@ public class UDPRegressionTest {
         }
 
         @Override public void sendBroadcast(Intent intent) { events.add(new Intent(intent)); }
+        @Override void sendRoundEndControl(String message, InetAddress destination) {
+            roundControls.add(message);
+            roundControlRecipients.add(destination);
+            if (realListener) super.sendRoundEndControl(message, destination);
+        }
         @Override public void sendUDPMessageAllRepeat(String message, int repeatCount) {
             sentMessages.add(message);
             repeatCounts.add(repeatCount);

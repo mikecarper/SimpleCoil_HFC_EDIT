@@ -144,6 +144,41 @@ public class TcpClientSessionRegressionTest {
     }
 
     @Test
+    public void losingHubConnectivityDoesNotClaimTheHostCancelled() throws Exception {
+        connect();
+        listener.close();
+        peer.close();
+        // Allow the seven-second missing-heartbeat window plus three retries.
+        assertTrue("Unreachable lobby did not return to discovery", awaitStopped(12000));
+        assertTrue(client.actions.contains(NetMsg.NETMSG_SERVERUNREACHABLE));
+        assertFalse(client.actions.contains(NetMsg.NETMSG_SERVERCANCEL));
+        assertFalse(client.actions.contains(NetMsg.NETMSG_ENDGAME));
+        Intent pending = client.consumePendingTerminalEvent();
+        assertNotNull(pending);
+        assertEquals(NetMsg.NETMSG_SERVERUNREACHABLE, pending.getAction());
+        assertNull(client.consumePendingTerminalEvent());
+    }
+
+    @Test
+    public void lostClockProbeRetriesWithoutWaitingFiveSeconds() throws Exception {
+        connect();
+        synchronized (client) {
+            Field clock = TcpClient.class.getDeclaredField("mGameClock");
+            clock.setAccessible(true);
+            ((GameClock) clock.get(client)).beginSampling();
+            Field pending = TcpClient.class.getDeclaredField("mPendingClockRequest");
+            pending.setAccessible(true);
+            pending.setLong(client, SystemClock.elapsedRealtime() - 600);
+            Method request = TcpClient.class.getDeclaredMethod("requestClockSync");
+            request.setAccessible(true);
+            request.invoke(client);
+        }
+        peer.setSoTimeout(1000);
+        assertTrue("Lost clock probe did not retry promptly",
+                received.readUTF().contains(TcpServer.JSON_CLOCK_REQUEST));
+    }
+
+    @Test
     public void versionRejectionStopsWithoutAnActivityReceiver() throws Exception {
         assertTerminalMessage(NetMsg.NETMSG_VERSIONERROR, NetMsg.NETMSG_VERSIONERROR);
     }
@@ -474,13 +509,17 @@ public class TcpClientSessionRegressionTest {
     }
 
     @Test
-    public void peerStartStopsReconnectAndSurvivesUntilPausedActivityResumes() throws Exception {
+    public void peerStartKeepsRosterChannelAndSurvivesUntilPausedActivityResumes() throws Exception {
         connect();
         long startAt = SystemClock.elapsedRealtime() + 10000;
         send(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                 + TcpServer.createStartInfo(1, startAt, 60000));
-        assertTrue("Peer start tried to reconnect without an activity", awaitStopped(1500));
-        assertEquals(-1, peer.getInputStream().read());
+        long deadline = SystemClock.elapsedRealtime() + 1500;
+        while (!client.actions.contains(NetMsg.NETMSG_STARTGAME) && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        assertFalse("Peer start closed the roster channel", awaitStopped(50));
+        send(TcpServer.TCP_SERVER_PING);
+        expectPong();
         Intent pending = client.consumePendingGameStart(0);
         assertNotNull(pending);
         assertEquals(NetMsg.NETMSG_STARTGAME, pending.getAction());

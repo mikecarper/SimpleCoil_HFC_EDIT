@@ -1,0 +1,23 @@
+British male kill-streak recordings
+==================================
+
+The kill_streak_*.wav resources are generated speech for SimpleCoil's existing
+English kill-streak prompts. The voice is bm_george (British male) from
+Kokoro v1.0, generated offline with kokoro-onnx 0.6.1.
+
+Kokoro model and voice weights: Apache License 2.0
+https://huggingface.co/hexgrad/Kokoro-82M
+https://github.com/hexgrad/kokoro
+https://www.apache.org/licenses/LICENSE-2.0
+
+kokoro-onnx generator: MIT License
+Copyright (c) 2025 github.com/thewh1teagle
+https://github.com/thewh1teagle/kokoro-onnx
+https://github.com/thewh1teagle/kokoro-onnx/blob/main/LICENSE
+
+Only generated recordings are included in this APK. No Kokoro model weights,
+kokoro-onnx code, ONNX Runtime, eSpeak NG, or other generator dependencies are
+included or executed on the phone. No affiliation or endorsement is implied.
+
+Generation settings, source links, and audio hashes are documented in the
+source repository's docs/british-male-voice.md and docs/kill-streak-audio.json.

@@ -20,9 +20,11 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    // Protocol 24 adds two-player end votes and non-terminal peer exits.
-    public static final int NETWORK_VERSION_NUMBER = 24;
-    public static final String NETWORK_VERSION = "24";
+    // Protocol 28 synchronizes the host's QR-or-timer / timer-only respawn rule.
+    public static final int NETWORK_VERSION_NUMBER = 28;
+    public static final String NETWORK_VERSION = "28";
+    public static final String INTENT_LOBBY_HOST_AGE = "lobby_host_age";
+    public static final String INTENT_LOBBY_HOST_KIND = "lobby_host_kind";
     public static final String NETMSG_LOBBYWAIT = "com.simplecoil.simplecoil.LOBBYWAIT";
     public static final String NETMSG_SHAREDLOBBY = "SHAREDLOBBY";
     public static final String INTENT_LOBBY_DEDICATED = "LOBBY_DEDICATED";
@@ -50,10 +52,12 @@ public class NetMsg {
     public static final String NETMSG_STARTGAME = "STARTGAME";
     public static final String NETMSG_CLOCKSYNCWAITING = "CLOCKSYNCWAITING";
     public static final String NETMSG_ENDGAME = "ENDGAME";
+    public static final String NETMSG_ROUNDCOMPLETE = "com.simplecoil.simplecoil.ROUNDCOMPLETE";
     public static final String NETMSG_ENDVOTE = "ENDVOTE";
     public static final String NETMSG_PEERHOSTCHANGED = "PEERHOSTCHANGED";
     public static final String NETMSG_ERROR = "ERROR";
     public static final String NETMSG_FAILEDTOJOIN = "FAILEDTOJOIN";
+    public static final String NETMSG_QRJOINREJECTED = "QRJOINREJECTED";
     public static final String NETMSG_VERSIONERROR = "VERSIONERROR";
     public static final String NETMSG_SAMETEAM = "SAMETEAM";
     public static final String NETMSG_SERVERCREATED = "SERVERCREATED";
@@ -98,6 +102,8 @@ public class NetMsg {
     public static final String NETMSG_PLAYERDATAREQUEST = "PLAYERDATAREQUEST";
     public static final String NETMSG_NETWORKCONNECTED = "NETWORKCONNECTED";
     public static final String NETMSG_NETWORKDISCONNECTED = "NETWORKDISCONNECTED";
+    // Local client notification, not a wire command or an explicit host cancellation.
+    public static final String NETMSG_SERVERUNREACHABLE = "SERVERUNREACHABLE";
     public static final String NETMSG_PLAYERSETTINGSUPDATE = "PLAYERSETTINGSUPDATE";
     public static final String NETMSG_BALANCEDLOBBY = "BALANCEDLOBBY";
     // Peer-hosted games close their TCP listener after the round starts. Every
@@ -138,6 +144,7 @@ public class NetMsg {
 
     public static final String INTENT_LONGITUDE = "longitude";
     public static final String INTENT_LATITUDE = "latitude";
+    public static final String INTENT_GPS_FIX_ELAPSED_MS = "gps_fix_elapsed_ms";
     public static final String INTENT_FULLUPDATE = "fullupdate";
     public static final String INTENT_PLAYERDATA = "playerdata";
 

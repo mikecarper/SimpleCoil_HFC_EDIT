@@ -3,6 +3,7 @@ package com.simplecoil.simplecoil;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.ServiceConnection;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
@@ -56,6 +57,9 @@ public class DedicatedServerRegressionTest {
     private long originalRespawnTime;
     private long originalTimeRemaining;
     private boolean originalUseGPS;
+    private boolean originalRespawnQrEnabled;
+    private boolean originalRespawnPreferencePresent;
+    private boolean originalRespawnPreference;
     private boolean originalOnlyServerSettings;
     private boolean originalAllowPlayerSettings;
     private boolean originalTournamentMode;
@@ -76,6 +80,11 @@ public class DedicatedServerRegressionTest {
         originalRespawnTime = globals.mRespawnTime;
         originalTimeRemaining = globals.mServerGameTimeRemaining;
         originalUseGPS = globals.mUseGPS;
+        originalRespawnQrEnabled = globals.mRespawnQrEnabled;
+        SharedPreferences preferences = InstrumentationRegistry.getInstrumentation()
+                .getTargetContext().getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
+        originalRespawnPreferencePresent = preferences.contains(FullscreenActivity.PREF_RESPAWN_QR_ENABLED);
+        originalRespawnPreference = preferences.getBoolean(FullscreenActivity.PREF_RESPAWN_QR_ENABLED, true);
         originalOnlyServerSettings = globals.mOnlyServerSettings;
         originalAllowPlayerSettings = globals.mAllowPlayerSettings;
         originalTournamentMode = globals.mTournamentMode;
@@ -146,6 +155,15 @@ public class DedicatedServerRegressionTest {
         globals.mRespawnTime = originalRespawnTime;
         globals.mServerGameTimeRemaining = originalTimeRemaining;
         globals.mUseGPS = originalUseGPS;
+        globals.mRespawnQrEnabled = originalRespawnQrEnabled;
+        SharedPreferences preferences = InstrumentationRegistry.getInstrumentation()
+                .getTargetContext().getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = preferences.edit();
+        if (originalRespawnPreferencePresent)
+            editor.putBoolean(FullscreenActivity.PREF_RESPAWN_QR_ENABLED, originalRespawnPreference);
+        else
+            editor.remove(FullscreenActivity.PREF_RESPAWN_QR_ENABLED);
+        editor.commit();
         globals.mOnlyServerSettings = originalOnlyServerSettings;
         globals.mAllowPlayerSettings = originalAllowPlayerSettings;
         globals.mTournamentMode = originalTournamentMode;
@@ -159,6 +177,18 @@ public class DedicatedServerRegressionTest {
             assertTrue("The host switch disagrees with the active policy", control.isChecked());
             assertTrue(Globals.getInstance().mOnlyServerSettings);
             assertEquals(0, tcp.gameInfoUpdates);
+        });
+    }
+
+    @Test
+    public void closingDedicatedHostKeepsTheSavedRespawnChoiceInTheLobby() {
+        scenario.onActivity(current -> {
+            boolean selected = !Globals.getInstance().mRespawnQrEnabled;
+            current.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE)
+                    .edit().putBoolean(FullscreenActivity.PREF_RESPAWN_QR_ENABLED, selected).commit();
+            Globals.getInstance().mRespawnQrEnabled = selected;
+            invoke("restorePreviousAppState");
+            assertEquals(selected, Globals.getInstance().mRespawnQrEnabled);
         });
     }
 

@@ -33,6 +33,27 @@ import java.util.concurrent.Semaphore;
 import java.util.Locale;
 
 public class Globals {
+    public volatile com.simplecoil.protocol.RoundRoster mRoundRoster;
+    public volatile int mRequestedJoinTeam;
+
+    synchronized void installRoundRoster(com.simplecoil.protocol.RoundRoster roster) {
+        com.simplecoil.protocol.RoundRoster previous = mRoundRoster;
+        Set<Byte> infected = new HashSet<>(mInfectedPlayers);
+        for (byte id = 1; id <= MAX_PLAYER_ID; id++) {
+            com.simplecoil.protocol.RoundRoster.Member member = roster.seat(id);
+            if (member == null || previous == null || !previous.token.equals(roster.token)
+                    || previous.generation(id) != roster.generation(id)) infected.remove(id);
+            if (member != null && member.infected) infected.add(id);
+        }
+        mRoundRoster = roster;
+        mInfectedPlayers = Collections.unmodifiableSet(infected);
+    }
+
+    synchronized void replaceInfectionSeat(byte id, boolean infected) {
+        Set<Byte> update = new HashSet<>(mInfectedPlayers);
+        if (infected) update.add(id); else update.remove(id);
+        mInfectedPlayers = Collections.unmodifiableSet(update);
+    }
     private static Globals mInstance= null;
     // GPS-derived UTC is intentionally kept separate from the device wall
     // clock. Ordinary apps cannot set system time, and game timing uses the
@@ -66,7 +87,24 @@ public class Globals {
     public static final long MAX_RESPAWN_TIME_SECONDS = 1000;
     // Team games give a player three minutes to reach and scan their team's respawn checkpoint.
     public static final long TEAM_QR_RESPAWN_WAIT_SECONDS = 3 * 60L;
+    public static final long GPS_DISPLAY_FIX_MAX_AGE_MS = 30_000L;
     public volatile long mRespawnTime = RESPAWN_TIME_SECONDS;
+    /** Match-wide: false means timer-only respawns, with no checkpoint scanner. */
+    public volatile boolean mRespawnQrEnabled = true;
+
+    public static long respawnWaitSeconds(boolean networked, boolean startingGame,
+                                         int gameMode, long configuredSeconds) {
+        if (networked && !startingGame
+                && (gameMode == GAME_MODE_2TEAMS || gameMode == GAME_MODE_4TEAMS))
+            return TEAM_QR_RESPAWN_WAIT_SECONDS;
+        return Math.max(MIN_RESPAWN_TIME_SECONDS, Math.min(MAX_RESPAWN_TIME_SECONDS, configuredSeconds));
+    }
+
+    public static boolean isFreshGpsFix(long fixElapsedMs, long nowElapsedMs) {
+        return fixElapsedMs > 0 && nowElapsedMs >= fixElapsedMs
+                && nowElapsedMs - fixElapsedMs <= GPS_DISPLAY_FIX_MAX_AGE_MS;
+    }
+
     public static final long RELOAD_TIME_MILLISECONDS = 1500; // Reload downtime in ms. 1.5 seconds
     public static final long MIN_RELOAD_TIME_MILLISECONDS = 0;
     public static final long MAX_RELOAD_TIME_MILLISECONDS = 10000;
@@ -136,6 +174,8 @@ public class Globals {
     public volatile Map<Byte, Boolean> mLobbyPlayerReady = Collections.emptyMap();
     public volatile Map<Byte, LobbyPlayer> mLobbyPlayers = Collections.emptyMap();
     public volatile boolean mLocalLobbyBenched;
+    public volatile boolean mWaitingForLobbyRoundEnd;
+    public volatile String mSittingOutRoundToken;
     public volatile boolean mLobbyRoundActive;
     public volatile long mEndGameVotes;
     public volatile boolean mEndGameVoteRequested;
@@ -297,6 +337,17 @@ public class Globals {
                 || firingMode == FIRING_MODE_INDOOR_NO_CONE;
     }
 
+    /** Indoor stays low-power/no-cone; an outdoor boss always gets the wide cone. */
+    public static int resolveFiringMode(int firingMode, boolean tournament, boolean localBoss) {
+        if (firingMode == FIRING_MODE_INDOOR_NO_CONE)
+            return FIRING_MODE_INDOOR_NO_CONE;
+        if (localBoss)
+            return FIRING_MODE_OUTDOOR_WITH_CONE;
+        if (tournament || !isValidFiringMode(firingMode))
+            return FIRING_MODE_OUTDOOR_NO_CONE;
+        return firingMode;
+    }
+
     public static boolean isValidPlayerSettings(int health, int reloadShots, long reloadTime,
                                                 long spawnTime, int damage, int lives,
                                                 boolean allowSingle, boolean allowBurst,
@@ -349,7 +400,7 @@ public class Globals {
         settings.firingMode = FIRING_MODE_OUTDOOR_NO_CONE;
     }
 
-    /** Apply Boss Mode health to a server-owned player profile. */
+    /** Apply Boss Mode health and weapon rules to a server-owned player profile. */
     public static void applyBossHealth(PlayerSettings settings, int playerID, int hunterCount) {
         if (settings == null)
             return;
@@ -360,6 +411,7 @@ public class Globals {
         settings.allowShotModeSingle = true;
         settings.allowShotModeBurst3 = playerID == BOSS_PLAYER_ID;
         settings.allowShotModeAuto = playerID == BOSS_PLAYER_ID;
+        settings.firingMode = resolveFiringMode(settings.firingMode, true, playerID == BOSS_PLAYER_ID);
     }
 
     /** Apply the common tournament profile to the local phone and weapon configuration. */
@@ -392,11 +444,8 @@ public class Globals {
         mAllowSingleShotMode = true;
         mAllowBurst3ShotMode = localBoss;
         mAllowAutoShotMode = localBoss;
-        // Indoor range is a field choice, not a weapon advantage. Keep it for
-        // every player while continuing to reserve the wide cone for the boss.
-        if (!isValidFiringMode(mCurrentFiringMode)
-                || (!localBoss && mCurrentFiringMode == FIRING_MODE_OUTDOOR_WITH_CONE))
-            mCurrentFiringMode = FIRING_MODE_OUTDOOR_NO_CONE;
+        // Indoor range remains a field choice; outdoors, only the boss gets a cone.
+        mCurrentFiringMode = resolveFiringMode(mCurrentFiringMode, true, localBoss);
         mAllowPlayerSettings = false;
         mOnlyServerSettings = true;
     }
@@ -494,6 +543,9 @@ public class Globals {
         if (mInfectionMode)
             return isPlayerInfected(player_id) ? 1 : 2;
         if (mBalancedRandom && mGameMode == GAME_MODE_2TEAMS) {
+            com.simplecoil.protocol.RoundRoster roster = mRoundRoster;
+            com.simplecoil.protocol.RoundRoster.Member member = roster == null ? null : roster.seat(player_id);
+            if (mGameState != GAME_STATE_NONE && member != null) return member.team;
             Integer assigned = mBalancedTeams.get(player_id);
             if (assigned != null)
                 return assigned;

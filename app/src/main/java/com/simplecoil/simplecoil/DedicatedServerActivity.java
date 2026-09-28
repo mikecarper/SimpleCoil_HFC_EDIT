@@ -74,6 +74,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private Button mGPSModeButton = null;
     private Button mEndGameButton = null;
     private Button mGameMasterRespawnButton = null;
+    private Button mRespawnModeButton = null;
     private Button mStartGameButton = null;
     private TextView mGameLimitTV = null;
     private TextView mGameStatusTV = null;
@@ -92,6 +93,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private boolean mPreviousUseGPS;
     private boolean mPreviousBalancedRandom;
     private boolean mPreviousBalancedRequireQr;
+    private boolean mPreviousRespawnQrEnabled;
     private boolean mPreviousOnlyServerSettings;
     private boolean mPreviousAllowPlayerSettings;
     private boolean mPreviousTournamentMode;
@@ -117,8 +119,31 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private boolean mUdpServerStarting;
     private boolean mUdpServerActive;
     private boolean mTcpServerStartupPending;
+    private final SharedLobby mOtherHosts = new SharedLobby();
+
+    private boolean yieldToPreferredHost() {
+        if (isFinishing() || isDestroyed() || mUDPListenerService == null
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                || mTcpServer != null && mTcpServer.hasPendingOrAnnouncedStart()) return false;
+        long now = SystemClock.elapsedRealtime();
+        InetAddress local = Globals.getIPAddress(this);
+        SharedLobby.Host preferred = mOtherHosts.best(now);
+        if (local == null || preferred == null || preferred.address.equals(local)
+                || !SharedLobby.preferred(preferred, new SharedLobby.Host(local,
+                SharedLobby.Kind.DEDICATED_PHONE, false, now, mUDPListenerService.hostAgeMillis()))) return false;
+        // Retire these bindings before the player activity resumes. Its newly
+        // joined lobby must not be stopped later by this screen's onDestroy.
+        if (mTcpServer != null && !mTcpServer.stopIdleLobbyForHandoff()) return false;
+        mUDPListenerService.stopListen();
+        unbindUDPService();
+        unbindTcpServerService();
+        Toast.makeText(this, R.string.lobby_host_yield, Toast.LENGTH_LONG).show();
+        finish();
+        return true;
+    }
 
     private void startUdpServerIfTcpReady() {
+        if (yieldToPreferredHost()) return;
         if (isFinishing() || isDestroyed() || mUdpServerStarting || mUdpServerActive
                 || mUDPListenerService == null || mTcpServer == null || !mTcpServer.isTcpServerReady())
             return;
@@ -265,6 +290,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mPreviousUseGPS = globals.mUseGPS;
         mPreviousBalancedRandom = globals.mBalancedRandom;
         mPreviousBalancedRequireQr = globals.mBalancedRequireQr;
+        mPreviousRespawnQrEnabled = globals.mRespawnQrEnabled;
         mPreviousOnlyServerSettings = globals.mOnlyServerSettings;
         mPreviousAllowPlayerSettings = globals.mAllowPlayerSettings;
         mPreviousTournamentMode = globals.mTournamentMode;
@@ -331,6 +357,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             }));
         }
         sharedPreferences = getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
+        globals.mRespawnQrEnabled = FullscreenActivity.readBooleanPreference(sharedPreferences,
+                FullscreenActivity.PREF_RESPAWN_QR_ENABLED, true);
+        mRespawnModeButton = findViewById(R.id.respawn_mode_button);
+        mRespawnModeButton.setOnClickListener(v -> showRespawnModeDialog());
+        updateGameMasterRespawnButton();
         globals.mBossMode = FullscreenActivity.readBooleanPreference(sharedPreferences,
                 FullscreenActivity.PREF_BOSS_MODE, false);
         globals.mCaptureTheFlag = !globals.mBossMode
@@ -477,6 +508,9 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         globals.mUseGPS = mPreviousUseGPS;
         globals.mBalancedRandom = mPreviousBalancedRandom;
         globals.mBalancedRequireQr = mPreviousBalancedRequireQr;
+        globals.mRespawnQrEnabled = sharedPreferences == null ? mPreviousRespawnQrEnabled
+                : FullscreenActivity.readBooleanPreference(sharedPreferences,
+                FullscreenActivity.PREF_RESPAWN_QR_ENABLED, mPreviousRespawnQrEnabled);
         globals.clearBalancedAssignments();
         globals.mOnlyServerSettings = mPreviousOnlyServerSettings;
         globals.mAllowPlayerSettings = mPreviousAllowPlayerSettings;
@@ -1059,6 +1093,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mGameCountdownTimer.cancel();
             mGameCountdownTimer = null;
         }
+        yieldToPreferredHost();
     }
 
     private void updateBalancedLobbyStatus() {
@@ -1079,7 +1114,17 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             if (isFinishing() || isDestroyed())
                 return;
             final String action = intent.getAction();
-            if (NetMsg.NETMSG_TCPSERVERREADY.equals(action)) {
+            if (NetMsg.NETMSG_SHAREDLOBBY.equals(action)) {
+                String address = intent.getStringExtra(UDPListenerService.INTENT_SERVERIP);
+                SharedLobby.Kind kind = SharedLobby.Kind.parse(intent.getStringExtra(NetMsg.INTENT_LOBBY_HOST_KIND));
+                try {
+                    if (address != null && kind != null)
+                        mOtherHosts.observe(new SharedLobby.Host(InetAddress.getByName(address), kind,
+                                intent.getBooleanExtra(NetMsg.INTENT_LOBBY_PLAYING, false),
+                                SystemClock.elapsedRealtime(), intent.getLongExtra(NetMsg.INTENT_LOBBY_HOST_AGE, 0)));
+                } catch (java.net.UnknownHostException ignored) { }
+                yieldToPreferredHost();
+            } else if (NetMsg.NETMSG_TCPSERVERREADY.equals(action)) {
                 if (mTcpServer != null && mTcpServer.isTcpServerReady())
                     mTcpServerStartupPending = false;
                 startUdpServerIfTcpReady();
@@ -1129,6 +1174,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 }
                 mUdpServerStarting = false;
                 mUdpServerActive = true;
+                mTcpServer.setLobbyHostRole(true, mUDPListenerService.hostStartedAt());
                 if (Globals.getInstance().mServerIP != null) {
                     String ip = Globals.getInstance().mServerIP.toString();
                     if (ip.startsWith("/"))
@@ -1155,6 +1201,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
 
     private static IntentFilter makeServerUpdateIntentFilter() {
         final IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(NetMsg.NETMSG_SHAREDLOBBY);
         intentFilter.addAction(NetMsg.NETMSG_JOIN);
         intentFilter.addAction(NetMsg.NETMSG_LEAVE);
         intentFilter.addAction(NetMsg.NETMSG_QUIT);
@@ -1173,11 +1220,36 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     }
 
     private void updateGameMasterRespawnButton() {
+        if (mRespawnModeButton != null) {
+            Globals globals = Globals.getInstance();
+            mRespawnModeButton.setText(globals.mRespawnQrEnabled
+                    ? R.string.respawn_mode_qr : R.string.respawn_mode_timer);
+            mRespawnModeButton.setEnabled(globals.mGameState == Globals.GAME_STATE_NONE);
+        }
         if (mGameMasterRespawnButton == null)
             return;
         boolean enabled = mTcpServer != null
                 && !mTcpServer.getGameMasterRespawnCandidates().isEmpty();
         mGameMasterRespawnButton.setEnabled(enabled);
+    }
+
+    private void showRespawnModeDialog() {
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            return;
+        new AlertDialog.Builder(this).setTitle(R.string.respawn_mode_title)
+                .setSingleChoiceItems(new String[]{getString(R.string.respawn_mode_qr),
+                                getString(R.string.respawn_mode_timer)},
+                        Globals.getInstance().mRespawnQrEnabled ? 0 : 1, (dialog, which) -> {
+                            if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
+                                Globals.getInstance().mRespawnQrEnabled = which == 0;
+                                sharedPreferences.edit().putBoolean(
+                                        FullscreenActivity.PREF_RESPAWN_QR_ENABLED, which == 0).apply();
+                                if (mTcpServer != null)
+                                    mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+                                updateGameMasterRespawnButton();
+                            }
+                            dialog.dismiss();
+                        }).setNegativeButton(R.string.cancel, null).show();
     }
 
     private void showGameMasterRespawnDialog() {

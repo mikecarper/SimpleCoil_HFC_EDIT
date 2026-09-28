@@ -33,6 +33,12 @@ final class GameOutcome {
             return Result.UNKNOWN;
         long[] otherTeamScores = new long[gameMode + 1];
         boolean[] otherTeamSeen = new boolean[gameMode + 1];
+        if (globals.mRoundRoster != null) {
+            for (int team = 1; team <= gameMode; team++) {
+                otherTeamScores[team] = globals.mRoundRoster.archivedScore(team, false);
+                otherTeamSeen[team] = team != localTeam && otherTeamScores[team] > 0;
+            }
+        }
         for (int id = 1; id <= Globals.MAX_PLAYER_ID && id < scores.length; id++) {
             if (scores[id] < 0)
                 continue;

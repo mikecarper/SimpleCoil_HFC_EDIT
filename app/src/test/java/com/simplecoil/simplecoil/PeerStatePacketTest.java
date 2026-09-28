@@ -17,14 +17,14 @@ public class PeerStatePacketTest {
                     Globals.GAME_STATE_RUNNING, id % Globals.MAX_GRENADE_IDS,
                     10_000 + id, 500 + id, 1000, 250, 255, 30,
                     37.77491 + id / 100_000.0, -122.41942 - id / 100_000.0,
-                    id == 32 ? 1 : 0, id == 32 ? 7 : 0);
+                    id == 32 ? 1 : 0, id == 32 ? 7 : 0).withGeneration(id, 255);
         }
 
         byte[] encoded = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
                 UUID.randomUUID(), 9, 32,
                 Globals.GAME_MODE_FFA, players);
 
-        assertEquals(1312, encoded.length);
+        assertEquals(1376, encoded.length);
         assertTrue(encoded.length <= PeerStatePacket.MAX_UDP_PAYLOAD_BYTES);
         PeerStatePacket.Decoded decoded = PeerStatePacket.decode(encoded, 0, encoded.length);
         assertNotNull(decoded);
@@ -35,6 +35,8 @@ public class PeerStatePacketTest {
         assertEquals(255, decoded.players[32].shotsRemaining);
         assertEquals(1, decoded.players[32].carriedFlagTeam);
         assertEquals(7, decoded.players[32].ctfCaptures);
+        assertEquals(32, decoded.players[32].generation);
+        assertEquals(255, decoded.players[32].targetGeneration);
     }
 
     @Test
@@ -81,6 +83,6 @@ public class PeerStatePacketTest {
         assertNotNull(decoded);
         assertEquals(PeerStatePacket.FLAG_PRESENT | PeerStatePacket.FLAG_INFECTED,
                 decoded.players[2].flags);
-        assertEquals(1312, encoded.length);
+        assertEquals(1376, encoded.length);
     }
 }

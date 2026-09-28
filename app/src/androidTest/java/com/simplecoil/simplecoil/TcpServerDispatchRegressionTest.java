@@ -64,10 +64,13 @@ public class TcpServerDispatchRegressionTest {
     private boolean originalUseGPS;
     private long originalEndVotes;
     private boolean originalEndVoteRequested;
+    private com.simplecoil.protocol.RoundRoster originalRoundRoster;
 
     @Before
     public void setUp() throws Exception {
         Globals globals = Globals.getInstance();
+        originalRoundRoster = globals.mRoundRoster;
+        globals.mRoundRoster = null;
         originalGameMode = globals.mGameMode;
         originalGameState = globals.mGameState;
         originalGameLimit = globals.mGameLimit;
@@ -107,6 +110,7 @@ public class TcpServerDispatchRegressionTest {
         if (server != null)
             InstrumentationRegistry.getInstrumentation().runOnMainSync(server::onDestroy);
         Globals globals = Globals.getInstance();
+        globals.mRoundRoster = originalRoundRoster;
         restore(globals.mTeamIPMap, originalAddresses, globals.mTeamIPMapSemaphore);
         restore(globals.mIPTeamMap, originalPlayers, globals.mIPTeamMapSemaphore);
         restore(globals.mTeamPlayerNameMap, originalNames, globals.mTeamPlayerNameSemaphore);
@@ -120,6 +124,38 @@ public class TcpServerDispatchRegressionTest {
         globals.mEndGameVoteRequested = originalEndVoteRequested;
         for (Thread worker : workers) assertFalse("Dispatch task survived cleanup", worker.isAlive());
         assertTrue("Dispatch task crashed: " + failures, failures.isEmpty());
+    }
+
+    @Test
+    public void teamQrAdmitsNewPlayerIntoRunningRoundWithoutChangingDeadline() throws Exception {
+        String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        Globals globals = Globals.getInstance();
+        globals.mRoundRoster = new com.simplecoil.protocol.RoundRoster(token);
+        globals.mRoundRoster.restore(new com.simplecoil.protocol.RoundRoster.Member(
+                java.util.UUID.randomUUID().toString(), 1, 1, 0));
+        globals.mGameState = Globals.GAME_STATE_RUNNING;
+        set(server, "mStartAnnounced", true);
+        set(server, "mRoundToken", token);
+        set(server, "mRoundSequence", 5L);
+        long startAt = SystemClock.elapsedRealtime() - 1000;
+        set(server, "mScheduledStart", startAt);
+        MemorySocket joining = new MemorySocket() {
+            @Override public InetAddress getInetAddress() {
+                try { return InetAddress.getByName("127.0.0.17"); }
+                catch (Exception e) { throw new AssertionError(e); }
+            }
+        };
+        addClient(17, 0, joining);
+        parseClock(17, new JSONObject().put(TcpServer.JSON_PLAYERID, 1)
+                .put(TcpServer.JSON_PLAYERNAME, "Newcomer")
+                .put(LiveJoin.IDENTITY, java.util.UUID.randomUUID().toString()).put(LiveJoin.TEAM, 2));
+        for (Thread task : captureClientTasks()) task.join(2000);
+        JSONObject assignment = readJson(joining);
+        assertEquals(17, assignment.getInt(LiveJoin.ASSIGNED));
+        assertEquals(token, assignment.getString(TcpServer.JSON_ROUND_TOKEN));
+        assertEquals(startAt, server.getScheduledGameStart().getLongExtra(NetMsg.INTENT_START_AT, 0));
+        assertEquals(1, globals.mRoundRoster.generation(17));
+        assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
     }
 
     @Test
@@ -173,6 +209,22 @@ public class TcpServerDispatchRegressionTest {
             assertEquals(Globals.MAX_PLAYER_ID, players.length());
             for (int i = 0; i < players.length(); i++)
                 assertEquals(name, TcpJson.getPlayerName(players.getJSONObject(i), TcpServer.JSON_PLAYERNAME));
+        }
+    }
+
+    @Test
+    public void rosterBroadcastIncludesHostRespawnMode() throws Exception {
+        Globals globals = Globals.getInstance();
+        boolean previous = globals.mRespawnQrEnabled;
+        try {
+            for (boolean enabled : new boolean[]{false, true}) {
+                globals.mRespawnQrEnabled = enabled;
+                sockets.get(0).bytes.reset();
+                dispatchThenChange(() -> server.sendAllGameInfo(TcpServer.SEND_ALL), () -> { });
+                assertEquals(enabled, readJson(sockets.get(0)).getBoolean(TcpServer.JSON_RESPAWN_QR_ENABLED));
+            }
+        } finally {
+            globals.mRespawnQrEnabled = previous;
         }
     }
 
@@ -540,17 +592,68 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
-    public void completedRoundCleanupAllowsTheNextRoundToStart() throws Exception {
+    public void cancelledCountdownAllowsImmediateRestartAfterCleanup() throws Exception {
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         dispatchThenChange(server::endGame, () -> { });
         MemorySocket nextRound = new MemorySocket();
         addClient(1, nextRound);
-        assertFalse("The cooldown must block immediate restarts", server.startGame());
-        set(server, "mNextGameStartAllowedAt", SystemClock.elapsedRealtime() - 1);
+        assertEquals(0, server.getNextGameStartWaitMillis());
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         assertTrue(nextRound.bytes.size() > 0);
         assertEquals(2, java.util.Collections.frequency(server.events, NetMsg.NETMSG_STARTGAME));
         assertEquals(1, java.util.Collections.frequency(server.events, NetMsg.NETMSG_ENDGAME));
+    }
+
+    @Test
+    public void shortRoundRestartsImmediatelyButLongRoundKeepsCooldown() throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 59_000);
+        dispatchThenChange(server::endGame, () -> { });
+        assertEquals(0, server.getNextGameStartWaitMillis());
+        addClient(1, new MemorySocket());
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 60_000);
+        dispatchThenChange(server::endGame, () -> { });
+        assertTrue(server.getNextGameStartWaitMillis() > 29_000);
+        addClient(1, new MemorySocket());
+        assertFalse("A full round must keep its cooldown", server.startGame());
+    }
+
+    @Test
+    public void delayedEndCleanupCannotTurnQuickRestartIntoThirtySecondWait() throws Exception {
+        set(server, "mStartAnnounced", true);
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 59_000);
+        Method record = TcpServer.class.getDeclaredMethod("recordRoundCooldownLocked");
+        record.setAccessible(true);
+        record.invoke(server);
+        assertEquals(0, server.getNextGameStartWaitMillis());
+        // Model cleanup arriving after the same round crosses the threshold.
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 60_000);
+        server.clearScheduledStart();
+        assertEquals(0, server.getNextGameStartWaitMillis());
+    }
+
+    @Test
+    public void laptopHandoffCannotCancelAQueuedOrAnnouncedStart() throws Exception {
+        Field listening = TcpServer.class.getDeclaredField("keepListening");
+        listening.setAccessible(true);
+        clientsLock.acquire();
+        Thread start;
+        try {
+            assertTrue(server.startGame());
+            start = queuedWorker();
+            assertTrue(server.hasPendingOrAnnouncedStart());
+            assertFalse(server.stopIdleLobbyForHandoff());
+            assertTrue(listening.getBoolean(server));
+        } finally { clientsLock.release(); }
+        start.join(1000);
+        assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
+        assertTrue(server.hasPendingOrAnnouncedStart());
+        assertFalse(server.stopIdleLobbyForHandoff());
+        dispatchThenChange(server::endGame, () -> { });
+        assertFalse(server.hasPendingOrAnnouncedStart());
+        assertTrue(server.stopIdleLobbyForHandoff());
+        assertFalse(listening.getBoolean(server));
     }
 
     @Test
@@ -676,6 +779,8 @@ public class TcpServerDispatchRegressionTest {
 
     @Test
     public void interruptedEndReleasesTheRoundCleanupReservation() throws Exception {
+        // A real long-running round records its wait even if cleanup is interrupted.
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 60_000);
         clientsLock.acquire();
         Thread start;
         try {
@@ -1218,6 +1323,37 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void rejectedClockSamplesDoNotStrandPlayerAtSlowPolling() throws Exception {
+        set(clients.get(1), "clockSynchronized", false);
+        set(clients.get(1), "clockSamples", GameClock.SAMPLES_PER_SYNC);
+        set(server, "mClockSamplingUntil", 0L);
+        long before = SystemClock.elapsedRealtime();
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 5000));
+        Field deadline = TcpServer.class.getDeclaredField("mClockSamplingUntil");
+        deadline.setAccessible(true);
+        assertTrue("Host slowed polling before the phone accepted enough samples",
+                deadline.getLong(server) > before);
+        assertFalse(server.arePlayerClocksSynchronized());
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+        assertTrue(server.arePlayerClocksSynchronized());
+    }
+
+    @Test
+    public void refreshBatchGetsFastPollingButIsolatedCountdownProbeDoesNot() throws Exception {
+        set(clients.get(1), "clockSamples", GameClock.SAMPLES_PER_SYNC);
+        set(clients.get(1), "clockSynchronized", true);
+        set(clients.get(1), "lastClockRequestAt", -1L);
+        set(server, "mClockSamplingUntil", 0L);
+        Field deadline = TcpServer.class.getDeclaredField("mClockSamplingUntil");
+        deadline.setAccessible(true);
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 5000));
+        assertEquals("Isolated probe should not start a high-rate poll", 0, deadline.getLong(server));
+        parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 5010));
+        assertTrue("Follow-up calibration batch was left at slow polling",
+                deadline.getLong(server) > SystemClock.elapsedRealtime());
+    }
+
+    @Test
     public void everyConnectedPlayerMustHaveASynchronizedClock() throws Exception {
         addClient(2, new MemorySocket());
         set(clients.get(2), "clockSynchronized", false);
@@ -1309,6 +1445,10 @@ public class TcpServerDispatchRegressionTest {
                                 .getInt(TcpServer.JSON_HEALTH));
                 assertEquals(Globals.BOSS_HUNTER_HEALTH,
                         playerSettings(players, 2).getInt(TcpServer.JSON_HEALTH));
+                assertEquals(Globals.FIRING_MODE_OUTDOOR_WITH_CONE,
+                        playerSettings(players, Globals.BOSS_PLAYER_ID).getInt(TcpServer.JSON_FIRING_MODE));
+                assertEquals(Globals.FIRING_MODE_OUTDOOR_NO_CONE,
+                        playerSettings(players, 2).getInt(TcpServer.JSON_FIRING_MODE));
                 assertTrue(start.getLong(TcpServer.JSON_GAMESTART) > 0);
             }
             assertEquals(2, globals.mBossHunterCount);
@@ -1445,23 +1585,23 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
-    public void busyFirstPlayerCannotStarveClockReadinessOfTheTwentiethPlayer() throws Exception {
-        for (int id = 2; id <= 20; id++) addClient(id, new MemorySocket());
-        set(clients.get(20), "clockSynchronized", false);
+    public void busyFirstPlayerCannotStarveClockReadinessOfTheThirtySecondPlayer() throws Exception {
+        for (int id = 2; id <= 32; id++) addClient(id, new MemorySocket());
+        set(clients.get(32), "clockSynchronized", false);
         ByteArrayOutputStream flood = new ByteArrayOutputStream();
         DataOutputStream first = new DataOutputStream(flood);
         for (int i = 0; i < 500; i++)
             first.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                     + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, i));
         ByteArrayOutputStream ready = new ByteArrayOutputStream();
-        DataOutputStream twentieth = new DataOutputStream(ready);
+        DataOutputStream lastPlayer = new DataOutputStream(ready);
         for (int i = 0; i < GameClock.SAMPLES_PER_SYNC; i++)
-            twentieth.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+            lastPlayer.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                     + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 1000 + i));
-        twentieth.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+        lastPlayer.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                 + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
         set(clients.get(1), "in", new DataInputStream(new ByteArrayInputStream(flood.toByteArray())));
-        set(clients.get(20), "in", new DataInputStream(new ByteArrayInputStream(ready.toByteArray())));
+        set(clients.get(32), "in", new DataInputStream(new ByteArrayInputStream(ready.toByteArray())));
         Constructor<?> constructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
                 .getDeclaredConstructor(TcpServer.class);
         constructor.setAccessible(true);

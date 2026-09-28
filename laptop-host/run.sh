@@ -8,6 +8,8 @@ output_dir="$script_dir/out"
 source_file="$script_dir/src/main/java/com/simplecoil/laptophost/LaptopHost.java"
 
 mkdir -p "$output_dir"
-javac --release 17 --add-modules jdk.httpserver -d "$output_dir" "$source_file"
+javac --release 17 --add-modules jdk.httpserver -d "$output_dir" "$source_file" \
+    "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RoundRoster.java" \
+    "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RoundRestart.java"
 exec java --add-modules jdk.httpserver -Dsimplecoil.home="$script_dir" -cp "$output_dir" \
     com.simplecoil.laptophost.LaptopHost "$@"

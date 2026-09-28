@@ -4,7 +4,7 @@
 keeps the game authority and live display on a laptop; players still use the
 Android app and their BLE laser-tag hardware.
 
-It speaks the protocol-24 TCP lobby, clock synchronization, GPS,
+It speaks the protocol-28 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
 
@@ -50,11 +50,13 @@ To enable gameplay QR power-ups on the laptop host, add `--powerup-qr 4` through
 different codes to earn each random reward. Progress resets on death.
 
 For Boss Mode, run `./laptop-host/run.sh --boss`. Player 1 is the boss and all
-other player IDs are hunters. The roster freezes when the round starts. Hunters
+other player IDs are hunters. Boss scaling freezes when the round starts. Hunters
 have 2 health, 3 shields, 30 rounds, and locked single-shot fire. The boss has
 5 health and 10 shields plus 1 health and 2 shields for every hunter, carries
 120 rounds, starts in automatic, and may switch between single, burst, and
-automatic fire. Health and shields do not regenerate in this mode. In normal
+automatic fire. Outdoor range automatically enables the wide cone on both
+boss guns; Indoor range remains reduced-power with no cone. Hunters keep
+their no-cone profile. Health and shields do not regenerate in this mode. In normal
 tournament games, health starts returning one point per second after 30 seconds
 without another damaging hit.
 
@@ -65,16 +67,18 @@ Players take the opposing flag and score by scanning their own existing
 
 For Infection, run `./laptop-host/run.sh --infection`. Player 1 is the original
 zombie. Killed survivors scan the Team 1 respawn QR to join the zombie team;
-recruited zombies use the same QR after later deaths. Hits drain the original
+recruited zombies use the same QR after later deaths. Players can also wait
+the three-minute respawn timer; with `--timer-respawn`, no camera opens and
+killed survivors convert when the timer completes. Hits drain the original
 zombie's ammunition until that player earns two kills. After the second kill,
-the original zombie can die and must scan Team 1 to return. That player's reload
+the original zombie can die and scan Team 1 or wait the timer to return. That player's reload
 takes 20% of normal only until the original zombie's first death, then returns
 to normal speed. The host ends the round when all connected survivors have
 converted, or when conversions leave one final uninfected player. Infection is
 always a five-minute round; players still alive and uninfected at the deadline
 win.
 
-Phones running 1.23 automatically discover and join this host on the same
+Phones running 1.32 automatically discover and join this host on the same
 Wi-Fi/AP, even before their guns are paired. The laptop announces its lobby
 every two seconds and takes priority over idle phone hosts. Automatic player
 assignment uses free IDs and balances ordinary teams. The host waits until
@@ -90,7 +94,21 @@ end. Two different players must agree; the non-playing laptop operator and
 sitting-out phones do not count. The button shows the approval count. Players
 can withdraw approval or confirm **Leave game** on their phone at any time;
 leaving does not end the shared round. Timer and victory-condition endings
-remain automatic. Use protocol-24 phones (app 1.23) with this host.
+remain automatic. Use protocol-28 phones (app 1.32) with this host. Update the
+laptop and every phone together; the previous protocol is not compatible.
+
+A round stopped before 60 seconds of actual play can be restarted without
+the usual 30-second between-game wait. A canceled countdown can also be
+restarted immediately. The synchronized countdown remains in place for the
+next round; a round lasting 60 seconds or longer still requires the wait.
+
+During a running match, a new or returning phone can scan its team's base QR
+to join. This explicit QR admission also works with `--no-late-join`, which
+still blocks ordinary discovery/manual late joins. Returning phones preserve
+their round counters and current team (including infection), while new players
+start at zero. Vacated slots can be reused without accepting the previous
+occupant's delayed combat packets. Joining does not reset the round deadline
+or rescale the boss.
 
 The launcher also prints each usable laptop IPv4 address. If automatic
 discovery is blocked, open **Equipment and advanced options > Advanced: enter
@@ -98,8 +116,14 @@ host address** on the phone. The app's UDP join step and TCP lobby connection
 then happen automatically. Disable AP client isolation and allow the laptop through its firewall
 on TCP port `17510` and UDP port `17500` if prompted.
 
-Idle phone lobbies now migrate automatically to the laptop. For an explicit
-takeover announcement, start the laptop host with
+Idle phone lobbies migrate automatically to the laptop, including manually
+selected phone hosts, regardless of their hosting age. A laptop always has
+priority over phones. While the laptop is reachable, phones disable both
+manual hosting and automatic host election. Without a laptop, the phone
+lobby's **Make this phone host** control selects a phone for everyone else to
+join. A newer explicit phone selection replaces an older one.
+
+For an extra takeover announcement, start the laptop host with
 `--takeover` before the game starts. Updated phones in that idle lobby
 automatically reconnect to the laptop, which then becomes the game authority:
 
@@ -107,8 +131,13 @@ automatically reconnect to the laptop, which then becomes the game authority:
 ./laptop-host/run.sh --takeover
 ```
 
-The laptop's selected rules become authoritative. A takeover deliberately does
-not interrupt or move an in-progress round; end that game first.
+The laptop's selected rules become authoritative. If a phone-hosted round is
+already in progress, it finishes on that host first; the phones move to the
+laptop afterward. This also applies to `--takeover`. Among multiple laptops,
+phones prefer the oldest host, with lowest IP breaking near-simultaneous ties.
+Discovery leases and stalled lobby joins expire after 15 seconds; failed
+endpoints are skipped for 30 seconds. Phones can fall back to automatic
+hosting if the laptop disappears, without leaving a permanent host lock.
 
 The launcher opens a local landing page at `http://127.0.0.1:17511/`. Use its
 buttons to open the two independent display windows:
@@ -184,6 +213,7 @@ large high-zoom downloads from public community tile servers.
 ./laptop-host/run.sh --no-late-join --no-browser
 ./laptop-host/run.sh --takeover
 ./laptop-host/run.sh --boss
+./laptop-host/run.sh --timer-respawn
 ./laptop-host/run.sh --tiles /path/to/xyz-tiles
 ./laptop-host/run.sh --tile-port 17512
 ```
@@ -192,6 +222,14 @@ Run `./laptop-host/run.sh --help` for every option. Keep the default TCP and
 UDP ports for stock SimpleCoil phones. Tournament mode is always enabled and
 locks the two-team health, ammunition, reload, damage, recoil, and single-shot
 rules. `--tournament` remains accepted only for compatibility with old scripts.
+
+## Respawn mode
+
+Team respawns take three minutes. Add `--timer-respawn` to keep the camera
+closed and disable early checkpoint respawns; `--qr-respawn` restores the
+default QR-or-timer choice. The host publishes this rule to every phone.
+Game Master respawn remains available in either mode. CTF objectives and
+optional power-up/team-check-in QRs are independent of respawn scanning.
 
 ## GPS and laser display
 

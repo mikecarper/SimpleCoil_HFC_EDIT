@@ -46,7 +46,9 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -65,13 +67,25 @@ public class GameplayRegressionTest {
     private RecordingTcpClient tcp;
     private byte originalPairedGrenade;
     private int originalPowerupQrRequired;
+    private boolean originalRespawnQrEnabled;
     private boolean originalLobbyBenched;
+    private boolean originalWaitingForRoundEnd;
+    private String originalSittingOutToken;
+    private com.simplecoil.protocol.RoundRoster originalRoundRoster;
 
     @Before
     public void setUp() {
+        originalRoundRoster = Globals.getInstance().mRoundRoster;
+        Globals.getInstance().mRoundRoster = null;
+        Globals.getInstance().mRequestedJoinTeam = 0;
         originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
         originalPowerupQrRequired = Globals.getInstance().mPowerupQrRequired;
+        originalRespawnQrEnabled = Globals.getInstance().mRespawnQrEnabled;
         originalLobbyBenched = Globals.getInstance().mLocalLobbyBenched;
+        originalWaitingForRoundEnd = Globals.getInstance().mWaitingForLobbyRoundEnd;
+        originalSittingOutToken = Globals.getInstance().mSittingOutRoundToken;
+        Globals.getInstance().mWaitingForLobbyRoundEnd = false;
+        Globals.getInstance().mSittingOutRoundToken = null;
         Globals.getInstance().mLocalLobbyBenched = false;
         Globals.getInstance().mPairedGrenadeID = 0;
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
@@ -114,6 +128,7 @@ public class GameplayRegressionTest {
             globals.mFullShields = 0;
             globals.mFullReload = 30;
             globals.mRespawnTime = 10;
+            globals.mRespawnQrEnabled = true;
             globals.mGameLimit = Globals.GAME_LIMIT_NONE;
             globals.mOverrideLives = false;
             globals.mOnlyServerSettings = false;
@@ -163,7 +178,129 @@ public class GameplayRegressionTest {
             udp.onDestroy();
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
         Globals.getInstance().mPowerupQrRequired = originalPowerupQrRequired;
+        Globals.getInstance().mRespawnQrEnabled = originalRespawnQrEnabled;
         Globals.getInstance().mLocalLobbyBenched = originalLobbyBenched;
+        Globals.getInstance().mWaitingForLobbyRoundEnd = originalWaitingForRoundEnd;
+        Globals.getInstance().mSittingOutRoundToken = originalSittingOutToken;
+        Globals.getInstance().mRoundRoster = originalRoundRoster;
+        Globals.getInstance().mRequestedJoinTeam = 0;
+    }
+
+    @Test
+    public void qrRejoinKeepsCountersAndBypassesOnlyTheNewRoundCooldown() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+            globals.mGameState = Globals.GAME_STATE_NONE;
+            globals.mLocalLobbyBenched = true;
+            globals.mWaitingForLobbyRoundEnd = true;
+            globals.mRoundRoster = new com.simplecoil.protocol.RoundRoster(token);
+            com.simplecoil.protocol.RoundRoster.Member member = new com.simplecoil.protocol.RoundRoster.Member(
+                    LiveJoin.identity(activity), 1, 1, 2);
+            member.kills = 7; member.deaths = 2;
+            globals.mRoundRoster.restore(member);
+            set(activity, "mReady", true);
+            set(activity, "mNextGameStartAllowedAt", android.os.SystemClock.elapsedRealtime() + 30000);
+            Intent join = new Intent(NetMsg.NETMSG_STARTGAME).putExtra(LiveJoin.INTENT, true)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, token).putExtra(NetMsg.INTENT_ROUND_ID, 3L)
+                    .putExtra(NetMsg.INTENT_START_AT, android.os.SystemClock.elapsedRealtime() - 1000)
+                    .putExtra(NetMsg.INTENT_END_AT, android.os.SystemClock.elapsedRealtime() + 60000);
+            invoke(activity, "startGame", new Class<?>[]{Intent.class}, join);
+            assertEquals(7, get(activity, "mScore"));
+            assertEquals(2, get(activity, "mEliminationCount"));
+            assertFalse(globals.mLocalLobbyBenched);
+            assertFalse(globals.mWaitingForLobbyRoundEnd);
+            assertEquals(token, get(activity, "mActivePeerRoundToken"));
+            assertTrue(globals.mGameState != Globals.GAME_STATE_NONE);
+        });
+    }
+
+    @Test
+    public void previousGameStatsSurviveDuplicateEndAndAbortedCountdown() {
+        scenario.onActivity(activity -> {
+            set(activity, "mScore", 7);
+            set(activity, "mEliminationCount", 3);
+            set(activity, "mHitsTaken", 25);
+            set(activity, "mTeamScore", 12);
+            invoke(activity, "endGame");
+            assertEquals(View.VISIBLE, activity.findViewById(R.id.lobby_last_game).getVisibility());
+            assertEquals(activity.getString(R.string.lobby_stat_kills, 7),
+                    ((TextView) activity.findViewById(R.id.lobby_last_game_kills)).getText().toString());
+            assertEquals(activity.getString(R.string.lobby_stat_deaths, 3),
+                    ((TextView) activity.findViewById(R.id.lobby_last_game_deaths)).getText().toString());
+            assertEquals(activity.getString(R.string.lobby_stat_hits, 25),
+                    ((TextView) activity.findViewById(R.id.lobby_last_game_hits)).getText().toString());
+            assertEquals(activity.getString(R.string.lobby_stat_team_kills, 12),
+                    ((TextView) activity.findViewById(R.id.lobby_last_game_team)).getText().toString());
+            set(activity, "mScore", 0);
+            invoke(activity, "endGame");
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            set(activity, "mStartGameTimer", true);
+            invoke(activity, "endGame");
+            // Load from storage, not from the activity's cached snapshot.
+            set(activity, "mLastGameStats", null);
+            set(activity, "mLastGameStatsLoaded", false);
+            invoke(activity, "renderLobby");
+            LastGameStats saved = (LastGameStats) get(activity, "mLastGameStats");
+            assertEquals(7, saved.kills);
+            assertEquals(3, saved.deaths);
+            assertEquals(25, saved.hitsTaken);
+            assertEquals(12, saved.teamKills);
+            assertEquals(false, saved.leftEarly);
+        });
+    }
+
+    @Test
+    public void leavingSavesLivesUsedAndMatchingCompletionClearsSitOutOnly() {
+        scenario.onActivity(activity -> {
+            String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+            Globals globals = Globals.getInstance();
+            set(activity, "mActivePeerRoundToken", token);
+            set(activity, "mHasLivesLimit", true);
+            set(activity, "mLives", 5);
+            set(activity, "mEliminationCount", 2);
+            set(activity, "mScore", 4);
+            invoke(activity, "quitGame");
+            assertEquals(0, udp.endRequests);
+            assertTrue(globals.mLocalLobbyBenched);
+            assertTrue(globals.mWaitingForLobbyRoundEnd);
+            assertEquals(token, globals.mSittingOutRoundToken);
+            LastGameStats saved = (LastGameStats) get(activity, "mLastGameStats");
+            assertTrue(saved.leftEarly);
+            assertEquals(3, saved.deaths);
+            assertEquals(4, saved.kills);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ROUNDCOMPLETE)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+            assertTrue(globals.mLocalLobbyBenched);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ROUNDCOMPLETE)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+            assertEquals(false, globals.mLocalLobbyBenched);
+            assertEquals(false, globals.mWaitingForLobbyRoundEnd);
+            assertEquals(false, globals.mLobbyRoundActive);
+            assertNull(globals.mSittingOutRoundToken);
+            assertSame("Round completion replaced the saved exit stats", saved, get(activity, "mLastGameStats"));
+        });
+    }
+
+    @Test
+    public void matchingRoundCompletionEndsGameButOldReceiptCannotEndNextRound() {
+        scenario.onActivity(activity -> {
+            String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+            set(activity, "mActivePeerRoundToken", token);
+            Globals globals = Globals.getInstance();
+            globals.mLocalLobbyBenched = true;
+            globals.mWaitingForLobbyRoundEnd = true;
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ROUNDCOMPLETE)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+            assertEquals(Globals.GAME_STATE_NONE, globals.mGameState);
+            assertEquals(false, globals.mLocalLobbyBenched);
+            assertEquals(false, globals.mWaitingForLobbyRoundEnd);
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+            set(activity, "mActivePeerRoundToken", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ROUNDCOMPLETE)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+            assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
+        });
     }
 
     @Test
@@ -227,6 +364,65 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void lobbyShowsCoordinatesAndGpsOffIsExplicitDuringPlay() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mGameState = Globals.GAME_STATE_NONE;
+            globals.mUseGPS = true;
+            TextView lobby = activity.findViewById(R.id.lobby_gps_coordinates);
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            assertEquals(activity.getString(R.string.gps_acquiring), lobby.getText().toString());
+            Intent fix = new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                    .putExtra(NetMsg.INTENT_LATITUDE, 47.60621)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, -122.33207);
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class}, fix);
+            assertEquals(activity.getString(R.string.gps_coordinates_format,
+                    47.60621, -122.33207), lobby.getText().toString());
+
+            globals.mUseGPS = false;
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            TextView hud = activity.findViewById(R.id.gps_coordinates_tv);
+            assertEquals(View.VISIBLE, hud.getVisibility());
+            assertEquals(activity.getString(R.string.gps_mode_disabled), hud.getText().toString());
+            assertEquals(hud.getText().toString(), lobby.getText().toString());
+        });
+    }
+
+    @Test
+    public void oldGpsFixesExpireAndDoNotReturnAfterGpsIsReenabled() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+            globals.mUseGPS = true;
+            TextView coordinates = activity.findViewById(R.id.gps_coordinates_tv);
+            long now = SystemClock.elapsedRealtime();
+            Intent stale = new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                    .putExtra(NetMsg.INTENT_LATITUDE, 47.60621)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, -122.33207)
+                    .putExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS,
+                            now - Globals.GPS_DISPLAY_FIX_MAX_AGE_MS - 1);
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class}, stale);
+            assertEquals(activity.getString(R.string.gps_acquiring), coordinates.getText().toString());
+
+            Intent fresh = new Intent(stale).putExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS, now);
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class}, fresh);
+            assertEquals(activity.getString(R.string.gps_coordinates_format,
+                    47.60621, -122.33207), coordinates.getText().toString());
+
+            set(activity, "mLastGpsFixElapsedMs", now - Globals.GPS_DISPLAY_FIX_MAX_AGE_MS - 1);
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            assertEquals(activity.getString(R.string.gps_acquiring), coordinates.getText().toString());
+            globals.mUseGPS = false;
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            assertEquals(activity.getString(R.string.gps_mode_disabled), coordinates.getText().toString());
+            globals.mUseGPS = true;
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            assertEquals(activity.getString(R.string.gps_acquiring), coordinates.getText().toString());
+        });
+    }
+
+    @Test
     public void cancellingPeerHostEndsAnActiveRoundLocally() {
         scenario.onActivity(activity -> {
             int[] calls = new int[1];
@@ -243,6 +439,29 @@ public class GameplayRegressionTest {
                     Globals.getInstance().mGameState);
             assertEquals(false, get(activity, "mIsServer"));
             assertEquals(false, get(activity, "mReady"));
+        });
+    }
+
+    @Test
+    public void hostKeepsTenureAcrossRoundsButNotWhenLeaving() {
+        scenario.onActivity(activity -> {
+            set(activity, "mIsServer", true);
+            udp.hostingSince = Math.max(0, SystemClock.elapsedRealtime() - 30_000);
+            set(activity, "mTcpServer", new TcpServer() {
+                @Override public void cancelServer() { }
+                @Override boolean isTcpServerReady() { return true; }
+            });
+            invoke(activity, "endGame");
+            assertEquals(udp.hostingSince, get(activity, "mResumePeerHostSince"));
+            set(activity, "mPeerHostCreationPending", true);
+            invoke(activity, "startPeerUdpServerIfTcpReady");
+            assertEquals(udp.hostingSince, udp.resumedSince);
+            assertEquals(1, udp.serverCreates);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            set(activity, "mIsServer", true);
+            invoke(activity, "quitGame");
+            assertEquals("Leaving the game must not immediately reclaim hosting", -1L,
+                    get(activity, "mResumePeerHostSince"));
         });
     }
 
@@ -875,6 +1094,100 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void shortOfflineRoundCanRestartWithoutTheBetweenGameWait() {
+        scenario.onActivity(activity -> {
+            set(activity, "mUseNetwork", false);
+            set(activity, "mLocalRoundStartedAt", SystemClock.elapsedRealtime() - 59_000);
+            invoke(activity, "endGame");
+            assertTrue((long) get(activity, "mNextGameStartAllowedAt") <= SystemClock.elapsedRealtime());
+            invoke(activity, "startGame");
+            assertEquals(true, get(activity, "mStartGameTimer"));
+        });
+    }
+
+    @Test
+    public void hostAcceptedQuickRestartOverridesADelayedClientsLocalWait() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mReady", true);
+            set(activity, "mNextGameStartAllowedAt", SystemClock.elapsedRealtime() + 30_000);
+            Intent start = new Intent(NetMsg.NETMSG_STARTGAME)
+                    .putExtra(NetMsg.INTENT_ROUND_TOKEN, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+                    .putExtra(NetMsg.INTENT_ROUND_ID, 3L)
+                    .putExtra(NetMsg.INTENT_START_AT, SystemClock.elapsedRealtime() + 10_000);
+            invoke(activity, "startGame", new Class<?>[]{Intent.class}, start);
+            assertEquals(true, get(activity, "mStartGameTimer"));
+        });
+    }
+
+    @Test
+    public void stalledManualHostJoinTimesOutWithoutAffectingARunningRound() {
+        scenario.onActivity(activity -> {
+            ((android.os.Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+            java.net.InetAddress host;
+            try { host = java.net.InetAddress.getByName("192.168.1.250"); }
+            catch (Exception e) { throw new AssertionError(e); }
+            SharedLobby directory = (SharedLobby) get(activity, "mSharedLobby");
+            long now = SystemClock.elapsedRealtime();
+            directory.observe(new SharedLobby.Host(host, SharedLobby.Kind.MANUAL_PHONE, false, now, 0));
+            set(activity, "mReady", true);
+            set(activity, "mManualPhoneHost", true);
+            set(activity, "mManualHostSelectedAt", now - 20_000);
+            set(activity, "mLobbyTakeoverPending", true);
+            set(activity, "mLobbyTarget", host);
+            set(activity, "mLobbyConnectionDeadline", now);
+            invoke(activity, "updateLobbyConnection", new Class<?>[]{long.class}, now);
+            assertEquals("Host timeout interrupted play", true, get(activity, "mReady"));
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            Globals.getInstance().mRequestedJoinTeam = 1;
+            invoke(activity, "updateLobbyConnection", new Class<?>[]{long.class}, now);
+            assertEquals(false, get(activity, "mReady"));
+            assertEquals(false, get(activity, "mManualPhoneHost"));
+            assertEquals(false, get(activity, "mLobbyTakeoverPending"));
+            assertEquals(0, Globals.getInstance().mRequestedJoinTeam);
+            assertTrue(directory.isBackedOff(host, now + 29_999));
+            assertFalse(directory.isBackedOff(host, now + 30_000));
+        });
+    }
+
+    @Test
+    public void committedCountdownDefersLaptopTakeoverBeforeStartUiReceivesItsBroadcast() {
+        scenario.onActivity(activity -> {
+            ((android.os.Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            TcpServer original = (TcpServer) get(activity, "mTcpServer");
+            TcpServer starting = new TcpServer() {
+                @Override boolean hasPendingOrAnnouncedStart() { return true; }
+                @Override public boolean isTcpServerReady() { return true; }
+            };
+            try {
+                set(activity, "mTcpServer", starting);
+                set(activity, "mIsServer", true);
+                set(activity, "mReady", true);
+                set(activity, "mLobbyConnectionDeadline", 1L);
+                long now = SystemClock.elapsedRealtime();
+                java.net.InetAddress laptop;
+                try { laptop = java.net.InetAddress.getByName("192.168.1.250"); }
+                catch (Exception e) { throw new AssertionError(e); }
+                ((SharedLobby) get(activity, "mSharedLobby")).observe(new SharedLobby.Host(laptop,
+                        SharedLobby.Kind.LAPTOP, false, now, 0));
+                assertEquals(true, invokeResult(activity, "hasCommittedRound"));
+                invoke(activity, "updateSharedLobby");
+                invoke(activity, "updateLobbyConnection", new Class<?>[]{long.class}, now);
+                assertEquals(true, get(activity, "mIsServer"));
+                assertEquals(true, get(activity, "mReady"));
+                assertEquals(false, get(activity, "mLobbyTakeoverPending"));
+                invoke(activity, "renderLobby");
+                assertFalse(activity.findViewById(R.id.lobby_host_button).isEnabled());
+            } finally {
+                set(activity, "mIsServer", false);
+                set(activity, "mTcpServer", original);
+                starting.onDestroy();
+            }
+        });
+    }
+
+    @Test
     public void creditedKillStreakResetsWhenThePlayerIsEliminated() {
         scenario.onActivity(activity -> {
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
@@ -903,6 +1216,206 @@ public class GameplayRegressionTest {
             assertEquals(Arrays.asList(R.string.enemy_destroyed_voice_prompt,
                     R.string.enemy_destroyed_voice_prompt,
                     R.string.kill_streak_2_voice_prompt), new ArrayList<>(pending));
+        });
+    }
+
+    @Test
+    public void britishMaleVoiceIsScopedToTheJokeAndKeepsTheKillCuePause() {
+        withRecordingSpeech((activity, speech) -> {
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.enemy_destroyed_voice_prompt);
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
+            invoke(activity, "announceReloadReminder");
+            assertEquals(Arrays.asList("normal:1.5:" + activity.getString(R.string.enemy_destroyed_voice_prompt),
+                    "silence:1000", "en-gb-x-rjs-local:1.0:" + activity.getString(R.string.kill_streak_2_voice_prompt),
+                    "normal:1.0:" + activity.getString(R.string.reload_voice_prompt)), speech.queued);
+            assertEquals(speech.normal, speech.current);
+        });
+    }
+
+    @Test
+    public void unavailableBritishVoiceKeepsTheJokeAudibleInTheNormalVoice() {
+        withRecordingSpeech((activity, speech) -> {
+            speech.rejectMaleVoice = true;
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
+            assertEquals(Arrays.asList("silence:1000", "normal:1.0:"
+                    + activity.getString(R.string.kill_streak_2_voice_prompt)), speech.queued);
+            assertEquals(speech.normal, speech.current);
+            assertEquals(null, get(activity, "mKillStreakSpeechVoice"));
+        });
+    }
+
+    @Test
+    public void failedJokeStillRestoresNormalVoiceForTheNextInstruction() {
+        withRecordingSpeech((activity, speech) -> {
+            speech.failNextUtterance = true;
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
+            assertEquals(speech.normal, speech.current);
+            invoke(activity, "announceReloadReminder");
+            assertEquals(Arrays.asList("silence:1000", "normal:1.0:"
+                    + activity.getString(R.string.reload_voice_prompt)), speech.queued);
+        });
+    }
+
+    private interface SpeechCheck {
+        void run(FullscreenActivity activity, RecordingSpeech speech);
+    }
+
+    private void withRecordingSpeech(SpeechCheck check) {
+        scenario.onActivity(activity -> {
+            Object original = get(activity, "mCountdownSpeech");
+            Object ready = get(activity, "mCountdownSpeechReady");
+            Object normal = get(activity, "mDefaultSpeechVoice");
+            Object streak = get(activity, "mKillStreakSpeechVoice");
+            Object clips = get(activity, "mKillStreakAudioKeys");
+            RecordingSpeech speech = new RecordingSpeech(activity);
+            try {
+                set(activity, "mCountdownSpeech", speech);
+                set(activity, "mCountdownSpeechReady", true);
+                set(activity, "mDefaultSpeechVoice", speech.normal);
+                set(activity, "mKillStreakSpeechVoice", speech.britishMale);
+                set(activity, "mKillStreakAudioKeys", new HashMap<String, String>());
+                check.run(activity, speech);
+            } finally {
+                set(activity, "mCountdownSpeech", original);
+                set(activity, "mCountdownSpeechReady", ready);
+                set(activity, "mDefaultSpeechVoice", normal);
+                set(activity, "mKillStreakSpeechVoice", streak);
+                set(activity, "mKillStreakAudioKeys", clips);
+                speech.shutdown();
+            }
+        });
+    }
+
+    private static final class RecordingSpeech extends android.speech.tts.TextToSpeech {
+        final android.speech.tts.Voice normal = new android.speech.tts.Voice("normal", java.util.Locale.US,
+                400, 200, false, Collections.emptySet());
+        final android.speech.tts.Voice britishMale = new android.speech.tts.Voice("en-gb-x-rjs-local",
+                java.util.Locale.UK, 400, 200, false, Collections.emptySet());
+        android.speech.tts.Voice current = normal;
+        final List<String> queued = new ArrayList<>();
+        final List<Integer> queueModes = new ArrayList<>();
+        final Map<String, Integer> clips = new HashMap<>();
+        float rate = 1;
+        boolean rejectMaleVoice;
+        boolean failNextUtterance;
+        boolean rejectClip;
+        boolean throwOnClip;
+        int rejectRegistration;
+
+        RecordingSpeech(Context context) { super(context, status -> { }); }
+
+        @Override public int setVoice(android.speech.tts.Voice voice) {
+            if (rejectMaleVoice && voice == britishMale) return ERROR;
+            current = voice;
+            return SUCCESS;
+        }
+        @Override public int setSpeechRate(float value) { rate = value; return SUCCESS; }
+        @Override public int addSpeech(CharSequence text, String packageName, int resource) {
+            if (resource == rejectRegistration) return ERROR;
+            clips.put(text.toString(), resource);
+            return SUCCESS;
+        }
+        @Override public int speak(CharSequence text, int queueMode, android.os.Bundle params, String id) {
+            if (clips.containsKey(text.toString())) {
+                assertNotNull(params);
+                assertEquals(id, params.getString(Engine.KEY_PARAM_UTTERANCE_ID));
+                if (throwOnClip) throw new IllegalStateException("Simulated clip failure");
+                if (rejectClip) return ERROR;
+                queued.add("clip:" + clips.get(text.toString()));
+                queueModes.add(queueMode);
+                return SUCCESS;
+            }
+            if (failNextUtterance) {
+                failNextUtterance = false;
+                throw new IllegalStateException("Simulated broken speech engine");
+            }
+            queued.add(current.getName() + ":" + rate + ":" + text);
+            queueModes.add(queueMode);
+            return SUCCESS;
+        }
+        @Override public int playSilentUtterance(long duration, int queueMode, String id) {
+            queued.add("silence:" + duration);
+            queueModes.add(queueMode);
+            return SUCCESS;
+        }
+    }
+
+    @Test
+    public void bundledGeorgeJokeKeepsTheCuePauseAndNormalInstructionVoice() {
+        withRecordingSpeech((activity, speech) -> {
+            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            set(activity, "mKillStreakSpeechVoice", null);
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.enemy_destroyed_voice_prompt);
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
+            invoke(activity, "announceReloadReminder");
+            assertEquals(Arrays.asList("normal:1.5:" + activity.getString(R.string.enemy_destroyed_voice_prompt),
+                    "silence:1000", "clip:" + R.raw.kill_streak_2,
+                    "normal:1.0:" + activity.getString(R.string.reload_voice_prompt)), speech.queued);
+            assertEquals(Arrays.asList(1, 1, 1, 1), speech.queueModes);
+            assertEquals(speech.normal, speech.current);
+        });
+    }
+
+    @Test
+    public void bundledRegistrationCoversEveryJokeAndSkipsTranslations() {
+        withRecordingSpeech((activity, speech) -> {
+            Map<String, String> keys = KillStreakAudio.register(activity, speech, java.util.Locale.US);
+            assertEquals(20, keys.size());
+            assertEquals(20, speech.clips.size());
+            assertFalse(keys.containsKey(activity.getString(R.string.enemy_destroyed_voice_prompt)));
+            speech.clips.clear();
+            assertTrue(KillStreakAudio.register(activity, speech, java.util.Locale.GERMANY).isEmpty());
+            assertTrue(speech.clips.isEmpty());
+        });
+    }
+
+    @Test
+    public void rejectedBundledClipFallsBackToRealTextInsteadOfItsPrivateKey() {
+        withRecordingSpeech((activity, speech) -> {
+            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            set(activity, "mKillStreakSpeechVoice", null);
+            speech.rejectClip = true;
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
+            assertEquals(Arrays.asList("silence:1000", "normal:1.0:"
+                    + activity.getString(R.string.kill_streak_2_voice_prompt)), speech.queued);
+            assertEquals(19, ((Map<?, ?>) get(activity, "mKillStreakAudioKeys")).size());
+        });
+    }
+
+    @Test
+    public void throwingBundledClipStillSpeaksTheJokeAndNextInstruction() {
+        withRecordingSpeech((activity, speech) -> {
+            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            set(activity, "mKillStreakSpeechVoice", null);
+            speech.throwOnClip = true;
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
+            invoke(activity, "announceReloadReminder");
+            assertEquals(Arrays.asList("silence:1000", "normal:1.0:"
+                    + activity.getString(R.string.kill_streak_2_voice_prompt), "normal:1.0:"
+                    + activity.getString(R.string.reload_voice_prompt)), speech.queued);
+        });
+    }
+
+    @Test
+    public void oneRejectedRegistrationDoesNotLoseOtherRecordings() {
+        withRecordingSpeech((activity, speech) -> {
+            speech.rejectRegistration = R.raw.kill_streak_2;
+            Map<String, String> keys = KillStreakAudio.register(activity, speech, java.util.Locale.US);
+            assertEquals(19, keys.size());
+            assertFalse(keys.containsKey(activity.getString(R.string.kill_streak_2_voice_prompt)));
+            assertTrue(keys.containsKey(activity.getString(R.string.kill_streak_3_voice_prompt)));
+        });
+    }
+
+    @Test
+    public void normalSpeechWithMatchingWordsDoesNotUseTheKillStreakRecording() {
+        withRecordingSpeech((activity, speech) -> {
+            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            String text = activity.getString(R.string.kill_streak_2_voice_prompt);
+            invoke(activity, "speakGameText", new Class<?>[]{android.speech.tts.TextToSpeech.class,
+                    CharSequence.class, float.class, int.class, String.class, boolean.class},
+                    speech, text, 1.0f, 1, "ordinary", false);
+            assertEquals(Collections.singletonList("normal:1.0:" + text), speech.queued);
         });
     }
 
@@ -1796,6 +2309,28 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void hubConnectionLossCannotEndAnActiveRound() {
+        receiveWhilePaused(NetMsg.NETMSG_SERVERUNREACHABLE);
+        scenario.onActivity(activity -> {
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(false, get(activity, "mLobbyJoined"));
+        });
+    }
+
+    @Test
+    public void hubConnectionLossReturnsLobbyToQuietDiscovery() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mReady", true);
+            set(activity, "mLobbyJoined", true);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_SERVERUNREACHABLE));
+            assertEquals(false, get(activity, "mReady"));
+            assertEquals(false, get(activity, "mLobbyJoined"));
+            assertEquals(activity.getString(R.string.lobby_reconnecting), get(activity, "mLobbyNotice"));
+        });
+    }
+
+    @Test
     public void versionRejectionReceivedWhilePausedClearsLobbyReadiness() {
         scenario.onActivity(activity -> {
             Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
@@ -1983,6 +2518,48 @@ public class GameplayRegressionTest {
             assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
             assertTrue(((TextView) get(activity, "mSpawnInTV")).getText().toString().contains("03:00"));
             assertSame(roundTimer, get(activity, "mGameCountdownTimer"));
+        });
+    }
+
+    @Test
+    public void timerOnlyTeamRespawnKeepsThreeMinutesWithoutCameraOrQrReminders() {
+        scenario.onActivity(activity -> {
+            prepareDedicatedJoin(activity);
+            Globals globals = Globals.getInstance();
+            globals.mRespawnQrEnabled = false;
+            long deadline = SystemClock.elapsedRealtime() - 1000;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 600000));
+            Object roundTimer = get(activity, "mGameCountdownTimer");
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Hit");
+            assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
+            assertEquals(activity.getString(R.string.respawn_timer_wait_label, 3, 0),
+                    ((TextView) get(activity, "mSpawnInTV")).getText().toString());
+            assertEquals(false, get(activity, "mRespawnQrScannerActive"));
+            assertEquals(false, get(activity, "mRespawnQrVoiceReminderActive"));
+            assertEquals(View.GONE, activity.findViewById(R.id.respawn_qr_scanner_overlay).getVisibility());
+            assertSame(roundTimer, get(activity, "mGameCountdownTimer"));
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+            assertNotNull(timer);
+            timer.onFinish();
+            assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+            assertSame(roundTimer, get(activity, "mGameCountdownTimer"));
+        });
+    }
+
+    @Test
+    public void timerOnlyInfectionConvertsKilledSurvivorBeforeRespawning() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mRespawnQrEnabled = false;
+            globals.mInfectionMode = true;
+            globals.mPlayerID = 2;
+            globals.resetInfectedPlayers();
+            assertFalse(globals.isPlayerInfected((byte) 2));
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Zombie");
+            ((CountDownTimer) get(activity, "mSpawnTimer")).onFinish();
+            assertTrue(globals.isPlayerInfected((byte) 2));
+            assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
         });
     }
 
@@ -3056,6 +3633,10 @@ public class GameplayRegressionTest {
     }
 
     private static final class RecordingUDPService extends UDPListenerService {
+        long hostingSince = -1;
+        long resumedSince = -1;
+        @Override long hostStartedAt() { return hostingSince; }
+        @Override void resumeHostTenure(long startedAt) { resumedSince = startedAt; }
         final List<String> messages = new ArrayList<>();
         int endRequests;
         int endVoteRequests;

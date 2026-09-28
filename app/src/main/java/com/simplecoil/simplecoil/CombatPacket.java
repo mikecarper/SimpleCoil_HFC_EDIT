@@ -21,18 +21,26 @@ final class CombatPacket {
     static final int KIND_ACK = 2;
 
     private static final int MAGIC = 0x53434f43; // "SCOC"
-    private static final int FORMAT_VERSION = 1;
+    private static final int FORMAT_VERSION = 2;
 
     private CombatPacket() { }
 
     static byte[] encode(int networkVersion, UUID roundToken, int kind, int eventType,
                          int senderID, int targetID, long eventSequence) {
+        return encode(networkVersion, roundToken, kind, eventType, senderID, targetID,
+                eventSequence, 0, 0);
+    }
+
+    static byte[] encode(int networkVersion, UUID roundToken, int kind, int eventType,
+                         int senderID, int targetID, long eventSequence,
+                         int generation, int targetGeneration) {
         if (networkVersion < 0 || networkVersion > 0xff || roundToken == null
                 || (kind != KIND_EVENT && kind != KIND_ACK)
                 || !isCombatEvent(eventType)
                 || !Globals.isValidPlayerID(senderID)
                 || targetID < 0 || targetID > Globals.MAX_PLAYER_ID
-                || eventSequence <= 0 || eventSequence > 0xffffffffL)
+                || eventSequence <= 0 || eventSequence > 0xffffffffL
+                || generation < 0 || generation > 255 || targetGeneration < 0 || targetGeneration > 255)
             throw new IllegalArgumentException("Invalid combat packet");
         if (kind == KIND_EVENT && eventType == PeerStatePacket.EVENT_SHOT_FIRED)
             targetID = 0;
@@ -47,6 +55,8 @@ final class CombatPacket {
         packet[7] = (byte) eventType;
         packet[8] = (byte) senderID;
         packet[9] = (byte) targetID;
+        packet[10] = (byte) generation;
+        packet[11] = (byte) targetGeneration;
         putInt(packet, 12, (int) eventSequence);
         putLong(packet, 16, roundToken.getMostSignificantBits());
         putLong(packet, 24, roundToken.getLeastSignificantBits());
@@ -56,8 +66,7 @@ final class CombatPacket {
     static Decoded decode(byte[] payload, int offset, int length) {
         if (payload == null || offset < 0 || length != PACKET_BYTES
                 || offset > payload.length - length || getInt(payload, offset) != MAGIC
-                || unsigned(payload[offset + 4]) != FORMAT_VERSION
-                || payload[offset + 10] != 0 || payload[offset + 11] != 0)
+                || unsigned(payload[offset + 4]) != FORMAT_VERSION)
             return null;
         int networkVersion = unsigned(payload[offset + 5]);
         int kind = unsigned(payload[offset + 6]);
@@ -75,7 +84,8 @@ final class CombatPacket {
             return null;
         }
         return new Decoded(networkVersion, kind, eventType, senderID, targetID, sequence,
-                getLong(payload, offset + 16), getLong(payload, offset + 24));
+                getLong(payload, offset + 16), getLong(payload, offset + 24),
+                unsigned(payload[offset + 10]), unsigned(payload[offset + 11]));
     }
 
     static boolean looksLikeCombat(byte[] payload, int offset, int length) {
@@ -121,9 +131,12 @@ final class CombatPacket {
         final long eventSequence;
         final long roundTokenMost;
         final long roundTokenLeast;
+        final int generation;
+        final int targetGeneration;
 
         Decoded(int networkVersion, int kind, int eventType, int senderID, int targetID,
-                long eventSequence, long roundTokenMost, long roundTokenLeast) {
+                long eventSequence, long roundTokenMost, long roundTokenLeast,
+                int generation, int targetGeneration) {
             this.networkVersion = networkVersion;
             this.kind = kind;
             this.eventType = eventType;
@@ -132,6 +145,8 @@ final class CombatPacket {
             this.eventSequence = eventSequence;
             this.roundTokenMost = roundTokenMost;
             this.roundTokenLeast = roundTokenLeast;
+            this.generation = generation;
+            this.targetGeneration = targetGeneration;
         }
 
         boolean matchesRound(UUID token) {

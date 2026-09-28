@@ -7,6 +7,21 @@
     android:background="#0D141D">
 
     <TextView
+        android:id="@+id/lobby_host_banner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp"
+        android:background="#FFBA6A"
+        android:padding="8dp"
+        android:gravity="center"
+        android:text="@string/lobby_you_host"
+        android:textAllCaps="true"
+        android:textColor="#0D141D"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
+    <TextView
         android:id="@+id/lobby_title"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -20,6 +35,25 @@
         android:layout_marginTop="4dp"
         android:text="@string/lobby_searching" />
 
+    <LinearLayout android:id="@+id/lobby_last_game" style="@style/LobbyCard"
+        android:orientation="vertical" android:visibility="gone">
+        <TextView android:id="@+id/lobby_last_game_title" style="@style/LobbyEyebrow"
+            android:text="@string/lobby_previous_game" android:textColor="#BCE698" />
+        <TextView android:id="@+id/lobby_last_game_mode" style="@style/LobbyBody"
+            android:textSize="13sp" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:layout_marginTop="6dp" android:baselineAligned="false">
+            <TextView android:id="@+id/lobby_last_game_kills" style="@style/LobbyHeading"
+                android:layout_width="0dp" android:layout_weight="1" android:gravity="center" android:textSize="14sp" />
+            <TextView android:id="@+id/lobby_last_game_deaths" style="@style/LobbyHeading"
+                android:layout_width="0dp" android:layout_weight="1" android:gravity="center" android:textSize="14sp" />
+            <TextView android:id="@+id/lobby_last_game_hits" style="@style/LobbyHeading"
+                android:layout_width="0dp" android:layout_weight="1" android:gravity="center" android:textSize="14sp" />
+        </LinearLayout>
+        <TextView android:id="@+id/lobby_last_game_team" style="@style/LobbyBody"
+            android:layout_marginTop="6dp" android:gravity="center" />
+    </LinearLayout>
+
     <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal" android:gravity="center_vertical">
@@ -31,6 +65,8 @@
             <Button android:id="@+id/lobby_wifi_button" style="@style/LobbyTextButton"
                 android:text="@string/lobby_wifi_action" />
         </LinearLayout>
+        <Button android:id="@+id/lobby_host_button" style="@style/LobbyTextButton"
+            android:text="@string/lobby_host_manual" />
     </LinearLayout>
 
     <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
@@ -44,6 +80,18 @@
                 android:text="@string/lobby_edit_name" />
         </LinearLayout>
         <TextView android:id="@+id/lobby_gun_status" style="@style/LobbyBody" />
+        <TextView android:id="@+id/lobby_gun_battery" style="@style/LobbyBody"
+            android:layout_marginTop="4dp" android:drawablePadding="4dp"
+            android:gravity="center_vertical" android:textSize="14sp" />
+        <TextView android:id="@+id/lobby_second_gun_battery" style="@style/LobbyBody"
+            android:drawablePadding="4dp" android:gravity="center_vertical"
+            android:textSize="14sp" android:visibility="gone" />
+        <TextView android:id="@+id/lobby_gps_coordinates" style="@style/LobbyBody"
+            android:layout_marginTop="4dp" android:textSize="13sp"
+            android:textColor="#C6CCD3" android:text="@string/gps_acquiring" />
+        <TextView android:id="@+id/lobby_team" style="@style/LobbyHeading"
+            android:layout_marginTop="6dp" android:textSize="32sp"
+            android:textStyle="bold" />
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal">
             <Button android:id="@+id/lobby_gun_button" style="@style/LobbyTextButton"
