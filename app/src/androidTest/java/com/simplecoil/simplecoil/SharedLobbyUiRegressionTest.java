@@ -532,6 +532,50 @@ public class SharedLobbyUiRegressionTest {
         } finally { Globals.getInstance().mGameState = Globals.GAME_STATE_NONE; }
     }
 
+    @Test public void setupPresentsGunBeforeWifi() {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                invoke(activity, "leaveSharedLobby");
+                set(activity, "mUseNetwork", true);
+                set(activity, "mCommunicating", false);
+                invoke(activity, "renderLobby");
+                LinearLayout panel = activity.findViewById(R.id.lobby_panel);
+                assertTrue(panel.indexOfChild(activity.findViewById(R.id.lobby_gun_card))
+                        < panel.indexOfChild(activity.findViewById(R.id.lobby_wifi_card)));
+                assertEquals(activity.getString(R.string.lobby_gun_action),
+                        ((TextView) activity.findViewById(R.id.lobby_primary_button)).getText().toString());
+                if (!(Boolean) invokeResult(activity, "isGameNetworkAvailable")) {
+                    set(activity, "mCommunicating", true);
+                    invoke(activity, "renderLobby");
+                    assertEquals(activity.getString(R.string.lobby_wifi_needed),
+                            ((TextView) activity.findViewById(R.id.lobby_primary_button)).getText().toString());
+                }
+            });
+        }
+    }
+
+    @Test public void appLaunchPromptsWhenLegacyLocationIsNotHighAccuracy() {
+        org.junit.Assume.assumeTrue(android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.P);
+        int mode = android.provider.Settings.Secure.getInt(
+                InstrumentationRegistry.getInstrumentation().getTargetContext().getContentResolver(),
+                android.provider.Settings.Secure.LOCATION_MODE,
+                android.provider.Settings.Secure.LOCATION_MODE_OFF);
+        org.junit.Assume.assumeTrue(mode != android.provider.Settings.Secure.LOCATION_MODE_HIGH_ACCURACY);
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                assertFalse((Boolean) invokeResult(activity, "isLocationReadyForTracking"));
+                assertTrue((Boolean) get(activity, "mLocationSettingsPromptShown"));
+                androidx.appcompat.app.AlertDialog dialog =
+                        (androidx.appcompat.app.AlertDialog) get(activity, "mLocationSettingsDialog");
+                assertNotNull(dialog);
+                assertTrue(dialog.isShowing());
+            });
+        }
+    }
+
     private static Object get(Object target, String name) {
         try { Field f = FullscreenActivity.class.getDeclaredField(name); f.setAccessible(true); return f.get(target); }
         catch (Exception e) { throw new AssertionError(e); }
@@ -542,6 +586,10 @@ public class SharedLobbyUiRegressionTest {
     }
     private static void invoke(Object target, String name) {
         invoke(target, name, new Class<?>[0]);
+    }
+    private static Object invokeResult(Object target, String name) {
+        try { Method m = FullscreenActivity.class.getDeclaredMethod(name); m.setAccessible(true); return m.invoke(target); }
+        catch (Exception e) { throw new AssertionError(e); }
     }
     private static void invoke(Object target, String name, Class<?>[] types, Object... args) {
         try { Method m = FullscreenActivity.class.getDeclaredMethod(name, types); m.setAccessible(true); m.invoke(target, args); }

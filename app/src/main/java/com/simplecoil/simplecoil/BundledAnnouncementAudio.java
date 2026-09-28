@@ -9,9 +9,12 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
-/** Pre-generated Kokoro/George recordings. No model or voice downloads on the phone. */
-final class KillStreakAudio {
+/** English announcements extracted from the supplied Roman recording. */
+final class BundledAnnouncementAudio {
     private static final int[][] CLIPS = {
+            {R.string.game_end_won_voice_prompt, R.raw.game_end_won},
+            {R.string.game_end_lost_voice_prompt, R.raw.game_end_lost},
+            {R.string.game_end_tied_voice_prompt, R.raw.game_end_tied},
             {R.string.kill_streak_2_voice_prompt, R.raw.kill_streak_2},
             {R.string.kill_streak_3_voice_prompt, R.raw.kill_streak_3},
             {R.string.kill_streak_4_voice_prompt, R.raw.kill_streak_4},
@@ -59,18 +62,18 @@ final class KillStreakAudio {
         if (!supports(locale)) return keys;
         for (int[] clip : CLIPS) {
             // Private keys keep matching words in ordinary speech from being
-            // replaced. Only speakGameText's kill-streak path uses these keys.
-            String key = "simplecoil.kill-streak." + clip[0];
+            // replaced. Only speakGameText's bundled path uses these keys.
+            String key = "simplecoil.announcement." + clip[0];
             try {
                 if (speech.addSpeech((CharSequence) key, context.getPackageName(), clip[1])
                         == TextToSpeech.SUCCESS)
                     keys.put(context.getString(clip[0]), key);
             } catch (RuntimeException e) {
-                Log.w("KillStreakAudio", "Unable to register bundled joke " + clip[0], e);
+                Log.w("BundledAnnouncementAudio", "Unable to register announcement " + clip[0], e);
             }
         }
         return keys;
     }
 
-    private KillStreakAudio() { }
+    private BundledAnnouncementAudio() { }
 }

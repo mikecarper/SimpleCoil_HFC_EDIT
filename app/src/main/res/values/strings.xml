@@ -32,9 +32,9 @@
     <string name="lobby_stat_team_kills">Your team: %1$d kills</string>
     <string name="lobby_stat_team_captures">Your team: %1$d captures</string>
     <string name="lobby_searching">Finding everyone on this Wi-Fi...</string>
-    <string name="lobby_connection_label">1 / SHARED WI-FI</string>
+    <string name="lobby_connection_label">WI-FI / AUTOMATIC</string>
     <string name="lobby_wifi_action">Wi-Fi</string>
-    <string name="lobby_player_label">2 / YOUR PLAYER</string>
+    <string name="lobby_player_label">PAIR YOUR GUN FIRST</string>
     <string name="lobby_edit_name">Edit name</string>
     <string name="lobby_gun_action">Connect gun</string>
     <string name="lobby_team_action">Team</string>
@@ -451,6 +451,11 @@
     <string name="gps_mode_teammate">GPS Teammates Only</string>
     <string name="gps_mode_all">GPS All On</string>
     <string name="gps_acquiring">GPS acquiring...</string>
+    <string name="location_settings_prompt_title">Turn on location</string>
+    <string name="location_settings_prompt_high_accuracy_title">Enable High accuracy location</string>
+    <string name="location_settings_prompt_high_accuracy">Set Android Location to High accuracy (GPS and networks) so your position can be shared in a game.</string>
+    <string name="location_settings_prompt_modern">Turn on Android Location so your position can be shared in a game.</string>
+    <string name="location_settings_open">Open location settings</string>
     <string name="gps_coordinates_format">LAT %1$.5f\nLON %2$.5f</string>
     <string name="player_name_not_connected">{Not Connected}</string>
     <string name="scoreboard_button">KILLS</string>

@@ -54,22 +54,8 @@
             android:layout_marginTop="6dp" android:gravity="center" />
     </LinearLayout>
 
-    <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
-        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:orientation="horizontal" android:gravity="center_vertical">
-            <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
-                android:layout_weight="1" android:orientation="vertical">
-                <TextView android:id="@+id/lobby_wifi" style="@style/LobbyBody" />
-                <TextView android:id="@+id/lobby_host" style="@style/LobbyEyebrow" />
-            </LinearLayout>
-            <Button android:id="@+id/lobby_wifi_button" style="@style/LobbyTextButton"
-                android:text="@string/lobby_wifi_action" />
-        </LinearLayout>
-        <Button android:id="@+id/lobby_host_button" style="@style/LobbyTextButton"
-            android:text="@string/lobby_host_manual" />
-    </LinearLayout>
-
-    <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
+    <LinearLayout android:id="@+id/lobby_gun_card" style="@style/LobbyCard" android:orientation="vertical">
+        <TextView style="@style/LobbyEyebrow" android:text="@string/lobby_player_label" />
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal" android:gravity="center_vertical">
             <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
@@ -104,6 +90,22 @@
                 android:layout_width="0dp" android:layout_weight="1"
                 android:text="@string/lobby_scan_action" />
         </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout android:id="@+id/lobby_wifi_card" style="@style/LobbyCard" android:orientation="vertical">
+        <TextView style="@style/LobbyEyebrow" android:text="@string/lobby_connection_label" />
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:gravity="center_vertical">
+            <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:orientation="vertical">
+                <TextView android:id="@+id/lobby_wifi" style="@style/LobbyBody" />
+                <TextView android:id="@+id/lobby_host" style="@style/LobbyEyebrow" />
+            </LinearLayout>
+            <Button android:id="@+id/lobby_wifi_button" style="@style/LobbyTextButton"
+                android:text="@string/lobby_wifi_action" />
+        </LinearLayout>
+        <Button android:id="@+id/lobby_host_button" style="@style/LobbyTextButton"
+            android:text="@string/lobby_host_manual" />
     </LinearLayout>
 
     <LinearLayout style="@style/LobbyCard" android:orientation="vertical">

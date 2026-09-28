@@ -40,6 +40,7 @@ import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.drawable.AnimationDrawable;
 import android.location.Location;
+import android.location.LocationManager;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
@@ -245,6 +246,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private CountDownTimer mConnectFailTimer = null;
     private CountDownTimer mGameInviteTimer = null;
     private AlertDialog mGameExitDialog;
+    private AlertDialog mLocationSettingsDialog;
+    private boolean mLocationSettingsPromptShown;
     private long mGameControlGeneration;
     private boolean mEndVotePrompted;
     private AlertDialog mGameInviteDialog = null;
@@ -436,7 +439,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private volatile boolean mCountdownSpeechReady;
     private Voice mDefaultSpeechVoice;
     private Voice mKillStreakSpeechVoice;
-    private Map<String, String> mKillStreakAudioKeys = new HashMap<>();
+    private Map<String, String> mBundledAnnouncementAudioKeys = new HashMap<>();
     private volatile int mLastSpokenGameStartSecond = Integer.MAX_VALUE;
     private final ArrayDeque<Integer> mPendingVoicePrompts = new ArrayDeque<>();
     private final KillStreakVoice mKillStreakVoice = new KillStreakVoice(new Random());
@@ -963,7 +966,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void initializeLobbyScreen() {
         if (getSupportActionBar() != null)
             getSupportActionBar().hide();
-        // The shared lobby replaces the old gun-first setup wizard.
+        // The shared lobby guides gun pairing before Wi-Fi setup.
         mStartWizardShown = true;
         findViewById(R.id.lobby_action_bar).addOnLayoutChangeListener(
                 (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) ->
@@ -987,10 +990,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             } else if (mUseNetwork && ((!mIsServer && Globals.getInstance().mLocalLobbyBenched)
                     || Globals.getInstance().mLobbyRoundActive)) {
                 return;
-            } else if (mUseNetwork && !isGameNetworkAvailable()) {
-                showLobbyWifiOptions();
             } else if (!mCommunicating) {
                 toggleLobbyPairing();
+            } else if (mUseNetwork && !isGameNetworkAvailable()) {
+                showLobbyWifiOptions();
             } else if (!mUseNetwork || mIsServer) {
                 mStartGameButton.performClick();
             }
@@ -1513,12 +1516,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             enabled = !mLobbyTakeoverPending && globals.mRequestedJoinTeam == 0;
         } else if (mUseNetwork && globals.mLocalLobbyBenched && !mIsServer) {
             label = R.string.lobby_benched; hint = R.string.lobby_bench_hint;
-        } else if (mUseNetwork && !wifi) {
-            label = R.string.lobby_wifi_needed; hint = R.string.lobby_same_wifi; enabled = true;
         } else if (!mCommunicating) {
             label = isLobbyPairingBusy() ? R.string.cancel : R.string.lobby_gun_action;
             hint = R.string.lobby_gun_missing;
             enabled = true;
+        } else if (mUseNetwork && !wifi) {
+            label = R.string.lobby_wifi_needed; hint = R.string.lobby_same_wifi; enabled = true;
         } else if (!mUseNetwork) {
             label = R.string.lobby_start; hint = R.string.lobby_practice; enabled = true;
         } else if (!mLobbyJoined) {
@@ -1540,8 +1543,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         lobbyText(R.id.lobby_primary_button, getString(label));
         findViewById(R.id.lobby_primary_button).setEnabled(enabled);
         lobbyText(R.id.lobby_next_step, getString(hint));
-        if (!mCommunicating && !globals.mLocalLobbyBenched && !globals.mLobbyRoundActive
-                && (!mUseNetwork || wifi))
+        if (!mCommunicating && !globals.mLocalLobbyBenched && !globals.mLobbyRoundActive)
             lobbyText(R.id.lobby_next_step, lobbyGunStatus());
     }
 
@@ -4457,6 +4459,45 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             lobbyGps.setText(text);
     }
 
+    private boolean isLocationReadyForTracking() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            LocationManager manager = (LocationManager) getSystemService(LOCATION_SERVICE);
+            return manager != null && manager.isLocationEnabled();
+        }
+        return Settings.Secure.getInt(getContentResolver(), Settings.Secure.LOCATION_MODE,
+                Settings.Secure.LOCATION_MODE_OFF) == Settings.Secure.LOCATION_MODE_HIGH_ACCURACY;
+    }
+
+    private void checkLocationSettingsOnLaunch() {
+        if (!mActivityResumed || isFinishing() || isDestroyed()
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            return;
+        if (isLocationReadyForTracking()) {
+            mLocationSettingsPromptShown = false;
+            return;
+        }
+        if (mLocationSettingsPromptShown) return;
+        mLocationSettingsPromptShown = true;
+        mLocationSettingsDialog = new AlertDialog.Builder(this)
+                .setTitle(Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                        ? R.string.location_settings_prompt_title
+                        : R.string.location_settings_prompt_high_accuracy_title)
+                .setMessage(Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                        ? R.string.location_settings_prompt_modern
+                        : R.string.location_settings_prompt_high_accuracy)
+                .setPositiveButton(R.string.location_settings_open, (dialog, which) -> {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
+                    } catch (ActivityNotFoundException e) {
+                        Log.w(TAG, "Unable to open Android location settings", e);
+                    }
+                })
+                .setNegativeButton(R.string.cancel, null)
+                .create();
+        mLocationSettingsDialog.setOnDismissListener(dialog -> mLocationSettingsDialog = null);
+        mLocationSettingsDialog.show();
+    }
+
     private void receiveLocalGpsLocation(Intent intent) {
         double latitude = intent.getDoubleExtra(NetMsg.INTENT_LATITUDE, Double.NaN);
         double longitude = intent.getDoubleExtra(NetMsg.INTENT_LONGITUDE, Double.NaN);
@@ -6138,6 +6179,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             enableGameLock();
         updateGpsCoordinatesDisplay();
+        checkLocationSettingsOnLaunch();
         if (mUseHubAutoJoin && mRecoilWifiAutoJoiner != null)
             mRecoilWifiAutoJoiner.start();
         ContextCompat.registerReceiver(this, mGattUpdateReceiver, makeGattUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
@@ -6303,6 +6345,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (isFinishing())
             stopNetworkServices();
         shutdownCountdownSpeech();
+        if (mLocationSettingsDialog != null) mLocationSettingsDialog.dismiss();
         releaseSoundPool();
         super.onDestroy();
     }
@@ -7670,7 +7713,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     synchronized (mPendingVoicePrompts) {
                         if (mCountdownSpeech != speech)
                             return;
-                        configureKillStreakSpeechVoice(speech);
+                        configureAnnouncementSpeech(speech);
                         mCountdownSpeechReady = true;
                         while (!mPendingVoicePrompts.isEmpty())
                             speakRoundVoicePrompt(mPendingVoicePrompts.removeFirst());
@@ -7696,16 +7739,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
     }
 
-    private void configureKillStreakSpeechVoice(TextToSpeech speech) {
+    private void configureAnnouncementSpeech(TextToSpeech speech) {
         mDefaultSpeechVoice = null;
         mKillStreakSpeechVoice = null;
-        mKillStreakAudioKeys = KillStreakAudio.register(this, speech, Locale.getDefault());
-        if (mKillStreakAudioKeys.size() == KillStreakAudio.count()) {
-            Log.i(TAG, "Kill-streak voice: bundled Kokoro George (British male)");
+        mBundledAnnouncementAudioKeys = BundledAnnouncementAudio.register(this, speech, Locale.getDefault());
+        if (mBundledAnnouncementAudioKeys.size() == BundledAnnouncementAudio.count()) {
+            Log.i(TAG, "English game-over and kill-streak recordings registered");
             return;
         }
         // Keep translated prompts in their own language. Only the English
-        // streak jokes change accent; all other game speech keeps its voice.
+        // streak jokes use the optional British male fallback voice.
         if (!"en".equals(Locale.getDefault().getLanguage())) return;
         try {
             mDefaultSpeechVoice = speech.getVoice();
@@ -7738,23 +7781,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private int speakGameText(TextToSpeech speech, CharSequence text, float rate,
-                              int queueMode, String utteranceId, boolean killStreak) {
+                              int queueMode, String utteranceId, boolean bundledPrompt) {
         synchronized (mPendingVoicePrompts) {
             if (speech != mCountdownSpeech || !mCountdownSpeechReady) return TextToSpeech.ERROR;
-            String audioKey = killStreak ? mKillStreakAudioKeys.get(text.toString()) : null;
+            String audioKey = bundledPrompt ? mBundledAnnouncementAudioKeys.get(text.toString()) : null;
             if (audioKey != null) {
                 try {
                     int result = speech.speak(audioKey, queueMode,
-                            KillStreakAudio.parameters(utteranceId), utteranceId);
+                            BundledAnnouncementAudio.parameters(utteranceId), utteranceId);
                     if (result == TextToSpeech.SUCCESS) return result;
                 } catch (RuntimeException e) {
-                    Log.w(TAG, "Bundled joke unavailable; falling back to speech", e);
+                    Log.w(TAG, "Bundled announcement unavailable; falling back to speech", e);
                 }
-                // A rejected clip must not silence the joke or change other
+                // A rejected clip must not silence the announcement or change other
                 // announcements. Retry real text, never synthesize a private key.
-                mKillStreakAudioKeys.remove(text.toString());
+                mBundledAnnouncementAudioKeys.remove(text.toString());
             }
-            boolean restoreVoice = killStreak && mDefaultSpeechVoice != null && mKillStreakSpeechVoice != null
+            boolean restoreVoice = KILL_STREAK_UTTERANCE_ID.equals(utteranceId)
+                    && mDefaultSpeechVoice != null && mKillStreakSpeechVoice != null
                     && !mDefaultSpeechVoice.equals(mKillStreakSpeechVoice);
             try {
                 if (restoreVoice) {
@@ -7816,7 +7860,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mCountdownSpeechReady = false;
             mDefaultSpeechVoice = null;
             mKillStreakSpeechVoice = null;
-            mKillStreakAudioKeys.clear();
+            mBundledAnnouncementAudioKeys.clear();
             mLastSpokenGameStartSecond = Integer.MAX_VALUE;
             mPendingVoicePrompts.clear();
         }
@@ -7906,7 +7950,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         endPrompt ? ROUND_END_UTTERANCE_ID
                                 : killCue ? ENEMY_DESTROYED_UTTERANCE_ID
                                 : roundStartPrompt ? ROUND_START_UTTERANCE_ID
-                                : KILL_STREAK_UTTERANCE_ID, killStreakPrompt);
+                                : KILL_STREAK_UTTERANCE_ID, killStreakPrompt || endPrompt);
             } catch (RuntimeException e) {
                 Log.w(TAG, "Unable to speak round announcement", e);
             }

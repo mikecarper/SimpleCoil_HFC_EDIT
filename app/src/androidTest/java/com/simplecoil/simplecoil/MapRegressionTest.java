@@ -104,6 +104,8 @@ public class MapRegressionTest {
             current.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                     | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED);
+            current.findViewById(R.id.lobby_panel).setVisibility(View.GONE);
+            current.findViewById(R.id.lobby_action_bar).setVisibility(View.GONE);
             current.findViewById(R.id.connect_layout).setVisibility(View.GONE);
             current.findViewById(R.id.play_layout).setVisibility(View.VISIBLE);
             current.getSupportFragmentManager().executePendingTransactions();

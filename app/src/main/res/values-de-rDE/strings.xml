@@ -33,9 +33,9 @@
     <string name="lobby_eyebrow">SIMPLECOIL / SPIELTREFF</string>
     <string name="lobby_title">Deine Spiellobby</string>
     <string name="lobby_searching">Suche Spieler in diesem WLAN...</string>
-    <string name="lobby_connection_label">1 / GEMEINSAMES WLAN</string>
+    <string name="lobby_connection_label">WLAN / AUTOMATISCH</string>
     <string name="lobby_wifi_action">WLAN</string>
-    <string name="lobby_player_label">2 / DEIN SPIELER</string>
+    <string name="lobby_player_label">ZUERST WAFFE VERBINDEN</string>
     <string name="lobby_edit_name">Name</string>
     <string name="lobby_gun_action">Waffe verbinden</string>
     <string name="lobby_team_action">Team</string>
@@ -384,6 +384,11 @@
     <string name="gps_mode_teammate">GPS nur Teammitglieder</string>
     <string name="gps_mode_all">GPS Alle An</string>
     <string name="gps_acquiring">GPS-Suche...</string>
+    <string name="location_settings_prompt_title">Standort aktivieren</string>
+    <string name="location_settings_prompt_high_accuracy_title">Hohe Standortgenauigkeit aktivieren</string>
+    <string name="location_settings_prompt_high_accuracy">Stelle den Android-Standortmodus auf Hohe Genauigkeit (GPS und Netzwerke), damit deine Position im Spiel geteilt werden kann.</string>
+    <string name="location_settings_prompt_modern">Aktiviere den Android-Standort, damit deine Position im Spiel geteilt werden kann.</string>
+    <string name="location_settings_open">Standorteinstellungen oeffnen</string>
     <string name="gps_coordinates_format">LAT %1$.5f\nLON %2$.5f</string>
     <string name="player_name_not_connected">{Nicht Verbunden}</string>
     <string name="scoreboard_button">KILLS</string>

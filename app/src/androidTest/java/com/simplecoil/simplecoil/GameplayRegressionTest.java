@@ -1266,21 +1266,21 @@ public class GameplayRegressionTest {
             Object ready = get(activity, "mCountdownSpeechReady");
             Object normal = get(activity, "mDefaultSpeechVoice");
             Object streak = get(activity, "mKillStreakSpeechVoice");
-            Object clips = get(activity, "mKillStreakAudioKeys");
+            Object clips = get(activity, "mBundledAnnouncementAudioKeys");
             RecordingSpeech speech = new RecordingSpeech(activity);
             try {
                 set(activity, "mCountdownSpeech", speech);
                 set(activity, "mCountdownSpeechReady", true);
                 set(activity, "mDefaultSpeechVoice", speech.normal);
                 set(activity, "mKillStreakSpeechVoice", speech.britishMale);
-                set(activity, "mKillStreakAudioKeys", new HashMap<String, String>());
+                set(activity, "mBundledAnnouncementAudioKeys", new HashMap<String, String>());
                 check.run(activity, speech);
             } finally {
                 set(activity, "mCountdownSpeech", original);
                 set(activity, "mCountdownSpeechReady", ready);
                 set(activity, "mDefaultSpeechVoice", normal);
                 set(activity, "mKillStreakSpeechVoice", streak);
-                set(activity, "mKillStreakAudioKeys", clips);
+                set(activity, "mBundledAnnouncementAudioKeys", clips);
                 speech.shutdown();
             }
         });
@@ -1341,9 +1341,9 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void bundledGeorgeJokeKeepsTheCuePauseAndNormalInstructionVoice() {
+    public void bundledRomanJokeKeepsTheCuePauseAndNormalInstructionVoice() {
         withRecordingSpeech((activity, speech) -> {
-            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            set(activity, "mBundledAnnouncementAudioKeys", BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US));
             set(activity, "mKillStreakSpeechVoice", null);
             invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.enemy_destroyed_voice_prompt);
             invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
@@ -1357,14 +1357,48 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void bundledRegistrationCoversEveryJokeAndSkipsTranslations() {
+    public void bundledGameEndUsesTheCorrectClipAndFlushesQueuedSpeech() {
         withRecordingSpeech((activity, speech) -> {
-            Map<String, String> keys = KillStreakAudio.register(activity, speech, java.util.Locale.US);
-            assertEquals(20, keys.size());
-            assertEquals(20, speech.clips.size());
+            set(activity, "mBundledAnnouncementAudioKeys", BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US));
+            int[] prompts = {R.string.game_end_won_voice_prompt,
+                    R.string.game_end_lost_voice_prompt, R.string.game_end_tied_voice_prompt};
+            int[] resources = {R.raw.game_end_won, R.raw.game_end_lost, R.raw.game_end_tied};
+            for (int i = 0; i < prompts.length; i++) {
+                invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, prompts[i]);
+                assertEquals("clip:" + resources[i], speech.queued.get(i));
+                assertEquals(android.speech.tts.TextToSpeech.QUEUE_FLUSH,
+                        (int) speech.queueModes.get(i));
+            }
+            assertEquals(speech.normal, speech.current);
+        });
+    }
+
+    @Test
+    public void rejectedGameEndClipFallsBackToNormalSpeech() {
+        withRecordingSpeech((activity, speech) -> {
+            set(activity, "mBundledAnnouncementAudioKeys", BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US));
+            speech.rejectClip = true;
+            invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.game_end_won_voice_prompt);
+            assertEquals(Collections.singletonList("normal:1.0:"
+                    + activity.getString(R.string.game_end_won_voice_prompt)), speech.queued);
+            assertEquals(Collections.singletonList(android.speech.tts.TextToSpeech.QUEUE_FLUSH),
+                    speech.queueModes);
+            assertEquals(speech.normal, speech.current);
+        });
+    }
+
+    @Test
+    public void bundledRegistrationCoversJokesAndGameEndAndSkipsTranslations() {
+        withRecordingSpeech((activity, speech) -> {
+            Map<String, String> keys = BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US);
+            assertEquals(23, keys.size());
+            assertEquals(23, speech.clips.size());
+            assertTrue(keys.containsKey(activity.getString(R.string.game_end_won_voice_prompt)));
+            assertTrue(keys.containsKey(activity.getString(R.string.game_end_lost_voice_prompt)));
+            assertTrue(keys.containsKey(activity.getString(R.string.game_end_tied_voice_prompt)));
             assertFalse(keys.containsKey(activity.getString(R.string.enemy_destroyed_voice_prompt)));
             speech.clips.clear();
-            assertTrue(KillStreakAudio.register(activity, speech, java.util.Locale.GERMANY).isEmpty());
+            assertTrue(BundledAnnouncementAudio.register(activity, speech, java.util.Locale.GERMANY).isEmpty());
             assertTrue(speech.clips.isEmpty());
         });
     }
@@ -1372,20 +1406,20 @@ public class GameplayRegressionTest {
     @Test
     public void rejectedBundledClipFallsBackToRealTextInsteadOfItsPrivateKey() {
         withRecordingSpeech((activity, speech) -> {
-            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            set(activity, "mBundledAnnouncementAudioKeys", BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US));
             set(activity, "mKillStreakSpeechVoice", null);
             speech.rejectClip = true;
             invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
             assertEquals(Arrays.asList("silence:1000", "normal:1.0:"
                     + activity.getString(R.string.kill_streak_2_voice_prompt)), speech.queued);
-            assertEquals(19, ((Map<?, ?>) get(activity, "mKillStreakAudioKeys")).size());
+            assertEquals(22, ((Map<?, ?>) get(activity, "mBundledAnnouncementAudioKeys")).size());
         });
     }
 
     @Test
     public void throwingBundledClipStillSpeaksTheJokeAndNextInstruction() {
         withRecordingSpeech((activity, speech) -> {
-            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            set(activity, "mBundledAnnouncementAudioKeys", BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US));
             set(activity, "mKillStreakSpeechVoice", null);
             speech.throwOnClip = true;
             invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, R.string.kill_streak_2_voice_prompt);
@@ -1400,8 +1434,8 @@ public class GameplayRegressionTest {
     public void oneRejectedRegistrationDoesNotLoseOtherRecordings() {
         withRecordingSpeech((activity, speech) -> {
             speech.rejectRegistration = R.raw.kill_streak_2;
-            Map<String, String> keys = KillStreakAudio.register(activity, speech, java.util.Locale.US);
-            assertEquals(19, keys.size());
+            Map<String, String> keys = BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US);
+            assertEquals(22, keys.size());
             assertFalse(keys.containsKey(activity.getString(R.string.kill_streak_2_voice_prompt)));
             assertTrue(keys.containsKey(activity.getString(R.string.kill_streak_3_voice_prompt)));
         });
@@ -1410,7 +1444,7 @@ public class GameplayRegressionTest {
     @Test
     public void normalSpeechWithMatchingWordsDoesNotUseTheKillStreakRecording() {
         withRecordingSpeech((activity, speech) -> {
-            set(activity, "mKillStreakAudioKeys", KillStreakAudio.register(activity, speech, java.util.Locale.US));
+            set(activity, "mBundledAnnouncementAudioKeys", BundledAnnouncementAudio.register(activity, speech, java.util.Locale.US));
             String text = activity.getString(R.string.kill_streak_2_voice_prompt);
             invoke(activity, "speakGameText", new Class<?>[]{android.speech.tts.TextToSpeech.class,
                     CharSequence.class, float.class, int.class, String.class, boolean.class},

@@ -16,15 +16,17 @@ and retains the project's Apache-2.0 license.
 
 ### Shared lobby (1.23)
 
-Open the app on every phone connected to the same Wi-Fi/AP. The new lobby
-automatically discovers the host, joins it, and assigns an unused player ID.
-You no longer need to pair a gun or separately choose Create/Join first.
+Open the app on every phone and pair each gun first. Wi-Fi connects
+automatically when configured; if needed, use the Wi-Fi button to join the same
+network/AP. The lobby automatically discovers the host, joins it, and assigns
+an unused player ID. You do not need to separately choose Create/Join.
 If no host exists, a phone creates one after a short discovery period.
 Simultaneous phone hosts converge on the lowest IPv4 address; a laptop or
 dedicated host takes priority while the lobby is idle. An already running
 match is never migrated to another host.
 
-The screen separates Wi-Fi, your player, match rules, and the shared roster.
+The screen presents gun and player setup first, then Wi-Fi status, match rules,
+and the shared roster.
 The bottom action always stays visible and tells you the next step. Connect
 your gun, edit your name, and optionally use Team or Scan QR to choose your
 team. Automatic assignment balances ordinary team games. Every player sees
@@ -72,18 +74,17 @@ to prevent voltage-rebound cycling; reconnect with a healthy pack (initial
 smoothed reading at least 4.8 V) to restore normal recoil. This saves motor power
 but does not shut down the gun or make an empty pack safe to keep using.
 
-### Kill-streak voice
+### Recorded announcements
 
-English kill-streak jokes use bundled recordings of Kokoro's British male
-"George" voice. No voice-pack install, Internet connection, or on-phone neural
-speech processing is needed. "Enemy Destroyed"
-keeps the normal voice at 150% speed, followed by the existing one-second
-pause before the joke. Countdown, reload, respawn, and other announcements
-keep their usual voice. Non-English prompts keep their original language.
+English game over results and all 20 kill streak lines use clips extracted
+from the supplied Roman recording. "Enemy Destroyed" keeps the normal voice
+at 150% speed, followed by the existing one-second pause before the streak
+line. Countdown, reload, respawn, and other announcements keep their usual
+voice. Non-English prompts keep their original language.
 
-All 20 jokes are included in the APK and share the normal speech queue. If a
-recording cannot be registered or queued, the joke falls back to system speech.
-See [voice sources, generation, and checks](docs/british-male-voice.md).
+The 23 clips share the normal speech queue. If a recording cannot be
+registered or queued, its line falls back to system speech. See
+[audio source, extraction, and checks](docs/announcement-audio.md).
 
 ### Ending, leaving, or joining a round (1.27)
 
@@ -103,7 +104,7 @@ host leaves, the remaining phone with the lowest player ID takes over the
 game-state broadcasts and the join service. Leaving sits you out until you
 scan back in, or until the next round opens.
 
-To join a game already running, connect to its Wi-Fi and pair your gun, then
+To join a game already running, pair your gun and connect to its Wi-Fi, then
 tap **Scan team QR to join**. Scan the team's existing respawn/base code
 (`SIMPLECOIL:RESPAWN:1` through `SIMPLECOIL:RESPAWN:4`, as appropriate for the
 mode). The host assigns an available slot on that team. New players and
@@ -438,10 +439,10 @@ adb shell am instrument -w com.simplecoil.simplecoil.test/androidx.test.runner.A
 1. Install the same build on every participating phone.
 2. Grant the Bluetooth, location, and (for checkpoint respawns) Camera
    permissions requested by the app.
-3. Join every phone to the same Wi-Fi network and verify the host has a usable
-   local IPv4 address.
-4. Select unique player IDs, connect the supported BLE hardware, and then join
-   the host.
+3. Pair each phone with its supported BLE gun and set the player name or team.
+4. Let Wi-Fi connect automatically, or use the Wi-Fi button if needed. Verify
+   all phones are on the same network and the host has a local IPv4 address.
+   The lobby joins automatically.
 5. Wait for clock synchronization before pressing Start; if prompted, wait a
    moment and try again.
 
