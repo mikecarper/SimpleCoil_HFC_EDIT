@@ -105,6 +105,8 @@ public final class LaptopHost {
     private static final long EARLIEST_GPS_UTC_MS = 1_577_836_800_000L; // 2020-01-01
     private static final long HIT_ENEMY_GPS_REVEAL_MS = 10_000;
     private static final long LASER_LIFETIME_MS = 1_500;
+    private static final long GRENADE_BURST_WINDOW_MS = 2_000;
+    private static final long GRENADE_MARKER_LIFETIME_MS = 8_000;
     private static final long JOIN_ASSIGNMENT_TIMEOUT_MS = 10_000;
     private static final long BALANCED_QR_CHECK_IN_TIMEOUT_MS = 90_000;
     // Match the dedicated phone host's practical heartbeat window. A Wi-Fi
@@ -143,6 +145,7 @@ public final class LaptopHost {
     private final Map<InetAddress, PendingAssignment> pendingAssignments = new HashMap<>();
     private final Map<Integer, Integer> grenadeOwners = new HashMap<>();
     private final Deque<LaserEvent> lasers = new ArrayDeque<>();
+    private final Deque<GrenadeBurst> grenadeBursts = new ArrayDeque<>();
     private final StateRow[] gossipState = new StateRow[MAX_PLAYERS + 1];
     private final long[] lastGossipPacketSequence = new long[MAX_PLAYERS + 1];
     // A compact combat event can beat its sender's first full state row to the
@@ -820,8 +823,28 @@ public final class LaptopHost {
                         || !areOpponents(attacker.id, reporter.id))
                     return;
                 attacker.hits = addScore(attacker.hits, 1);
+                reporter.lastGrenadeHitAt = 0;
                 addLaserLocked(attacker, reporter, "hit");
                 grantEnemyGpsRevealLocked(attacker.id, reporter.id);
+            } else if ("grenadehit".equals(event)) {
+                int grenadeID = intValue(json.get("grenadeID"), 0);
+                if (grenadeID <= 0 || grenadeID >= MAX_GRENADE_IDS)
+                    return;
+                if (!addGrenadeHitLocked(grenadeID, reporter))
+                    return;
+                int ownerID = grenadeOwners.getOrDefault(grenadeID, 0);
+                Player owner = players.get(ownerID);
+                if (owner != null && owner != reporter && owner.connected
+                        && areOpponents(owner.id, reporter.id)) {
+                    owner.hits = addScore(owner.hits, 1);
+                    reporter.lastGrenadeHitAt = elapsedMillis();
+                    reporter.lastGrenadeOwnerID = ownerID;
+                    // The elimination UDP event can reach the host before
+                    // this TCP telemetry. Remove its shooter-to-victim line.
+                    lasers.removeIf(laser -> laser.shooterID == ownerID
+                            && laser.targetID == reporter.id && "kill".equals(laser.kind)
+                            && elapsedMillis() - laser.createdAt <= GRENADE_BURST_WINDOW_MS);
+                }
             }
         }
     }
@@ -1109,7 +1132,10 @@ public final class LaptopHost {
             victim.eliminated = true;
             victim.deaths = addScore(victim.deaths, 1);
             attacker.kills = addScore(attacker.kills, 1);
-            addLaserLocked(attacker, victim, "kill");
+            if (victim.lastGrenadeOwnerID != attackerID
+                    || elapsedMillis() - victim.lastGrenadeHitAt > GRENADE_BURST_WINDOW_MS)
+                addLaserLocked(attacker, victim, "kill");
+            victim.lastGrenadeHitAt = 0;
             // A death ends the short confirmed-hit map reveal immediately so
             // a respawn cannot inherit an opponent's last known position.
             clearEnemyGpsRevealsForPlayerLocked(victim.id);
@@ -1199,6 +1225,7 @@ public final class LaptopHost {
                     && (balancedCheckInDeadline == 0 || elapsedMillis() < balancedCheckInDeadline))
                 return StartResult.waitingForQr();
             roundID++;
+            grenadeBursts.clear();
             roundToken = UUID.randomUUID().toString();
             roundRoster = new RoundRoster(roundToken);
             for (ClientConnection client : recipients) {
@@ -1231,6 +1258,8 @@ public final class LaptopHost {
                 player.deaths = 0;
                 player.shots = 0;
                 player.hits = 0;
+                player.lastGrenadeHitAt = 0;
+                player.lastGrenadeOwnerID = 0;
                 player.awaitingRespawn = false;
                 player.eliminated = false;
             }
@@ -1842,6 +1871,38 @@ public final class LaptopHost {
             lasers.removeFirst();
     }
 
+    private boolean addGrenadeHitLocked(int grenadeID, Player target) {
+        long now = elapsedMillis();
+        while (!grenadeBursts.isEmpty()
+                && now - grenadeBursts.peekFirst().firstAt > GRENADE_MARKER_LIFETIME_MS)
+            grenadeBursts.removeFirst();
+        GrenadeBurst burst = null;
+        for (java.util.Iterator<GrenadeBurst> it = grenadeBursts.descendingIterator(); it.hasNext();) {
+            GrenadeBurst candidate = it.next();
+            if (candidate.grenadeID == grenadeID
+                    && now - candidate.firstAt <= GRENADE_BURST_WINDOW_MS) {
+                burst = candidate;
+                break;
+            }
+        }
+        if (burst == null) {
+            burst = new GrenadeBurst(grenadeID, now);
+            grenadeBursts.addLast(burst);
+        }
+        // A burst counts each receiving player once. A GPS fix that predates
+        // the hit by too long cannot be used to estimate the grenade's center.
+        if (burst.hits.containsKey(target.id))
+            return false;
+        boolean fresh = target.lastGpsAt > 0 && now - target.lastGpsAt <= GPS_STALE_AFTER_MS
+                && validCoordinates(target.longitude, target.latitude);
+        burst.hits.put(target.id, new GrenadeHit(target.id,
+                fresh ? target.longitude : Double.NaN,
+                fresh ? target.latitude : Double.NaN));
+        while (grenadeBursts.size() > 30)
+            grenadeBursts.removeFirst();
+        return true;
+    }
+
     private Player playerForClientLocked(ClientConnection client) {
         Player player = players.get(client.playerID);
         return player != null && player.connection == client && player.connected
@@ -1891,6 +1952,7 @@ public final class LaptopHost {
         pendingAssignments.clear();
         grenadeOwners.clear();
         lasers.clear();
+        grenadeBursts.clear();
         enemyGpsRevealUntil.clear();
         gpsVisibilityRefreshPlayers.clear();
         balancedTeams = Collections.emptyMap();
@@ -2251,6 +2313,29 @@ public final class LaptopHost {
         }
     }
 
+    private static final class GrenadeHit {
+        final int playerID;
+        final double longitude;
+        final double latitude;
+
+        GrenadeHit(int playerID, double longitude, double latitude) {
+            this.playerID = playerID;
+            this.longitude = longitude;
+            this.latitude = latitude;
+        }
+    }
+
+    private static final class GrenadeBurst {
+        final int grenadeID;
+        final long firstAt;
+        final Map<Integer, GrenadeHit> hits = new LinkedHashMap<>();
+
+        GrenadeBurst(int grenadeID, long firstAt) {
+            this.grenadeID = grenadeID;
+            this.firstAt = firstAt;
+        }
+    }
+
     private static final class Player {
         final int id;
         String name;
@@ -2263,6 +2348,8 @@ public final class LaptopHost {
         double longitude = Double.NaN;
         double latitude = Double.NaN;
         long lastGpsAt;
+        long lastGrenadeHitAt;
+        int lastGrenadeOwnerID;
         boolean gpsDirty;
         int kills;
         int deaths;
@@ -2922,6 +3009,38 @@ public final class LaptopHost {
                 laserList.add(item);
             }
             state.put("lasers", laserList);
+
+            while (!grenadeBursts.isEmpty()
+                    && now - grenadeBursts.peekFirst().firstAt > GRENADE_MARKER_LIFETIME_MS)
+                grenadeBursts.removeFirst();
+            List<Object> burstList = new ArrayList<>();
+            for (GrenadeBurst burst : grenadeBursts) {
+                List<Object> hitList = new ArrayList<>();
+                double latitudeSum = 0;
+                double longitudeSinSum = 0;
+                double longitudeCosSum = 0;
+                for (GrenadeHit hit : burst.hits.values()) {
+                    if (!validCoordinates(hit.longitude, hit.latitude))
+                        continue;
+                    hitList.add(mapOf("playerID", hit.playerID,
+                            "longitude", hit.longitude, "latitude", hit.latitude));
+                    latitudeSum += hit.latitude;
+                    longitudeSinSum += Math.sin(Math.toRadians(hit.longitude));
+                    longitudeCosSum += Math.cos(Math.toRadians(hit.longitude));
+                }
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("grenadeID", burst.grenadeID);
+                item.put("hitCount", burst.hits.size());
+                item.put("ageMs", now - burst.firstAt);
+                item.put("hits", hitList);
+                if (hitList.size() >= 4) {
+                    item.put("centerLatitude", latitudeSum / hitList.size());
+                    item.put("centerLongitude", Math.toDegrees(
+                            Math.atan2(longitudeSinSum, longitudeCosSum)));
+                }
+                burstList.add(item);
+            }
+            state.put("grenadeBursts", burstList);
             return state;
         }
     }
@@ -3557,10 +3676,10 @@ public final class LaptopHost {
             <link rel="stylesheet" href="/assets/leaflet/leaflet.css">
             <style>
             :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:15px system-ui,sans-serif;overflow:hidden}header{height:60px;display:flex;align-items:center;gap:12px;padding:9px 14px;background:#111c27;border-bottom:1px solid #274257}h1{font-size:20px;margin:0;white-space:nowrap}#status{color:#b8c8d8;flex:1}button{border:0;border-radius:7px;padding:9px 12px;background:#267ec8;color:#fff;font:inherit;cursor:pointer}button.danger{background:#b83d46}button:disabled{opacity:.45;cursor:not-allowed}#map{width:100vw;height:calc(100vh - 60px);background-color:#0d1720;background-image:linear-gradient(#203445 1px,transparent 1px),linear-gradient(90deg,#203445 1px,transparent 1px);background-size:50px 50px}.legend{position:fixed;z-index:1000;right:16px;bottom:16px;max-width:340px;background:#101a25e8;border:1px solid #34516a;border-radius:8px;padding:10px;line-height:1.7}.swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.team1{background:#49a5ff}.team2{background:#ff5d67}#tile-status{color:#ffd98a;font-size:12px}#respawns:empty{display:none}#respawns{border-top:1px solid #34516a;margin-top:7px;padding-top:7px}.respawn{font-size:12px;padding:5px 7px;margin:3px 3px 0 0;background:#466c32}.player-label{background:#101a25e8;border:1px solid #7890a5;color:#fff;font-weight:700;box-shadow:none}.player-label:before{border-top-color:#7890a5}.leaflet-control-zoom a{background:#152332;color:#fff;border-color:#35516a}.leaflet-control-zoom a:hover{background:#22384b;color:#fff}@media(max-width:760px){header{gap:6px;padding:7px}h1{font-size:15px}#status{font-size:11px}button{padding:7px 8px;font-size:12px}}
-            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
+            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
             <script src="/assets/leaflet/leaflet.js"></script><script>
             const status=document.querySelector('#status'),start=document.querySelector('#start'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status'),lobbyPlayers=document.querySelector('#lobby-players');let lobbySignature='';
-            const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:false}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],fitted=false,mapConfig={maxZoom:19};
+            const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:false}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],grenadeLayers=[],fitted=false,mapConfig={maxZoom:19};
             function color(team){return team===1?'#49a5ff':team===2?'#ff5d67':`hsl(${(team*57)%360} 90% 63%)`}
             function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)}function ll(p){return[p.latitude,p.longitude]}
             async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tiles=L.tileLayer('/tiles/{z}/{x}/{y}.png',{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom,maxNativeZoom:mapConfig.maxZoom,noWrap:true,keepBuffer:4,updateWhenIdle:false}).addTo(map);let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent=`Offline map loaded (zoom ${mapConfig.minZoom}-${mapConfig.maxZoom})`}});tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.'}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
@@ -3572,7 +3691,8 @@ public final class LaptopHost {
             function fitPlayers(force){const points=(state?.players||[]).filter(valid).map(ll),maxZoom=Number.isFinite(mapConfig.maxZoom)?mapConfig.maxZoom:18;if(!points.length)return;if(points.length===1)map.setView(points[0],Math.min(18,maxZoom));else map.fitBounds(points,{padding:[70,70],maxZoom:Math.min(18,maxZoom)});if(force||!fitted)fitted=true}
             function drawPlayers(s){const visible=new Set();for(const p of s.players.filter(p=>!p.benched&&valid(p))){visible.add(p.id);let item=players.get(p.id);if(!item){const trail=L.polyline([],{color:color(p.team),weight:3,opacity:.48,interactive:false}).addTo(map);const marker=L.circleMarker(ll(p),{radius:11,color:'#fff',weight:2,fillColor:color(p.team),fillOpacity:1}).addTo(map).bindTooltip('',{permanent:true,direction:'top',className:'player-label',offset:[0,-9]});item={marker,trail};players.set(p.id,item)}const opacity=p.connected?1:.4;item.marker.setLatLng(ll(p)).setRadius(p.awaitingRespawn?8:11).setStyle({fillColor:color(p.team),opacity,fillOpacity:opacity});const label=document.createElement('span');label.textContent=`${p.name} #${p.id}${p.awaitingRespawn?' - RESPAWN':''}`;item.marker.setTooltipContent(label);item.trail.setStyle({color:color(p.team),opacity:.48*opacity});item.trail.setLatLngs((p.trail||[]).filter(valid).map(ll))}for(const [id,item] of players){if(visible.has(id))continue;map.removeLayer(item.marker);map.removeLayer(item.trail);players.delete(id)}}
             function drawLasers(s){for(const layer of laserLayers)map.removeLayer(layer);laserLayers=[];const byId=Object.fromEntries(s.players.filter(valid).map(p=>[p.id,p]));function point(event,prefix,fallback){const p={longitude:event[prefix+'Longitude'],latitude:event[prefix+'Latitude']};return valid(p)?p:fallback}for(const event of s.lasers||[]){const a=point(event,'shooter',byId[event.shooter]),b=point(event,'target',byId[event.target]);if(!valid(a)||!valid(b))continue;const kill=event.kind==='kill',opacity=Math.max(0,1-event.ageMs/1500);laserLayers.push(L.polyline([ll(a),ll(b)],{color:kill?'#ff3047':'#fff36b',weight:kill?7:5,opacity,interactive:false}).addTo(map))}}
-            function draw(s){status.textContent=label(s);start.disabled=!s.canStart;end.disabled=!['countdown','running'].includes(s.state);end.textContent=!end.disabled&&s.endVoteRequested?`End game (${s.endVoteCount}/2)`:'End game';drawRespawns(s);drawLobby(s);drawPlayers(s);drawLasers(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}
+            function drawGrenades(s){for(const layer of grenadeLayers)map.removeLayer(layer);grenadeLayers=[];for(const burst of s.grenadeBursts||[]){const opacity=Math.max(0,1-burst.ageMs/8000);for(const hit of burst.hits||[]){if(!valid(hit))continue;grenadeLayers.push(L.circleMarker(ll(hit),{radius:17,color:'#ff3047',weight:3,opacity,fillColor:'#ff3047',fillOpacity:.24*opacity,interactive:true}).addTo(map).bindTooltip(`Grenade #${burst.grenadeID} hit player #${hit.playerID}`))}const center={latitude:burst.centerLatitude,longitude:burst.centerLongitude};if(!valid(center))continue;grenadeLayers.push(L.circleMarker(ll(center),{radius:8,color:'#fff',weight:2,opacity,fillColor:'#ff3047',fillOpacity:opacity,interactive:true}).addTo(map).bindTooltip(`Estimated grenade #${burst.grenadeID} center (${burst.hits.length} mapped hits)`))}}
+            function draw(s){status.textContent=label(s);start.disabled=!s.canStart;end.disabled=!['countdown','running'].includes(s.state);end.textContent=!end.disabled&&s.endVoteRequested?`End game (${s.endVoteCount}/2)`:'End game';drawRespawns(s);drawLobby(s);drawPlayers(s);drawLasers(s);drawGrenades(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}
             async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();draw(state)}catch(e){status.textContent='Disconnected from laptop host.'}setTimeout(refresh,150)}setupTiles();refresh();
             </script></body></html>
             """;

@@ -3518,6 +3518,7 @@ public class UDPListenerService extends Service {
             mPendingPeerEndGame = null;
             resetPeerGameSequences();
             releaseGameplayWifiLocksLocked();
+            releaseMulticastLockLocked();
             clearJoinAssignments();
             keepListening = false;
             mReadyToScan = 0;
@@ -3579,7 +3580,9 @@ public class UDPListenerService extends Service {
 
     private void releaseGameplayWifiLocksLocked() {
         releaseWifiLockLocked();
-        releaseMulticastLockLocked();
+        // The UDP listener owns the multicast lock in the lobby too. Reusing
+        // its socket for hosting, joining, or handoff must keep beacons audible.
+        // stopListen() and the listener's finally block release that lock.
     }
 
     // Caller holds mListenerStateLock. Both locks are non-reference-counted so

@@ -75,6 +75,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private Button mEndGameButton = null;
     private Button mGameMasterRespawnButton = null;
     private Button mRespawnModeButton = null;
+    private Button mGrenadeDamageButton = null;
     private Button mStartGameButton = null;
     private TextView mGameLimitTV = null;
     private TextView mGameStatusTV = null;
@@ -94,6 +95,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private boolean mPreviousBalancedRandom;
     private boolean mPreviousBalancedRequireQr;
     private boolean mPreviousRespawnQrEnabled;
+    private int mPreviousGrenadeDamage;
     private boolean mPreviousOnlyServerSettings;
     private boolean mPreviousAllowPlayerSettings;
     private boolean mPreviousTournamentMode;
@@ -291,6 +293,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mPreviousBalancedRandom = globals.mBalancedRandom;
         mPreviousBalancedRequireQr = globals.mBalancedRequireQr;
         mPreviousRespawnQrEnabled = globals.mRespawnQrEnabled;
+        mPreviousGrenadeDamage = globals.mGrenadeDamage;
         mPreviousOnlyServerSettings = globals.mOnlyServerSettings;
         mPreviousAllowPlayerSettings = globals.mAllowPlayerSettings;
         mPreviousTournamentMode = globals.mTournamentMode;
@@ -361,6 +364,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                 FullscreenActivity.PREF_RESPAWN_QR_ENABLED, true);
         mRespawnModeButton = findViewById(R.id.respawn_mode_button);
         mRespawnModeButton.setOnClickListener(v -> showRespawnModeDialog());
+        mGrenadeDamageButton = findViewById(R.id.grenade_damage_button);
+        mGrenadeDamageButton.setOnClickListener(v -> showGrenadeDamageDialog());
         updateGameMasterRespawnButton();
         globals.mBossMode = FullscreenActivity.readBooleanPreference(sharedPreferences,
                 FullscreenActivity.PREF_BOSS_MODE, false);
@@ -373,6 +378,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         globals.resetInfectedPlayers();
         globals.mBossHunterCount = -1;
         globals.applyTournamentRules();
+        int savedGrenadeDamage = FullscreenActivity.readIntPreference(sharedPreferences,
+                FullscreenActivity.PREF_GRENADE_DAMAGE, Globals.DAMAGE_PER_HIT);
+        globals.mGrenadeDamage = Globals.isValidGrenadeDamage(savedGrenadeDamage)
+                ? savedGrenadeDamage : Globals.DAMAGE_PER_HIT;
+        updateGrenadeDamageButton();
         globals.mBalancedRandom = false;
         globals.clearBalancedAssignments();
         mGameModeButton.setText(globals.mBossMode ? R.string.game_mode_boss
@@ -511,6 +521,11 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         globals.mRespawnQrEnabled = sharedPreferences == null ? mPreviousRespawnQrEnabled
                 : FullscreenActivity.readBooleanPreference(sharedPreferences,
                 FullscreenActivity.PREF_RESPAWN_QR_ENABLED, mPreviousRespawnQrEnabled);
+        int savedGrenadeDamage = sharedPreferences == null ? mPreviousGrenadeDamage
+                : FullscreenActivity.readIntPreference(sharedPreferences,
+                FullscreenActivity.PREF_GRENADE_DAMAGE, mPreviousGrenadeDamage);
+        globals.mGrenadeDamage = Globals.isValidGrenadeDamage(savedGrenadeDamage)
+                ? savedGrenadeDamage : Globals.DAMAGE_PER_HIT;
         globals.clearBalancedAssignments();
         globals.mOnlyServerSettings = mPreviousOnlyServerSettings;
         globals.mAllowPlayerSettings = mPreviousAllowPlayerSettings;
@@ -1001,6 +1016,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         if (mTournamentModeSwitch != null)
             mTournamentModeSwitch.setEnabled(false);
         mGameLimitButton.setEnabled(false);
+        mGrenadeDamageButton.setEnabled(false);
         mGPSModeButton.setEnabled(false);
         mAllowJoinSwitch.setEnabled(!Globals.getInstance().mBalancedRandom
                 && !Globals.getInstance().mBossMode);
@@ -1070,6 +1086,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mTournamentModeSwitch.setEnabled(false);
         }
         mGameLimitButton.setEnabled(true);
+        mGrenadeDamageButton.setEnabled(true);
         mGPSModeButton.setEnabled(true);
         mAllowJoinSwitch.setEnabled(true);
         mGameStatusTV.setText(R.string.dedicated_game_waiting);
@@ -1250,6 +1267,36 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                             }
                             dialog.dismiss();
                         }).setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void updateGrenadeDamageButton() {
+        if (mGrenadeDamageButton != null)
+            mGrenadeDamageButton.setText(getString(R.string.grenade_damage_summary,
+                    -Globals.getInstance().mGrenadeDamage));
+    }
+
+    private void showGrenadeDamageDialog() {
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+            return;
+        final int[] values = {1, 2, 3, 5, 10, 15};
+        CharSequence[] choices = new CharSequence[values.length];
+        int selected = 0;
+        for (int i = 0; i < values.length; i++) {
+            choices[i] = getString(R.string.grenade_damage_choice, values[i]);
+            if (Globals.getInstance().mGrenadeDamage == -values[i]) selected = i;
+        }
+        new AlertDialog.Builder(this).setTitle(R.string.grenade_damage_rule)
+                .setSingleChoiceItems(choices, selected, (dialog, which) -> {
+                    if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {
+                        Globals.getInstance().mGrenadeDamage = -values[which];
+                        sharedPreferences.edit().putInt(FullscreenActivity.PREF_GRENADE_DAMAGE,
+                                -values[which]).apply();
+                        updateGrenadeDamageButton();
+                        if (mTcpServer != null)
+                            mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+                    }
+                    dialog.dismiss();
+                }).setNegativeButton(R.string.cancel, null).show();
     }
 
     private void showGameMasterRespawnDialog() {

@@ -2,10 +2,12 @@ package com.simplecoil.simplecoil;
 
 import android.graphics.Rect;
 import android.graphics.Bitmap;
+import android.content.SharedPreferences;
 import android.os.Handler;
 import android.view.View;
 import android.widget.TextView;
 import android.widget.LinearLayout;
+import androidx.appcompat.app.AlertDialog;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -18,9 +20,133 @@ import java.io.FileOutputStream;
 import java.util.HashMap;
 import java.util.Map;
 import static org.junit.Assert.*;
+import static androidx.test.espresso.Espresso.onView;
+import static androidx.test.espresso.action.ViewActions.click;
+import static androidx.test.espresso.matcher.ViewMatchers.withText;
 
 @RunWith(AndroidJUnit4.class)
 public class SharedLobbyUiRegressionTest {
+    @Test public void hostBannerConfirmsOptOutAndRemembersItAfterReopening() throws Exception {
+        SharedPreferences preferences = InstrumentationRegistry.getInstrumentation()
+                .getTargetContext().getSharedPreferences(FullscreenActivity.PREF_NAME, 0);
+        String key = FullscreenActivity.PREF_PHONE_HOSTING_ENABLED;
+        boolean hadSaved = preferences.contains(key);
+        boolean saved = preferences.getBoolean(key, true);
+        preferences.edit().putBoolean(key, true).commit();
+        Globals globals = Globals.getInstance();
+        globals.mGameState = Globals.GAME_STATE_NONE;
+        java.net.InetAddress local = java.net.InetAddress.getByName("192.168.1.20");
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            Object[] originalServer = new Object[1];
+            RecordingServer[] server = new RecordingServer[1];
+            try {
+                scenario.onActivity(activity -> {
+                    ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                    invoke(activity, "leaveSharedLobby");
+                    originalServer[0] = get(activity, "mTcpServer");
+                    server[0] = new RecordingServer();
+                    set(activity, "mTcpServer", server[0]);
+                    set(activity, "mUseNetwork", true);
+                    set(activity, "mIsServer", true);
+                    set(activity, "mReady", true);
+                    set(activity, "mLobbyJoined", true);
+                    invoke(activity, "renderLobby");
+                    View banner = activity.findViewById(R.id.lobby_host_banner);
+                    assertTrue(banner.isClickable());
+                    banner.performClick();
+                    AlertDialog dialog = (AlertDialog) get(activity, "mStopHostingDialog");
+                    assertNotNull(dialog);
+                    assertTrue(dialog.isShowing());
+                });
+                onView(withText(R.string.lobby_keep_hosting)).perform(click());
+                scenario.onActivity(activity -> {
+                    assertTrue((Boolean) get(activity, "mIsServer"));
+                    assertTrue(canHost(activity, local, android.os.SystemClock.elapsedRealtime()));
+                    assertFalse(server[0].cancelled);
+
+                    activity.findViewById(R.id.lobby_host_banner).performClick();
+                    server[0].pendingStart = true;
+                });
+                onView(withText(R.string.lobby_stop_hosting)).perform(click());
+                scenario.onActivity(activity -> {
+                    assertTrue("Stale confirmation stopped a committed round",
+                            (Boolean) get(activity, "mIsServer"));
+                    assertFalse(server[0].cancelled);
+                    assertTrue(preferences.getBoolean(key, false));
+                    server[0].pendingStart = false;
+
+                    activity.findViewById(R.id.lobby_host_banner).performClick();
+                });
+                onView(withText(R.string.lobby_stop_hosting)).perform(click());
+                scenario.onActivity(activity -> {
+                    assertTrue(server[0].cancelled);
+                    assertFalse((Boolean) get(activity, "mIsServer"));
+                    assertFalse((Boolean) get(activity, "mReady"));
+                    assertTrue("Stopping hosting disabled shared Wi-Fi play",
+                            (Boolean) get(activity, "mUseNetwork"));
+                    assertFalse(canHost(activity, local, android.os.SystemClock.elapsedRealtime() + 60_000));
+                    assertFalse(preferences.getBoolean(key, true));
+                    assertEquals(View.GONE, activity.findViewById(R.id.lobby_host_banner).getVisibility());
+                });
+            } finally {
+                scenario.onActivity(activity -> {
+                    set(activity, "mTcpServer", originalServer[0]);
+                    if (server[0] != null) server[0].onDestroy();
+                });
+            }
+            scenario.recreate();
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                assertFalse("Reopening the app enabled hosting again",
+                        (Boolean) get(activity, "mPhoneHostingEnabled"));
+                assertFalse(canHost(activity, local, android.os.SystemClock.elapsedRealtime()));
+                invoke(activity, "setPhoneHostingEnabled", new Class<?>[]{boolean.class}, true);
+                ((SharedLobby) get(activity, "mSharedLobby")).clear();
+                assertTrue(canHost(activity, local, android.os.SystemClock.elapsedRealtime()));
+                assertTrue(preferences.getBoolean(key, false));
+            });
+        } finally {
+            SharedPreferences.Editor editor = preferences.edit();
+            if (hadSaved) editor.putBoolean(key, saved);
+            else editor.remove(key);
+            editor.commit();
+            globals.mGameState = Globals.GAME_STATE_NONE;
+        }
+    }
+
+    @Test public void matchOptionsSetAndShowGrenadeDamage() {
+        SharedPreferences preferences = InstrumentationRegistry.getInstrumentation()
+                .getTargetContext().getSharedPreferences(FullscreenActivity.PREF_NAME, 0);
+        boolean hadSaved = preferences.contains(FullscreenActivity.PREF_GRENADE_DAMAGE);
+        int saved = preferences.getInt(FullscreenActivity.PREF_GRENADE_DAMAGE,
+                Globals.DAMAGE_PER_HIT);
+        Globals globals = Globals.getInstance();
+        int previous = globals.mGrenadeDamage;
+        globals.mGameState = Globals.GAME_STATE_NONE;
+        try (ActivityScenario<FullscreenActivity> scenario =
+                     ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                set(activity, "mReady", false);
+                invoke(activity, "showLobbyMatchOptions");
+            });
+            onView(withText(R.string.grenade_damage_rule)).perform(click());
+            onView(withText(InstrumentationRegistry.getInstrumentation().getTargetContext()
+                    .getString(R.string.grenade_damage_choice, 5))).perform(click());
+            scenario.onActivity(activity -> {
+                assertEquals(-5, globals.mGrenadeDamage);
+                assertTrue(((TextView) activity.findViewById(R.id.lobby_rules))
+                        .getText().toString().contains(activity.getString(
+                                R.string.grenade_damage_summary, 5)));
+            });
+        } finally {
+            SharedPreferences.Editor editor = preferences.edit();
+            if (hadSaved) editor.putInt(FullscreenActivity.PREF_GRENADE_DAMAGE, saved);
+            else editor.remove(FullscreenActivity.PREF_GRENADE_DAMAGE);
+            editor.commit();
+            globals.mGrenadeDamage = previous;
+        }
+    }
+
     @Test public void manualHostControlCannotOverrideALaptopOrRunningRound() throws Exception {
         Globals g = Globals.getInstance();
         g.mGameState = Globals.GAME_STATE_NONE;
@@ -31,6 +157,7 @@ public class SharedLobbyUiRegressionTest {
                 ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
                 invoke(activity, "leaveSharedLobby");
                 set(activity, "mUseNetwork", true);
+                set(activity, "mPhoneHostingEnabled", true);
                 long now = android.os.SystemClock.elapsedRealtime();
                 SharedLobby directory = (SharedLobby) get(activity, "mSharedLobby");
                 directory.observe(new SharedLobby.Host(remote, SharedLobby.Kind.AUTO_PHONE, false, now, 50_000));
@@ -432,6 +559,8 @@ public class SharedLobbyUiRegressionTest {
     private static class RecordingServer extends TcpServer {
         boolean cancelled;
         boolean stopped;
+        boolean pendingStart;
+        @Override boolean hasPendingOrAnnouncedStart() { return pendingStart; }
         @Override public void cancelServer() { cancelled = true; }
         @Override public void stopTcpServer() { stopped = true; }
     }
@@ -510,6 +639,7 @@ public class SharedLobbyUiRegressionTest {
                 assertEquals(View.VISIBLE, activity.findViewById(R.id.lobby_panel).getVisibility());
                 assertEquals(View.GONE, activity.findViewById(R.id.connect_layout).getVisibility());
                 assertEquals(View.GONE, activity.findViewById(R.id.play_layout).getVisibility());
+                assertEquals(View.GONE, activity.findViewById(R.id.map_fragment).getVisibility());
                 assertEquals(activity.getString(R.string.lobby_gun_action),
                         ((TextView) activity.findViewById(R.id.lobby_primary_button)).getText().toString());
             });
@@ -524,10 +654,12 @@ public class SharedLobbyUiRegressionTest {
                 invoke(activity, "renderLobby");
                 assertEquals(View.GONE, dock.getVisibility());
                 assertEquals(View.VISIBLE, activity.findViewById(R.id.play_layout).getVisibility());
+                assertEquals(View.VISIBLE, activity.findViewById(R.id.map_fragment).getVisibility());
                 assertEquals(0, activity.findViewById(R.id.scrollView).getPaddingBottom());
                 Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
                 invoke(activity, "renderLobby");
                 assertEquals(View.VISIBLE, dock.getVisibility());
+                assertEquals(View.GONE, activity.findViewById(R.id.map_fragment).getVisibility());
             });
         } finally { Globals.getInstance().mGameState = Globals.GAME_STATE_NONE; }
     }

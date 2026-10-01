@@ -246,6 +246,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private CountDownTimer mConnectFailTimer = null;
     private CountDownTimer mGameInviteTimer = null;
     private AlertDialog mGameExitDialog;
+    private AlertDialog mStopHostingDialog;
     private AlertDialog mLocationSettingsDialog;
     private boolean mLocationSettingsPromptShown;
     private long mGameControlGeneration;
@@ -309,6 +310,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private volatile boolean mConnected = false;
     private boolean mCommunicating = false; // Used to make sure that we start receiving telemetry data after initial connection
     private String mDeviceAddress = ""; // MAC address of the tagger
+    private static final long GUN_RECONNECT_INTERVAL_MS = 5_000L;
+    private Runnable mPrimaryReconnectRunnable;
+    private boolean mPrimaryReconnectActive;
+    private long mLastPrimaryConnectAttemptAt;
+    private boolean mGrenadePairingInProgress;
+    private Runnable mGrenadePairingTimeout;
+    private byte mPendingGrenadeID;
+    private Runnable mGrenadeConfirmTimeout;
     private String mSecondaryDeviceAddress = "";
     private ServiceConnection mSecondaryBLEServiceConnection;
     private BluetoothLeService mSecondaryBluetoothLeService;
@@ -336,7 +345,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private Runnable mSecondaryScanFinish;
     private long mSecondaryTeamCommandAt;
     private Runnable mSecondaryReconnectRunnable;
-    private int mSecondaryReconnectAttempts;
     // A first-time scan must not connect to whichever nearby blaster happens to
     // advertise first. Collect viable SRG1 devices briefly, then use a held
     // trigger notification to identify the player's gun if there is a choice.
@@ -667,6 +675,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     public static final String PREF_INFECTION_MODE = "InfectionMode";
     public static final String PREF_POWERUP_QR_REQUIRED = "PowerupQrRequired";
     public static final String PREF_RESPAWN_QR_ENABLED = "RespawnQrEnabled";
+    public static final String PREF_GRENADE_DAMAGE = "GrenadeDamage";
+    static final String PREF_PHONE_HOSTING_ENABLED = "PhoneHostingEnabled";
     public static final String PREF_LIMIT_TIME = "TimeLimit";
     public static final String PREF_LIMIT_LIVES = "LivesLimit";
     public static final String PREF_LIMIT_SCORE = "ScoreLimit";
@@ -722,6 +732,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void restoreSavedProfile() {
+        mPhoneHostingEnabled = readBooleanPreference(sharedPreferences, PREF_PHONE_HOSTING_ENABLED, true);
         String savedPlayerName = readStringPreference(sharedPreferences, PREF_PLAYER_NAME, DEFAULT_PLAYER_NAME);
         String playerName = normalizePlayerName(savedPlayerName);
         String savedDeviceAddress = readStringPreference(sharedPreferences, PREF_DEVICE_ADDRESS, "");
@@ -787,6 +798,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (mBLEServiceConnection != this || !mBLEServiceBound)
                     return;
                 mBluetoothLeService = null;
+                handleDisconnect();
             }
         };
     }
@@ -807,6 +819,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     Log.w(TAG, "Unable to connect second boss gun");
                     resetSecondaryBluetoothServices();
                 }
+                scheduleSecondaryReconnect();
                 updateSecondGunControls();
             }
 
@@ -814,9 +827,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (mSecondaryBLEServiceConnection != this)
                     return;
                 mSecondaryBluetoothLeService = null;
-                mSecondaryConnected = false;
-                mSecondaryCommunicating = false;
-                updateSecondGunControls();
+                resetSecondaryBluetoothServices();
+                scheduleSecondaryReconnect();
             }
         };
         mSecondaryBLEServiceBound = bindService(
@@ -832,7 +844,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mWeaponPairingHandler.removeCallbacks(mSecondaryReconnectRunnable);
             mSecondaryReconnectRunnable = null;
         }
-        mSecondaryReconnectAttempts = 0;
         if (mSecondaryReloadTimer != null) {
             mSecondaryReloadTimer.cancel();
             mSecondaryReloadTimer = null;
@@ -864,18 +875,23 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void scheduleSecondaryReconnect() {
         if (mSecondaryReconnectRunnable != null || !mActivityResumed
                 || !isLocalBoss() || mSecondaryDeviceAddress.isEmpty()
-                || mSecondaryReconnectAttempts >= 5)
+                || mSecondaryDeviceAddress.equals(mDeviceAddress) || mSecondaryConnected
+                || isFinishing() || isDestroyed())
             return;
         mSecondaryReconnectRunnable = () -> {
             mSecondaryReconnectRunnable = null;
             if (!mActivityResumed || !isLocalBoss() || mSecondaryConnected
-                    || mSecondaryBluetoothLeService == null)
+                    || mSecondaryDeviceAddress.isEmpty() || isFinishing() || isDestroyed())
                 return;
-            mSecondaryReconnectAttempts++;
-            if (!mSecondaryBluetoothLeService.connect(mSecondaryDeviceAddress))
-                scheduleSecondaryReconnect();
+            if (mSecondaryBluetoothLeService == null) {
+                setupSecondaryBLEServiceConnection();
+            } else if (!mSecondaryBluetoothLeService.connect(mSecondaryDeviceAddress)) {
+                resetSecondaryBluetoothServices();
+                setupSecondaryBLEServiceConnection();
+            }
+            scheduleSecondaryReconnect();
         };
-        mWeaponPairingHandler.postDelayed(mSecondaryReconnectRunnable, 2000);
+        mWeaponPairingHandler.postDelayed(mSecondaryReconnectRunnable, GUN_RECONNECT_INTERVAL_MS);
     }
 
     // Code to manage Service lifecycle.
@@ -939,6 +955,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean mLobbyTakeoverPending;
     private long mResumePeerHostSince = -1;
     private boolean mManualPhoneHost;
+    private boolean mPhoneHostingEnabled = true;
     private long mManualHostSelectedAt = -1;
     private long mLobbyConnectionDeadline;
     private InetAddress mLobbyTarget;
@@ -973,7 +990,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         updateLobbyContentInset());
         findViewById(R.id.lobby_wifi_button).setOnClickListener(v -> showLobbyWifiOptions());
         findViewById(R.id.lobby_host_button).setOnClickListener(v -> toggleManualPhoneHost());
+        findViewById(R.id.lobby_host_banner).setOnClickListener(v -> showStopHostingDialog());
         findViewById(R.id.lobby_name_button).setOnClickListener(v -> requestPlayerName());
+        findViewById(R.id.lobby_grenade_confirm_button).setOnClickListener(v -> confirmGrenadePairing());
         findViewById(R.id.lobby_gun_button).setOnClickListener(v -> {
             if (mCommunicating) showLobbyEquipment();
             else toggleLobbyPairing();
@@ -1007,12 +1026,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private boolean isLobbyPairingBusy() {
-        return !mCommunicating && (mScanning || mConnected || mTriggerPairingActive
+        return !mCommunicating && (mPrimaryReconnectActive || mScanning || mConnected || mTriggerPairingActive
                 || mCollectingNewWeaponCandidates);
     }
 
     private void toggleLobbyPairing() {
         if (isLobbyPairingBusy()) {
+            cancelPrimaryReconnect();
             cancelNewWeaponPairing();
             returnFromNewWeaponPairing();
         } else {
@@ -1032,22 +1052,57 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void showLobbyWifiOptions() {
-        new AlertDialog.Builder(this).setTitle(R.string.lobby_connection_label)
+        new AlertDialog.Builder(this).setTitle(R.string.lobby_connection_options)
                 .setItems(new String[]{getString(R.string.lobby_wifi_settings),
-                        getString(R.string.lobby_phone_hotspot), getString(R.string.lobby_retry)},
+                        getString(R.string.lobby_phone_hotspot), getString(R.string.lobby_retry),
+                        getString(R.string.lobby_practice_no_wifi)},
                         (dialog, which) -> {
-                            mUseNetwork = true;
-                            mUseHubAutoJoin = which != 1;
-                            mPhoneHubMode = which == 1;
-                            mLobbyNotice = null;
+                            if (which == 3) {
+                                setLobbyPracticeMode();
+                                return;
+                            }
+                            setLobbyNetworkMode(which == 1);
                             if (which == 0)
                                 startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS));
                             else if (which == 1)
                                 openPhoneHotspotSettings();
                             else if (mRecoilWifiAutoJoiner != null)
                                 mRecoilWifiAutoJoiner.scanAndJoinNow();
-                            startGameInviteListening();
                         }).setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void setLobbyPracticeMode() {
+        leaveSharedLobby();
+        clearManualPhoneHost();
+        mUseNetwork = false;
+        mUseHubAutoJoin = false;
+        mPhoneHubMode = false;
+        mLobbyNotice = null;
+        if (mGameInviteDialog != null)
+            dismissGameInvite(mGameInviteDialog, mPendingGameInviteID, true);
+        if (mRecoilWifiAutoJoiner != null)
+            mRecoilWifiAutoJoiner.stop();
+        cancelNetworkOptionsWifiWait();
+        mUseNetworkingButton.setText(R.string.use_network_button);
+        displayAllNetworkingOptions(false);
+        setNetworkMenu(NETWORK_TYPE_ENABLED);
+        renderLobby();
+    }
+
+    private void setLobbyNetworkMode(boolean phoneHub) {
+        mUseNetwork = true;
+        mUseHubAutoJoin = !phoneHub;
+        mPhoneHubMode = phoneHub;
+        mLobbyNotice = null;
+        if (mRecoilWifiAutoJoiner != null) {
+            if (mUseHubAutoJoin) mRecoilWifiAutoJoiner.start();
+            else mRecoilWifiAutoJoiner.stop();
+        }
+        mUseNetworkingButton.setText(R.string.network_menu_button);
+        displayAllNetworkingOptions(true);
+        setNetworkMenu(NETWORK_TYPE_ENABLED);
+        startGameInviteListening();
+        renderLobby();
     }
 
     private void showLobbyEquipment() {
@@ -1081,10 +1136,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         new AlertDialog.Builder(this).setTitle(R.string.lobby_match_options)
                 .setItems(new String[]{getString(R.string.game_limit_button),
                         mPowerupSettingsButton.getText().toString(),
-                        getString(R.string.lobby_range), getString(R.string.respawn_mode_title)}, (dialog, which) -> {
+                        getString(R.string.lobby_range), getString(R.string.respawn_mode_title),
+                        getString(R.string.grenade_damage_rule)}, (dialog, which) -> {
                     if (which == 0) requestGameLimit();
                     else if (which == 1) showPowerupSettingsMenu(findViewById(R.id.lobby_rules_button));
                     else if (which == 3) showRespawnModeMenu();
+                    else if (which == 4) showGrenadeDamageMenu();
                     else {
                         PopupMenu popup = new PopupMenu(this, findViewById(R.id.lobby_rules_button));
                         popup.inflate(R.menu.firing_mode_menu);
@@ -1093,6 +1150,28 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         popup.setOnMenuItemClickListener(this);
                         popup.show();
                     }
+                }).setNegativeButton(R.string.cancel, null).show();
+    }
+
+    private void showGrenadeDamageMenu() {
+        if (!canChangeGameModeInLobby()) return;
+        final int[] values = {1, 2, 3, 5, 10, 15};
+        CharSequence[] choices = new CharSequence[values.length];
+        int selected = 0;
+        for (int i = 0; i < values.length; i++) {
+            choices[i] = getString(R.string.grenade_damage_choice, values[i]);
+            if (Globals.getInstance().mGrenadeDamage == -values[i]) selected = i;
+        }
+        new AlertDialog.Builder(this).setTitle(R.string.grenade_damage_rule)
+                .setSingleChoiceItems(choices, selected, (dialog, which) -> {
+                    if (canChangeGameModeInLobby()) {
+                        Globals.getInstance().mGrenadeDamage = -values[which];
+                        sharedPreferences.edit().putInt(PREF_GRENADE_DAMAGE, -values[which]).apply();
+                        if (mIsServer && mTcpServer != null)
+                            mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+                        renderLobby();
+                    }
+                    dialog.dismiss();
                 }).setNegativeButton(R.string.cancel, null).show();
     }
 
@@ -1105,13 +1184,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     if (which == 0) showLobbyEquipment();
                     else if (which == 1) requestServerIP();
                     else if (which == 2) {
-                        boolean enable = !mUseNetwork;
-                        leaveSharedLobby();
-                        clearManualPhoneHost();
-                        mUseNetwork = enable;
-                        mUseHubAutoJoin = enable;
-                        if (enable) startGameInviteListening();
-                        renderLobby();
+                        if (mUseNetwork) setLobbyPracticeMode();
+                        else setLobbyNetworkMode(false);
                     } else {
                         leaveSharedLobby();
                         clearManualPhoneHost();
@@ -1329,7 +1403,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private boolean canCreatePhoneLobby(InetAddress local, long now) {
-        if (local == null || mSharedLobby.isBackedOff(local, now)) return false;
+        if (!mPhoneHostingEnabled || local == null || mSharedLobby.isBackedOff(local, now)) return false;
         SharedLobby.Host host = mSharedLobby.best(now);
         if (host == null || host.address.equals(local)) return true;
         if (host.playing || host.kind == SharedLobby.Kind.LAPTOP) return false;
@@ -1344,6 +1418,46 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mUDPListenerService != null) mUDPListenerService.setManualPhoneHost(false, -1);
         if (mTcpServer != null) mTcpServer.setLobbyHostRole(false,
                 mUDPListenerService == null ? -1 : mUDPListenerService.hostStartedAt());
+    }
+
+    private void setPhoneHostingEnabled(boolean enabled) {
+        mPhoneHostingEnabled = enabled;
+        sharedPreferences.edit().putBoolean(PREF_PHONE_HOSTING_ENABLED, enabled).apply();
+    }
+
+    private void showStopHostingDialog() {
+        if (!mUseNetwork || !mIsServer || hasCommittedRound()
+                || mStopHostingDialog != null && mStopHostingDialog.isShowing()) return;
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.lobby_stop_hosting_title)
+                .setMessage(R.string.lobby_stop_hosting_message)
+                .setPositiveButton(R.string.lobby_stop_hosting, (ignored, which) -> stopPhoneHosting())
+                .setNegativeButton(R.string.lobby_keep_hosting, null)
+                .create();
+        mStopHostingDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (mStopHostingDialog == dialog) mStopHostingDialog = null;
+        });
+        dialog.show();
+    }
+
+    private void dismissStopHostingDialog() {
+        AlertDialog dialog = mStopHostingDialog;
+        mStopHostingDialog = null;
+        if (dialog != null) dialog.dismiss();
+    }
+
+    private void stopPhoneHosting() {
+        if (!mUseNetwork || !mIsServer || hasCommittedRound()) return;
+        // A client can request a start while the confirmation is open. Retire
+        // only an idle lobby, atomically with the server's start decision.
+        if (mTcpServer != null && !mTcpServer.cancelIdleLobby()) return;
+        setPhoneHostingEnabled(false);
+        leaveSharedLobby();
+        clearManualPhoneHost();
+        mLobbyNotice = getString(R.string.lobby_waiting_for_host);
+        startGameInviteListening();
+        renderLobby();
     }
 
     private void recordLobbyConnectionFailure() {
@@ -1379,6 +1493,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             // Selection is a new claim. Within a simultaneous-claim window all
             // devices use the same IP tie-break rather than trading host forever.
             if (!mIsServer) leaveSharedLobby(true);
+            setPhoneHostingEnabled(true);
             mManualPhoneHost = true;
             mManualHostSelectedAt = now;
             mUDPListenerService.setManualPhoneHost(true, now);
@@ -1410,6 +1525,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return;
         Globals globals = Globals.getInstance();
         boolean inGame = globals.mGameState != Globals.GAME_STATE_NONE;
+        if (!mIsServer || hasCommittedRound()) dismissStopHostingDialog();
         findViewById(R.id.game_host_badge).setVisibility(inGame && mIsServer ? View.VISIBLE : View.GONE);
         findViewById(R.id.lobby_host_banner).setVisibility(mIsServer ? View.VISIBLE : View.GONE);
         lobbyText(R.id.lobby_host_banner, getString(mManualPhoneHost
@@ -1419,6 +1535,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         updateLobbyContentInset();
         findViewById(R.id.connect_layout).setVisibility(View.GONE);
         findViewById(R.id.play_layout).setVisibility(inGame ? View.VISIBLE : View.GONE);
+        findViewById(R.id.map_fragment).setVisibility(inGame ? View.VISIBLE : View.GONE);
+        updateGrenadePairingDisplay();
         updateGpsCoordinatesDisplay();
         if (inGame)
             return;
@@ -1436,24 +1554,32 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 }
             } catch (SecurityException ignored) { }
         }
+        lobbyText(R.id.lobby_connection_title, getString(mUseNetwork
+                ? R.string.lobby_connection_label : R.string.lobby_practice_label));
         lobbyText(R.id.lobby_wifi, mUseNetwork ? wifiName : getString(R.string.lobby_practice));
+        lobbyText(R.id.lobby_wifi_button, getString(mUseNetwork
+                ? R.string.lobby_wifi_action : R.string.lobby_change_mode));
         long now = SystemClock.elapsedRealtime();
         SharedLobby.Host selected = mSharedLobby.get(globals.mServerIP, now);
         boolean laptop = mSharedLobby.laptop(now) != null;
-        lobbyText(R.id.lobby_host, mIsServer ? getString(mManualPhoneHost
+        lobbyText(R.id.lobby_host, !mUseNetwork ? getString(R.string.lobby_practice_hint)
+                : mIsServer ? getString(mManualPhoneHost
                 ? R.string.lobby_you_manual_host : R.string.lobby_you_host)
                 : mLobbyJoined && globals.mServerIP != null ? getString(R.string.lobby_other_host,
                 globals.mServerIP.getHostAddress()) + (selected != null && selected.kind.priority > 0
                 ? getString(selected.kind == SharedLobby.Kind.LAPTOP ? R.string.lobby_laptop_host_suffix
-                : R.string.lobby_manual_host_suffix) : "") : getString(R.string.lobby_same_wifi));
+                : R.string.lobby_manual_host_suffix) : "") : getString(mPhoneHostingEnabled
+                ? R.string.lobby_same_wifi : R.string.lobby_waiting_for_host));
         lobbyText(R.id.lobby_host_button, getString(laptop ? R.string.lobby_laptop_controls_host
                 : mManualPhoneHost ? R.string.lobby_host_auto : R.string.lobby_host_manual));
+        findViewById(R.id.lobby_host_button).setVisibility(mUseNetwork ? View.VISIBLE : View.GONE);
         findViewById(R.id.lobby_host_button).setEnabled(mUseNetwork && wifi && !laptop
                 && !globals.mLobbyRoundActive && !hasCommittedRound() && networkServicesReady());
         lobbyText(R.id.lobby_status, !mUseNetwork ? getString(R.string.lobby_practice)
                 : mLobbyNotice != null ? mLobbyNotice : mLobbyJoined
                 ? getString(R.string.lobby_connected) : getString(mReady || mPeerHostCreationPending
-                ? R.string.lobby_joining : R.string.lobby_searching));
+                ? R.string.lobby_joining : mPhoneHostingEnabled
+                ? R.string.lobby_searching : R.string.lobby_waiting_for_host));
         lobbyText(R.id.lobby_name, globals.mPlayerName);
         lobbyText(R.id.lobby_gun_status, lobbyGunStatus());
         updateBatteryDisplay();
@@ -1688,7 +1814,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         String respawn = getString(teamCheckpoints ? R.string.respawn_summary_qr
                 : R.string.respawn_summary_timer, respawnSeconds / 60, respawnSeconds % 60);
         return limits + "\n" + getString(R.string.lobby_vitals_summary, g.mFullHealth,
-                g.mFullShields, g.mFullReload & 255) + "\n" + weapon + "\n" + respawn + "\n" + objective;
+                g.mFullShields, g.mFullReload & 255) + "\n"
+                + getString(R.string.grenade_damage_summary, -g.mGrenadeDamage)
+                + "\n" + weapon + "\n" + respawn + "\n" + objective;
     }
 
     private String lobbyTeamLabel(byte playerID) {
@@ -2247,8 +2375,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mTcpClient.reportHostedShots(count);
     }
 
-    private void reportHostedHit(byte attackerID) {
-        if (canReportHostedTelemetry())
+    private void reportHostedHit(int hitSource, byte hitData, byte attackerID) {
+        if (!canReportHostedTelemetry())
+            return;
+        if (hitSource == Globals.GRENADE_PLAYER_ID)
+            mTcpClient.reportHostedGrenadeHit((hitData & 0xf0) >> 4);
+        else
             mTcpClient.reportHostedHit(attackerID & 0xff);
     }
 
@@ -2307,6 +2439,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mEliminationCountTV = findViewById(R.id.eliminations_count_tv);
         mReconnectButton = findViewById(R.id.reconnect_weapon_button);
         mReconnectButton.setOnClickListener((v -> {
+            cancelPrimaryReconnect();
             if (sharedPreferences == null)
                 sharedPreferences = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
             String savedAddress = readStringPreference(sharedPreferences, PREF_DEVICE_ADDRESS, "");
@@ -2322,6 +2455,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mConnectButton = findViewById(R.id.connect_weapon_button);
         if (mConnectButton != null) {
             mConnectButton.setOnClickListener((v -> {
+                cancelPrimaryReconnect();
                 mDeviceAddress = "";
                 connectWeapon();
             }));
@@ -2417,6 +2551,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         Log.w(TAG, "Ignoring start-game request before network services are ready");
                         return;
                     }
+                    if (mReady) {
+                        updateSharedLobby();
+                        if (mLobbyTakeoverPending) {
+                            renderLobby();
+                            return;
+                        }
+                    }
                     // In network mode, Start is also the fast path to host a
                     // lobby. Once peers have joined, the same button starts
                     // the synchronized round as usual.
@@ -2486,6 +2627,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mEndGameButton != null) {
             mEndGameButton.setOnClickListener((v -> confirmEndGame()));
         }
+        findViewById(R.id.grenade_confirm_button).setOnClickListener(v -> confirmGrenadePairing());
         mEndNetworkGameButton = findViewById(R.id.end_network_game_button);
         if (mEndNetworkGameButton != null) {
             mEndNetworkGameButton.setOnClickListener(v -> confirmEndGame());
@@ -2601,6 +2743,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         globals.mPowerupQrRequired = PowerupQrProgress.isValidRequiredCount(savedPowerupCount)
                 ? savedPowerupCount : 0;
         globals.mRespawnQrEnabled = readBooleanPreference(sharedPreferences, PREF_RESPAWN_QR_ENABLED, true);
+        int savedGrenadeDamage = readIntPreference(sharedPreferences, PREF_GRENADE_DAMAGE,
+                Globals.DAMAGE_PER_HIT);
+        globals.mGrenadeDamage = Globals.isValidGrenadeDamage(savedGrenadeDamage)
+                ? savedGrenadeDamage : Globals.DAMAGE_PER_HIT;
         applyBossWeaponRole();
         mRecoilEnabled = true;
         getFiringMode();
@@ -2770,6 +2916,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         Toast.makeText(getApplicationContext(), getString(R.string.error_select_team), Toast.LENGTH_SHORT).show();
                         return true;
                     }
+                    setPhoneHostingEnabled(true);
                     createPeerLobbyIfNeeded();
                     return true;
             }else if (id == R.id.player_name_item) {
@@ -3690,13 +3837,19 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             globals.mPowerupQrRequired = PowerupQrProgress.isValidRequiredCount(savedPowerupCount)
                     ? savedPowerupCount : 0;
             globals.mRespawnQrEnabled = readBooleanPreference(sharedPreferences, PREF_RESPAWN_QR_ENABLED, true);
+            int savedGrenadeDamage = readIntPreference(sharedPreferences, PREF_GRENADE_DAMAGE,
+                    Globals.DAMAGE_PER_HIT);
+            globals.mGrenadeDamage = Globals.isValidGrenadeDamage(savedGrenadeDamage)
+                    ? savedGrenadeDamage : Globals.DAMAGE_PER_HIT;
             mBossWeaponInitialized = false;
             applyBossWeaponRole();
             dismissGameControlDialog();
             mFiringModeButton.setVisibility(View.VISIBLE);
             mStartGameButton.setVisibility(View.VISIBLE);
             mPlayerSettingsButton.setVisibility(View.VISIBLE);
-            Globals.getInstance().mUseGPS = false;
+            // Keep local location tracking active in the lobby and solo practice.
+            // A dedicated host can still override this with its match GPS setting.
+            Globals.getInstance().mUseGPS = true;
             if (sendPlayerLeft && mTcpClient != null) {
                 mTcpClient.leaveServer();
             }
@@ -4273,6 +4426,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mStartGameTimer = true;
         setShotMode(mCurrentShotMode); // make sure that the shot mode is correctly set at the start of each game
         startSpawn("");
+        updateGrenadePairingDisplay();
         updateGpsCoordinatesDisplay();
         if (mHasSynchronizedStart && mSynchronizedEndAt > 0 && !mGameTimerRunning
                 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
@@ -4459,6 +4613,54 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             lobbyGps.setText(text);
     }
 
+    private void updateGrenadePairingDisplay() {
+        int status = mPendingGrenadeID != 0 ? R.string.grenade_status_confirm
+                : mGrenadePairingInProgress ? R.string.grenade_status_pairing
+                : Globals.getInstance().mPairedGrenadeID == 0
+                ? R.string.grenade_status_unpaired : R.string.grenade_status_paired;
+        String statusText = mPendingGrenadeID != 0
+                ? getString(status, mPendingGrenadeID & 0xff) : getString(status);
+        lobbyText(R.id.lobby_grenade_status, statusText);
+        findViewById(R.id.lobby_grenade_status).setVisibility(View.GONE);
+        findViewById(R.id.lobby_grenade_confirm_button).setVisibility(View.GONE);
+        TextView gameStatus = findViewById(R.id.grenade_status_tv);
+        if (gameStatus != null) {
+            gameStatus.setVisibility(View.GONE);
+            lobbyText(R.id.grenade_status_tv, statusText);
+        }
+        findViewById(R.id.grenade_confirm_button).setVisibility(View.GONE);
+    }
+
+    private void confirmGrenadePairing() {
+        if (mPendingGrenadeID == 0)
+            return;
+        byte grenadeID = mPendingGrenadeID;
+        clearPendingGrenadePairing();
+        Globals globals = Globals.getInstance();
+        globals.mPairedGrenadeID = grenadeID;
+        updateGrenadePairingDisplay();
+        publishGrenadePairing();
+        Toast.makeText(getApplicationContext(), R.string.grenade_paired_toast,
+                Toast.LENGTH_SHORT).show();
+    }
+
+    private void clearPendingGrenadePairing() {
+        if (mGrenadeConfirmTimeout != null) {
+            mWeaponPairingHandler.removeCallbacks(mGrenadeConfirmTimeout);
+            mGrenadeConfirmTimeout = null;
+        }
+        mPendingGrenadeID = 0;
+    }
+
+    private void publishGrenadePairing() {
+        if (!mUseNetwork)
+            return;
+        if (isDedicatedServerConnection())
+            mTcpClient.sendPlayerGrenade();
+        if (mUDPListenerService != null)
+            mUDPListenerService.publishPeerGrenadePairing();
+    }
+
     private boolean isLocationReadyForTracking() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             LocationManager manager = (LocationManager) getSystemService(LOCATION_SERVICE);
@@ -4600,6 +4802,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if (mUseNetwork) PlayerHistory.recordRound(this, mActivePeerRoundToken, mScore, currentDeathCount());
         }
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        updateGrenadePairingDisplay();
         updateSecondGunControls();
         mPowerupQrProgress.reset();
         updatePowerupScanButton();
@@ -6185,14 +6388,23 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         ContextCompat.registerReceiver(this, mGattUpdateReceiver, makeGattUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
         mGattReceiverRegistered = true;
         if (mBluetoothLeService != null && mDeviceAddress != null && !mDeviceAddress.isEmpty()) {
+            if (mPrimaryReconnectActive)
+                mLastPrimaryConnectAttemptAt = SystemClock.elapsedRealtime();
             final boolean result = mBluetoothLeService.connect(mDeviceAddress);
             Log.d(TAG, "Connect request result=" + result);
+            if (!result)
+                handleDisconnect();
         }
+        if (mPrimaryReconnectActive)
+            schedulePrimaryReconnect();
+        else
+            startSavedGunReconnectOnLaunch();
         if (isLocalBoss() && !mSecondaryDeviceAddress.isEmpty()) {
             if (mSecondaryBluetoothLeService != null)
                 mSecondaryBluetoothLeService.connect(mSecondaryDeviceAddress);
             else
                 setupSecondaryBLEServiceConnection();
+            scheduleSecondaryReconnect();
         }
         IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
         registerReceiver(mBluetoothReceiver, filter);
@@ -6253,7 +6465,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onPause() {
+        clearPrimaryReconnectCallback();
+        if (mSecondaryReconnectRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mSecondaryReconnectRunnable);
+            mSecondaryReconnectRunnable = null;
+        }
         dismissGameControlDialog();
+        dismissStopHostingDialog();
         mLobbyHandler.removeCallbacks(mLobbyPulse);
         if (mScanningSecondary)
             stopBLEScan();
@@ -6304,8 +6522,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        cancelPrimaryReconnect();
+        clearGrenadePairingSignal();
+        clearPendingGrenadePairing();
         BluetoothLeService.setFireTimingCapture(false);
         dismissGameControlDialog();
+        dismissStopHostingDialog();
         mLobbyHandler.removeCallbacksAndMessages(null);
         if (mStartWizardDialog != null) {
             mStartWizardDialog.dismiss();
@@ -6740,6 +6962,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void returnFromNewWeaponPairing() {
+        cancelPrimaryReconnect();
         stopConnectFailTest();
         stopBLEScan();
         resetBluetoothServices();
@@ -7025,9 +7248,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return;
         }
 
+        if (mDeviceAddress != null && !mDeviceAddress.isEmpty())
+            mLastPrimaryConnectAttemptAt = SystemClock.elapsedRealtime();
         mBluetoothLeScanner = bluetoothAdapter.getBluetoothLeScanner();
         if (mBluetoothLeScanner == null) {
             Log.w(TAG, "Bluetooth scanner unavailable");
+            schedulePrimaryReconnect();
             return;
         }
         Log.d(TAG, "starting to scan");
@@ -7044,6 +7270,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } catch (SecurityException | IllegalStateException e) {
             Log.w(TAG, "Unable to start Bluetooth scan", e);
             stopBLEScan();
+            schedulePrimaryReconnect();
             return;
         }
         mConnectButton.setEnabled(false);
@@ -7063,7 +7290,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mConnected = false;
         if (mConnectFailTimer != null)
             mConnectFailTimer.cancel();
-        mConnectFailTimer = new CountDownTimer(CONNECTION_FAIL_TEST_INTERVAL_MILLISECONDS, CONNECTION_FAIL_TEST_INTERVAL_MILLISECONDS) {
+        long timeout = mDeviceAddress != null && !mDeviceAddress.isEmpty()
+                && !mTriggerPairingActive && !mCollectingNewWeaponCandidates
+                ? GUN_RECONNECT_INTERVAL_MS : CONNECTION_FAIL_TEST_INTERVAL_MILLISECONDS;
+        mConnectFailTimer = new CountDownTimer(timeout, timeout) {
 
             public void onTick(long millisUntilFinished) {
                 // Do nothing
@@ -7155,21 +7385,73 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
     }
 
+    private void clearPrimaryReconnectCallback() {
+        if (mPrimaryReconnectRunnable != null) {
+            mWeaponPairingHandler.removeCallbacks(mPrimaryReconnectRunnable);
+            mPrimaryReconnectRunnable = null;
+        }
+    }
+
+    private void cancelPrimaryReconnect() {
+        clearPrimaryReconnectCallback();
+        mPrimaryReconnectActive = false;
+        mLastPrimaryConnectAttemptAt = 0;
+    }
+
+    private void startSavedGunReconnectOnLaunch() {
+        if (!mActivityResumed || mBLEServiceBound || mBluetoothLeService != null
+                || mCommunicating || mConnected || mScanning || mTriggerPairingActive
+                || mCollectingNewWeaponCandidates || mDeviceAddress == null
+                || mDeviceAddress.isEmpty())
+            return;
+        mPrimaryReconnectActive = true;
+        schedulePrimaryReconnect();
+    }
+
+    private void schedulePrimaryReconnect() {
+        if (!mPrimaryReconnectActive || mPrimaryReconnectRunnable != null || !mActivityResumed
+                || mCommunicating || mConnected || mScanning || mTriggerPairingActive
+                || mDeviceAddress == null || mDeviceAddress.isEmpty()
+                || isFinishing() || isDestroyed())
+            return;
+        long elapsed = mLastPrimaryConnectAttemptAt == 0 ? GUN_RECONNECT_INTERVAL_MS
+                : SystemClock.elapsedRealtime() - mLastPrimaryConnectAttemptAt;
+        long delay = Math.max(0, GUN_RECONNECT_INTERVAL_MS - elapsed);
+        mPrimaryReconnectRunnable = () -> {
+            mPrimaryReconnectRunnable = null;
+            if (!mPrimaryReconnectActive || !mActivityResumed || mCommunicating
+                    || mConnected || mScanning || mDeviceAddress == null
+                    || mDeviceAddress.isEmpty() || isFinishing() || isDestroyed())
+                return;
+            if (mBLEServiceBound)
+                resetBluetoothServices();
+            connectWeapon();
+        };
+        mWeaponPairingHandler.postDelayed(mPrimaryReconnectRunnable, delay);
+    }
+
     private void handleDisconnect() {
         if (mTriggerPairingActive) {
             probeNextWeaponTrigger();
             return;
         }
-        if (mCollectingNewWeaponCandidates || mWeaponPairingDialog != null)
+        boolean choosingNewWeapon = mCollectingNewWeaponCandidates || mWeaponPairingDialog != null;
+        boolean wasCommunicating = mCommunicating;
+        if (choosingNewWeapon)
             cancelNewWeaponPairing();
         stopConnectFailTest();
         stopBLEScan();
         // Release the old binding before scanning again. Otherwise finding the
         // blaster calls setupBLEServiceConnection(), which skips an existing binding.
         resetBluetoothServices();
+        if (!choosingNewWeapon && mDeviceAddress != null && !mDeviceAddress.isEmpty()) {
+            mPrimaryReconnectActive = true;
+            schedulePrimaryReconnect();
+        } else {
+            cancelPrimaryReconnect();
+        }
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
-            Log.e(TAG, "blaster disconnected mid-game, attempt to reconnect");
-            connectWeapon();
+            Log.e(TAG, "blaster disconnected mid-game, retrying saved gun");
             if (isLocalBoss() && mSecondaryCommunicating) {
                 // The second boss blaster remains usable while the first reconnects.
                 updateSecondGunControls();
@@ -7184,12 +7466,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mDedicatedServerButton.setEnabled(true);
         mQRConnectButton.setEnabled(true);
         TextView connectStatusTV = findViewById(R.id.connect_status_tv);
-        if (connectStatusTV != null) connectStatusTV.setText(R.string.connect_status_not_connected);
+        if (connectStatusTV != null) connectStatusTV.setText(mPrimaryReconnectActive
+                ? R.string.connect_status_reconnecting : R.string.connect_status_not_connected);
         mLastShotCount = 0;
         // A failed gun scan must not remove a player from the shared lobby.
         updateSharedLobby();
         renderLobby();
-        playSound(R.raw.eliminated);
+        if (wasCommunicating)
+            playSound(R.raw.eliminated);
     }
 
     private AlertDialog mBlasterDisconnectDialog = null;
@@ -7207,6 +7491,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 .setCancelable(false)
                 .setNegativeButton(R.string.blaster_disconnected_cancel_quit,
                         (dialog, id) -> {
+                            cancelPrimaryReconnect();
                             mDeviceAddress = "";
                             Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
                             handleDisconnect();
@@ -7237,7 +7522,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mSecondaryConnected = true;
             mSecondaryCommunicating = false;
             resetBatteryLevel(true);
-            mSecondaryReconnectAttempts = 0;
             if (mSecondaryReconnectRunnable != null) {
                 mWeaponPairingHandler.removeCallbacks(mSecondaryReconnectRunnable);
                 mSecondaryReconnectRunnable = null;
@@ -7426,7 +7710,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             } else if (BluetoothLeService.ACTION_GATT_DISCONNECTED.equals(action)) {
                 if (mTriggerPairingActive)
                     probeNextWeaponTrigger();
-                else
+                else if (mBluetoothLeService != null || mConnected || mCommunicating)
                     handleDisconnect();
             } else if (BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED.equals(action)) {
                 // Show all the supported services and characteristics on the user interface.
@@ -8313,7 +8597,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             return (byte) (hitSource >> 2);
 
         int grenadeID = (hitData & 0xF0) >> 4;
-        if (grenadeID == 0 || !Globals.isValidGrenadeID(grenadeID))
+        if (grenadeID == 0)
+            return 0;
+        if (!Globals.isValidGrenadeID(grenadeID))
             return 0;
 
         Globals.getmGrenadePairingsSemaphore();
@@ -8439,6 +8725,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 updateSecondGunControls();
             } else if (!secondary && !mCommunicating) {
                 mCommunicating = true;
+                cancelPrimaryReconnect();
                 cancelWeaponSyncTriggerHint();
                 RelativeLayout connectLayout = findViewById(R.id.connect_layout);
                 if (connectLayout != null) connectLayout.setVisibility(View.GONE);
@@ -8589,7 +8876,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 final boolean playerWasAlreadyEliminated = Globals.getInstance().mGameState
                         == Globals.GAME_STATE_ELIMINATED;
                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
-                    if (hit_by_player1 != 0 && !isBenchedHit(hitByPlayer1ID)) {
+                    if (hit_by_player1 != 0 && (hit_by_player1 == Globals.GRENADE_PLAYER_ID
+                            || !isBenchedHit(hitByPlayer1ID))) {
                     if ((mLastHitData1.playerID == hit_by_player1 && mLastHitData1.shotID == shot_id1) || (mLastHitData2.playerID == hit_by_player1 && mLastHitData2.shotID == shot_id1)) {
                         //Log.e(TAG, "Hit by 1 is using same shot ID from a previous hit, filter!" + hit_by_player1 + " " + data[RECOIL_OFFSET_HIT_BY1_SHOTID]);
                     } else {
@@ -8606,15 +8894,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             // Offline games have no per-player settings snapshot. Use the
                             // locally configured damage value instead of silently reverting
                             // every weapon to the one-hit default.
-                            healthRemoved = Globals.getInstance().mDamage;
+                            healthRemoved = hit_by_player1 == Globals.GRENADE_PLAYER_ID
+                                    ? Globals.getInstance().mGrenadeDamage
+                                    : Globals.getInstance().mDamage;
                             if (mUseNetwork) {
-                                if (isFriendlyHit(hitByPlayer1ID)) {
+                                if (hit_by_player1 != Globals.GRENADE_PLAYER_ID
+                                        && isFriendlyHit(hitByPlayer1ID)) {
                                     //Log.d(TAG, "friendly fire ignored");
                                     healthRemoved = 0;
                                 } else {
-                                    healthRemoved = getPlayerDamage(hitByPlayer1ID);
+                                    if (hit_by_player1 != Globals.GRENADE_PLAYER_ID)
+                                        healthRemoved = getPlayerDamage(hitByPlayer1ID);
                                     hit_by_id = hitByPlayer1ID;
-                                    reportHostedHit(hitByPlayer1ID);
+                                    reportHostedHit(hit_by_player1,
+                                            data[RECOIL_OFFSET_HIT_BY1_SHOTID], hitByPlayer1ID);
                                     if (hitByPlayer1ID > 0 && mLastHitMessage < System.currentTimeMillis()) {
                                         mLastHitMessage = System.currentTimeMillis() + HIT_ANIMATION_DURATION_MILLISECONDS;
                                         if (survivesDamage(healthRemoved))
@@ -8633,7 +8926,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     boolean duplicateInPacket = hit_by_player2 == hit_by_player1 && shot_id2 == shot_id1;
                     if (duplicateInPacket || (mLastHitData1.playerID == hit_by_player2 && mLastHitData1.shotID == shot_id2) || (mLastHitData2.playerID == hit_by_player2 && mLastHitData2.shotID == shot_id2)) {
                         //Log.e(TAG, "Hit by 2 is using same shot ID from a previous hit, filter!");
-                    } else if (hit_by_player2 != 0 && !isBenchedHit(hitByPlayer2ID)
+                    } else if (hit_by_player2 != 0
+                            && (hit_by_player2 == Globals.GRENADE_PLAYER_ID
+                            || !isBenchedHit(hitByPlayer2ID))
                             && (playerWasAlreadyEliminated || survivesDamage(healthRemoved))) {
                         if (playerWasAlreadyEliminated) {
                             if (!mStartGameTimer && isDamageHit(hit_by_player2,
@@ -8644,15 +8939,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         } else {
                             mHitsTaken = incrementCounter(mHitsTaken, Globals.MAX_SCOREBOARD_VALUE);
                             mHitsTakenTV.setText(String.valueOf(mHitsTaken));
-                            int secondHitDamage = Globals.getInstance().mDamage;
+                            int secondHitDamage = hit_by_player2 == Globals.GRENADE_PLAYER_ID
+                                    ? Globals.getInstance().mGrenadeDamage
+                                    : Globals.getInstance().mDamage;
                             if (mUseNetwork) {
-                                if (isFriendlyHit(hitByPlayer2ID)) {
+                                if (hit_by_player2 != Globals.GRENADE_PLAYER_ID
+                                        && isFriendlyHit(hitByPlayer2ID)) {
                                     //Log.d(TAG, "friendly fire ignored");
                                     secondHitDamage = 0;
                                 } else {
-                                    secondHitDamage = getPlayerDamage(hitByPlayer2ID);
+                                    if (hit_by_player2 != Globals.GRENADE_PLAYER_ID)
+                                        secondHitDamage = getPlayerDamage(hitByPlayer2ID);
                                     hit_by_id = hitByPlayer2ID;
-                                    reportHostedHit(hitByPlayer2ID);
+                                    reportHostedHit(hit_by_player2,
+                                            data[RECOIL_OFFSET_HIT_BY2_SHOTID], hitByPlayer2ID);
                                     if (hitByPlayer2ID > 0 && mLastHitMessage < System.currentTimeMillis()) {
                                         mLastHitMessage = System.currentTimeMillis() + HIT_ANIMATION_DURATION_MILLISECONDS;
                                         if (survivesDamage(healthRemoved + secondHitDamage))
@@ -8797,26 +9097,64 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         byte grenadeID = (byte) ((data & 0xF0) >> 4);
         Globals globals = Globals.getInstance();
         if (command == GRENADE_PAIR_ID) {
-            if (grenadeID == 0 || globals.mPairedGrenadeID != 0)
+            if (grenadeID == 0)
                 return;
-            globals.mPairedGrenadeID = grenadeID;
-            Toast.makeText(getApplicationContext(), getString(R.string.grenade_paired_toast), Toast.LENGTH_SHORT).show();
-        } else if (command == GRENADE_NEW_PAIR || command == GRENADE_DISARM) {
-            if (globals.mPairedGrenadeID == 0)
+            clearGrenadePairingSignal();
+            clearPendingGrenadePairing();
+            mPendingGrenadeID = grenadeID;
+            mGrenadeConfirmTimeout = () -> {
+                mGrenadeConfirmTimeout = null;
+                mPendingGrenadeID = 0;
+                updateGrenadePairingDisplay();
+            };
+            mWeaponPairingHandler.postDelayed(mGrenadeConfirmTimeout, 30_000L);
+            updateGrenadePairingDisplay();
+            return;
+        } else if (command == GRENADE_NEW_PAIR) {
+            clearPendingGrenadePairing();
+            noteGrenadePairingSignal();
+            if (grenadeID != 0 && grenadeID == globals.mPairedGrenadeID) {
+                globals.mPairedGrenadeID = 0;
+                updateGrenadePairingDisplay();
+                publishGrenadePairing();
+            }
+            return;
+        } else if (command == GRENADE_DISARM && grenadeID != 0
+                && (grenadeID == globals.mPairedGrenadeID
+                || grenadeID == mPendingGrenadeID)) {
+            clearPendingGrenadePairing();
+            if (grenadeID != globals.mPairedGrenadeID) {
+                updateGrenadePairingDisplay();
                 return;
+            }
+            clearGrenadePairingSignal();
             globals.mPairedGrenadeID = 0;
         } else {
             return;
         }
-        // Publish removals too, so the server cannot keep crediting the old owner.
-        // A peer host closes its TCP listener at the round start, so its updates
-        // must use the roster-validated UDP path instead.
-        if (mUseNetwork) {
-            if (isDedicatedServerConnection())
-                mTcpClient.sendPlayerGrenade();
-            if (mUDPListenerService != null)
-                mUDPListenerService.publishPeerGrenadePairing();
+        updateGrenadePairingDisplay();
+        publishGrenadePairing();
+    }
+
+    private void noteGrenadePairingSignal() {
+        mGrenadePairingInProgress = true;
+        if (mGrenadePairingTimeout != null)
+            mWeaponPairingHandler.removeCallbacks(mGrenadePairingTimeout);
+        mGrenadePairingTimeout = () -> {
+            mGrenadePairingTimeout = null;
+            mGrenadePairingInProgress = false;
+            updateGrenadePairingDisplay();
+        };
+        mWeaponPairingHandler.postDelayed(mGrenadePairingTimeout, 3_000L);
+        updateGrenadePairingDisplay();
+    }
+
+    private void clearGrenadePairingSignal() {
+        if (mGrenadePairingTimeout != null) {
+            mWeaponPairingHandler.removeCallbacks(mGrenadePairingTimeout);
+            mGrenadePairingTimeout = null;
         }
+        mGrenadePairingInProgress = false;
     }
 
     private final BroadcastReceiver mUDPUpdateReceiver = new BroadcastReceiver() {
@@ -8916,12 +9254,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             ? intent.getBooleanExtra(NetMsg.INTENT_LOBBY_DEDICATED, false)
                             ? SharedLobby.Kind.DEDICATED_PHONE : SharedLobby.Kind.AUTO_PHONE
                             : SharedLobby.Kind.parse(wireKind);
-                    if (address != null && kind != null)
+                    if (address != null && kind != null) {
                         mSharedLobby.observe(new SharedLobby.Host(InetAddress.getByName(address),
                                 kind,
                                 intent.getBooleanExtra(NetMsg.INTENT_LOBBY_PLAYING, false),
                                 SystemClock.elapsedRealtime(),
                                 intent.getLongExtra(NetMsg.INTENT_LOBBY_HOST_AGE, 0)));
+                        updateSharedLobby();
+                        renderLobby();
+                    }
                 } catch (UnknownHostException ignored) { }
                 return;
             }

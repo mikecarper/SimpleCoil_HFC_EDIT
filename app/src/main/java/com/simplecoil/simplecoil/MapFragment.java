@@ -279,6 +279,8 @@ public class MapFragment extends GlobeMapFragment {
     public void onResume() {
         super.onResume();
         mResumed = true;
+        if (mLocationManager == null && isAdded())
+            mLocationManager = (LocationManager) requireActivity().getSystemService(Context.LOCATION_SERVICE);
         IntentFilter filter = new IntentFilter(NetMsg.NETMSG_GPSDATAUPDATE);
         filter.addAction(NetMsg.NETMSG_LISTPLAYERS);
         filter.addAction(NetMsg.NETMSG_GPSSETTING);

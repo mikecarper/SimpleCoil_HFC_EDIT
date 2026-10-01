@@ -141,8 +141,10 @@ public class TcpServer extends Service {
     public static final String JSON_TELEMETRY = "telemetry";
     public static final String JSON_TELEMETRY_COUNT = "count";
     public static final String JSON_TELEMETRY_ATTACKER = "attacker";
+    public static final String JSON_TELEMETRY_GRENADE_ID = "grenadeID";
     public static final String JSON_TELEMETRY_SHOT = "shot";
     public static final String JSON_TELEMETRY_HIT = "hit";
+    public static final String JSON_TELEMETRY_GRENADE_HIT = "grenadehit";
     public static final String JSON_TEAMPOINTS = "teampoints";
     public static final String JSON_TIMEREMAINING = "timeremaining";
     static final String JSON_CLOCK_REQUEST = "clocksync";
@@ -166,6 +168,7 @@ public class TcpServer extends Service {
     public static final String JSON_RELOAD_ON_EMPTY = "reloadonempty";
     public static final String JSON_SPAWN_TIME = "spawntime";
     public static final String JSON_DAMAGE = "damage";
+    public static final String JSON_GRENADE_DAMAGE = "grenadedamage";
     public static final String JSON_SHOT_MODE_SINGLE = "shotmodesingle";
     public static final String JSON_SHOT_MODE_BURST3 = "shotmodeburst3";
     public static final String JSON_SHOT_MODE_AUTO = "shotmodeauto";
@@ -985,6 +988,16 @@ public class TcpServer extends Service {
         return true;
     }
 
+    /** Notify lobby players when the phone opts out of hosting before a round. */
+    boolean cancelIdleLobby() {
+        synchronized (mServerStateLock) {
+            if (hasPendingOrAnnouncedStart() || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                return false;
+            cancelServer();
+            return true;
+        }
+    }
+
     Intent getScheduledGameStart() {
         synchronized (mServerStateLock) {
             if (mDestroyed || !mStartAnnounced || mScheduledStart < 0)
@@ -1398,6 +1411,7 @@ public class TcpServer extends Service {
             game.put(JSON_BALANCED_QR, Globals.getInstance().mBalancedRequireQr);
             game.put(JSON_POWERUP_QR_REQUIRED, Globals.getInstance().mPowerupQrRequired);
             game.put(JSON_RESPAWN_QR_ENABLED, Globals.getInstance().mRespawnQrEnabled);
+            game.put(JSON_GRENADE_DAMAGE, Globals.getInstance().mGrenadeDamage);
             if (mIsDedicated) {
                 game.put(JSON_DEDICATED, true);
                 game.put(JSON_GAMESTATE, Globals.getInstance().mGameState);
@@ -2872,6 +2886,25 @@ public class TcpServer extends Service {
                             grantEnemyGPSRevealLocked(attackerID, client.mPlayerID);
                         }
                         sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+                    } else if (JSON_TELEMETRY_GRENADE_HIT.equals(event)) {
+                        int grenadeID = TcpJson.getInt(player, JSON_TELEMETRY_GRENADE_ID);
+                        if (!Globals.isValidGrenadeID(grenadeID) || grenadeID == 0)
+                            return;
+                        int ownerID;
+                        Globals.getmGrenadePairingsSemaphore();
+                        try {
+                            ownerID = Globals.getInstance().mGrenadePairings[grenadeID];
+                        } finally {
+                            Globals.getInstance().mGrenadePairingsSemaphore.release();
+                        }
+                        ClientData owner = ownerID > 0 && Globals.isValidPlayerID(ownerID)
+                                ? mClientData.get(clientIDFromPlayerID((byte) ownerID)) : null;
+                        if (owner != null && owner != client
+                                && (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                                || owner.getNetworkTeam() != client.getNetworkTeam())) {
+                            owner.hits = Math.min(Globals.MAX_SCOREBOARD_VALUE, owner.hits + 1);
+                            sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+                        }
                     }
                 } catch (JSONException e) {
                     Log.w(TAG, "Ignoring malformed hosted-game telemetry", e);

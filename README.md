@@ -25,6 +25,12 @@ Simultaneous phone hosts converge on the lowest IPv4 address; a laptop or
 dedicated host takes priority while the lobby is idle. An already running
 match is never migrated to another host.
 
+Tap the lobby's host bar to choose Stop hosting or Keep hosting. Stopping leaves
+the phone on Wi-Fi, waiting to join another host, and disables lobby hosting
+across app restarts. Choose Make this phone host to enable hosting again.
+Lobby discovery stays active before a round, so competing hosts can converge
+before Start is tapped.
+
 The screen presents gun and player setup first, then Wi-Fi status, match rules,
 and the shared roster.
 The bottom action always stays visible and tells you the next step. Connect
@@ -40,7 +46,14 @@ the countdown, entering combat, or affecting Boss health and victory counts.
 They wait for the next round; only the host changes participation. A phone
 promoted to host participates, and therefore needs a gun, or can instead use
 the dedicated-host option. The laptop map has the same participation controls.
-The compact roster is grouped by team and shows the host, gun status, clock
+The host can choose grenade damage in Match options before a round. The choices
+are 1, 2, 3, 5, 10, and 15 damage per hit; the default is 1. This applies to
+paired and unpaired grenade hits on every phone, without changing gun damage.
+Grenade blasts also damage the thrower's team because the gun's damage report
+does not include a grenade ID. Pairing is unnecessary for damage, and grenade
+pairing text and controls are hidden to save screen space.
+The dedicated phone host has the same setting. The compact roster is grouped
+by team and shows the host, gun status, clock
 sync, and reconnecting players. Unnamed phones display their player ID.
 Match summaries include limits, health/shields, ammo, reload, fire mode, and
 the objective. All these changes preserve automatic lobby join and the single
@@ -233,7 +246,7 @@ included dedicated host, so no phone is consumed as the host.
 | Infection | Original zombie: Player 1; Survivors: Players 2-32 |
 
 Every game uses the same server-authoritative tournament profile: 5 health, 10 shields,
-30-shot magazines, a 1.5-second reload, one damage per hit, recoil enabled,
+30-shot magazines, a 1.5-second reload, one damage per gun hit, recoil enabled,
 and single-shot firing. Player and host controls cannot change those rules.
 After health damage, another damaging hit restarts a 30-second inactivity
 wait. Health then regenerates one point per second until full, like shields.

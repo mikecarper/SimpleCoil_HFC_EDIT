@@ -13,6 +13,16 @@ Nothing is fetched from the internet while a game is running. Player markers,
 trails, hit lines, and game-master controls continue to work even when no base
 map tiles have been installed.
 
+When a gun supplies a valid grenade ID in its damage report, the receiving
+phone forwards that hit over Wi-Fi. The map shows a red circle at each hit player's recent GPS
+position for eight seconds. When four or more distinct players with recent GPS
+positions are hit by the same grenade within two seconds, it also shows a red
+dot at their geographic center. This dot estimates the middle of the hit
+players, not the grenade's measured location. Hits without a recent GPS fix
+are counted but cannot be placed on the map.
+The tested grenades omit their ID from damage reports, so those hits damage
+everyone in range but cannot currently produce these grenade map markers.
+
 During a round, the laptop continues sending an authoritative state tick once
 per second by broadcast and per-phone unicast. Phones also broadcast their
 fixed-size state snapshots to the whole local network once per second. If a

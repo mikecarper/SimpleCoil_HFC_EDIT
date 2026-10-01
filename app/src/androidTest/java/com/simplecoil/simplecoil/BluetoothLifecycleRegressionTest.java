@@ -7,10 +7,10 @@ import android.content.BroadcastReceiver;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.os.SystemClock;
 import android.widget.PopupMenu;
 import android.widget.TextView;
 
-import androidx.appcompat.app.AlertDialog;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -175,7 +175,46 @@ public class BluetoothLifecycleRegressionTest {
             assertFalse((boolean) get("mScanning"));
             assertNull(get("mBluetoothLeService"));
             assertEquals(1, bluetooth.closes);
-            assertEquals(current.getString(R.string.connect_status_not_connected), status().getText().toString());
+            assertEquals(ADDRESS, get("mDeviceAddress"));
+            assertTrue((boolean) get("mPrimaryReconnectActive"));
+            assertTrue(get("mPrimaryReconnectRunnable") != null);
+            assertEquals(current.getString(R.string.connect_status_reconnecting),
+                    status().getText().toString());
+        });
+    }
+
+    @Test
+    public void repeatedDisconnectKeepsOneRetryAndManualCancelStopsIt() {
+        scenario.onActivity(current -> {
+            invoke("handleDisconnect");
+            Runnable retry = (Runnable) get("mPrimaryReconnectRunnable");
+            assertTrue(retry != null);
+            invoke("handleDisconnect");
+            assertSame(retry, get("mPrimaryReconnectRunnable"));
+            invoke("cancelPrimaryReconnect");
+            assertNull(get("mPrimaryReconnectRunnable"));
+            assertFalse((boolean) get("mPrimaryReconnectActive"));
+            assertEquals(ADDRESS, get("mDeviceAddress"));
+        });
+    }
+
+    @Test
+    public void savedGunStartsReconnectLoopFromStartScreen() {
+        scenario.onActivity(current -> {
+            invoke("cancelPrimaryReconnect");
+            set("mConnected", false);
+            set("mCommunicating", false);
+            set("mBluetoothLeService", null);
+            set("mLastPrimaryConnectAttemptAt", SystemClock.elapsedRealtime());
+            set("mDeviceAddress", "");
+            invoke("startSavedGunReconnectOnLaunch");
+            assertFalse((boolean) get("mPrimaryReconnectActive"));
+
+            set("mDeviceAddress", ADDRESS);
+            invoke("startSavedGunReconnectOnLaunch");
+            assertTrue((boolean) get("mPrimaryReconnectActive"));
+            assertTrue(get("mPrimaryReconnectRunnable") != null);
+            invoke("cancelPrimaryReconnect");
         });
     }
 
@@ -232,7 +271,7 @@ public class BluetoothLifecycleRegressionTest {
     }
 
     @Test
-    public void startWizardAppearsOnlyOnceAfterWeaponIsCommunicating() {
+    public void sharedLobbyDoesNotOpenTheOldStartWizardAfterPairing() {
         scenario.onActivity(current -> {
             set("mCommunicating", false);
             invoke("maybeShowStartWizard");
@@ -240,10 +279,7 @@ public class BluetoothLifecycleRegressionTest {
 
             set("mCommunicating", true);
             invoke("maybeShowStartWizard");
-            AlertDialog wizard = (AlertDialog) get("mStartWizardDialog");
-            assertTrue(wizard.isShowing());
-            assertEquals(2, wizard.getListView().getCount());
-            wizard.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+            assertNull(get("mStartWizardDialog"));
         });
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
         scenario.onActivity(current -> {

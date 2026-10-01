@@ -66,6 +66,7 @@ public class GameplayRegressionTest {
     private TcpServer originalTcpServer;
     private RecordingTcpClient tcp;
     private byte originalPairedGrenade;
+    private int originalGrenadeDamage;
     private int originalPowerupQrRequired;
     private boolean originalRespawnQrEnabled;
     private boolean originalLobbyBenched;
@@ -79,6 +80,7 @@ public class GameplayRegressionTest {
         Globals.getInstance().mRoundRoster = null;
         Globals.getInstance().mRequestedJoinTeam = 0;
         originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
+        originalGrenadeDamage = Globals.getInstance().mGrenadeDamage;
         originalPowerupQrRequired = Globals.getInstance().mPowerupQrRequired;
         originalRespawnQrEnabled = Globals.getInstance().mRespawnQrEnabled;
         originalLobbyBenched = Globals.getInstance().mLocalLobbyBenched;
@@ -88,6 +90,7 @@ public class GameplayRegressionTest {
         Globals.getInstance().mSittingOutRoundToken = null;
         Globals.getInstance().mLocalLobbyBenched = false;
         Globals.getInstance().mPairedGrenadeID = 0;
+        Globals.getInstance().mGrenadeDamage = Globals.DAMAGE_PER_HIT;
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().mEndGameVotes = 0;
         Globals.getInstance().mEndGameVoteRequested = false;
@@ -109,6 +112,7 @@ public class GameplayRegressionTest {
             set(activity, "mCommandCharacteristic", characteristic(GattAttributes.RECOIL_COMMAND_UUID));
             set(activity, "mTelemetryCharacteristic", characteristic(GattAttributes.RECOIL_TELEMETRY_UUID));
             set(activity, "mUseNetwork", true);
+            set(activity, "mPhoneHostingEnabled", true);
             set(activity, "mCommunicating", true);
             set(activity, "mReloading", 0);
             set(activity, "mNetworkTeam", 1);
@@ -177,6 +181,7 @@ public class GameplayRegressionTest {
         if (udp != null)
             udp.onDestroy();
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
+        Globals.getInstance().mGrenadeDamage = originalGrenadeDamage;
         Globals.getInstance().mPowerupQrRequired = originalPowerupQrRequired;
         Globals.getInstance().mRespawnQrEnabled = originalRespawnQrEnabled;
         Globals.getInstance().mLocalLobbyBenched = originalLobbyBenched;
@@ -347,6 +352,67 @@ public class GameplayRegressionTest {
             globals.mGameState = Globals.GAME_STATE_NONE;
             invoke(activity, "updateGpsCoordinatesDisplay");
             assertEquals(View.GONE, coordinates.getVisibility());
+        });
+    }
+
+    @Test
+    public void gpsFitsWhileGrenadePairingControlsStayHidden() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+            globals.mUseGPS = true;
+            globals.mPairedGrenadeID = 3;
+            set(activity, "mPendingGrenadeID", (byte) 4);
+            activity.findViewById(R.id.connect_layout).setVisibility(View.GONE);
+            activity.findViewById(R.id.play_layout).setVisibility(View.VISIBLE);
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            invoke(activity, "updateGrenadePairingDisplay");
+            ((TextView) activity.findViewById(R.id.gps_coordinates_tv)).setText(
+                    activity.getString(R.string.gps_coordinates_format, 47.60621, -122.33207));
+        });
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        scenario.onActivity(activity -> {
+            View team = activity.findViewById(R.id.team_tv);
+            View gps = activity.findViewById(R.id.gps_coordinates_tv);
+            View grenade = activity.findViewById(R.id.grenade_status_tv);
+            View confirm = activity.findViewById(R.id.grenade_confirm_button);
+            View shots = activity.findViewById(R.id.shots_label_tv);
+            View play = activity.findViewById(R.id.play_layout);
+            int[] teamPosition = new int[2];
+            int[] gpsPosition = new int[2];
+            int[] shotsPosition = new int[2];
+            int[] playPosition = new int[2];
+            team.getLocationOnScreen(teamPosition);
+            gps.getLocationOnScreen(gpsPosition);
+            shots.getLocationOnScreen(shotsPosition);
+            play.getLocationOnScreen(playPosition);
+            assertTrue("GPS overlaps the team number",
+                    gpsPosition[1] >= teamPosition[1] + team.getHeight());
+            assertEquals(View.GONE, grenade.getVisibility());
+            assertEquals(View.GONE, confirm.getVisibility());
+            assertEquals(View.GONE, activity.findViewById(R.id.lobby_grenade_status).getVisibility());
+            assertEquals(View.GONE, activity.findViewById(R.id.lobby_grenade_confirm_button)
+                    .getVisibility());
+            assertTrue("GPS overlaps combat controls",
+                    shotsPosition[1] >= gpsPosition[1] + gps.getHeight());
+            assertTrue("GPS extends past the screen edge",
+                    gpsPosition[0] >= playPosition[0]
+                            && gpsPosition[0] + gps.getWidth() <= playPosition[0] + play.getWidth());
+        });
+    }
+
+    @Test
+    public void returningToPracticeTurnsLocalGpsTrackingBackOn() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mUseGPS = false;
+            set(activity, "mUseNetwork", false);
+            invoke(activity, "setReady", new Class<?>[]{boolean.class}, false);
+            assertTrue(globals.mUseGPS);
+            invoke(activity, "updateGpsCoordinatesDisplay");
+            assertEquals(activity.getString(R.string.gps_acquiring),
+                    ((TextView) activity.findViewById(R.id.lobby_gps_coordinates))
+                            .getText().toString());
         });
     }
 
@@ -761,9 +827,56 @@ public class GameplayRegressionTest {
         scenario.onActivity(activity -> {
             tcp.dedicated = true;
             receiveTelemetry(activity, grenadePacket(true, 0x3F));
+            assertEquals(0, Globals.getInstance().mPairedGrenadeID);
+            assertTrue(tcp.messages.isEmpty());
+            invoke(activity, "confirmGrenadePairing");
             assertEquals(3, Globals.getInstance().mPairedGrenadeID);
             assertEquals(1, tcp.messages.size());
             assertTrue(tcp.messages.get(0).contains("\"" + TcpServer.JSON_PAIRED_GRENADE_ID + "\":3"));
+        });
+    }
+
+    @Test
+    public void grenadeHoldAndReleaseRequireConfirmationToPair() {
+        scenario.onActivity(activity -> {
+            tcp.dedicated = true;
+            receiveTelemetry(activity, grenadePacket(false, 0x0E));
+            assertEquals(0, Globals.getInstance().mPairedGrenadeID);
+            assertEquals(activity.getString(R.string.grenade_status_pairing),
+                    ((TextView) activity.findViewById(R.id.lobby_grenade_status))
+                            .getText().toString());
+            assertEquals(View.GONE, activity.findViewById(R.id.grenade_status_tv).getVisibility());
+            assertTrue(tcp.messages.isEmpty());
+
+            receiveTelemetry(activity, grenadePacket(true, 0x3F));
+            assertEquals(0, Globals.getInstance().mPairedGrenadeID);
+            assertEquals(activity.getString(R.string.grenade_status_confirm, 3),
+                    ((TextView) activity.findViewById(R.id.lobby_grenade_status))
+                            .getText().toString());
+            assertEquals(View.GONE, activity.findViewById(R.id.lobby_grenade_confirm_button)
+                    .getVisibility());
+            assertTrue(tcp.messages.isEmpty());
+            invoke(activity, "confirmGrenadePairing");
+            assertEquals(3, Globals.getInstance().mPairedGrenadeID);
+            assertEquals(activity.getString(R.string.grenade_status_paired),
+                    ((TextView) activity.findViewById(R.id.lobby_grenade_status))
+                            .getText().toString());
+            assertEquals(View.GONE, activity.findViewById(R.id.grenade_status_tv).getVisibility());
+            assertEquals(1, tcp.messages.size());
+        });
+    }
+
+    @Test
+    public void nearbyGrenadeHoldDoesNotReplaceAnExistingPairWithoutConfirmation() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mPairedGrenadeID = 3;
+            receiveTelemetry(activity, grenadePacket(false, 0x0E));
+            assertEquals(3, Globals.getInstance().mPairedGrenadeID);
+            receiveTelemetry(activity, grenadePacket(false, 0x4F));
+            assertEquals(3, Globals.getInstance().mPairedGrenadeID);
+            assertEquals(0, udp.peerGrenadePairingPublishes);
+            assertEquals(View.GONE, activity.findViewById(R.id.lobby_grenade_confirm_button)
+                    .getVisibility());
         });
     }
 
@@ -772,10 +885,42 @@ public class GameplayRegressionTest {
         scenario.onActivity(activity -> {
             tcp.dedicated = false;
             receiveTelemetry(activity, grenadePacket(true, 0x3F));
+            assertEquals(0, Globals.getInstance().mPairedGrenadeID);
+            assertEquals(0, udp.peerGrenadePairingPublishes);
+            invoke(activity, "confirmGrenadePairing");
             assertEquals(3, Globals.getInstance().mPairedGrenadeID);
             assertEquals("Peer pairing did not leave the local phone", 1,
                     udp.peerGrenadePairingPublishes);
             assertTrue(tcp.messages.isEmpty());
+        });
+    }
+
+    @Test
+    public void grenadePairingStatusTracksReplacementAndMatchingDisarm() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPairedGrenadeID = 3;
+
+            // The start-pair signal may be missed, so a new ID can still be confirmed.
+            receiveTelemetry(activity, grenadePacket(false, 0x4F));
+            assertEquals(3, globals.mPairedGrenadeID);
+            invoke(activity, "confirmGrenadePairing");
+            assertEquals(4, globals.mPairedGrenadeID);
+            String paired = activity.getString(R.string.grenade_status_paired);
+            assertEquals(paired, ((TextView) activity.findViewById(R.id.lobby_grenade_status))
+                    .getText().toString());
+            assertEquals(paired, ((TextView) activity.findViewById(R.id.grenade_status_tv))
+                    .getText().toString());
+            assertEquals(View.GONE, activity.findViewById(R.id.grenade_status_tv).getVisibility());
+
+            receiveTelemetry(activity, grenadePacket(false, 0x3D));
+            assertEquals("Another grenade's disarm removed the current pairing", 4,
+                    globals.mPairedGrenadeID);
+            receiveTelemetry(activity, grenadePacket(false, 0x4D));
+            assertEquals(0, globals.mPairedGrenadeID);
+            assertEquals(activity.getString(R.string.grenade_status_unpaired),
+                    ((TextView) activity.findViewById(R.id.lobby_grenade_status)).getText().toString());
+            assertEquals(View.GONE, activity.findViewById(R.id.grenade_status_tv).getVisibility());
         });
     }
 
@@ -3411,9 +3556,10 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void grenadeDamageStillUsesThePairedOwnersSettings() {
+    public void grenadeDamageUsesTheMatchRuleInsteadOfOwnersGunDamage() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
+            globals.mGrenadeDamage = -3;
             Globals.getmGrenadePairingsSemaphore();
             int previousOwner;
             try {
@@ -3422,7 +3568,7 @@ public class GameplayRegressionTest {
             } finally { globals.mGrenadePairingsSemaphore.release(); }
             try {
                 receiveTelemetry(activity, grenadePacket(false, 0x31));
-                assertEquals(15, get(activity, "mHealth"));
+                assertEquals(17, get(activity, "mHealth"));
                 assertEquals(1, get(activity, "mHitsTaken"));
             } finally {
                 Globals.getmGrenadePairingsSemaphore();
@@ -3433,7 +3579,7 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void teammateGrenadeDoesNotBypassFriendlyFire() {
+    public void teammateGrenadeDamagesFriendlyTeam() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
             Globals.getmGrenadePairingsSemaphore();
@@ -3444,10 +3590,9 @@ public class GameplayRegressionTest {
             } finally { globals.mGrenadePairingsSemaphore.release(); }
             try {
                 receiveTelemetry(activity, grenadePacket(false, 0x31));
-                assertEquals("A teammate grenade bypassed friendly-fire protection", 20,
+                assertEquals("A teammate grenade should damage everyone", 19,
                         get(activity, "mHealth"));
                 assertEquals(1, get(activity, "mHitsTaken"));
-                assertTrue(udp.messages.isEmpty());
             } finally {
                 Globals.getmGrenadePairingsSemaphore();
                 try { globals.mGrenadePairings[3] = previousOwner; }
@@ -3457,9 +3602,40 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void unpairedGrenadeDoesNotNotifyAnInvalidPseudoPlayer() {
+    public void idFreeGrenadeHitDamagesPairedPlayersTeam() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mPairedGrenadeID = 3;
+            receiveTelemetry(activity, grenadePacket(false, 0x01));
+            assertEquals(19, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mHitsTaken"));
+            assertTrue(udp.messages.isEmpty());
+        });
+    }
+
+    @Test
+    public void idFreeEnemyGrenadeUsesTheMatchDamage() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mGrenadeDamage = -3;
+            receiveTelemetry(activity, grenadePacket(false, 0x01));
+            assertEquals(17, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mHitsTaken"));
+        });
+    }
+
+    @Test
+    public void idFreeGrenadeHitWithNoOwnerDamagesEveryone() {
+        scenario.onActivity(activity -> {
+            receiveTelemetry(activity, grenadePacket(false, 0x01));
+            assertEquals(19, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mHitsTaken"));
+        });
+    }
+
+    @Test
+    public void unpairedGrenadeUsesMatchDamageWithoutAnInvalidPseudoPlayer() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
+            globals.mGrenadeDamage = -2;
             Globals.getmGrenadePairingsSemaphore();
             int previousOwner;
             try {
@@ -3471,7 +3647,7 @@ public class GameplayRegressionTest {
                 packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY2] = (byte) Globals.GRENADE_PLAYER_ID;
                 packet[FullscreenActivity.RECOIL_OFFSET_HIT_BY2_SHOTID] = 0x31;
                 receiveTelemetry(activity, packet);
-                assertEquals("An unpaired grenade should still use default damage", 14,
+                assertEquals("An unpaired grenade should use the match's grenade damage", 13,
                         get(activity, "mHealth"));
                 assertTrue(udp.messages.contains(NetMsg.NETMSG_HIT + ":17"));
                 assertTrue("An unpaired grenade was credited to pseudo-player 41",
@@ -3498,7 +3674,7 @@ public class GameplayRegressionTest {
                 byte[] packet = grenadePacket(false, 0x31);
                 receiveTelemetry(activity, packet);
                 receiveTelemetry(activity, packet);
-                assertEquals("Repeated grenade telemetry applied damage twice", 15, get(activity, "mHealth"));
+                assertEquals("Repeated grenade telemetry applied damage twice", 19, get(activity, "mHealth"));
                 assertEquals(1, get(activity, "mHitsTaken"));
             } finally {
                 Globals.getmGrenadePairingsSemaphore();

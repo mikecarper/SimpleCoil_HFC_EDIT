@@ -1076,6 +1076,20 @@ public class TcpClient extends Service {
         }
     }
 
+    /** Report a verified grenade hit without inventing a shooter position. */
+    public void reportHostedGrenadeHit(int grenadeID) {
+        if (grenadeID <= 0 || !Globals.isValidGrenadeID(grenadeID))
+            return;
+        try {
+            JSONObject telemetry = new JSONObject();
+            telemetry.put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_GRENADE_HIT);
+            telemetry.put(TcpServer.JSON_TELEMETRY_GRENADE_ID, grenadeID);
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry.toString());
+        } catch (JSONException e) {
+            Log.w(TAG, "Unable to encode hosted grenade hit telemetry", e);
+        }
+    }
+
     private void sendPlayerGrenade(boolean priority) {
         try {
             JSONObject playerGrenade = new JSONObject();
@@ -1461,6 +1475,11 @@ public class TcpClient extends Service {
                         && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_QR);
                 int powerupQrRequired = game.has(TcpServer.JSON_POWERUP_QR_REQUIRED)
                         ? TcpJson.getInt(game, TcpServer.JSON_POWERUP_QR_REQUIRED) : 0;
+                int grenadeDamage = game.has(TcpServer.JSON_GRENADE_DAMAGE)
+                        ? TcpJson.getInt(game, TcpServer.JSON_GRENADE_DAMAGE)
+                        : Globals.DAMAGE_PER_HIT;
+                if (!Globals.isValidGrenadeDamage(grenadeDamage))
+                    throw new JSONException("Invalid grenade damage from server");
                 boolean respawnQrEnabled = !game.has(TcpServer.JSON_RESPAWN_QR_ENABLED)
                         || TcpJson.getBoolean(game, TcpServer.JSON_RESPAWN_QR_ENABLED);
                 if (powerupQrRequired != 0
@@ -1691,6 +1710,7 @@ public class TcpClient extends Service {
                                         globals.applyTournamentRules();
                                     else
                                         globals.applyClassicRules(gameMode);
+                                    globals.mGrenadeDamage = grenadeDamage;
                                     if (settingsUpdate != null)
                                         applyPlayerSettingsLocked(settingsUpdate, allowPlayerSettings);
                                     globals.mTeamIPMap.clear();

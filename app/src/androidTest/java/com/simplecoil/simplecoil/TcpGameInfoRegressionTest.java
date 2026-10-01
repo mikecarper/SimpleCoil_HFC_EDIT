@@ -48,6 +48,7 @@ public class TcpGameInfoRegressionTest {
     private boolean originalBossMode;
     private int originalBossHunterCount;
     private int originalPowerupQrRequired;
+    private int originalGrenadeDamage;
     private boolean originalRespawnQrEnabled;
     private int originalMapTilePort;
     private long originalEndVotes;
@@ -80,6 +81,7 @@ public class TcpGameInfoRegressionTest {
         originalBossMode = globals.mBossMode;
         originalBossHunterCount = globals.mBossHunterCount;
         originalPowerupQrRequired = globals.mPowerupQrRequired;
+        originalGrenadeDamage = globals.mGrenadeDamage;
         originalRespawnQrEnabled = globals.mRespawnQrEnabled;
         originalMapTilePort = globals.mMapTilePort;
         originalEndVotes = globals.mEndGameVotes;
@@ -134,6 +136,7 @@ public class TcpGameInfoRegressionTest {
         globals.mBossMode = originalBossMode;
         globals.mBossHunterCount = originalBossHunterCount;
         globals.mPowerupQrRequired = originalPowerupQrRequired;
+        globals.mGrenadeDamage = originalGrenadeDamage;
         globals.mRespawnQrEnabled = originalRespawnQrEnabled;
         globals.mMapTilePort = originalMapTilePort;
         globals.mEndGameVotes = originalEndVotes;
@@ -405,6 +408,23 @@ public class TcpGameInfoRegressionTest {
                 assertTrue(client.events.isEmpty());
             }
         }
+    }
+
+    @Test
+    public void grenadeDamageComesFromHostAndRejectsInvalidValues() throws Exception {
+        globals.mGrenadeDamage = Globals.DAMAGE_PER_HIT;
+        parse(roster(new JSONArray().put(player(3)))
+                .put(TcpServer.JSON_GRENADE_DAMAGE, -5));
+        assertEquals(-5, globals.mGrenadeDamage);
+
+        for (Object invalid : new Object[]{0, -1001, 2.5, "-3"}) {
+            parse(roster(new JSONArray().put(player(3)))
+                    .put(TcpServer.JSON_GRENADE_DAMAGE, invalid));
+            assertEquals(-5, globals.mGrenadeDamage);
+        }
+
+        parse(roster(new JSONArray().put(player(3))));
+        assertEquals(Globals.DAMAGE_PER_HIT, globals.mGrenadeDamage);
     }
 
     @Test

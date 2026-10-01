@@ -12,6 +12,9 @@
         android:layout_height="wrap_content"
         android:layout_marginBottom="8dp"
         android:background="#FFBA6A"
+        android:clickable="true"
+        android:focusable="true"
+        android:contentDescription="@string/lobby_host_banner_action"
         android:padding="8dp"
         android:gravity="center"
         android:text="@string/lobby_you_host"
@@ -72,6 +75,13 @@
         <TextView android:id="@+id/lobby_second_gun_battery" style="@style/LobbyBody"
             android:drawablePadding="4dp" android:gravity="center_vertical"
             android:textSize="14sp" android:visibility="gone" />
+        <TextView android:id="@+id/lobby_grenade_status" style="@style/LobbyBody"
+            android:layout_marginTop="4dp" android:text="@string/grenade_status_unpaired"
+            android:visibility="gone" />
+        <Button android:id="@+id/lobby_grenade_confirm_button" style="@style/LobbyTextButton"
+            android:text="@string/grenade_confirm_button" android:visibility="gone" />
+        <TextView style="@style/LobbyBody" android:textSize="13sp"
+            android:text="@string/grenade_pair_instructions" android:visibility="gone" />
         <TextView android:id="@+id/lobby_gps_coordinates" style="@style/LobbyBody"
             android:layout_marginTop="4dp" android:textSize="13sp"
             android:textColor="#C6CCD3" android:text="@string/gps_acquiring" />
@@ -93,7 +103,8 @@
     </LinearLayout>
 
     <LinearLayout android:id="@+id/lobby_wifi_card" style="@style/LobbyCard" android:orientation="vertical">
-        <TextView style="@style/LobbyEyebrow" android:text="@string/lobby_connection_label" />
+        <TextView android:id="@+id/lobby_connection_title" style="@style/LobbyEyebrow"
+            android:text="@string/lobby_connection_label" />
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="horizontal" android:gravity="center_vertical">
             <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"

@@ -154,11 +154,19 @@
             android:layout_below="@id/game_master_respawn_button"
             android:text="@string/respawn_mode_qr" />
 
+        <Button
+            android:id="@+id/grenade_damage_button"
+            style="@style/Widget.AppCompat.Button.Colored"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/respawn_mode_button"
+            android:text="@string/grenade_damage_rule" />
+
         <Switch
             android:id="@+id/allow_join_switch"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_below="@id/respawn_mode_button"
+            android:layout_below="@id/grenade_damage_button"
             android:layout_marginStart="10dp"
             android:layout_marginTop="10dp"
             android:layout_marginEnd="10dp"

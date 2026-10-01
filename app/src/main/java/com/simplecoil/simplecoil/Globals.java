@@ -127,6 +127,11 @@ public class Globals {
     public static final int MIN_DAMAGE_PER_HIT = -1000;
     public static final int MAX_DAMAGE_PER_HIT = -1;
     public volatile int mDamage = DAMAGE_PER_HIT;
+    public volatile int mGrenadeDamage = DAMAGE_PER_HIT;
+
+    public static boolean isValidGrenadeDamage(int damage) {
+        return damage >= MIN_DAMAGE_PER_HIT && damage <= MAX_DAMAGE_PER_HIT;
+    }
     public volatile boolean mOverrideLives = false;
     public volatile int mOverrideLivesVal = 0;
     public volatile boolean mAllowPlayerSettings = false;
@@ -502,7 +507,7 @@ public class Globals {
     public Semaphore mGPSDataSemaphore;
     public Semaphore mPlayerSettingsSemaphore;
     public Semaphore mGrenadePairingsSemaphore;
-    public volatile boolean mUseGPS = false;
+    public volatile boolean mUseGPS = true;
     public volatile boolean mOnlyServerSettings = true;
 
     public volatile long mServerGameTimeRemaining = 0; // in seconds

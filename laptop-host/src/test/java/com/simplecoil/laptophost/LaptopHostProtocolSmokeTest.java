@@ -71,6 +71,8 @@ public final class LaptopHostProtocolSmokeTest {
             require(get("/map").contains("Tactical GPS Map"), "map display was unavailable");
             require(get("/map").contains("/assets/leaflet/leaflet.js"),
                     "map display did not load the bundled renderer");
+            require(get("/map").contains("drawGrenades(s)"),
+                    "map display did not draw grenade hit circles");
             require(get("/assets/leaflet/leaflet.js").contains("Leaflet"),
                     "bundled map renderer was unavailable");
             require(get("/api/map-config").contains("\"available\":true"),
@@ -160,6 +162,24 @@ public final class LaptopHostProtocolSmokeTest {
                         "a confirmed hit did not reveal the shooter to the target");
                 require(redTeammate.readUntil(frame -> gpsFrameContainsPlayer(frame, 1)) != null,
                         "a confirmed hit did not reveal the shooter to the target's team");
+                blueTeammate.send(JSON_PREFIX + "{\"gpslongitude\":-122.3,\"gpslatitude\":47.8}");
+                redTeammate.send(JSON_PREFIX + "{\"gpslongitude\":-122.4,\"gpslatitude\":47.9}");
+                String grenadeHit = JSON_PREFIX + "{\"telemetry\":\"grenadehit\",\"grenadeID\":3}";
+                first.send(grenadeHit);
+                blueTeammate.send(grenadeHit);
+                second.send(grenadeHit);
+                String threeHits = waitForDashboard(value -> value.contains("\"grenadeID\":3")
+                        && value.contains("\"hitCount\":3"));
+                require(threeHits != null && !threeHits.contains("\"centerLatitude\""),
+                        "grenade center appeared before four distinct mapped hits");
+                redTeammate.send(grenadeHit);
+                redTeammate.send(grenadeHit);
+                String fourHits = waitForDashboard(value -> value.contains("\"grenadeID\":3")
+                        && value.contains("\"hitCount\":4")
+                        && value.contains("\"centerLatitude\":47.75"));
+                require(fourHits != null, "four grenade victims did not produce an estimated center");
+                require(fourHits.contains("\"centerLongitude\":"),
+                        "grenade estimate omitted longitude");
                 second.send(MESSAGE_PREFIX + "ELIMINATED1");
                 String kill = first.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ELIMINATED17"));
                 require(kill != null, "scorer did not receive the authoritative kill frame");
@@ -175,6 +195,13 @@ public final class LaptopHostProtocolSmokeTest {
                         "game-master respawn was not accepted");
                 require(second.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "RESPAWNGRANTED")) != null,
                         "respawning player did not receive the grant");
+                first.send(JSON_PREFIX + "{\"playerID\":1,\"pairedgrenadeID\":4}");
+                require(first.readUntil(frame -> frame.contains("\"grenadepairings\"")) != null,
+                        "grenade pairing was not shared");
+                second.send(JSON_PREFIX + "{\"telemetry\":\"grenadehit\",\"grenadeID\":4}");
+                require(waitForDashboard(value -> value.contains("\"grenadeID\":4")
+                        && value.contains("\"hits\":2")) != null,
+                        "paired grenade hit did not credit its owner");
                 require(post("/api/end").contains("\"ok\":true"), "host did not request approval");
                 require(first.readUntil(frame -> frame.contains("\"endvotes\":0")) != null,
                         "the operator incorrectly counted as a player approval");
@@ -318,7 +345,7 @@ public final class LaptopHostProtocolSmokeTest {
                 socket.bind(new InetSocketAddress("127.0.0." + (20 + index), UDP_PORT));
                 socket.setSoTimeout(1_000);
                 pendingJoins.add(socket);
-                byte[] request = "SimpleCoil:JOIN271".getBytes(StandardCharsets.UTF_8);
+                byte[] request = "SimpleCoil:JOIN281".getBytes(StandardCharsets.UTF_8);
                 socket.send(new DatagramPacket(request, request.length,
                         InetAddress.getByName("127.0.0.1"), UDP_PORT));
                 byte[] reply = new byte[128];
@@ -650,12 +677,23 @@ public final class LaptopHostProtocolSmokeTest {
         throw new AssertionError("laptop host did not start");
     }
 
+    private static String waitForDashboard(Predicate<String> wanted) throws Exception {
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        while (System.nanoTime() < deadline) {
+            String state = get("/api/state");
+            if (wanted.test(state))
+                return state;
+            Thread.sleep(25);
+        }
+        return null;
+    }
+
     private static void verifyUdpDiscovery() throws Exception {
         try (DatagramSocket socket = new DatagramSocket(null)) {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.3", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN271".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN281".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -678,7 +716,7 @@ public final class LaptopHostProtocolSmokeTest {
             require(new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8)
                             .matches("SimpleCoil:LOBBYSTATE:28:L:OPEN:[0-9]+"),
                     "shared lobby did not advertise a compatible dedicated host");
-            byte[] join = "SimpleCoil:JOIN270".getBytes(StandardCharsets.UTF_8);
+            byte[] join = "SimpleCoil:JOIN280".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(join, join.length, InetAddress.getLoopbackAddress(), UDP_PORT));
             socket.receive(reply);
             String assignment = new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8);
@@ -697,7 +735,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.4", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN272".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN282".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);

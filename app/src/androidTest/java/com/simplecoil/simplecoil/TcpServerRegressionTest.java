@@ -82,6 +82,25 @@ public class TcpServerRegressionTest {
     }
 
     @Test
+    public void stoppingHostingCannotCancelAPendingOrRunningMatch() throws Exception {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        set(server, "keepListening", true);
+        set(server, "mStartingGame", true);
+        assertFalse(server.cancelIdleLobby());
+        assertTrue(server.hasPendingOrAnnouncedStart());
+
+        set(server, "mStartingGame", false);
+        set(server, "mStartAnnounced", true);
+        assertFalse(server.cancelIdleLobby());
+        assertTrue(server.hasPendingOrAnnouncedStart());
+
+        set(server, "mStartAnnounced", false);
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        assertFalse(server.cancelIdleLobby());
+        assertTrue((Boolean) get(server, "keepListening"));
+    }
+
+    @Test
     public void deeplyNestedArraysCannotCrashServerParsing() throws Exception {
         assertDeepMessageIgnored(true);
     }
@@ -528,6 +547,33 @@ public class TcpServerRegressionTest {
             globals.mGPSMode = originalMode;
             globals.mUseGPS = originalUseGps;
         }
+    }
+
+    @Test
+    public void grenadeHitCreditsPairedOwnerWithoutRevealingOwnersPhone() throws Exception {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        Object target = client(1, 1);
+        Object owner = client(2, 9);
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        Globals.getInstance().mGrenadePairings[3] = 9;
+        assertEquals((byte) 1, get(target, "mPlayerID"));
+        assertEquals((byte) 9, get(owner, "mPlayerID"));
+        assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+
+        parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY,
+                TcpServer.JSON_TELEMETRY_GRENADE_HIT)
+                .put(TcpServer.JSON_TELEMETRY_GRENADE_ID, 3));
+        assertEquals(1, get(owner, "hits"));
+
+        parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY,
+                TcpServer.JSON_TELEMETRY_GRENADE_HIT)
+                .put(TcpServer.JSON_TELEMETRY_GRENADE_ID, 4));
+        assertEquals(1, get(owner, "hits"));
+        @SuppressWarnings("unchecked")
+        Map<Byte, Map<Byte, Long>> reveals = (Map<Byte, Map<Byte, Long>>) get(server,
+                "mEnemyGPSRevealUntil");
+        assertTrue(reveals.isEmpty());
     }
 
     @Test

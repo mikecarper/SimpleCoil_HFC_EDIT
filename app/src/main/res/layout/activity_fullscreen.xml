@@ -132,7 +132,7 @@
             android:layout_height="400dp"
             android:layout_below="@id/health_pb"
             android:layout_centerHorizontal="true"
-            android:visibility="visible" />
+            android:visibility="gone" />
 
         <ImageView
             android:id="@+id/battery_iv"
@@ -160,22 +160,6 @@
             android:layout_marginEnd="10dp"
             android:layout_alignParentEnd="true"
             android:textAppearance="@android:style/TextAppearance.Material.Small.Inverse" />
-
-        <TextView
-            android:id="@+id/gps_coordinates_tv"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_below="@id/player_count_tv"
-            android:layout_alignParentEnd="true"
-            android:layout_marginTop="2dp"
-            android:layout_marginEnd="10dp"
-            android:background="#99000000"
-            android:gravity="end"
-            android:padding="3dp"
-            android:text="@string/gps_acquiring"
-            android:textColor="#FFFFFF"
-            android:textSize="13sp"
-            android:visibility="gone" />
 
         <TextView
             android:id="@+id/eliminations_count_label_tv"
@@ -252,6 +236,55 @@
             android:text="@string/no_team"
             android:textAppearance="@android:style/TextAppearance.Material.Large.Inverse" />
 
+        <LinearLayout
+            android:id="@+id/game_status_row"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_below="@id/team_tv"
+            android:gravity="end"
+            android:orientation="vertical"
+            android:paddingEnd="10dp">
+
+            <TextView
+                android:id="@+id/gps_coordinates_tv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:layout_marginTop="2dp"
+                android:background="#99000000"
+                android:gravity="end"
+                android:padding="3dp"
+                android:text="@string/gps_acquiring"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/grenade_status_tv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:layout_marginTop="2dp"
+                android:background="#99000000"
+                android:padding="3dp"
+                android:text="@string/grenade_status_paired"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/grenade_confirm_button"
+                style="@style/Widget.AppCompat.Button.Borderless.Colored"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:minHeight="40dp"
+                android:text="@string/grenade_confirm_button"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+        </LinearLayout>
+
         <TextView
             android:id="@+id/game_host_badge"
             android:layout_width="wrap_content"
@@ -269,7 +302,7 @@
             android:id="@+id/shots_label_tv"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_below="@+id/team_tv"
+            android:layout_below="@id/game_status_row"
             android:layout_marginTop="6dp"
             android:layout_marginStart="15dp"
             android:text="@string/shots_remaining_label"
@@ -298,7 +331,7 @@
             android:id="@+id/recoil_label_tv"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_below="@+id/team_tv"
+            android:layout_below="@id/game_status_row"
             android:layout_marginTop="6dp"
             android:layout_centerHorizontal="true"
             android:text="@string/recoil_label"
@@ -318,7 +351,7 @@
             android:id="@+id/shot_mode_label_tv"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_below="@+id/team_tv"
+            android:layout_below="@id/game_status_row"
             android:layout_marginTop="6dp"
             android:layout_marginEnd="15dp"
             android:layout_alignParentEnd="true"
@@ -340,7 +373,7 @@
             android:id="@+id/boss_ammo_row"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_below="@id/team_tv"
+            android:layout_below="@id/game_status_row"
             android:layout_marginTop="6dp"
             android:orientation="horizontal"
             android:paddingStart="15dp"

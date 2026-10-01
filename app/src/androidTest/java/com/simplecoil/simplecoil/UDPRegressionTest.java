@@ -1,6 +1,8 @@
 package com.simplecoil.simplecoil;
 
 import android.content.Intent;
+import android.content.Context;
+import android.net.wifi.WifiManager;
 import android.os.CountDownTimer;
 import android.os.SystemClock;
 
@@ -695,6 +697,11 @@ public class UDPRegressionTest {
 
     @Test
     public void invitedJoinReusesThePassiveListenerInsteadOfReportingFailure() throws Exception {
+        WifiManager manager = (WifiManager) service.getApplicationContext()
+                .getSystemService(Context.WIFI_SERVICE);
+        service.multicastLock = manager.createMulticastLock("Lobby reuse regression");
+        service.multicastLock.setReferenceCounted(false);
+        service.multicastLock.acquire();
         set(service, "mPassiveInviteListener", true);
         set(service, "doneListening", false);
         set(service, "keepListening", true);
@@ -708,6 +715,26 @@ public class UDPRegressionTest {
                 ((Integer) get(service, "mReadyToScan")).intValue());
         assertEquals(1, service.listenerStarts);
         assertTrue("Accepting an invite emitted a spurious join failure", service.events.isEmpty());
+        assertTrue("Reusing the lobby listener disabled Wi-Fi host discovery",
+                service.multicastLock.isHeld());
+        service.stopListen();
+        assertFalse("Stopping the lobby leaked its multicast lock", service.multicastLock.isHeld());
+    }
+
+    @Test
+    public void returningDedicatedHostKeepsLobbyDiscoveryButReleasesGameplayWifi() throws Exception {
+        Globals.getInstance().mPlayerID = 0;
+        Globals.getInstance().mServerIP = InetAddress.getByName("127.0.0.1");
+        service.startAuthoritativeStateTicks(PEER_ROUND_TOKEN);
+        assertTrue(service.multicastLock.isHeld());
+        assertTrue(service.wifiLock.isHeld());
+
+        service.finishAuthoritativeStateTicks();
+
+        assertTrue("Returning to the lobby disabled host discovery", service.multicastLock.isHeld());
+        assertFalse("Lobby kept the gameplay Wi-Fi power mode", service.wifiLock.isHeld());
+        service.stopListen();
+        assertFalse(service.multicastLock.isHeld());
     }
 
     @Test
