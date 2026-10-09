@@ -607,11 +607,10 @@ public class WeaponSettingsRegressionTest {
                     .putExtra(BluetoothLeService.EXTRA_UUID, GattAttributes.RECOIL_CONFIG_UUID)
                     .putExtra(BluetoothLeService.EXTRA_DATA, off)
                     .putExtra(BluetoothLeService.EXTRA_STATUS, BluetoothGatt.GATT_SUCCESS);
-            BroadcastReceiver receiver = (BroadcastReceiver) get("mGattUpdateReceiver");
-            receiver.onReceive(current, finished);
+            deliverGattEvent(finished);
             assertEquals(1, bluetooth.configs.size());
             finished.putExtra(BluetoothLeService.EXTRA_STATUS, BluetoothGatt.GATT_FAILURE);
-            for (int i = 0; i < 10; i++) receiver.onReceive(current, finished);
+            for (int i = 0; i < 10; i++) deliverGattEvent(finished);
             batteryPackets(false, 2704, 100);
             assertEquals(3, bluetooth.configs.size());
             for (byte[] config : bluetooth.configs) org.junit.Assert.assertArrayEquals(off, config);
@@ -664,8 +663,8 @@ public class WeaponSettingsRegressionTest {
     }
 
     private void identify(byte type) {
-        ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(activity,
-                new Intent(BluetoothLeService.ID_DATA_AVAILABLE).putExtra(BluetoothLeService.EXTRA_DATA, type));
+        deliverGattEvent(new Intent(BluetoothLeService.ID_DATA_AVAILABLE)
+                .putExtra(BluetoothLeService.EXTRA_DATA, type));
     }
 
     private void firstTelemetry() {
@@ -673,9 +672,21 @@ public class WeaponSettingsRegressionTest {
         byte[] packet = new byte[20];
         packet[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = 30;
         packet[FullscreenActivity.RECOIL_OFFSET_BATTERY_LEVEL] = 16;
-        ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(activity,
-                new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
-                        .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+        deliverGattEvent(new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+    }
+
+    private void deliverGattEvent(Intent intent) {
+        // Physical callbacks stay unregistered. The intended synthetic event
+        // models a live receiver only for the duration of its direct delivery.
+        assertFalse("The fixture must not register physical gun callbacks",
+                (boolean) get("mGattReceiverRegistered"));
+        set("mGattReceiverRegistered", true);
+        try {
+            ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(activity, intent);
+        } finally {
+            set("mGattReceiverRegistered", false);
+        }
     }
 
     private void selectMode(int mode) {

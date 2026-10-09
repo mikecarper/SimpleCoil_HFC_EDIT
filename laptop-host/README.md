@@ -4,7 +4,7 @@
 keeps the game authority and live display on a laptop; players still use the
 Android app and their BLE laser-tag hardware.
 
-It speaks the protocol-28 TCP lobby, clock synchronization, GPS,
+It speaks the protocol-30 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
 
@@ -47,17 +47,41 @@ run this from the repository root:
 
 For Balanced Random teams, start the laptop with `--balanced-qr` to require
 each player to scan the assigned Team 1 or Team 2 QR, or `--balanced-no-qr` to
-start the 10-second countdown as soon as teams are assigned. The laptop uses
+start the 24-second countdown as soon as teams are assigned. The laptop uses
 the prior kills and deaths reported by each phone and keeps team sizes within
 two players. The dashboard Start button assigns teams; QR mode starts
 automatically after the last check-in. These options also work with `--takeover`.
-If a player does not scan, QR mode starts the same 10-second countdown after
+If a player does not scan, QR mode starts the same 24-second countdown after
 90 seconds; that player stays on their assigned team.
 
-To enable gameplay QR power-ups on the laptop host, add `--powerup-qr 4` through
+Ordinary rounds also start with a shared 24-second countdown. An explicit
+`--start-delay 1` through `--start-delay 1000` overrides that duration for
+ordinary rounds; Balanced Random rounds always use 24 seconds. Phones announce
+the countdown from "10 Mississippi" to "0 Mississippi" every two seconds over
+the first 20 seconds. The final four seconds leave time for
+"All out of Mississippi's." before play starts. "May the odds be ever in
+your favor." follows as play starts.
+
+To enable gameplay QR power-ups on the laptop host, add `--powerup-qr 2` through
 `--powerup-qr 8` (off by default). Print eight QR codes containing the text
 `SIMPLECOIL:POWERUP:1` through `SIMPLECOIL:POWERUP:8`; each phone must scan
-different codes to earn each random reward. Progress resets on death.
+different codes to earn each random reward. Progress resets on death. The host
+validates each scan set and grants a reward only once per completed set during
+active play; duplicate reports, stale lives, and reconnects cannot award it again.
+Teams behind in the current score receive stronger rewards more often.
+For every five points a team trails the leading opponent, its scan requirement
+drops by one from the configured base, down to a minimum of two. For example,
+an eight-code game requires seven codes when five points behind and six when
+ten points behind. Codes already spent on a reward cannot be reused when the
+requirement changes; only unspent progress counts toward another reward.
+
+Rewards are EMP (10 seconds); 50% extra shields for the player or their team;
+automatic fire; automatic fire with a 90-round magazine; double damage;
+full-health healing for the team; a burst damaging every living enemy for 25%
+of normal health; or invulnerability. Temporary buffs last 15 seconds unless
+otherwise noted. The host sends one grant to every phone, so team effects and
+attacker damage buffs agree across the game. Reconnecting phones receive the
+remaining active grants without restarting their timers.
 
 For Boss Mode, run `./laptop-host/run.sh --boss`. Player 1 is the boss and all
 other player IDs are hunters. Boss scaling freezes when the round starts. Hunters
@@ -88,7 +112,7 @@ converted, or when conversions leave one final uninfected player. Infection is
 always a five-minute round; players still alive and uninfected at the deadline
 win.
 
-Phones running 1.32 automatically discover and join this host on the same
+Phones running this release automatically discover and join this host on the same
 Wi-Fi/AP, even before their guns are paired. The laptop announces its lobby
 every two seconds and takes priority over idle phone hosts. Automatic player
 assignment uses free IDs and balances ordinary teams. The host waits until
@@ -104,7 +128,7 @@ end. Two different players must agree; the non-playing laptop operator and
 sitting-out phones do not count. The button shows the approval count. Players
 can withdraw approval or confirm **Leave game** on their phone at any time;
 leaving does not end the shared round. Timer and victory-condition endings
-remain automatic. Use protocol-28 phones (app 1.32) with this host. Update the
+remain automatic. Use protocol-30 phones with this host. Update the
 laptop and every phone together; the previous protocol is not compatible.
 
 A round stopped before 60 seconds of actual play can be restarted without
@@ -249,6 +273,18 @@ produce a useful initial location while a phone is acquiring satellites. The
 app forwards meaningful movement to a hosted game immediately. The laptop
 forwards changed positions at up to four updates per second and sends periodic
 complete snapshots to correct stale markers.
+
+Protocol 30 shares a fixed lobby GPS origin alongside clock synchronization.
+The first fresh player fix establishes the laptop's origin. In-area updates
+use signed 16-bit north/east offsets in 2.5 cm units over a 1,638.4 m square
+(about 1.02 miles). Every binary snapshot carries its origin and remains
+independently decodable after packet loss. Fixes outside the square retain
+full absolute coordinates over TCP. The host rejects invalid (0, 0) fixes
+and mismatched relative origins; zero offsets at a valid origin are accepted.
+The 2.5 cm figure describes encoding precision, not the phone's GPS accuracy.
+Stationary phones refresh fresh fixes every five seconds. Position updates retain
+the original measurement age; current map markers and new hit lines omit fixes
+older than 15 seconds, while historical trails remain visible.
 
 When a phone has a fresh GPS fix, SimpleCoil also uses its UTC timestamp as an
 optional refinement for the shared countdown. It does not change the phone's

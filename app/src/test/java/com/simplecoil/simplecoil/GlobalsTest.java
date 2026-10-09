@@ -31,7 +31,13 @@ public class GlobalsTest {
     }
 
     @Test public void respawnWaitDoesNotExtendInitialCountdownSoloOrFfa() {
-        assertEquals(10L, Globals.respawnWaitSeconds(true, true, Globals.GAME_MODE_2TEAMS, 10));
+        for (boolean networked : new boolean[]{false, true}) {
+            for (int mode : new int[]{Globals.GAME_MODE_FFA, Globals.GAME_MODE_2TEAMS,
+                    Globals.GAME_MODE_4TEAMS}) {
+                for (long respawn : new long[]{1, 10, 90, Long.MIN_VALUE, Long.MAX_VALUE})
+                    assertEquals(24L, Globals.respawnWaitSeconds(networked, true, mode, respawn));
+            }
+        }
         assertEquals(10L, Globals.respawnWaitSeconds(false, false, Globals.GAME_MODE_2TEAMS, 10));
         assertEquals(10L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_FFA, 10));
         assertEquals(42L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_FFA, 42));

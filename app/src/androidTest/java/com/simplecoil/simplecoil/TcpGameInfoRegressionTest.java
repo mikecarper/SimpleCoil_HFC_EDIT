@@ -51,6 +51,7 @@ public class TcpGameInfoRegressionTest {
     private int originalGrenadeDamage;
     private boolean originalRespawnQrEnabled;
     private int originalMapTilePort;
+    private com.simplecoil.protocol.GpsOffset originalGpsOffset;
     private long originalEndVotes;
     private boolean originalEndVoteRequested;
     private int[] originalPairings;
@@ -84,6 +85,8 @@ public class TcpGameInfoRegressionTest {
         originalGrenadeDamage = globals.mGrenadeDamage;
         originalRespawnQrEnabled = globals.mRespawnQrEnabled;
         originalMapTilePort = globals.mMapTilePort;
+        originalGpsOffset = globals.mGpsOffset;
+        globals.mGpsOffset = null;
         originalEndVotes = globals.mEndGameVotes;
         originalEndVoteRequested = globals.mEndGameVoteRequested;
         globals.mEndGameVotes = 0;
@@ -139,6 +142,7 @@ public class TcpGameInfoRegressionTest {
         globals.mGrenadeDamage = originalGrenadeDamage;
         globals.mRespawnQrEnabled = originalRespawnQrEnabled;
         globals.mMapTilePort = originalMapTilePort;
+        globals.mGpsOffset = originalGpsOffset;
         globals.mEndGameVotes = originalEndVotes;
         globals.mEndGameVoteRequested = originalEndVoteRequested;
         System.arraycopy(originalPairings, 0, globals.mGrenadePairings, 0, originalPairings.length);
@@ -1093,9 +1097,9 @@ public class TcpGameInfoRegressionTest {
     }
 
     @Test
-    public void zeroCoordinatePlaceholderDoesNotReplaceTheGpsSnapshot() throws Exception {
+    public void nullIslandPlaceholderDoesNotReplaceTheGpsSnapshot() throws Exception {
         Globals.GPSData original = putGPS(5, 1);
-        double[][] placeholders = {{0, 0}, {10, 0}, {0, 20}};
+        double[][] placeholders = {{0, 0}};
         for (double[] coordinates : placeholders) {
             JSONObject placeholder = gps(5, 2).put(TcpServer.JSON_GPSLONGITUDE, coordinates[0])
                     .put(TcpServer.JSON_GPSLATITUDE, coordinates[1]);
@@ -1103,6 +1107,62 @@ public class TcpGameInfoRegressionTest {
             assertSame(original, globals.mGPSData.get((byte) 5));
             assertTrue(client.events.isEmpty());
         }
+    }
+
+    @Test
+    public void gpsSnapshotsAcceptEquatorAndPrimeMeridian() throws Exception {
+        for (double[] coordinates : new double[][]{{10, 0}, {0, 20}}) {
+            JSONObject update = gps(5, 1).put(TcpServer.JSON_GPSLONGITUDE, coordinates[0])
+                    .put(TcpServer.JSON_GPSLATITUDE, coordinates[1]);
+            parse(gpsUpdate(true, update));
+            assertEquals(coordinates[0], globals.mGPSData.get((byte) 5).longitude, 0);
+            assertEquals(coordinates[1], globals.mGPSData.get((byte) 5).latitude, 0);
+        }
+    }
+
+    @Test
+    public void malformedGpsSnapshotCannotCommitAnOrigin() throws Exception {
+        JSONObject invalid = gpsUpdate(true, new JSONObject().put(TcpServer.JSON_PLAYERID, 9));
+        GpsWire.putOrigin(invalid, com.simplecoil.protocol.GpsOffset.create(47.6, -122.1));
+        parse(invalid);
+        assertNull(globals.mGpsOffset);
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void mismatchedRoundRosterCannotCommitAnOriginOrTournamentRules() throws Exception {
+        JSONObject invalid = roster(new JSONArray().put(player(1)).put(player(2)));
+        com.simplecoil.protocol.RoundRoster round = new com.simplecoil.protocol.RoundRoster(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        invalid.put(LiveJoin.ROSTER, round.encode());
+        GpsWire.putOrigin(invalid, com.simplecoil.protocol.GpsOffset.create(47.6, -122.1));
+        parse(invalid);
+        assertNull(globals.mGpsOffset);
+        assertFalse(globals.mTournamentMode);
+        assertOriginalRoster();
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void gpsSnapshotCannotReplaceTheFixedLobbyOrigin() throws Exception {
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        globals.mGpsOffset = origin;
+        JSONObject changed = gpsUpdate(true, gps(5, 1));
+        GpsWire.putOrigin(changed, com.simplecoil.protocol.GpsOffset.create(48.6, -122.1));
+        parse(changed);
+        assertSame(origin, globals.mGpsOffset);
+        assertTrue(globals.mGPSData.isEmpty());
+        assertTrue(client.events.isEmpty());
+    }
+
+    @Test
+    public void pendingNullOriginCannotEraseTheChosenOrigin() throws Exception {
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        globals.mGpsOffset = origin;
+        JSONObject snapshot = gpsUpdate(true);
+        GpsWire.putOrigin(snapshot, null);
+        parse(snapshot);
+        assertSame(origin, globals.mGpsOffset);
     }
 
     @Test
@@ -1126,6 +1186,29 @@ public class TcpGameInfoRegressionTest {
         assertSame(original, globals.mGPSData.get((byte) 5));
         assertFalse(original.hasUpdate);
         assertTrue(client.events.get(0).getBooleanExtra(NetMsg.INTENT_FULLUPDATE, false));
+    }
+
+    @Test
+    public void unchangedTcpCoordinatesRetainTheHostsMeasurementAge() throws Exception {
+        Globals.GPSData original = putGPS(5, 1);
+        original.longitude = 10;
+        original.latitude = 20;
+        original.fromPeerState = true;
+        original.fixElapsedMs = SystemClock.elapsedRealtime();
+        long before = SystemClock.elapsedRealtime();
+        parse(gpsUpdate(true, gps(5, 1).put(TcpServer.JSON_GPS_FIX_AGE, 10_000)));
+        assertSame(original, globals.mGPSData.get((byte) 5));
+        assertFalse(original.fromPeerState);
+        assertTrue(original.fixElapsedMs >= before - 10_000);
+        assertTrue(original.fixElapsedMs <= SystemClock.elapsedRealtime() - 10_000);
+    }
+
+    @Test
+    public void expiredTcpSnapshotDoesNotRefreshThePreviousLocation() throws Exception {
+        Globals.GPSData original = putGPS(5, 1);
+        parse(gpsUpdate(true, gps(5, 1).put(TcpServer.JSON_GPS_FIX_AGE, 31_000)));
+        assertSame(original, globals.mGPSData.get((byte) 5));
+        assertTrue(client.events.isEmpty());
     }
 
     private Globals.GPSData putGPS(int id, int team) {

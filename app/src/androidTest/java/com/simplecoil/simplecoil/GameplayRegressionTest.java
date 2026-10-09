@@ -8,6 +8,8 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.drawable.AnimationDrawable;
 import android.os.Build;
 import android.os.CountDownTimer;
@@ -28,6 +30,9 @@ import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import com.simplecoil.protocol.GameStartCountdown;
+import com.simplecoil.protocol.Powerups;
+
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -44,6 +49,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -67,6 +75,8 @@ public class GameplayRegressionTest {
     private RecordingTcpClient tcp;
     private byte originalPairedGrenade;
     private int originalGrenadeDamage;
+    private int originalEliminationCount;
+    private boolean eliminationCountCaptured;
     private int originalPowerupQrRequired;
     private boolean originalRespawnQrEnabled;
     private boolean originalLobbyBenched;
@@ -76,6 +86,11 @@ public class GameplayRegressionTest {
 
     @Before
     public void setUp() {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            originalEliminationCount = (int) get(null, "mEliminationCount");
+            eliminationCountCaptured = true;
+            set(null, "mEliminationCount", 0);
+        });
         originalRoundRoster = Globals.getInstance().mRoundRoster;
         Globals.getInstance().mRoundRoster = null;
         Globals.getInstance().mRequestedJoinTeam = 0;
@@ -121,6 +136,9 @@ public class GameplayRegressionTest {
             set(activity, "mLastTeam", (byte) 1);
             set(activity, "mLastShotCount", (byte) 30);
             set(activity, "mHasLivesLimit", false);
+            // Deaths survive real activity recreation, but separate tests
+            // must not inherit a previous test's life generation.
+            set(activity, "mEliminationCount", 0);
             set(activity, "mStartGameTimer", false);
             set(activity, "mReady", false);
             set(activity, "mIsServer", false);
@@ -154,7 +172,10 @@ public class GameplayRegressionTest {
 
     @After
     public void tearDown() {
-        if (scenario == null) return;
+        if (scenario == null) {
+            restoreEliminationCount();
+            return;
+        }
         // A live game's rendering/confirmation dialog can keep Android 5's
         // idle handler pending. Stop it on the main thread before waiting for
         // ActivityScenario's lifecycle cleanup to become idle.
@@ -177,7 +198,11 @@ public class GameplayRegressionTest {
             Globals.getInstance().mOverrideLives = false;
             set(activity, "mHasLivesLimit", false);
         });
-        scenario.close();
+        try {
+            scenario.close();
+        } finally {
+            restoreEliminationCount();
+        }
         if (udp != null)
             udp.onDestroy();
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
@@ -189,6 +214,12 @@ public class GameplayRegressionTest {
         Globals.getInstance().mSittingOutRoundToken = originalSittingOutToken;
         Globals.getInstance().mRoundRoster = originalRoundRoster;
         Globals.getInstance().mRequestedJoinTeam = 0;
+    }
+
+    private void restoreEliminationCount() {
+        if (eliminationCountCaptured)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() ->
+                    set(null, "mEliminationCount", originalEliminationCount));
     }
 
     @Test
@@ -1184,7 +1215,11 @@ public class GameplayRegressionTest {
             invoke(activity, "startGame");
             CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
             spawn.cancel();
+            set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() - 1);
             spawn.onFinish();
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(false, get(activity, "mStartGameTimer"));
+            assertEquals(0, get(activity, "mRespawnShieldBonus"));
             set(activity, "mUseNetwork", true);
             receiveNetwork(activity, new Intent(NetMsg.NETMSG_OUT));
             assertEquals("The old animation suppressed this round's hit confirmation", View.VISIBLE,
@@ -1205,7 +1240,11 @@ public class GameplayRegressionTest {
             invoke(activity, "startGame");
             CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
             spawn.cancel();
+            set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() - 1);
             spawn.onFinish();
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(false, get(activity, "mStartGameTimer"));
+            assertEquals(0, get(activity, "mRespawnShieldBonus"));
 
             // The offline start is only used to avoid requiring a peer round
             // nonce here. Restore the network damage table before verifying
@@ -1627,16 +1666,26 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void newestScoreFeedbackGetsItsOwnFullDisplayInterval() throws InterruptedException {
-        scenario.onActivity(activity -> receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED)));
-        Thread.sleep(500);
-        scenario.onActivity(activity -> receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED)));
-        Thread.sleep(400);
+    public void staleScoreCleanupCannotHideNewerFeedback() {
         scenario.onActivity(activity -> {
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            Runnable oldCleanup = (Runnable) get(activity, "mScoreFeedbackCleanup");
+            assertNotNull(oldCleanup);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            Runnable currentCleanup = (Runnable) get(activity, "mScoreFeedbackCleanup");
+            assertNotNull(currentCleanup);
+            assertNotSame(oldCleanup, currentCleanup);
+            oldCleanup.run();
             assertEquals(2, get(activity, "mScore"));
             assertEquals("The first kill's cleanup hid the newer score feedback", View.VISIBLE,
                     ((View) get(activity, "mScoreIncreaseIV")).getVisibility());
             assertEquals(View.VISIBLE, ((View) get(activity, "mScoreIncreasePlayerNameTV")).getVisibility());
+            assertSame(currentCleanup, get(activity, "mScoreFeedbackCleanup"));
+            currentCleanup.run();
+            ((android.os.Handler) get(activity, "mCombatFeedbackHandler")).removeCallbacks(currentCleanup);
+            assertEquals(View.GONE, ((View) get(activity, "mScoreIncreaseIV")).getVisibility());
+            assertEquals(View.GONE, ((View) get(activity, "mScoreIncreasePlayerNameTV")).getVisibility());
+            assertNull(get(activity, "mScoreFeedbackCleanup"));
         });
     }
 
@@ -1713,9 +1762,170 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void roundStartVoiceWaitsOneSecondAfterTheCountdown() {
-        scenario.onActivity(activity ->
-                assertEquals(1_000L, get(activity, "ROUND_START_VOICE_DELAY_MS")));
+    public void gameStartVoiceCountsMississippisEveryTwoSecondsWithoutRepeats() {
+        withRecordingSpeech((activity, speech) -> {
+            invoke(activity, "resetGameStartCountdownSpeech");
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class},
+                    GameStartCountdown.DURATION_MS + 1);
+            assertTrue("An early host deadline must not invent an eleventh Mississippi", speech.queued.isEmpty());
+            List<String> expected = new ArrayList<>();
+            List<Integer> expectedQueueModes = new ArrayList<>();
+            for (int number = GameStartCountdown.SPOKEN_MAX; number > 0; number--) {
+                long remaining = GameStartCountdown.ENDING_VOICE_MS
+                        + number * GameStartCountdown.VOICE_STEP_MS;
+                invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, remaining);
+                invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, remaining - 1);
+                // A clock refinement that moves the deadline later cannot repeat a number.
+                invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, remaining + 1);
+                expected.add("normal:1.0:" + activity.getString(R.string.game_start_mississippi_voice_prompt, number));
+                expectedQueueModes.add(android.speech.tts.TextToSpeech.QUEUE_FLUSH);
+            }
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, GameStartCountdown.ENDING_VOICE_MS);
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, GameStartCountdown.ENDING_VOICE_MS - 1);
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, 0L);
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, -1L);
+            expected.add("normal:1.0:" + activity.getString(R.string.game_start_countdown_finished_voice_prompt));
+            expectedQueueModes.add(android.speech.tts.TextToSpeech.QUEUE_ADD);
+            assertEquals(expected, speech.queued);
+            assertEquals(expectedQueueModes, speech.queueModes);
+            assertEquals(0, get(activity, "mLastSpokenGameStartSecond"));
+        });
+    }
+
+    @Test
+    public void synchronizedCountdownKeepsGunsLockedDuringFourSecondClosingLineBuffer() {
+        withRecordingSpeech((activity, speech) -> {
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+            assertNotNull(timer);
+            timer.cancel(); // Drive callbacks manually, without a real-time callback left behind.
+            assertEquals(Collections.singletonList("normal:1.0:"
+                    + activity.getString(R.string.game_start_mississippi_voice_prompt, 10)), speech.queued);
+            speech.queued.clear();
+            speech.queueModes.clear();
+            int lockedWrites = bluetooth.writes.size();
+            assertEquals(2, bluetooth.writes.get(lockedWrites - 1)[2]);
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS);
+
+            timer.onTick(0);
+
+            assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + 1000);
+            timer.onTick(Long.MAX_VALUE);
+            assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() - 1);
+
+            timer.onFinish();
+
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertNull(get(activity, "mSpawnTimer"));
+            assertEquals(false, get(activity, "mStartGameTimer"));
+            assertEquals("The blaster was not enabled at the absolute start deadline",
+                    4, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+            assertMississippiFinishAndRoundStart(activity, speech);
+            timer.onFinish();
+            assertEquals("A stale timer repeated the end-of-countdown speech", 3, speech.queued.size());
+        });
+    }
+
+    @Test
+    public void offlineStartWaitsTwentyFourSecondsIncludingClosingLineBuffer() {
+        withRecordingSpeech((activity, speech) -> {
+            Globals globals = Globals.getInstance();
+            long previousRespawnTime = globals.mRespawnTime;
+            try {
+                globals.mGameState = Globals.GAME_STATE_NONE;
+                globals.mRespawnTime = 90;
+                set(activity, "mUseNetwork", false);
+                long before = SystemClock.elapsedRealtime();
+                invoke(activity, "startGame");
+                long after = SystemClock.elapsedRealtime();
+                long deadline = (long) get(activity, "mLocalGameStartAt");
+                assertTrue(deadline >= before + GameStartCountdown.DURATION_MS);
+                assertTrue(deadline <= after + GameStartCountdown.DURATION_MS);
+                assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
+                CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+                assertNotNull(timer);
+                timer.cancel(); // Drive the absolute deadline without sleeping for 24 seconds.
+                assertEquals(Collections.singletonList("normal:1.0:"
+                        + activity.getString(R.string.game_start_mississippi_voice_prompt, 10)), speech.queued);
+
+                // Timer arguments can be stale; only the absolute deadline permits play.
+                timer.onTick(0);
+                assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
+                assertSame(timer, get(activity, "mSpawnTimer"));
+                assertEquals(1, speech.queued.size());
+                speech.queued.clear();
+                speech.queueModes.clear();
+                int lockedWrites = bluetooth.writes.size();
+                assertEquals(2, bluetooth.writes.get(lockedWrites - 1)[2]);
+                set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS);
+                timer.onTick(0);
+                assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+                set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() + 1000);
+                timer.onTick(Long.MAX_VALUE);
+                assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+                set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() - 1);
+                timer.onTick(Long.MAX_VALUE);
+                assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
+                assertNull(get(activity, "mSpawnTimer"));
+                assertEquals("The blaster was not enabled at the absolute start deadline",
+                        4, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+                assertMississippiFinishAndRoundStart(activity, speech);
+            } finally {
+                globals.mRespawnTime = previousRespawnTime;
+            }
+        });
+    }
+
+    @Test
+    public void delayedSpeechEngineKeepsZeroAndFinishLineBeforeTheRoundStartPrompt() {
+        withRecordingSpeech((activity, speech) -> {
+            invoke(activity, "resetGameStartCountdownSpeech");
+            set(activity, "mCountdownSpeechReady", false);
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, GameStartCountdown.DURATION_MS);
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, GameStartCountdown.ENDING_VOICE_MS);
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, 0L);
+            invoke(activity, "announceRoundStart");
+            @SuppressWarnings("unchecked")
+            ArrayDeque<Integer> pending = (ArrayDeque<Integer>) get(activity, "mPendingVoicePrompts");
+            assertEquals(Arrays.asList(R.string.game_start_countdown_finished_voice_prompt,
+                    R.string.game_start_voice_prompt), new ArrayList<>(pending));
+            assertTrue(speech.queued.isEmpty());
+
+            // Replay exactly as the real engine's readiness callback does.
+            set(activity, "mCountdownSpeechReady", true);
+            while (!pending.isEmpty())
+                invoke(activity, "speakRoundVoicePrompt", new Class<?>[]{int.class}, pending.removeFirst());
+            assertMississippiFinishAndRoundStart(activity, speech);
+        });
+    }
+
+    private void assertCountdownClosingLineKeepsGunsLocked(FullscreenActivity activity, RecordingSpeech speech,
+                                                          CountDownTimer timer, int lockedWrites) {
+        assertEquals(Collections.singletonList("normal:1.0:"
+                + activity.getString(R.string.game_start_countdown_finished_voice_prompt)), speech.queued);
+        assertEquals(Collections.singletonList(android.speech.tts.TextToSpeech.QUEUE_ADD), speech.queueModes);
+        assertEquals("The closing line must not start gameplay early",
+                Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+        assertEquals(true, get(activity, "mStartGameTimer"));
+        assertSame(timer, get(activity, "mSpawnTimer"));
+        assertEquals(get(activity, "RELOADING_STATE_ELIMINATED"), get(activity, "mReloading"));
+        invoke(activity, "finishReload");
+        assertEquals("The blaster was enabled during the closing-line buffer", lockedWrites, bluetooth.writes.size());
+    }
+
+    private static void assertMississippiFinishAndRoundStart(FullscreenActivity activity, RecordingSpeech speech) {
+        assertEquals(1_000L, get(activity, "ROUND_START_VOICE_DELAY_MS"));
+        assertEquals(Arrays.asList("normal:1.0:"
+                        + activity.getString(R.string.game_start_countdown_finished_voice_prompt),
+                "silence:1000", "normal:1.0:" + activity.getString(R.string.game_start_voice_prompt)), speech.queued);
+        assertEquals("The round-start phrase must not flush zero or the finish line",
+                Arrays.asList(android.speech.tts.TextToSpeech.QUEUE_ADD,
+                        android.speech.tts.TextToSpeech.QUEUE_ADD,
+                        android.speech.tts.TextToSpeech.QUEUE_ADD), speech.queueModes);
     }
 
     @Test
@@ -2281,12 +2491,23 @@ public class GameplayRegressionTest {
     public void finishedServerSnapshotDoesNotStartLobbyCountdown() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);
-            receiveNetwork(activity, gameUpdate(7, 5, 12, 0)
-                    .putExtra(NetMsg.INTENT_GAMESTATE, Globals.GAME_STATE_NONE));
-            assertNull(get(activity, "mGameCountdownTimer"));
-            assertEquals(false, get(activity, "mGameTimerRunning"));
-            assertEquals(7, get(activity, "mScore"));
-            assertTrue(tcp.messages.isEmpty());
+            set(activity, "mLobbyJoined", false);
+            boolean previousReady = Globals.getInstance().mLocalLobbyReady;
+            Globals.getInstance().mLocalLobbyReady = true;
+            try {
+                receiveNetwork(activity, gameUpdate(7, 5, 12, 0)
+                        .putExtra(NetMsg.INTENT_GAMESTATE, Globals.GAME_STATE_NONE));
+                assertNull(get(activity, "mGameCountdownTimer"));
+                assertEquals(false, get(activity, "mGameTimerRunning"));
+                assertEquals(7, get(activity, "mScore"));
+                assertEquals(Collections.singletonList(TcpServer.TCPMESSAGE_PREFIX
+                        + TcpServer.TCPPREFIX_JSON + "{\"" + TcpServer.JSON_LOBBY_READY
+                        + "\":true}"), tcp.messages);
+                assertFalse(tcp.messages.contains(TcpServer.TCPMESSAGE_PREFIX
+                        + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME));
+            } finally {
+                Globals.getInstance().mLocalLobbyReady = previousReady;
+            }
         });
     }
 
@@ -2667,9 +2888,13 @@ public class GameplayRegressionTest {
     public void initialCountdownTracksOnlyItsOwnClockAdjustment() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);
-            long deadline = SystemClock.elapsedRealtime() + 10000;
+            long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
             receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
             CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+            timer.onTick(0);
+            assertEquals("A timer argument replaced the shared absolute deadline",
+                    Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertSame(timer, get(activity, "mSpawnTimer"));
 
             long adjustedDeadline = deadline - 250;
             receiveNetwork(activity, synchronizedStart(adjustedDeadline, adjustedDeadline + 60000)
@@ -3157,7 +3382,11 @@ public class GameplayRegressionTest {
             invoke(activity, "startGame");
             CountDownTimer initialSpawn = (CountDownTimer) get(activity, "mSpawnTimer");
             assertTrue(initialSpawn != null);
+            initialSpawn.cancel();
+            set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() - 1);
             initialSpawn.onFinish();
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(false, get(activity, "mStartGameTimer"));
             assertEquals(0, get(activity, "mRespawnShieldBonus"));
             assertNull(get(activity, "mRespawnShieldBoostTimer"));
         });
@@ -3327,6 +3556,115 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void powerupRouletteReallyAnimatesRevealsAndDrawsOnThePhone() throws InterruptedException {
+        float animatorScale = rouletteAnimatorScale();
+        org.junit.Assume.assumeTrue("Animation duration must fit the bounded phone test",
+                animatorScale >= 0 && animatorScale <= 2);
+        PowerupRouletteView[] roulette = new PowerupRouletteView[1];
+        String[] reward = new String[1];
+        CountDownLatch announced = new CountDownLatch(1);
+        AtomicInteger announcements = new AtomicInteger();
+        try {
+            scenario.onActivity(activity -> {
+                roulette[0] = activity.findViewById(R.id.powerup_roulette);
+                reward[0] = activity.getString(PowerupPresentation.name(Powerups.SHIELD_PLAYER));
+                roulette[0].showReward(reward[0], () -> {
+                    announcements.incrementAndGet();
+                    announced.countDown();
+                });
+            });
+            assertTrue("The real roulette animation never announced its reward",
+                    announced.await(10, TimeUnit.SECONDS));
+            assertEquals(1, announcements.get());
+            scenario.onActivity(activity -> {
+                PowerupRouletteView view = roulette[0];
+                assertEquals(View.VISIBLE, view.getVisibility());
+                assertEquals(reward[0], view.getContentDescription().toString());
+                // Disabled animations may complete before Android's next layout.
+                // Measure the real XML-sized view before exercising its Canvas path.
+                int width = view.getLayoutParams().width;
+                int height = view.getLayoutParams().height;
+                assertTrue(width > 0 && height > 0);
+                view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY));
+                view.layout(0, 0, width, height);
+                Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                try {
+                    view.draw(new Canvas(bitmap));
+                    assertTrue("The roulette Canvas renderer produced no visible pixels",
+                            bitmap.getPixel(width / 2, height / 2) != 0);
+                } finally {
+                    bitmap.recycle();
+                }
+            });
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+                if (roulette[0] != null) {
+                    roulette[0].cancel();
+                    assertEquals(View.GONE, roulette[0].getVisibility());
+                }
+            });
+        }
+    }
+
+    @Test
+    public void queuedRealPowerupRouletteSpinKeepsTheSecondRevealVisible() throws InterruptedException {
+        float animatorScale = rouletteAnimatorScale();
+        org.junit.Assume.assumeTrue("Queue timing requires enabled, reasonably scaled animations",
+                animatorScale >= .25f && animatorScale <= 2);
+        PowerupRouletteView[] roulette = new PowerupRouletteView[1];
+        String[] secondReward = new String[1];
+        CountDownLatch announced = new CountDownLatch(2);
+        AtomicInteger announcements = new AtomicInteger();
+        // At faster scales, the obsolete first hide fires after the second
+        // reveal. Observe beyond it, before the second reward's own hide.
+        long observeAfter = Math.max(100L, (long) Math.ceil(2200 * (1f - animatorScale)) + 100L);
+        CountDownLatch oldHideBoundaryPassed = new CountDownLatch(1);
+        int[] observedVisibility = {-1};
+        String[] observedReward = new String[1];
+        try {
+            scenario.onActivity(activity -> {
+                roulette[0] = activity.findViewById(R.id.powerup_roulette);
+                secondReward[0] = activity.getString(PowerupPresentation.name(Powerups.FULL_AUTO_90));
+                roulette[0].showReward(activity.getString(PowerupPresentation.name(Powerups.SHIELD_PLAYER)), () -> {
+                    announcements.incrementAndGet();
+                    announced.countDown();
+                    roulette[0].showReward(secondReward[0], () -> {
+                        announcements.incrementAndGet();
+                        roulette[0].postDelayed(() -> {
+                            observedVisibility[0] = roulette[0].getVisibility();
+                            observedReward[0] = roulette[0].getContentDescription().toString();
+                            oldHideBoundaryPassed.countDown();
+                        }, observeAfter);
+                        announced.countDown();
+                    });
+                });
+            });
+            assertTrue("The first reward's old hide callback cancelled the next real spin",
+                    announced.await(12, TimeUnit.SECONDS));
+            assertEquals(2, announcements.get());
+            assertTrue("The main-thread reveal observation never ran",
+                    oldHideBoundaryPassed.await(3, TimeUnit.SECONDS));
+            assertEquals("An earlier reward hid the newer revealed reward", View.VISIBLE,
+                    observedVisibility[0]);
+            assertEquals(secondReward[0], observedReward[0]);
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+                if (roulette[0] != null) {
+                    roulette[0].cancel();
+                    assertEquals(View.GONE, roulette[0].getVisibility());
+                }
+            });
+        }
+    }
+
+    private static float rouletteAnimatorScale() {
+        return android.provider.Settings.Global.getFloat(
+                InstrumentationRegistry.getInstrumentation().getTargetContext().getContentResolver(),
+                android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f);
+    }
+
+    @Test
     public void powerupQrPreviewUsesASmallWindowWithoutChangingRespawnScanning() {
         scenario.onActivity(activity -> {
             View preview = activity.findViewById(R.id.powerup_qr_scanner_window);
@@ -3372,9 +3710,16 @@ public class GameplayRegressionTest {
             progress.scan("SIMPLECOIL:POWERUP:1", 4);
             progress.scan("SIMPLECOIL:POWERUP:2", 4);
             assertEquals(2, progress.scannedCount());
+            applyPowerup(activity, personalPowerup(101, Powerups.SHIELD_PLAYER, 0), true);
+            applyPowerup(activity, personalPowerup(102, Powerups.DOUBLE_DAMAGE, 0), true);
+            applyPowerup(activity, personalPowerup(103, Powerups.INVULNERABLE, 0), true);
+            assertEquals(5, get(activity, "mPowerupShieldBonus"));
 
             invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
             assertEquals(0, progress.scannedCount());
+            assertEquals(0, get(activity, "mPowerupShieldBonus"));
+            for (long until : (long[]) get(activity, "mPowerupUntil")) assertEquals(0, until);
+            assertTrue(((Map<?, ?>) get(activity, "mPowerupDoubleDamage")).isEmpty());
             assertEquals(View.GONE, activity.findViewById(R.id.powerup_scan_button).getVisibility());
             CountDownTimer spawn = (CountDownTimer) get(activity, "mSpawnTimer");
             spawn.onFinish();
@@ -3384,7 +3729,7 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void completedPowerupCanGrantTemporaryShieldBoost() {
+    public void powerupShieldBufferLastsFifteenSecondsWithoutErasingNormalShieldDamage() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
             globals.mPowerupQrRequired = 4;
@@ -3392,13 +3737,649 @@ public class GameplayRegressionTest {
             set(activity, "mShield", 10);
             set(activity, "mHealth", globals.mFullHealth);
 
-            invoke(activity, "grantRandomPowerup");
+            Powerups.Grant grant = personalPowerup(201, Powerups.SHIELD_PLAYER, 0);
+            applyPowerup(activity, grant, true);
 
-            assertEquals(5, get(activity, "mRespawnShieldBonus"));
+            assertEquals(5, get(activity, "mPowerupShieldBonus"));
+            assertEquals(0, get(activity, "mRespawnShieldBonus"));
+            assertEquals(grant.expiresAt, ((long[]) get(activity, "mPowerupUntil"))[Powerups.SHIELD_PLAYER]);
             ProgressBar shieldBar = activity.findViewById(R.id.shield_pb);
             assertEquals(15, shieldBar.getMax());
             assertEquals(15, shieldBar.getProgress());
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -3);
+            assertEquals(2, get(activity, "mPowerupShieldBonus"));
+            assertEquals(10, get(activity, "mShield"));
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -7);
+            assertEquals(0, get(activity, "mPowerupShieldBonus"));
+            assertEquals(5, get(activity, "mShield"));
+            expirePowerup(activity, Powerups.SHIELD_PLAYER);
+            assertEquals("Expired boost retained an oversized health bar", 10, shieldBar.getMax());
+            assertEquals("Normal shield damage was undone when the buffer expired", 5, get(activity, "mShield"));
+            assertEquals(5, shieldBar.getProgress());
         });
+    }
+
+    @Test
+    public void powerupInvulnerabilityRejectsHitsUntilItsFifteenSecondExpiry() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mPowerupQrRequired = 2;
+            set(activity, "mShield", 0);
+            set(activity, "mHealth", 20);
+            applyPowerup(activity, personalPowerup(301, Powerups.INVULNERABLE, 0), true);
+            telemetry(activity, 17, 1, 0, 0);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            expirePowerup(activity, Powerups.INVULNERABLE);
+            telemetry(activity, 17, 2, 0, 0);
+            assertEquals(15, get(activity, "mHealth"));
+        });
+    }
+
+    @Test
+    public void powerupAutoNinetyOverridesTournamentAndRestoresNormalModeAndMagazine() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            boolean previousTournament = globals.mTournamentMode;
+            android.content.SharedPreferences preferences = (android.content.SharedPreferences) get(activity, "sharedPreferences");
+            String key = (String) get(activity, "PREF_SHOT_MODE");
+            boolean hadPrevious = preferences.contains(key);
+            int previousPreference = preferences.getInt(key, Globals.SHOT_MODE_SINGLE);
+            try {
+                globals.mPowerupQrRequired = 2;
+                globals.mTournamentMode = true;
+                globals.mFullReload = 30;
+                set(activity, "mCurrentShotMode", Globals.SHOT_MODE_SINGLE);
+                preferences.edit().putInt(key, Globals.SHOT_MODE_SINGLE).commit();
+                applyPowerup(activity, personalPowerup(401, Powerups.FULL_AUTO_90, 0), true);
+                assertEquals(Globals.SHOT_MODE_FULL_AUTO, get(activity, "mCurrentShotMode"));
+                assertEquals(90, invokeResult(activity, "activeMagazineSize"));
+                assertEquals("A temporary reward overwrote the saved firing preference",
+                        Globals.SHOT_MODE_SINGLE, preferences.getInt(key, -1));
+                assertEquals(90, bluetooth.writes.get(bluetooth.writes.size() - 1)[6] & 255);
+                set(activity, "mReloading", 1);
+                invoke(activity, "finishReload");
+                assertEquals(90, bluetooth.writes.get(bluetooth.writes.size() - 1)[6] & 255);
+                set(activity, "mLastShotCount", (byte) 90);
+                expirePowerup(activity, Powerups.FULL_AUTO_90);
+                assertEquals(Globals.SHOT_MODE_SINGLE, get(activity, "mCurrentShotMode"));
+                assertEquals(30, invokeResult(activity, "activeMagazineSize"));
+                assertEquals(30, bluetooth.writes.get(bluetooth.writes.size() - 1)[6] & 255);
+                assertEquals(Globals.SHOT_MODE_SINGLE, preferences.getInt(key, -1));
+            } finally {
+                globals.mTournamentMode = previousTournament;
+                android.content.SharedPreferences.Editor editor = preferences.edit();
+                if (hadPrevious) editor.putInt(key, previousPreference);
+                else editor.remove(key);
+                editor.commit();
+            }
+        });
+    }
+
+    @Test
+    public void powerupEmpLocksBothGunsForTenSecondsAndRestoresOnlyTheirRemainingAmmo() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mPowerupQrRequired = 2;
+            RecordingBluetoothService second = new RecordingBluetoothService();
+            Object previousSecond = get(activity, "mSecondaryBluetoothLeService");
+            Object previousCommand = get(activity, "mSecondaryCommandCharacteristic");
+            try {
+                set(activity, "mSecondaryBluetoothLeService", second);
+                set(activity, "mSecondaryCommandCharacteristic", characteristic(GattAttributes.RECOIL_COMMAND_UUID));
+                set(activity, "mSecondaryReloading", 0);
+                set(activity, "mLastShotCount", (byte) 17);
+                set(activity, "mSecondaryLastShotCount", (byte) 11);
+                applyPowerup(activity, personalPowerup(501, Powerups.EMP, 0), true);
+                assertEquals(3, get(activity, "mReloading"));
+                assertEquals(3, get(activity, "mSecondaryReloading"));
+                assertEquals(2, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+                assertEquals(2, second.writes.get(second.writes.size() - 1)[2]);
+                int firstWrites = bluetooth.writes.size(), secondWrites = second.writes.size();
+                invoke(activity, "finishReload");
+                invoke(activity, "finishSecondaryReload");
+                assertEquals(firstWrites, bluetooth.writes.size());
+                assertEquals(secondWrites, second.writes.size());
+                expirePowerup(activity, Powerups.EMP);
+                byte[] firstAmmo = bluetooth.writes.get(bluetooth.writes.size() - 1);
+                byte[] secondAmmo = second.writes.get(second.writes.size() - 1);
+                assertEquals(4, firstAmmo[2]);
+                assertEquals(4, secondAmmo[2]);
+                assertEquals(17, firstAmmo[6] & 255);
+                assertEquals(11, secondAmmo[6] & 255);
+                assertEquals(View.GONE, ((View) get(activity, "mPowerupEmpOverlay")).getVisibility());
+            } finally {
+                set(activity, "mSecondaryBluetoothLeService", previousSecond);
+                set(activity, "mSecondaryCommandCharacteristic", previousCommand);
+                second.onDestroy();
+            }
+        });
+    }
+
+    @Test
+    public void simultaneousEmpAndNinetyExpiryRestoresBothGunsWithoutOverwritingSavedAmmo() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mPowerupQrRequired = 2;
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                applyPowerup(activity, personalPowerup(511, Powerups.FULL_AUTO_90, 0), true);
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                set(activity, "mLastShotCount", (byte) 47);
+                set(activity, "mSecondaryLastShotCount", (byte) 11);
+                applyPowerup(activity, personalPowerup(512, Powerups.EMP, 0), true);
+                powerupAmmoTelemetry(activity, false, 0);
+                powerupAmmoTelemetry(activity, true, 0);
+                assertEquals(0, ((byte) get(activity, "mLastShotCount")) & 255);
+                assertEquals(0, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+                int firstWrites = bluetooth.writes.size(), secondWrites = guns.second.writes.size();
+                ((long[]) get(activity, "mPowerupUntil"))[Powerups.FULL_AUTO_90] = SystemClock.elapsedRealtime() - 1;
+                expirePowerup(activity, Powerups.EMP);
+                assertEquals("90-round cleanup replaced the EMP restoration", firstWrites + 1, bluetooth.writes.size());
+                assertEquals(secondWrites + 1, guns.second.writes.size());
+                byte[] primary = (byte[]) get(activity, "mPendingReloadCommand");
+                byte[] secondary = (byte[]) get(activity, "mSecondaryPendingReloadCommand");
+                assertEquals(4, primary[2]);
+                assertEquals(4, secondary[2]);
+                assertEquals("Saved ammo must also respect the expired magazine capacity", 30, primary[6] & 255);
+                assertEquals(11, secondary[6] & 255);
+                assertTrue(Arrays.equals(primary, bluetooth.writes.get(firstWrites)));
+                assertTrue(Arrays.equals(secondary, guns.second.writes.get(secondWrites)));
+                assertEquals(2, get(activity, "mReloading"));
+                assertEquals(2, get(activity, "mSecondaryReloading"));
+                completePowerupWrite(activity, false, primary, BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, secondary, BluetoothGatt.GATT_SUCCESS);
+                assertEquals(30, ((byte) get(activity, "mLastShotCount")) & 255);
+                assertEquals(11, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+            }
+        });
+    }
+
+    @Test
+    public void ninetyExpiryPreservesBothOrdinaryReloadTimersAndRefillsToNormalCapacity() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mPowerupQrRequired = 2;
+            Globals.getInstance().mReloadTime = 10000;
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                applyPowerup(activity, personalPowerup(521, Powerups.FULL_AUTO_90, 0), true);
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                set(activity, "mLastShotCount", (byte) 5);
+                set(activity, "mSecondaryLastShotCount", (byte) 7);
+                invoke(activity, "startReload");
+                invoke(activity, "startSecondaryReload", new Class<?>[]{int.class}, 1);
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                CountDownTimer firstTimer = (CountDownTimer) get(activity, "mReloadTimer");
+                CountDownTimer secondTimer = (CountDownTimer) get(activity, "mSecondaryReloadTimer");
+                assertNotNull(firstTimer);
+                assertNotNull(secondTimer);
+                powerupAmmoTelemetry(activity, false, 0);
+                powerupAmmoTelemetry(activity, true, 0);
+                int firstWrites = bluetooth.writes.size(), secondWrites = guns.second.writes.size();
+                expirePowerup(activity, Powerups.FULL_AUTO_90);
+                assertEquals("Expiry finished an ordinary reload early", firstWrites, bluetooth.writes.size());
+                assertEquals(secondWrites, guns.second.writes.size());
+                assertEquals(1, get(activity, "mReloading"));
+                assertEquals(1, get(activity, "mSecondaryReloading"));
+                assertSame(firstTimer, get(activity, "mReloadTimer"));
+                assertSame(secondTimer, get(activity, "mSecondaryReloadTimer"));
+                firstTimer.cancel();
+                secondTimer.cancel();
+                firstTimer.onFinish();
+                secondTimer.onFinish();
+                assertNull(get(activity, "mReloadTimer"));
+                assertNull(get(activity, "mSecondaryReloadTimer"));
+                byte[] primary = (byte[]) get(activity, "mPendingReloadCommand");
+                byte[] secondary = (byte[]) get(activity, "mSecondaryPendingReloadCommand");
+                assertEquals(30, primary[6] & 255);
+                assertEquals(30, secondary[6] & 255);
+                completePowerupWrite(activity, false, primary, BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, secondary, BluetoothGatt.GATT_SUCCESS);
+                assertEquals(30, ((byte) get(activity, "mLastShotCount")) & 255);
+                assertEquals(30, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+            }
+        });
+    }
+
+    @Test
+    public void ninetyExpiryCapsBothPendingRefillsAndIgnoresTheirOldAcknowledgements() {
+        scenario.onActivity(activity -> assertExpiredNinetyRefillAcknowledgements(activity, true));
+    }
+
+    @Test
+    public void ninetyRefillAcknowledgementAfterDeadlineCapsBothGunsBeforeTheExpiryTick() {
+        scenario.onActivity(activity -> assertExpiredNinetyRefillAcknowledgements(activity, false));
+    }
+
+    private void assertExpiredNinetyRefillAcknowledgements(FullscreenActivity activity, boolean runExpiryFirst) {
+        Globals.getInstance().mPowerupQrRequired = 2;
+        try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+            applyPowerup(activity, personalPowerup(531, Powerups.FULL_AUTO_90, 0), true);
+            byte[] oldPrimary = (byte[]) get(activity, "mPendingReloadCommand");
+            byte[] oldSecondary = (byte[]) get(activity, "mSecondaryPendingReloadCommand");
+            assertEquals(90, oldPrimary[6] & 255);
+            assertEquals(90, oldSecondary[6] & 255);
+            // Disabled telemetry may arrive while the 90-round refill write is in flight.
+            powerupAmmoTelemetry(activity, false, 0);
+            powerupAmmoTelemetry(activity, true, 0);
+            int firstWrites = bluetooth.writes.size(), secondWrites = guns.second.writes.size();
+            ((long[]) get(activity, "mPowerupUntil"))[Powerups.FULL_AUTO_90] = SystemClock.elapsedRealtime() - 1;
+            if (runExpiryFirst) expirePowerup(activity, Powerups.FULL_AUTO_90);
+            completePowerupWrite(activity, false, oldPrimary, BluetoothGatt.GATT_SUCCESS);
+            completePowerupWrite(activity, true, oldSecondary, BluetoothGatt.GATT_SUCCESS);
+            byte[] primary = (byte[]) get(activity, "mPendingReloadCommand");
+            byte[] secondary = (byte[]) get(activity, "mSecondaryPendingReloadCommand");
+            assertNotNull(primary);
+            assertNotNull(secondary);
+            assertEquals(30, primary[6] & 255);
+            assertEquals(30, secondary[6] & 255);
+            assertFalse(Arrays.equals(oldPrimary, primary));
+            assertFalse(Arrays.equals(oldSecondary, secondary));
+            assertEquals(firstWrites + 1, bluetooth.writes.size());
+            assertEquals(secondWrites + 1, guns.second.writes.size());
+            assertEquals(2, get(activity, "mReloading"));
+            assertEquals(2, get(activity, "mSecondaryReloading"));
+            assertEquals(0, ((byte) get(activity, "mLastShotCount")) & 255);
+            assertEquals(0, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+            // Duplicate old ACKs and the later expiry tick cannot replace the capped refill.
+            completePowerupWrite(activity, false, oldPrimary, BluetoothGatt.GATT_SUCCESS);
+            completePowerupWrite(activity, true, oldSecondary, BluetoothGatt.GATT_SUCCESS);
+            expirePowerup(activity, Powerups.FULL_AUTO_90);
+            assertSame(primary, get(activity, "mPendingReloadCommand"));
+            assertSame(secondary, get(activity, "mSecondaryPendingReloadCommand"));
+            assertEquals(firstWrites + 1, bluetooth.writes.size());
+            assertEquals(secondWrites + 1, guns.second.writes.size());
+            completePowerupWrite(activity, false, primary, BluetoothGatt.GATT_SUCCESS);
+            completePowerupWrite(activity, true, secondary, BluetoothGatt.GATT_SUCCESS);
+            assertEquals(0, get(activity, "mReloading"));
+            assertEquals(0, get(activity, "mSecondaryReloading"));
+            assertEquals(30, ((byte) get(activity, "mLastShotCount")) & 255);
+            assertEquals(30, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+        }
+    }
+
+    @Test
+    public void empZeroAmmoTelemetryAfterFailedDisableWritesDoesNotReportShotsOrStartReloads() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            boolean previousReloadOnEmpty = globals.mReloadOnEmpty;
+            globals.mPowerupQrRequired = 2;
+            globals.mReloadOnEmpty = true;
+            tcp.dedicated = true;
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                set(activity, "mLastShotCount", (byte) 17);
+                set(activity, "mSecondaryLastShotCount", (byte) 11);
+                applyPowerup(activity, personalPowerup(541, Powerups.EMP, 0), true);
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_FAILURE);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_FAILURE);
+                assertEquals(0, get(activity, "mReloading"));
+                assertEquals(0, get(activity, "mSecondaryReloading"));
+                int shotsBefore = tcp.hostedShots;
+                int firstWrites = bluetooth.writes.size(), secondWrites = guns.second.writes.size();
+                int udpMessages = udp.messages.size();
+                set(activity, "mLastShotFired", 0L);
+                powerupAmmoTelemetry(activity, false, 0);
+                powerupAmmoTelemetry(activity, true, 0);
+                assertEquals("EMP's forced zero was counted as fired shots", shotsBefore, tcp.hostedShots);
+                assertEquals(udpMessages, udp.messages.size());
+                assertEquals(firstWrites, bluetooth.writes.size());
+                assertEquals(secondWrites, guns.second.writes.size());
+                assertEquals(0, get(activity, "mReloading"));
+                assertEquals(0, get(activity, "mSecondaryReloading"));
+                assertEquals(0, ((byte) get(activity, "mLastShotCount")) & 255);
+                assertEquals(0, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+                assertEquals(17, get(activity, "mEmpSavedPrimaryAmmo"));
+                assertEquals(11, get(activity, "mEmpSavedSecondaryAmmo"));
+                // A failed disable can leave nonzero telemetry just before the
+                // deadline. Its later forced zero is still not a real shot until
+                // the expiry tick begins the saved-ammo restoration.
+                powerupAmmoTelemetry(activity, false, 17);
+                powerupAmmoTelemetry(activity, true, 11);
+                ((long[]) get(activity, "mPowerupUntil"))[Powerups.EMP] = SystemClock.elapsedRealtime() - 1;
+                set(activity, "mLastShotFired", 0L);
+                powerupAmmoTelemetry(activity, false, 0);
+                powerupAmmoTelemetry(activity, true, 0);
+                assertEquals("The EMP deadline preceded its restoration tick", shotsBefore, tcp.hostedShots);
+                assertEquals(udpMessages, udp.messages.size());
+                assertEquals(firstWrites, bluetooth.writes.size());
+                assertEquals(secondWrites, guns.second.writes.size());
+                assertEquals(0, get(activity, "mReloading"));
+                assertEquals(0, get(activity, "mSecondaryReloading"));
+                assertEquals(0, ((byte) get(activity, "mLastShotCount")) & 255);
+                assertEquals(0, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+            } finally {
+                globals.mReloadOnEmpty = previousReloadOnEmpty;
+            }
+        });
+    }
+
+    @Test
+    public void powerupInstantTeamEffectsApplyOnceAndNeverReplayFromSnapshots() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            int previousFullHealth = globals.mFullHealth;
+            try {
+                globals.mPowerupQrRequired = 2;
+                globals.mFullHealth = 8;
+                set(activity, "mHealth", 2);
+                Powerups.Grant heal = targetedPowerup(601, 2, 0, Powerups.HEAL_TEAM, 0);
+                applyPowerup(activity, heal, false);
+                assertEquals(8, get(activity, "mHealth"));
+                set(activity, "mHealth", 3);
+                applyPowerup(activity, heal, false);
+                applyPowerup(activity, targetedPowerup(602, 2, 0, Powerups.HEAL_TEAM, 0), true);
+                assertEquals(3, get(activity, "mHealth"));
+                set(activity, "mHealth", 8);
+                Powerups.Grant damage = targetedPowerup(603, 17, 0, Powerups.DAMAGE_TEAM, 0);
+                applyPowerup(activity, damage, false);
+                assertEquals(6, get(activity, "mHealth"));
+                applyPowerup(activity, damage, false);
+                applyPowerup(activity, targetedPowerup(604, 17, 0, Powerups.DAMAGE_TEAM, 0), true);
+                assertEquals(6, get(activity, "mHealth"));
+            } finally {
+                globals.mFullHealth = previousFullHealth;
+            }
+        });
+    }
+
+    @Test
+    public void powerupTeamDamageUsesNormalEliminationAndLifeAccounting() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 2;
+            set(activity, "mHealth", 1);
+            set(activity, "mShield", 0);
+            set(activity, "mEliminationCount", 0);
+            applyPowerup(activity, targetedPowerup(701, 17, 0, Powerups.DAMAGE_TEAM, 0), false);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
+            assertEquals(1, get(activity, "mEliminationCount"));
+            assertEquals(1, udp.peerEliminationPublishes);
+            assertEquals(Byte.valueOf((byte) 17), udp.lastPeerEliminationRecipient);
+            assertNotNull(get(activity, "mSpawnTimer"));
+        });
+    }
+
+    @Test
+    public void powerupOldTargetLifeAndOldDamageSourceLifeCannotSurviveRespawning() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 2;
+            globals.mFullShields = 10;
+            set(activity, "mEliminationCount", 1);
+            applyPowerup(activity, targetedPowerup(801, 2, 0, Powerups.SHIELD_TEAM, 0), true);
+            assertEquals(0, get(activity, "mPowerupShieldBonus"));
+            applyPowerup(activity, targetedPowerup(802, 2, 0, Powerups.SHIELD_TEAM, 1), true);
+            assertEquals(5, get(activity, "mPowerupShieldBonus"));
+            com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(
+                    "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+            com.simplecoil.protocol.RoundRoster.Member enemy = new com.simplecoil.protocol.RoundRoster.Member(
+                    "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 17, 2, 1);
+            enemy.deaths = 1;
+            roster.restore(enemy);
+            globals.mRoundRoster = roster;
+            applyPowerup(activity, new Powerups.Grant(803, 17, 0, Powerups.DOUBLE_DAMAGE,
+                    new int[]{17}, new int[]{0}, SystemClock.elapsedRealtime() + Powerups.BUFF_MS), true);
+            assertEquals(-5, powerupDamageFrom(activity, (byte) 17));
+            applyPowerup(activity, new Powerups.Grant(804, 17, 1, Powerups.DOUBLE_DAMAGE,
+                    new int[]{17}, new int[]{1}, SystemClock.elapsedRealtime() + Powerups.BUFF_MS), true);
+            assertEquals(-10, powerupDamageFrom(activity, (byte) 17));
+            enemy.deaths = 2;
+            assertEquals("A respawned source retained doubled hit damage", -5,
+                    powerupDamageFrom(activity, (byte) 17));
+            applyPowerup(activity, new Powerups.Grant(805, 17, 2, Powerups.DOUBLE_DAMAGE,
+                    new int[]{17}, new int[]{2}, SystemClock.elapsedRealtime() + Powerups.BUFF_MS), true);
+            assertEquals(-10, powerupDamageFrom(activity, (byte) 17));
+            com.simplecoil.protocol.RoundRoster.Member replacement = new com.simplecoil.protocol.RoundRoster.Member(
+                    "cccccccc-cccc-cccc-cccc-cccccccccccc", 17, 2, 2);
+            replacement.deaths = 2;
+            roster.restore(replacement);
+            assertEquals("A replacement occupant inherited the previous identity's damage boost", -5,
+                    powerupDamageFrom(activity, (byte) 17));
+        });
+    }
+
+    @Test
+    public void powerupDoubleDamageSurvivesSameIdentityReconnectButNotSeatReplacement() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 2;
+            String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+            String identity = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+            com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(token);
+            com.simplecoil.protocol.RoundRoster.Member enemy = new com.simplecoil.protocol.RoundRoster.Member(
+                    identity, 17, 2, 1);
+            enemy.deaths = 2;
+            roster.restore(enemy);
+            globals.mRoundRoster = roster;
+            applyPowerup(activity, new Powerups.Grant(1101, 17, 2, Powerups.DOUBLE_DAMAGE,
+                    new int[]{17}, new int[]{2}, SystemClock.elapsedRealtime() + Powerups.BUFF_MS), true);
+            assertEquals(-10, powerupDamageFrom(activity, (byte) 17));
+
+            com.simplecoil.protocol.RoundRoster reconnectedRoster = new com.simplecoil.protocol.RoundRoster(token);
+            com.simplecoil.protocol.RoundRoster.Member reconnected = new com.simplecoil.protocol.RoundRoster.Member(
+                    identity, 17, 2, 2);
+            reconnected.deaths = 2;
+            reconnectedRoster.restore(reconnected);
+            globals.mRoundRoster = reconnectedRoster;
+            assertEquals("A same-person reconnect lost its still-active damage boost", -10,
+                    powerupDamageFrom(activity, (byte) 17));
+
+            com.simplecoil.protocol.RoundRoster.Member replacement = new com.simplecoil.protocol.RoundRoster.Member(
+                    "cccccccc-cccc-cccc-cccc-cccccccccccc", 17, 2, 3);
+            replacement.deaths = 2;
+            reconnectedRoster.restore(replacement);
+            assertEquals("A different person inherited the prior occupant's damage boost", -5,
+                    powerupDamageFrom(activity, (byte) 17));
+        });
+    }
+
+    @Test
+    public void powerupIntentCapturedBeforeSourceReplacementIsRejectedWithoutConsumingGrant() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 2;
+            String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+            com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(token);
+            com.simplecoil.protocol.RoundRoster.Member enemy = new com.simplecoil.protocol.RoundRoster.Member(
+                    "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 17, 2, 1);
+            roster.restore(enemy);
+            globals.mRoundRoster = roster;
+            set(activity, "mActivePeerRoundToken", token);
+            Powerups.Grant grant = new Powerups.Grant(1201, 17, 0, Powerups.DOUBLE_DAMAGE,
+                    new int[]{17}, new int[]{0}, SystemClock.elapsedRealtime() + Powerups.BUFF_MS, 2);
+            Intent captured = TcpServer.powerupIntent(grant, token, false);
+            assertEquals("The service must capture the grant's original source identity", enemy.identity,
+                    captured.getStringExtra(NetMsg.INTENT_POWERUP_SOURCE_IDENTITY));
+
+            com.simplecoil.protocol.RoundRoster.Member replacement = new com.simplecoil.protocol.RoundRoster.Member(
+                    "cccccccc-cccc-cccc-cccc-cccccccccccc", 17, 2, 2);
+            roster.restore(replacement);
+            invoke(activity, "receivePowerup", new Class<?>[]{Intent.class}, captured);
+
+            assertFalse(((java.util.Set<?>) get(activity, "mSeenPowerupGrants")).contains(grant.id));
+            assertFalse(((Map<?, ?>) get(activity, "mPowerupDoubleDamage")).containsKey(17));
+            assertFalse(((Map<?, ?>) get(activity, "mPowerupDoubleDamageOwners")).containsKey(17));
+            assertEquals(-5, powerupDamageFrom(activity, (byte) 17));
+        });
+    }
+
+    @Test
+    public void powerupGrantIsDeferredDuringCountdownAndAcceptedOnlyOnceAfterPlayStarts() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 2;
+            globals.mFullShields = 10;
+            globals.mGameState = Globals.GAME_STATE_ELIMINATED;
+            set(activity, "mUseNetwork", false);
+            set(activity, "mStartGameTimer", true);
+            set(activity, "mHasSynchronizedStart", false);
+            set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() - 1);
+            Powerups.Grant grant = personalPowerup(901, Powerups.SHIELD_PLAYER, 0);
+            assertEquals(false, invokeResult(activity, "applyPowerupGrant",
+                    new Class<?>[]{Powerups.Grant.class, boolean.class}, grant, true));
+            assertFalse(((java.util.Set<?>) get(activity, "mSeenPowerupGrants")).contains(grant.id));
+            assertEquals(0, get(activity, "mPowerupShieldBonus"));
+
+            invoke(activity, "finishSpawn", new Class<?>[]{boolean.class}, false);
+
+            assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
+            assertEquals(false, get(activity, "mStartGameTimer"));
+            assertEquals(true, invokeResult(activity, "applyPowerupGrant",
+                    new Class<?>[]{Powerups.Grant.class, boolean.class}, grant, true));
+            assertEquals(5, get(activity, "mPowerupShieldBonus"));
+            invoke(activity, "takeDamage", new Class<?>[]{int.class}, -3);
+            assertEquals(true, invokeResult(activity, "applyPowerupGrant",
+                    new Class<?>[]{Powerups.Grant.class, boolean.class}, grant, true));
+            assertEquals("A replayed grant replenished an already damaged buffer", 2,
+                    get(activity, "mPowerupShieldBonus"));
+        });
+    }
+
+    @Test
+    public void powerupHudUsesArchivedAndLiveStandingsWithoutReusingSpentScans() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            boolean previousCtf = globals.mCaptureTheFlag;
+            try {
+                globals.mPowerupQrRequired = 6;
+                globals.mCaptureTheFlag = false;
+                // ActivityScenario recreation preserves this static counter;
+                // the authoritative scan fixture below explicitly describes life zero.
+                set(activity, "mEliminationCount", 0);
+                assertEquals(0, invokeResult(activity, "currentDeathCount"));
+                String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+                com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(token);
+                com.simplecoil.protocol.RoundRoster.Member own = new com.simplecoil.protocol.RoundRoster.Member(
+                        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 1, 1, 1);
+                own.kills = 4;
+                com.simplecoil.protocol.RoundRoster.Member archived = new com.simplecoil.protocol.RoundRoster.Member(
+                        "cccccccc-cccc-cccc-cccc-cccccccccccc", 17, 2, 1);
+                archived.kills = 6;
+                archived.active = false;
+                com.simplecoil.protocol.RoundRoster.Member enemy = new com.simplecoil.protocol.RoundRoster.Member(
+                        "dddddddd-dddd-dddd-dddd-dddddddddddd", 17, 2, 2);
+                enemy.kills = 8;
+                roster.restore(own);
+                roster.restore(archived);
+                roster.restore(enemy);
+                globals.mRoundRoster = roster;
+                set(activity, "mActivePeerRoundToken", token);
+                assertEquals(4, invokeResult(activity, "effectivePowerupRequired"));
+                PowerupQrProgress progress = (PowerupQrProgress) get(activity, "mPowerupQrProgress");
+                for (int code = 1; code <= 3; code++) progress.scan("SIMPLECOIL:POWERUP:" + code, 6);
+                invoke(activity, "updatePowerupScanButton");
+                TextView button = activity.findViewById(R.id.powerup_scan_button);
+                assertEquals(activity.getString(R.string.powerup_scan_progress, 3, 4), button.getText().toString());
+                progress.scan("SIMPLECOIL:POWERUP:4", 4);
+                applyPowerup(activity, new Powerups.Grant(1001, 1, 0, Powerups.SHIELD_PLAYER,
+                        new int[]{1}, new int[]{0}, SystemClock.elapsedRealtime() + Powerups.BUFF_MS, 4), true);
+                assertEquals("Network progress is committed by host state, not a reordered grant", 4,
+                        progress.progressCount(4));
+                org.json.JSONObject player = new org.json.JSONObject().put("id", 1).put("life", 0)
+                        .put("mask", 15).put("spent", 4).put("required", 4);
+                org.json.JSONObject snapshot = new org.json.JSONObject().put(TcpServer.JSON_ROUND_TOKEN, token)
+                        .put("powerupstate", new org.json.JSONObject().put("players", new org.json.JSONArray().put(player)));
+                assertEquals(true, invokeResult(activity, "hostConfirmedPowerupScans",
+                        new Class<?>[]{org.json.JSONObject.class}, snapshot));
+                assertEquals(0, progress.progressCount(4));
+                progress.scan("SIMPLECOIL:POWERUP:5", 4);
+                progress.scan("SIMPLECOIL:POWERUP:6", 4);
+                enemy.kills = 100;
+                assertEquals(2, invokeResult(activity, "effectivePowerupRequired"));
+                invoke(activity, "updatePowerupScanButton");
+                assertEquals(activity.getString(R.string.powerup_scan_progress, 2, 2), button.getText().toString());
+                player.put("mask", 63).put("spent", 6).put("required", 2);
+                assertEquals(true, invokeResult(activity, "hostConfirmedPowerupScans",
+                        new Class<?>[]{org.json.JSONObject.class}, snapshot));
+                assertEquals(63, progress.scannedMask());
+                assertEquals(0, progress.progressCount(2));
+                assertFalse(progress.consumeReward(2));
+                player.put("mask", 15).put("spent", 4).put("required", 4);
+                assertEquals(false, invokeResult(activity, "hostConfirmedPowerupScans",
+                        new Class<?>[]{org.json.JSONObject.class}, snapshot));
+                assertEquals(63, progress.scannedMask());
+                assertEquals(0, progress.progressCount(2));
+            } catch (org.json.JSONException e) {
+                throw new AssertionError(e);
+            } finally {
+                globals.mCaptureTheFlag = previousCtf;
+            }
+        });
+    }
+
+    private static Powerups.Grant personalPowerup(long id, int kind, int life) {
+        return targetedPowerup(id, Globals.getInstance().mPlayerID & 255, life, kind, life);
+    }
+
+    private static Powerups.Grant targetedPowerup(long id, int source, int sourceLife, int kind, int targetLife) {
+        return new Powerups.Grant(id, source, sourceLife, kind,
+                new int[]{Globals.getInstance().mPlayerID & 255}, new int[]{targetLife},
+                SystemClock.elapsedRealtime() + Powerups.durationMillis(kind));
+    }
+
+    private static void applyPowerup(FullscreenActivity activity, Powerups.Grant grant, boolean snapshot) {
+        invoke(activity, "applyPowerupGrant", new Class<?>[]{Powerups.Grant.class, boolean.class}, grant, snapshot);
+    }
+
+    private static void completePowerupWrite(FullscreenActivity activity, boolean secondary, byte[] command, int status) {
+        receivePowerupGatt(activity, new Intent(BluetoothLeService.CHARACTERISTIC_WRITE_FINISHED)
+                .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, secondary ? 1 : 0)
+                .putExtra(BluetoothLeService.EXTRA_UUID, GattAttributes.RECOIL_COMMAND_UUID)
+                .putExtra(BluetoothLeService.EXTRA_STATUS, status)
+                .putExtra(BluetoothLeService.EXTRA_DATA, command));
+    }
+
+    private static void powerupAmmoTelemetry(FullscreenActivity activity, boolean secondary, int shots) {
+        byte[] packet = telemetryPacket(0, 0, 0, 0);
+        packet[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = (byte) shots;
+        receivePowerupGatt(activity, new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, secondary ? 1 : 0)
+                .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+    }
+
+    private static void receivePowerupGatt(FullscreenActivity activity, Intent intent) {
+        boolean registered = (boolean) get(activity, "mGattReceiverRegistered");
+        set(activity, "mGattReceiverRegistered", true);
+        try {
+            ((BroadcastReceiver) get(activity, "mGattUpdateReceiver")).onReceive(activity, intent);
+        } finally {
+            set(activity, "mGattReceiverRegistered", registered);
+        }
+    }
+
+    private static void expirePowerup(FullscreenActivity activity, int kind) {
+        ((long[]) get(activity, "mPowerupUntil"))[kind] = SystemClock.elapsedRealtime() - 1;
+        android.os.Handler handler = (android.os.Handler) get(activity, "mPowerupHandler");
+        Runnable expiry = (Runnable) get(activity, "mPowerupExpiryTick");
+        handler.removeCallbacks(expiry);
+        expiry.run();
+        handler.removeCallbacks(expiry);
+    }
+
+    private static int powerupDamageFrom(FullscreenActivity activity, byte source) {
+        try {
+            Method method = FullscreenActivity.class.getDeclaredMethod("getPlayerDamage", byte.class);
+            method.setAccessible(true);
+            return (int) method.invoke(activity, source);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static Object invokeResult(FullscreenActivity activity, String name, Class<?>[] types, Object... args) {
+        try {
+            Method method = FullscreenActivity.class.getDeclaredMethod(name, types);
+            method.setAccessible(true);
+            return method.invoke(activity, args);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     @Test
@@ -3810,8 +4791,59 @@ public class GameplayRegressionTest {
         }
     }
 
+    /** Both real GATT receiver paths, with only the physical blasters replaced. */
+    private static final class PowerupDualGunFixture implements AutoCloseable {
+        private final FullscreenActivity activity;
+        final RecordingBluetoothService second = new RecordingBluetoothService();
+        private final Object previousService, previousCommand, previousTelemetry;
+        private final Object previousConfig, previousSecondConfig, previousCommunicating;
+        private final boolean previousBoss;
+
+        PowerupDualGunFixture(FullscreenActivity activity) {
+            this.activity = activity;
+            previousService = get(activity, "mSecondaryBluetoothLeService");
+            previousCommand = get(activity, "mSecondaryCommandCharacteristic");
+            previousTelemetry = get(activity, "mSecondaryTelemetryCharacteristic");
+            previousConfig = get(activity, "mConfigCharacteristic");
+            previousSecondConfig = get(activity, "mSecondaryConfigCharacteristic");
+            previousCommunicating = get(activity, "mSecondaryCommunicating");
+            previousBoss = Globals.getInstance().mBossMode;
+            Globals.getInstance().mBossMode = true;
+            Globals.getInstance().mFullReload = 30;
+            set(activity, "mSecondaryBluetoothLeService", second);
+            set(activity, "mSecondaryCommandCharacteristic", characteristic(GattAttributes.RECOIL_COMMAND_UUID));
+            set(activity, "mSecondaryTelemetryCharacteristic", characteristic(GattAttributes.RECOIL_TELEMETRY_UUID));
+            set(activity, "mSecondaryCommunicating", true);
+            set(activity, "mSecondaryReloading", 0);
+            // Isolate ammo writes from unrelated firing-mode configuration writes.
+            set(activity, "mConfigCharacteristic", null);
+            set(activity, "mSecondaryConfigCharacteristic", null);
+            for (String field : new String[]{"mLastTriggerCount", "mLastReloadButtonCount",
+                    "mLastThumbButtonCount", "mLastPowerButtonCount", "mSecondaryLastTriggerCount",
+                    "mSecondaryLastReloadButtonCount", "mSecondaryLastThumbButtonCount", "mSecondaryLastPowerButtonCount"})
+                set(activity, field, (byte) 0);
+        }
+
+        @Override public void close() {
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSecondaryReloadTimer");
+            if (timer != null) timer.cancel();
+            set(activity, "mSecondaryReloadTimer", null);
+            set(activity, "mSecondaryPendingReloadCommand", null);
+            set(activity, "mSecondaryReloading", 3);
+            set(activity, "mSecondaryBluetoothLeService", previousService);
+            set(activity, "mSecondaryCommandCharacteristic", previousCommand);
+            set(activity, "mSecondaryTelemetryCharacteristic", previousTelemetry);
+            set(activity, "mConfigCharacteristic", previousConfig);
+            set(activity, "mSecondaryConfigCharacteristic", previousSecondConfig);
+            set(activity, "mSecondaryCommunicating", previousCommunicating);
+            Globals.getInstance().mBossMode = previousBoss;
+            second.onDestroy();
+        }
+    }
+
     private static final class RecordingTcpClient extends TcpClient {
         boolean dedicated;
+        int hostedShots;
         int startRequests;
         byte playerIdWhenStarted;
         final List<String> messages = new ArrayList<>();
@@ -3823,6 +4855,12 @@ public class GameplayRegressionTest {
         @Override
         public boolean isDedicatedServer() {
             return dedicated;
+        }
+
+        @Override
+        public void reportHostedShots(int count) {
+            hostedShots += count;
+            super.reportHostedShots(count);
         }
 
         @Override

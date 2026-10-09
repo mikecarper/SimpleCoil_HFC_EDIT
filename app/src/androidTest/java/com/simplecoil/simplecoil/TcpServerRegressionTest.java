@@ -48,6 +48,14 @@ public class TcpServerRegressionTest {
     private Class<?> clientType;
     private Map<Integer, Object> clients;
     private int[] originalPairings;
+    private com.simplecoil.protocol.GpsOffset originalGpsOffset;
+    private Globals.LocalGpsFix originalLocalGpsFix;
+    private boolean originalUseGps;
+    private Map<Byte, Globals.GPSData> originalLocations;
+    private byte originalPlayerID;
+    private boolean originalLocalLobbyReady;
+    private com.simplecoil.protocol.RoundRoster originalRoundRoster;
+    private int originalGameState;
 
     @Before
     public void setUp() throws Exception {
@@ -59,6 +67,21 @@ public class TcpServerRegressionTest {
         clientHandler = innerInstance("ClientThread");
         Globals globals = Globals.getInstance();
         originalPairings = globals.mGrenadePairings.clone();
+        originalGpsOffset = globals.mGpsOffset;
+        originalLocalGpsFix = globals.mLocalGpsFix;
+        originalUseGps = globals.mUseGPS;
+        originalPlayerID = globals.mPlayerID;
+        originalLocalLobbyReady = globals.mLocalLobbyReady;
+        originalRoundRoster = globals.mRoundRoster;
+        originalGameState = globals.mGameState;
+        Globals.getmGPSDataSemaphore();
+        try { originalLocations = new java.util.HashMap<>(globals.mGPSData); }
+        finally { globals.mGPSDataSemaphore.release(); }
+        globals.mGpsOffset = null;
+        globals.mLocalGpsFix = null;
+        globals.mPlayerID = 0;
+        globals.mLocalLobbyReady = false;
+        globals.mRoundRoster = null;
         Globals.ClearGrenadePairings(true);
         globals.mUseGPS = false;
         globals.mGameState = Globals.GAME_STATE_RUNNING;
@@ -74,11 +97,23 @@ public class TcpServerRegressionTest {
         server.stopTcpServer();
         for (Object client : clients.values())
             invoke(client, "close", new Class<?>[0]);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(server::onDestroy);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_NONE;
         Globals.getInstance().mTournamentMode = false;
         System.arraycopy(originalPairings, 0, Globals.getInstance().mGrenadePairings, 0, originalPairings.length);
         clearPlayerMaps();
+        Globals globals = Globals.getInstance();
+        globals.mGpsOffset = originalGpsOffset;
+        globals.mLocalGpsFix = originalLocalGpsFix;
+        globals.mUseGPS = originalUseGps;
+        globals.mPlayerID = originalPlayerID;
+        globals.mLocalLobbyReady = originalLocalLobbyReady;
+        globals.mRoundRoster = originalRoundRoster;
+        globals.mGameState = originalGameState;
+        Globals.getmGPSDataSemaphore();
+        try { globals.mGPSData.putAll(originalLocations); }
+        finally { globals.mGPSDataSemaphore.release(); }
     }
 
     @Test
@@ -607,13 +642,13 @@ public class TcpServerRegressionTest {
     }
 
     @Test
-    public void zeroCoordinatePlaceholderDoesNotMoveThePlayer() throws Exception {
+    public void nullIslandPlaceholderDoesNotMoveThePlayer() throws Exception {
         Object player = client(1, 6);
         parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 10.0)
                 .put(TcpServer.JSON_GPSLATITUDE, 20.0));
         Globals.GPSData saved = Globals.getInstance().mGPSData.get((byte) 6);
         saved.hasUpdate = false;
-        double[][] placeholders = {{0, 0}, {10, 0}, {0, 20}};
+        double[][] placeholders = {{0, 0}};
         for (double[] coordinates : placeholders) {
             parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, coordinates[0])
                     .put(TcpServer.JSON_GPSLATITUDE, coordinates[1]));
@@ -622,6 +657,35 @@ public class TcpServerRegressionTest {
             assertEquals(20, saved.latitude, 0);
             assertFalse(saved.hasUpdate);
         }
+    }
+
+    @Test
+    public void equatorAndPrimeMeridianReportsMoveThePlayer() throws Exception {
+        Object player = client(1, 6);
+        for (double[] coordinates : new double[][]{{10, 0}, {0, 20}}) {
+            parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, coordinates[0])
+                    .put(TcpServer.JSON_GPSLATITUDE, coordinates[1]));
+            Globals.GPSData saved = Globals.getInstance().mGPSData.get((byte) 6);
+            assertEquals(coordinates[0], saved.longitude, 0);
+            assertEquals(coordinates[1], saved.latitude, 0);
+        }
+    }
+
+    @Test
+    public void tcpGpsReportPreservesMeasurementAgeAndRejectsStaleFixes() throws Exception {
+        Object player = client(1, 6);
+        long before = android.os.SystemClock.elapsedRealtime();
+        parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 10)
+                .put(TcpServer.JSON_GPSLATITUDE, 20).put(TcpServer.JSON_GPS_FIX_AGE, 10_000));
+        Globals.GPSData saved = Globals.getInstance().mGPSData.get((byte) 6);
+        assertTrue(saved.fixElapsedMs >= before - 10_000);
+        assertTrue(saved.fixElapsedMs <= android.os.SystemClock.elapsedRealtime() - 10_000);
+        long sourceTimestamp = saved.fixElapsedMs;
+        parse(player, new JSONObject().put(TcpServer.JSON_GPSLONGITUDE, 11)
+                .put(TcpServer.JSON_GPSLATITUDE, 21).put(TcpServer.JSON_GPS_FIX_AGE, 31_000));
+        assertSame(saved, Globals.getInstance().mGPSData.get((byte) 6));
+        assertEquals(sourceTimestamp, saved.fixElapsedMs);
+        assertEquals(10, saved.longitude, 0);
     }
 
     @Test
@@ -1106,10 +1170,23 @@ public class TcpServerRegressionTest {
         Globals.getInstance().mTournamentMode = true;
         Object clientRequestingEnd = client(1, 1);
         client(2, 11);
+        Socket socket = (Socket) get(clientRequestingEnd, "clientSocket");
+        set(clientRequestingEnd, "points", 7);
+        set(clientRequestingEnd, "eliminated", 3);
+        long votes = Globals.getInstance().mEndGameVotes;
+        boolean voteRequested = Globals.getInstance().mEndGameVoteRequested;
 
         processMessage(clientRequestingEnd, NetMsg.NETMSG_ENDGAME);
 
-        assertFalse(clients.containsKey(1));
+        assertSame("An ignored direct ENDGAME disconnected the registered player",
+                clientRequestingEnd, clients.get(1));
+        assertSame(socket, get(clientRequestingEnd, "clientSocket"));
+        assertFalse(socket.isClosed());
+        assertEquals(7, server.getScore((byte) 1).points);
+        assertEquals(3, server.getScore((byte) 1).eliminated);
+        assertTrue(server.getScore((byte) 1).isConnected);
+        assertEquals(votes, Globals.getInstance().mEndGameVotes);
+        assertEquals(voteRequested, Globals.getInstance().mEndGameVoteRequested);
         assertEquals("A tournament client ended the host's round", 0, server.endRequests);
         assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
     }
@@ -1162,9 +1239,20 @@ public class TcpServerRegressionTest {
 
     private void register(Object client, int playerID, boolean rejoin) throws Exception {
         JSONObject hello = new JSONObject().put(TcpServer.JSON_PLAYERID, playerID)
-                .put(TcpServer.JSON_PLAYERNAME, "Player " + playerID);
+                .put(TcpServer.JSON_PLAYERNAME, "Player " + playerID)
+                .put(LiveJoin.IDENTITY, String.format(java.util.Locale.US,
+                        "00000000-0000-0000-0000-%012d", playerID));
         if (rejoin) hello.put(TcpServer.JSON_REJOIN, true);
-        parse(client, hello);
+        // These synthetic players joined before the combat phase. Live-round
+        // admission is tested separately with a frozen roster in Dispatch tests.
+        Globals globals = Globals.getInstance();
+        int gameState = globals.mGameState;
+        try {
+            globals.mGameState = Globals.GAME_STATE_NONE;
+            parse(client, hello);
+        } finally {
+            globals.mGameState = gameState;
+        }
     }
 
     private void parse(Object client, JSONObject message) throws Exception {
@@ -1187,6 +1275,9 @@ public class TcpServerRegressionTest {
     }
 
     private void processMessage(Object sender, String message) throws Exception {
+        assertTrue("Protocol sender was removed before its message could be processed",
+                clients.containsValue(sender));
+        assertNotNull("Protocol sender has no connected socket", get(sender, "clientSocket"));
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         new DataOutputStream(bytes).writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG
                 + message);
@@ -1194,21 +1285,52 @@ public class TcpServerRegressionTest {
             @Override
             public synchronized int read() {
                 int result = super.read();
-                if (available() == 0) server.stopTcpServer();
+                if (available() == 0) stopFixtureClientLoop();
                 return result;
             }
 
             @Override
             public synchronized int read(byte[] buffer, int offset, int length) {
                 int result = super.read(buffer, offset, length);
-                if (available() == 0) server.stopTcpServer();
+                if (available() == 0) stopFixtureClientLoop();
                 return result;
             }
         };
         set(sender, "in", new DataInputStream(input));
         set(server, "keepListening", true);
         // The final byte stops the loop after it processes this complete protocol frame.
-        ((Runnable) clientHandler).run();
+        Throwable[] failure = new Throwable[1];
+        Thread worker = new Thread(() -> {
+            try {
+                // Exercise one real protocol pass, not whole-server lifetime
+                // cleanup. Session tests exercise ClientThread.run() and its
+                // final socket closure; this fixture owns its sockets in teardown.
+                invoke(clientHandler, "runSession", new Class<?>[0]);
+            } catch (Throwable error) {
+                failure[0] = error;
+            }
+        }, "SimpleCoil fixture protocol frame");
+        worker.start();
+        try {
+            worker.join(3000);
+        } finally {
+            if (worker.isAlive()) {
+                server.stopTcpServer();
+                worker.interrupt();
+            }
+            worker.join(2000);
+        }
+        assertFalse("Protocol frame processing did not finish", worker.isAlive());
+        assertNull("Protocol frame processing crashed", failure[0]);
+        assertEquals("Protocol sender's frame was never consumed", 0, input.available());
+    }
+
+    private void stopFixtureClientLoop() {
+        try {
+            set(server, "keepListening", false);
+        } catch (Exception error) {
+            throw new AssertionError("Could not stop the per-frame fixture loop", error);
+        }
     }
 
     private Object innerInstance(String name) throws Exception {

@@ -16,6 +16,9 @@
 
 package com.simplecoil.simplecoil;
 
+import com.simplecoil.protocol.GpsOffset;
+import com.simplecoil.protocol.GameStartCountdown;
+
 import android.content.Context;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
@@ -35,6 +38,57 @@ import java.util.Locale;
 public class Globals {
     public volatile com.simplecoil.protocol.RoundRoster mRoundRoster;
     public volatile int mRequestedJoinTeam;
+    private final PowerupRuntime[] mPowerupRuntime = new PowerupRuntime[Globals.MAX_PLAYER_ID + 1];
+    private String mPowerupRuntimeToken;
+
+    private static final class PowerupRuntime {
+        final int generation, life, gameState, health;
+        final boolean left;
+        PowerupRuntime(int generation, int life, int gameState, int health, boolean left) {
+            this.generation = generation;
+            this.life = life;
+            this.gameState = gameState;
+            this.health = health;
+            this.left = left;
+        }
+    }
+
+    /** Accepted owner state only; a power-up request cannot declare itself alive. */
+    public synchronized void recordPowerupRuntime(String token, int id, int generation,
+                                                  int life, int gameState, int health, boolean left) {
+        if (mRoundRoster == null || token == null || !token.equals(mRoundRoster.token)
+                || id < 1 || id > MAX_PLAYER_ID || !mRoundRoster.accepts(id, generation)
+                || life < 0 || life > MAX_SCOREBOARD_VALUE || health < 0
+                || gameState < GAME_STATE_NONE || gameState > GAME_STATE_ELIMINATED) return;
+        if (!token.equals(mPowerupRuntimeToken)) {
+            java.util.Arrays.fill(mPowerupRuntime, null);
+            mPowerupRuntimeToken = token;
+        }
+        PowerupRuntime previous = mPowerupRuntime[id];
+        if (previous != null && previous.generation == generation && previous.life > life) return;
+        mPowerupRuntime[id] = new PowerupRuntime(generation, life, gameState, health, left);
+    }
+
+    private PowerupRuntime currentPowerupRuntime(int id) {
+        if (id < 1 || id > MAX_PLAYER_ID || mRoundRoster == null
+                || !mRoundRoster.token.equals(mPowerupRuntimeToken)) return null;
+        PowerupRuntime runtime = mPowerupRuntime[id];
+        return runtime != null && mRoundRoster.accepts(id, runtime.generation) ? runtime : null;
+    }
+
+    public synchronized int powerupPlayerLife(int id) {
+        PowerupRuntime runtime = currentPowerupRuntime(id);
+        com.simplecoil.protocol.RoundRoster.Member member = mRoundRoster == null ? null : mRoundRoster.seat(id);
+        return Math.max(runtime == null ? 0 : runtime.life, member == null ? 0 : member.deaths);
+    }
+
+    public synchronized boolean isPowerupPlayerAlive(int id) {
+        PowerupRuntime runtime = currentPowerupRuntime(id);
+        com.simplecoil.protocol.RoundRoster.Member member = mRoundRoster == null ? null : mRoundRoster.seat(id);
+        return member != null && member.active && runtime != null && !runtime.left
+                && runtime.gameState == GAME_STATE_RUNNING && runtime.health > 0
+                && runtime.life >= member.deaths;
+    }
 
     synchronized void installRoundRoster(com.simplecoil.protocol.RoundRoster roster) {
         com.simplecoil.protocol.RoundRoster previous = mRoundRoster;
@@ -42,7 +96,10 @@ public class Globals {
         for (byte id = 1; id <= MAX_PLAYER_ID; id++) {
             com.simplecoil.protocol.RoundRoster.Member member = roster.seat(id);
             if (member == null || previous == null || !previous.token.equals(roster.token)
-                    || previous.generation(id) != roster.generation(id)) infected.remove(id);
+                    || previous.generation(id) != roster.generation(id)) {
+                infected.remove(id);
+                mPowerupRuntime[id] = null;
+            }
             if (member != null && member.infected) infected.add(id);
         }
         mRoundRoster = roster;
@@ -82,7 +139,7 @@ public class Globals {
     public static final int MIN_RELOAD_COUNT = 1;
     public static final int MAX_RELOAD_COUNT = 255;
     public volatile byte mFullReload = RELOAD_COUNT;
-    public static final long RESPAWN_TIME_SECONDS = 10; // Time to wait for respawn after elimination and to start the game
+    public static final long RESPAWN_TIME_SECONDS = 10; // Personal respawn wait after elimination, not game start.
     public static final long MIN_RESPAWN_TIME_SECONDS = 1;
     public static final long MAX_RESPAWN_TIME_SECONDS = 1000;
     // Team games give a player three minutes to reach and scan their team's respawn checkpoint.
@@ -94,7 +151,8 @@ public class Globals {
 
     public static long respawnWaitSeconds(boolean networked, boolean startingGame,
                                          int gameMode, long configuredSeconds) {
-        if (networked && !startingGame
+        if (startingGame) return GameStartCountdown.DURATION_SECONDS;
+        if (networked
                 && (gameMode == GAME_MODE_2TEAMS || gameMode == GAME_MODE_4TEAMS))
             return TEAM_QR_RESPAWN_WAIT_SECONDS;
         return Math.max(MIN_RESPAWN_TIME_SECONDS, Math.min(MAX_RESPAWN_TIME_SECONDS, configuredSeconds));
@@ -311,12 +369,7 @@ public class Globals {
     }
 
     public static boolean isValidCoordinates(double longitude, double latitude) {
-        // Game policy: a zero on either axis means the GPS fix is not usable.
-        return !Double.isNaN(longitude) && !Double.isInfinite(longitude)
-                && !Double.isNaN(latitude) && !Double.isInfinite(latitude)
-                && longitude != 0.0 && latitude != 0.0
-                && longitude >= -180.0 && longitude <= 180.0
-                && latitude >= -90.0 && latitude <= 90.0;
+        return GpsOffset.validCoordinates(longitude, latitude);
     }
 
     public static final int GAME_STATE_NONE = 0; // Game not started
@@ -491,6 +544,19 @@ public class Globals {
     public volatile Map<Byte, InetAddress> mTeamIPMap;
     public volatile Map<Byte, String> mTeamPlayerNameMap;
     public volatile Map<Byte, GPSData> mGPSData;
+    public volatile GpsOffset mGpsOffset;
+    public volatile LocalGpsFix mLocalGpsFix;
+
+    public static final class LocalGpsFix {
+        final double latitude, longitude;
+        final long elapsedMs;
+
+        LocalGpsFix(double latitude, double longitude, long elapsedMs) {
+            this.latitude = latitude;
+            this.longitude = longitude;
+            this.elapsedMs = elapsedMs;
+        }
+    }
     public volatile Map<Byte, PlayerSettings> mPlayerSettings;
 
     public static final int MAX_GRENADE_IDS = 16;
@@ -833,6 +899,10 @@ public class Globals {
         double longitude = 0;
         int team = 0;
         boolean hasUpdate = false;
+        // UDP positions can expire independently of the full-precision TCP fallback.
+        boolean fromPeerState;
+        long fixElapsedMs;
+        long ownerSequence;
     }
 
     public static void getmIPTeamMapSemaphore() {

@@ -20,9 +20,9 @@ package com.simplecoil.simplecoil;
 
 public class NetMsg {
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    // Protocol 28 synchronizes the host's QR-or-timer / timer-only respawn rule.
-    public static final int NETWORK_VERSION_NUMBER = 28;
-    public static final String NETWORK_VERSION = "28";
+    // Protocol 30 adds host-authorized, life-scoped power-up grants over TCP.
+    public static final int NETWORK_VERSION_NUMBER = 30;
+    public static final String NETWORK_VERSION = "30";
     public static final String INTENT_LOBBY_HOST_AGE = "lobby_host_age";
     public static final String INTENT_LOBBY_HOST_KIND = "lobby_host_kind";
     public static final String NETMSG_LOBBYWAIT = "com.simplecoil.simplecoil.LOBBYWAIT";
@@ -55,6 +55,17 @@ public class NetMsg {
     public static final String NETMSG_ROUNDCOMPLETE = "com.simplecoil.simplecoil.ROUNDCOMPLETE";
     public static final String NETMSG_ENDVOTE = "ENDVOTE";
     public static final String NETMSG_PEERHOSTCHANGED = "PEERHOSTCHANGED";
+    public static final String NETMSG_POWERUP = "com.simplecoil.simplecoil.POWERUP";
+    public static final String INTENT_POWERUP_ID = "POWERUP_ID";
+    public static final String INTENT_POWERUP_SOURCE = "POWERUP_SOURCE";
+    public static final String INTENT_POWERUP_SOURCE_LIFE = "POWERUP_SOURCE_LIFE";
+    public static final String INTENT_POWERUP_SOURCE_IDENTITY = "POWERUP_SOURCE_IDENTITY";
+    public static final String INTENT_POWERUP_KIND = "POWERUP_KIND";
+    public static final String INTENT_POWERUP_COST = "POWERUP_COST";
+    public static final String INTENT_POWERUP_TARGETS = "POWERUP_TARGETS";
+    public static final String INTENT_POWERUP_LIVES = "POWERUP_LIVES";
+    public static final String INTENT_POWERUP_EXPIRES = "POWERUP_EXPIRES";
+    public static final String INTENT_POWERUP_SNAPSHOT = "POWERUP_SNAPSHOT";
     public static final String NETMSG_ERROR = "ERROR";
     public static final String NETMSG_FAILEDTOJOIN = "FAILEDTOJOIN";
     public static final String NETMSG_QRJOINREJECTED = "QRJOINREJECTED";

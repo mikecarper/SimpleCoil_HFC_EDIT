@@ -12,10 +12,13 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -24,7 +27,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.*;
 
@@ -126,6 +132,77 @@ public class UDPDispatchRegressionTest {
         }
         await(sender);
         assertNoMessage(originalPeer);
+    }
+
+    @Test
+    public void senderThatPassedItsGenerationCheckCannotOpenSocketAfterDestruction() throws Exception {
+        Method generation = method("getSendGeneration");
+        Method current = method("isCurrentSend", long.class);
+        Method socket = method("getSendSocketLocked");
+        CountDownLatch checked = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        AtomicReference<DatagramSocket> created = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread sender = new Thread(() -> {
+            synchronized (sendLock) {
+                try {
+                    long sequence = (Long) generation.invoke(service);
+                    assertTrue((Boolean) current.invoke(service, sequence));
+                    checked.countDown();
+                    assertTrue("Socket creator was never resumed", resume.await(3, TimeUnit.SECONDS));
+                    created.set((DatagramSocket) socket.invoke(service));
+                } catch (InvocationTargetException error) {
+                    failure.set(error.getCause());
+                } catch (Throwable error) {
+                    failure.set(error);
+                }
+            }
+        }, "UDP late socket creation regression");
+        senders.add(sender);
+        sender.start();
+        try {
+            assertTrue("Sender did not pass its generation check", checked.await(2, TimeUnit.SECONDS));
+            // The sender still owns mSendLock. Destruction must finish promptly
+            // and make its earlier validation unusable at socket creation.
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(service::onDestroy);
+            resume.countDown();
+            sender.join(2000);
+            assertFalse("Socket creator survived destruction", sender.isAlive());
+            assertNull("Destroyed sender opened a new socket", created.get());
+            assertTrue("Destruction did not reject socket creation: " + failure.get(),
+                    failure.get() instanceof SocketException);
+            assertNull("Destroyed service published a socket", sendSocket());
+        } finally {
+            resume.countDown();
+            sender.join(2000);
+            if (created.get() != null) created.get().close();
+        }
+    }
+
+    @Test
+    public void destroyingServiceDetachesAndClosesAnExistingSendSocket() throws Exception {
+        Method socket = method("getSendSocketLocked");
+        DatagramSocket opened;
+        synchronized (sendLock) {
+            opened = (DatagramSocket) socket.invoke(service);
+            assertSame(opened, sendSocket());
+            // Cleanup cannot wait for this send lock, even with an open socket.
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(service::onDestroy);
+        }
+        assertTrue("Destruction left the outbound socket open", opened.isClosed());
+        assertNull("Destruction retained its outbound socket", sendSocket());
+    }
+
+    private static Method method(String name, Class<?>... parameters) throws Exception {
+        Method method = UDPListenerService.class.getDeclaredMethod(name, parameters);
+        method.setAccessible(true);
+        return method;
+    }
+
+    private DatagramSocket sendSocket() throws Exception {
+        Field field = UDPListenerService.class.getDeclaredField("mSendSocket");
+        field.setAccessible(true);
+        return (DatagramSocket) field.get(service);
     }
 
     @Test

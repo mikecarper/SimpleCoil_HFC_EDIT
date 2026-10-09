@@ -4,13 +4,14 @@ package com.simplecoil.simplecoil;
 
 /** Tracks distinct power-up checkpoints for one life. */
 final class PowerupQrProgress {
-    static final int MIN_REQUIRED = 4;
-    static final int MAX_REQUIRED = 8;
+    static final int MIN_REQUIRED = com.simplecoil.protocol.Powerups.MIN_REQUIRED;
+    static final int MAX_REQUIRED = com.simplecoil.protocol.Powerups.MAX_REQUIRED;
     private static final String PREFIX = "SIMPLECOIL:POWERUP:";
 
     enum ScanResult { INVALID, DUPLICATE, PROGRESS, UNLOCKED }
 
     private int scannedMask;
+    private int spent;
 
     static boolean isValidRequiredCount(int count) {
         return count >= MIN_REQUIRED && count <= MAX_REQUIRED;
@@ -37,7 +38,7 @@ final class PowerupQrProgress {
         if ((scannedMask & bit) != 0)
             return ScanResult.DUPLICATE;
         scannedMask |= bit;
-        return Integer.bitCount(scannedMask) % requiredCount == 0
+        return scannedCount() - spent >= requiredCount
                 ? ScanResult.UNLOCKED : ScanResult.PROGRESS;
     }
 
@@ -45,16 +46,36 @@ final class PowerupQrProgress {
         return Integer.bitCount(scannedMask);
     }
 
+    int scannedMask() {
+        return scannedMask;
+    }
+
     int progressCount(int requiredCount) {
-        return isValidRequiredCount(requiredCount) ? scannedCount() % requiredCount : 0;
+        return isValidRequiredCount(requiredCount) ? scannedCount() - spent : 0;
     }
 
     boolean canUnlockAnother(int requiredCount) {
         return isValidRequiredCount(requiredCount)
-                && scannedCount() / requiredCount < MAX_REQUIRED / requiredCount;
+                && MAX_REQUIRED - spent >= requiredCount;
+    }
+
+    /** Acknowledge only a new source-owned grant's recorded cost, not its current threshold. */
+    boolean consumeReward(int scanCost) {
+        if (!isValidRequiredCount(scanCost) || scannedCount() - spent < scanCost) return false;
+        spent += scanCost;
+        return true;
+    }
+
+    /** Merge delayed authoritative progress without losing locally scanned/unacknowledged codes. */
+    boolean syncHostProgress(int mask, int spentCount) {
+        if (mask < 0 || mask > 255 || spentCount < 0 || spentCount > Integer.bitCount(mask)) return false;
+        scannedMask |= mask;
+        spent = Math.max(spent, spentCount);
+        return true;
     }
 
     void reset() {
         scannedMask = 0;
+        spent = 0;
     }
 }

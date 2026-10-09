@@ -633,6 +633,10 @@ public class SharedLobbyUiRegressionTest {
                 assertTrue((Boolean) get(activity, "mUseNetwork"));
                 ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
                 invoke(activity, "leaveSharedLobby");
+                invoke(activity, "cancelNewWeaponPairing");
+                invoke(activity, "returnFromNewWeaponPairing");
+                assertFalse((Boolean) get(activity, "mPrimaryReconnectActive"));
+                assertFalse((Boolean) get(activity, "mScanning"));
                 set(activity, "mUseNetwork", false);
                 set(activity, "mCommunicating", false);
                 invoke(activity, "renderLobby");
@@ -670,6 +674,10 @@ public class SharedLobbyUiRegressionTest {
             scenario.onActivity(activity -> {
                 ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
                 invoke(activity, "leaveSharedLobby");
+                invoke(activity, "cancelNewWeaponPairing");
+                invoke(activity, "returnFromNewWeaponPairing");
+                assertFalse((Boolean) get(activity, "mPrimaryReconnectActive"));
+                assertFalse((Boolean) get(activity, "mScanning"));
                 set(activity, "mUseNetwork", true);
                 set(activity, "mCommunicating", false);
                 invoke(activity, "renderLobby");

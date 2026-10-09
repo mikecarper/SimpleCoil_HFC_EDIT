@@ -46,9 +46,20 @@ public class QrLaunchRegressionTest {
         scenario.onActivity(current -> {
             try {
                 originalInstrumentation = (Instrumentation) instrumentationField.get(current);
+                // Saved gun preferences can start a real BLE reconnect on launch.
+                // Exercise QR error handling from the intended idle connection screen.
+                java.lang.reflect.Method reset = FullscreenActivity.class.getDeclaredMethod(
+                        "returnFromNewWeaponPairing");
+                reset.setAccessible(true);
+                reset.invoke(current);
+                Field scanning = FullscreenActivity.class.getDeclaredField("mScanning");
+                scanning.setAccessible(true);
+                assertFalse(scanning.getBoolean(current));
+                assertTrue(current.findViewById(R.id.connect_weapon_button).isEnabled());
+                assertTrue(current.findViewById(R.id.connect_qr_weapon_button).isEnabled());
                 launches = new LaunchRecorder();
                 instrumentationField.set(current, launches);
-            } catch (IllegalAccessException e) { throw new AssertionError(e); }
+            } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
         });
     }
 

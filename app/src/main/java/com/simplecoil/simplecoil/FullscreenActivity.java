@@ -106,6 +106,8 @@ import com.journeyapps.barcodescanner.BarcodeCallback;
 import com.journeyapps.barcodescanner.BarcodeResult;
 import com.journeyapps.barcodescanner.DecoratedBarcodeView;
 import com.journeyapps.barcodescanner.DefaultDecoderFactory;
+import com.simplecoil.protocol.GameStartCountdown;
+import com.simplecoil.protocol.Powerups;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -120,6 +122,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.Locale;
 import java.util.Random;
@@ -208,6 +212,21 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private final PowerupQrProgress mPowerupQrProgress = new PowerupQrProgress();
     private final DualGunHitDeduper mDualGunHitDeduper = new DualGunHitDeduper();
     private final Random mPowerupRandom = new Random();
+    private final Powerups.Authority mSoloPowerupAuthority = new Powerups.Authority();
+    private final long[] mPowerupUntil = new long[10];
+    private final Map<Integer, Powerups.Grant> mPowerupDoubleDamage = new HashMap<>();
+    private final Map<Integer, String> mPowerupDoubleDamageOwners = new HashMap<>();
+    private final Set<Long> mSeenPowerupGrants = new LinkedHashSet<>();
+    private final Handler mPowerupHandler = new Handler(Looper.getMainLooper());
+    private int mPowerupShieldBonus;
+    private int mPowerupSavedShotMode = -1;
+    private int mEmpSavedPrimaryAmmo = -1;
+    private int mEmpSavedSecondaryAmmo = -1;
+    private boolean mPowerupRequestPending;
+    private final ArrayDeque<Integer> mPowerupRevealQueue = new ArrayDeque<>();
+    private int mPowerupRevealCurrent;
+    private PowerupRouletteView mPowerupRoulette;
+    private View mPowerupEmpOverlay;
     private TextView mHealthLabelTV = null;
     private TextView mPlayerNameTV = null;
     private ProgressBar mHealthBar = null;
@@ -453,11 +472,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private final KillStreakVoice mKillStreakVoice = new KillStreakVoice(new Random());
     private final InactivityVoice mInactivityVoice = new InactivityVoice(new Random());
     private long mNextGameStartAllowedAt;
+    private long mLocalGameStartAt;
     private long mLocalRoundStartedAt = -1;
     private volatile boolean mRespawnQrVoiceReminderActive;
-    private static final int GAME_START_VOICE_COUNTDOWN_SECONDS = 10;
     private static final long SYNCHRONIZED_COUNTDOWN_TICK_MS = 100;
     private static final String GAME_START_COUNTDOWN_UTTERANCE_ID = "simplecoil-game-start";
+    private static final String GAME_START_COUNTDOWN_FINISHED_UTTERANCE_ID =
+            "simplecoil-game-start-finished";
     private static final String ROUND_START_UTTERANCE_ID = "simplecoil-round-start";
     static final long ROUND_START_VOICE_DELAY_MS = 1_000;
     private static final String ROUND_START_PAUSE_UTTERANCE_ID = "simplecoil-round-start-pause";
@@ -975,6 +996,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if (!mActivityResumed || isFinishing() || isDestroyed())
                 return;
             updateSharedLobby();
+            if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                    && Globals.getInstance().mPowerupQrRequired != 0) {
+                updatePowerupScanButton();
+                if (mPowerupQrProgress.progressCount(effectivePowerupRequired()) >= effectivePowerupRequired())
+                    grantRandomPowerup();
+            }
             renderLobby();
             mLobbyHandler.postDelayed(this, 1_000);
         }
@@ -1263,9 +1290,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Globals globals = Globals.getInstance();
         if (hasCommittedRound()) {
             if (mUseNetwork && mIsServer && mTcpServer != null && !mTcpServer.isTcpServerReady()
-                    && mUDPListenerService != null && mUDPListenerService.isPeerStateAuthority())
+                    && mUDPListenerService != null && mUDPListenerService.isPeerStateAuthority()) {
                 mTcpServer.resumePeerRound(mSynchronizedRoundID, mSynchronizedStartAt,
                         mSynchronizedEndAt, mActivePeerRoundToken);
+                if (mTcpClient != null) mTcpServer.restorePowerupAuthority(mTcpClient.powerupAuthoritySnapshot());
+            }
             return;
         }
         boolean gunReady = mCommunicating && mCommandCharacteristic != null;
@@ -2406,7 +2435,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 ? mSecondaryLastShotCount & 0xff : 0);
         if (mUDPListenerService != null && mUseNetwork)
             mUDPListenerService.updatePeerRuntimeState(mScore, currentDeathCount(), mHealth,
-                    mShield + mRespawnShieldBonus, Math.min(255, shots),
+                    mShield + mRespawnShieldBonus + mPowerupShieldBonus, Math.min(255, shots),
                     Globals.getInstance().mGameState);
     }
 
@@ -2671,6 +2700,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mQrScannerCancelButton != null)
             mQrScannerCancelButton.setOnClickListener(v -> hideQrScanner());
         mPowerupQrScannerWindow = findViewById(R.id.powerup_qr_scanner_window);
+        mPowerupRoulette = findViewById(R.id.powerup_roulette);
+        mPowerupEmpOverlay = findViewById(R.id.powerup_emp_overlay);
         mPowerupQrScanner = findViewById(R.id.powerup_qr_scanner);
         mPowerupQrPrompt = findViewById(R.id.powerup_qr_prompt);
         if (mPowerupQrScanner != null) {
@@ -3912,7 +3943,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void updateVitalStatBars() {
         mHealthBar.setProgress(mHealth);
-        mShieldBar.setProgress(mShield + mRespawnShieldBonus);
+        mShieldBar.setProgress(mShield + mRespawnShieldBonus + mPowerupShieldBonus);
     }
 
     private void cancelRespawnShieldBoost() {
@@ -3922,7 +3953,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         mRespawnShieldBonus = 0;
         if (mShieldBar != null) {
-            mShieldBar.setMax(Globals.getInstance().mFullShields);
+            mShieldBar.setMax(Globals.getInstance().mFullShields + mPowerupShieldBonus);
             mShieldBar.setProgressTintList(ColorStateList.valueOf(
                     ContextCompat.getColor(this, android.R.color.holo_blue_dark)));
             updateVitalStatBars();
@@ -3938,7 +3969,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mRespawnShieldBonus = Math.max(0, bonus);
         if (mRespawnShieldBonus == 0)
             return;
-        mShieldBar.setMax(Globals.getInstance().mFullShields + mRespawnShieldBonus);
+        mShieldBar.setMax(Globals.getInstance().mFullShields + mRespawnShieldBonus + mPowerupShieldBonus);
         mShieldBar.setProgressTintList(ColorStateList.valueOf(
                 ContextCompat.getColor(this, android.R.color.holo_orange_light)));
         updateVitalStatBars();
@@ -4232,7 +4263,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean survivesDamage(int damage) {
         if (isOriginalZombieProtected())
             return true;
-        return mHealth + mShield + mRespawnShieldBonus + damage > 0;
+        return hasPowerup(Powerups.INVULNERABLE)
+                || mHealth + mShield + mRespawnShieldBonus + mPowerupShieldBonus + damage > 0;
     }
 
     private boolean isOriginalZombie() {
@@ -4249,7 +4281,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void takeDamage(int damage) {
+        if (damage < 0 && hasPowerup(Powerups.INVULNERABLE)) return;
         int remainingDamage = Math.max(0, -damage);
+        int powerupDamage = Math.min(mPowerupShieldBonus, remainingDamage);
+        mPowerupShieldBonus -= powerupDamage;
+        remainingDamage -= powerupDamage;
         int bonusDamage = Math.min(mRespawnShieldBonus, remainingDamage);
         mRespawnShieldBonus -= bonusDamage;
         remainingDamage -= bonusDamage;
@@ -4343,6 +4379,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mSynchronizedRoundID = mHasSynchronizedStart
                 ? start.getLongExtra(NetMsg.INTENT_ROUND_ID, 0) : 0;
         mLocalRoundStartedAt = -1;
+        mLocalGameStartAt = 0;
+        resetPowerups(true);
         if (mHasSynchronizedStart && mSynchronizedEndAt > 0
                 && mSynchronizedEndAt <= SystemClock.elapsedRealtime()) {
             endGame();
@@ -4830,6 +4868,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mSynchronizedEndAt = 0;
         mSynchronizedRoundID = 0;
         mLocalRoundStartedAt = -1;
+        mLocalGameStartAt = 0;
+        resetPowerups(true);
         mStartGameTimer = false;
         resetGameStartCountdownSpeech();
         mActivePeerRoundToken = null;
@@ -5405,7 +5445,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     /* Second stage of the reload commands which tells the tagger how many shots to load and allows
        it to shoot again. Command format is 00 00 04 00 PLAYER_ID 00 SHOT_COUNT and then 0 filled. */
     private void finishReload() {
-        if ((mReloading != RELOADING_STATE_STARTED && mReloading != RELOADING_STATE_ELIMINATED) || mCommandCharacteristic == null || mBluetoothLeService == null || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
+        if (hasPowerup(Powerups.EMP) || (mReloading != RELOADING_STATE_STARTED && mReloading != RELOADING_STATE_ELIMINATED) || mCommandCharacteristic == null || mBluetoothLeService == null || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
             return;
         mReloading = RELOADING_STATE_FINISHING;
         mEmptyTriggerCount = 0;
@@ -5417,7 +5457,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         command[2] = (byte)0x04;
         command[4] = Globals.getInstance().mPlayerID;
         command[5] = WEAPON_PROFILE;
-        command[6] = Globals.getInstance().mFullReload;
+        command[6] = (byte) activeMagazineSize();
         mCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
         mPendingReloadCommand = command.clone();
         mBluetoothLeService.writeCharacteristic(mCommandCharacteristic, command);
@@ -5522,13 +5562,42 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean isPowerupScanAvailable() {
         return Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
                 && !mStartGameTimer
+                && !hasPowerup(Powerups.EMP)
                 && PowerupQrProgress.isValidRequiredCount(
                         Globals.getInstance().mPowerupQrRequired)
                 && mPowerupQrProgress.canUnlockAnother(
-                        Globals.getInstance().mPowerupQrRequired);
+                        effectivePowerupRequired());
+    }
+
+    private int effectivePowerupRequired() {
+        Globals globals = Globals.getInstance();
+        int base = globals.mPowerupQrRequired;
+        com.simplecoil.protocol.RoundRoster roster = globals.mRoundRoster;
+        if (!mUseNetwork || roster == null || !PowerupQrProgress.isValidRequiredCount(base)) return base;
+        boolean teams = globals.mGameMode != Globals.GAME_MODE_FFA;
+        int own = teams ? globals.calcNetworkTeam(globals.mPlayerID) : globals.mPlayerID & 255;
+        Map<Integer, Integer> scores = new HashMap<>();
+        if (teams) for (int team = 1; team <= 4; team++)
+            scores.put(team, roster.archivedScore(team, globals.mCaptureTheFlag));
+        for (int id = 1; id <= 32; id++) {
+            com.simplecoil.protocol.RoundRoster.Member member = roster.seat(id);
+            if (member == null) continue;
+            int key = teams ? globals.calcNetworkTeam((byte) id) : id;
+            int points = globals.mCaptureTheFlag ? member.captures : member.kills;
+            scores.put(key, (int) Math.min(Integer.MAX_VALUE, (long) scores.getOrDefault(key, 0) + points));
+        }
+        int best = 0;
+        for (Map.Entry<Integer, Integer> score : scores.entrySet())
+            if (score.getKey() != own) best = Math.max(best, score.getValue());
+        return Powerups.effectiveRequired(base, scores.getOrDefault(own, 0), best);
     }
 
     private void updatePowerupScanButton() {
+        if (mUseNetwork && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
+            JSONObject snapshot = mIsServer && mTcpServer != null ? mTcpServer.powerupAuthoritySnapshot()
+                    : mTcpClient == null ? null : mTcpClient.powerupAuthoritySnapshot();
+            hostConfirmedPowerupScans(snapshot);
+        }
         boolean available = isPowerupScanAvailable();
         if (!available)
             hidePowerupQrScanner();
@@ -5537,8 +5606,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if (available)
                 mPowerupScanButton.setText(getString(R.string.powerup_scan_progress,
                         mPowerupQrProgress.progressCount(
-                                Globals.getInstance().mPowerupQrRequired),
-                        Globals.getInstance().mPowerupQrRequired));
+                                effectivePowerupRequired()),
+                        effectivePowerupRequired()));
         }
         updatePowerupSettingsButton();
     }
@@ -5547,32 +5616,361 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
                 || Globals.getInstance().mPowerupQrRequired == 0)
             return;
-        List<Integer> rewards = new ArrayList<>();
-        if (mHealth < Globals.getInstance().mFullHealth)
-            rewards.add(0);
-        if (mShield < Globals.getInstance().mFullShields)
-            rewards.add(1);
-        // A temporary shield boost is useful even when health and normal shields are full.
-        rewards.add(2);
-        int reward = rewards.get(mPowerupRandom.nextInt(rewards.size()));
-        if (reward == 0) {
-            mHealth = Globals.getInstance().mFullHealth;
-            cancelHealthRegeneration();
-            updateVitalStatBars();
-            publishPeerRuntimeState();
-            Toast.makeText(this, R.string.powerup_reward_health, Toast.LENGTH_LONG).show();
-        } else if (reward == 1) {
-            mShield = Globals.getInstance().mFullShields;
-            cancelShieldRegeneration();
-            updateVitalStatBars();
-            publishPeerRuntimeState();
-            Toast.makeText(this, R.string.powerup_reward_shields, Toast.LENGTH_LONG).show();
+        int mask = mPowerupQrProgress.scannedMask();
+        int life = currentDeathCount();
+        if (mUseNetwork) {
+            mPowerupRequestPending = true;
+            retryPowerupRequest();
         } else {
-            startTemporaryShieldBoost(Math.max(1,
-                    (Math.max(0, Globals.getInstance().mFullShields) + 1) / 2));
-            publishPeerRuntimeState();
-            Toast.makeText(this, R.string.powerup_reward_boost, Toast.LENGTH_LONG).show();
+            int id = Math.max(1, Globals.getInstance().mPlayerID & 255);
+            Map<Integer, Integer> teams = new HashMap<>();
+            teams.put(id, 0);
+            Map<Integer, Integer> scores = new HashMap<>();
+            scores.put(id, mScore);
+            Set<Integer> alive = new LinkedHashSet<>();
+            alive.add(id);
+            mSoloPowerupAuthority.setPlayerLife(id, life);
+            Powerups.Grant grant = mSoloPowerupAuthority.request(id, life, mask,
+                    Globals.getInstance().mPowerupQrRequired, 0, teams, scores, alive,
+                    SystemClock.elapsedRealtime(), mPowerupRandom);
+            if (grant != null) applyPowerupGrant(grant, false);
         }
+    }
+
+    private final Runnable mPowerupRequestRetry = this::retryPowerupRequest;
+
+    private void retryPowerupRequest() {
+        mPowerupHandler.removeCallbacks(mPowerupRequestRetry);
+        if (!mPowerupRequestPending || !mUseNetwork || mStartGameTimer
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                || !PowerupQrProgress.isValidRequiredCount(Globals.getInstance().mPowerupQrRequired)) return;
+        JSONObject state = mIsServer && mTcpServer != null ? mTcpServer.powerupAuthoritySnapshot()
+                : mTcpClient == null ? null : mTcpClient.powerupAuthoritySnapshot();
+        if (hostConfirmedPowerupScans(state)) {
+            mPowerupRequestPending = false;
+            return;
+        }
+        if (mIsServer && mTcpServer != null)
+            mTcpServer.requestHostPowerup(mPowerupQrProgress.scannedMask(), currentDeathCount());
+        else if (mTcpClient != null)
+            mTcpClient.requestPowerup(mPowerupQrProgress.scannedMask(), currentDeathCount());
+        if (mPowerupRequestPending)
+            mPowerupHandler.postDelayed(mPowerupRequestRetry, 2000);
+    }
+
+    private boolean hostConfirmedPowerupScans(JSONObject snapshot) {
+        if (snapshot == null || !android.text.TextUtils.equals(mActivePeerRoundToken,
+                snapshot.optString(TcpServer.JSON_ROUND_TOKEN))) return false;
+        JSONObject state = snapshot.optJSONObject("powerupstate");
+        JSONArray players = state == null ? null : state.optJSONArray("players");
+        if (players == null) return false;
+        int mask = mPowerupQrProgress.scannedMask();
+        for (int n = 0; n < players.length(); n++) {
+            JSONObject player = players.optJSONObject(n);
+            if (player != null && player.optInt("id", 0) == (Globals.getInstance().mPlayerID & 255)
+                    && player.optInt("life", -1) == currentDeathCount()) {
+                mPowerupQrProgress.syncHostProgress(player.optInt("mask", 0), player.optInt("spent", 0));
+                return (player.optInt("mask", 0) & mask) == mask
+                        && player.optInt("required", 0) == effectivePowerupRequired()
+                        && mPowerupQrProgress.progressCount(effectivePowerupRequired()) < effectivePowerupRequired();
+            }
+        }
+        return false;
+    }
+
+    private boolean hasPowerup(int kind) {
+        return kind > 0 && kind < mPowerupUntil.length
+                && mPowerupUntil[kind] > SystemClock.elapsedRealtime();
+    }
+
+    private int activeMagazineSize() {
+        return hasPowerup(Powerups.FULL_AUTO_90) ? 90 : Globals.getInstance().mFullReload & 255;
+    }
+
+    private void receivePowerup(Intent intent) {
+        if (!mUseNetwork || mActivePeerRoundToken == null
+                || !mActivePeerRoundToken.equals(intent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN))) return;
+        int[] targets = intent.getIntArrayExtra(NetMsg.INTENT_POWERUP_TARGETS);
+        int[] lives = intent.getIntArrayExtra(NetMsg.INTENT_POWERUP_LIVES);
+        if (targets == null || lives == null || targets.length != lives.length) return;
+        String sourceOwner = intent.getStringExtra(NetMsg.INTENT_POWERUP_SOURCE_IDENTITY);
+        if (sourceOwner == null || !sourceOwner.equals(powerupSeatOwner(
+                intent.getIntExtra(NetMsg.INTENT_POWERUP_SOURCE, 0)))) return;
+        boolean processed = applyPowerupGrant(new Powerups.Grant(intent.getLongExtra(NetMsg.INTENT_POWERUP_ID, 0),
+                intent.getIntExtra(NetMsg.INTENT_POWERUP_SOURCE, 0),
+                intent.getIntExtra(NetMsg.INTENT_POWERUP_SOURCE_LIFE, -1),
+                intent.getIntExtra(NetMsg.INTENT_POWERUP_KIND, 0), targets, lives,
+                intent.getLongExtra(NetMsg.INTENT_POWERUP_EXPIRES, 0),
+                intent.getIntExtra(NetMsg.INTENT_POWERUP_COST, 0)),
+                intent.getBooleanExtra(NetMsg.INTENT_POWERUP_SNAPSHOT, false), sourceOwner);
+        long id = intent.getLongExtra(NetMsg.INTENT_POWERUP_ID, 0);
+        if (processed) {
+            if (mIsServer && mTcpServer != null) mTcpServer.acknowledgePowerup(id);
+            else if (mTcpClient != null) mTcpClient.acknowledgePowerup(id);
+        }
+    }
+
+    private boolean applyPowerupGrant(Powerups.Grant grant, boolean snapshot) {
+        return applyPowerupGrant(grant, snapshot, grant == null ? null : powerupSeatOwner(grant.source));
+    }
+
+    private boolean applyPowerupGrant(Powerups.Grant grant, boolean snapshot, String sourceOwner) {
+        if (grant == null || grant.targets == null || grant.targetLives == null
+                || grant.targets.length != grant.targetLives.length || grant.targets.length > 32
+                || grant.source < 1 || grant.source > 32 || grant.sourceLife < 0) return false;
+        int kind = grant.kind;
+        if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE || mStartGameTimer
+                || Globals.getInstance().mPowerupQrRequired == 0
+                || grant.id <= 0 || grant.expiresAt <= SystemClock.elapsedRealtime()
+                || PowerupPresentation.name(kind) == 0) return false;
+        if (sourceOwner != null && !sourceOwner.equals(powerupSeatOwner(grant.source))) return false;
+        if (!mSeenPowerupGrants.add(grant.id)) return true;
+        // Bound dedup memory across a long match; authority snapshots retain only 64 active grants.
+        if (mSeenPowerupGrants.size() > 1024)
+            mSeenPowerupGrants.remove(mSeenPowerupGrants.iterator().next());
+        if (kind == Powerups.DOUBLE_DAMAGE) {
+            mPowerupDoubleDamage.put(grant.source, grant);
+            mPowerupDoubleDamageOwners.put(grant.source, sourceOwner);
+        }
+        int id = Math.max(1, Globals.getInstance().mPlayerID & 255);
+        if (!mUseNetwork && grant.source == id && grant.sourceLife == currentDeathCount())
+            mPowerupQrProgress.consumeReward(grant.scanCost);
+        boolean target = false;
+        for (int i = 0; i < grant.targets.length; i++)
+            if (grant.targets[i] == id && grant.targetLives[i] == currentDeathCount()) target = true;
+        if (target && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
+            if (kind == Powerups.HEAL_TEAM && !snapshot) {
+                mHealth = Globals.getInstance().mFullHealth;
+                cancelHealthRegeneration();
+            } else if (kind == Powerups.DAMAGE_TEAM && !snapshot) {
+                applyPowerupDamage(grant.source,
+                        Math.max(1, (Globals.getInstance().mFullHealth + 3) / 4));
+            } else if (kind != Powerups.HEAL_TEAM && kind != Powerups.DAMAGE_TEAM) {
+                mPowerupUntil[kind] = Math.max(mPowerupUntil[kind], grant.expiresAt);
+                if (kind == Powerups.SHIELD_PLAYER || kind == Powerups.SHIELD_TEAM) {
+                    mPowerupShieldBonus = Math.max(mPowerupShieldBonus,
+                            Math.max(1, (Globals.getInstance().mFullShields + 1) / 2));
+                    mShieldBar.setMax(Globals.getInstance().mFullShields
+                            + mRespawnShieldBonus + mPowerupShieldBonus);
+                } else if (kind == Powerups.FULL_AUTO || kind == Powerups.FULL_AUTO_90) {
+                    if (mPowerupSavedShotMode < 0) mPowerupSavedShotMode = mCurrentShotMode;
+                    setShotMode(Globals.SHOT_MODE_FULL_AUTO);
+                    if (kind == Powerups.FULL_AUTO_90) refillPowerupMagazine();
+                } else if (kind == Powerups.EMP) {
+                    if (mEmpSavedPrimaryAmmo < 0) {
+                        mEmpSavedPrimaryAmmo = mLastShotCount & 255;
+                        mEmpSavedSecondaryAmmo = mSecondaryLastShotCount & 255;
+                    }
+                    startReload(RELOADING_STATE_ELIMINATED);
+                    if (mPowerupEmpOverlay != null) {
+                        mPowerupEmpOverlay.setVisibility(View.VISIBLE);
+                        mPowerupEmpOverlay.startAnimation(AnimationUtils.loadAnimation(this, R.anim.fadeout));
+                    }
+                }
+                mPowerupHandler.removeCallbacks(mPowerupExpiryTick);
+                mPowerupHandler.postDelayed(mPowerupExpiryTick, 100);
+            }
+            updateVitalStatBars();
+            mShotsRemainingLabelTV.setText(getString(R.string.shots_remaining_label,
+                    activeMagazineSize(), -Globals.getInstance().mDamage));
+            publishPeerRuntimeState();
+        }
+        if (grant.source == id && grant.sourceLife == currentDeathCount()
+                && !snapshot && Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
+            mPowerupHandler.removeCallbacks(mPowerupRequestRetry);
+            JSONObject snapshotState = mIsServer && mTcpServer != null ? mTcpServer.powerupAuthoritySnapshot()
+                    : mTcpClient == null ? null : mTcpClient.powerupAuthoritySnapshot();
+            mPowerupRequestPending = mUseNetwork && !hostConfirmedPowerupScans(snapshotState);
+            if (mPowerupRequestPending) mPowerupHandler.postDelayed(mPowerupRequestRetry, 2000);
+            mPowerupRevealQueue.addLast(kind);
+            showNextPowerupReward();
+        }
+        updatePowerupScanButton();
+        return true;
+    }
+
+    private void showNextPowerupReward() {
+        if (mPowerupRevealCurrent != 0 || mPowerupRevealQueue.isEmpty()) return;
+        mPowerupRevealCurrent = mPowerupRevealQueue.removeFirst();
+        final int kind = mPowerupRevealCurrent;
+        Runnable announce = () -> {
+            speakRoundVoicePrompt(PowerupPresentation.voice(kind));
+            mPowerupRevealCurrent = 0;
+            showNextPowerupReward();
+        };
+        if (mPowerupRoulette != null && mActivityResumed)
+            mPowerupRoulette.showReward(getString(PowerupPresentation.name(kind)), announce);
+        else announce.run();
+    }
+
+    private void refillPowerupMagazine() {
+        if (hasPowerup(Powerups.EMP) || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING) return;
+        startReload(RELOADING_STATE_ELIMINATED);
+        finishReload();
+        finishSecondaryReload();
+    }
+
+    /** Restore/cap ammunition without rewarding an EMP victim with a free refill. */
+    private void programPowerupAmmo(int shots, boolean secondary) {
+        BluetoothLeService service = secondary ? mSecondaryBluetoothLeService : mBluetoothLeService;
+        BluetoothGattCharacteristic characteristic = secondary ? mSecondaryCommandCharacteristic : mCommandCharacteristic;
+        if (service == null || characteristic == null || hasPowerup(Powerups.EMP)
+                || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING) return;
+        byte[] command = new byte[20];
+        command[0] = secondary ? mSecondaryCommandID : mCommandID;
+        if (secondary) mSecondaryCommandID += COMMAND_ID_INCREMENT;
+        else mCommandID += COMMAND_ID_INCREMENT;
+        command[2] = 0x04;
+        command[4] = Globals.getInstance().mPlayerID;
+        command[5] = WEAPON_PROFILE;
+        command[6] = (byte) Math.max(0, Math.min(activeMagazineSize(), shots));
+        if (secondary) {
+            mSecondaryReloading = RELOADING_STATE_FINISHING;
+            mSecondaryPendingReloadCommand = command.clone();
+        } else {
+            mReloading = RELOADING_STATE_FINISHING;
+            mPendingReloadCommand = command.clone();
+        }
+        characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        service.writeCharacteristic(characteristic, command);
+    }
+
+    /** Expiry must not replace an ordinary reload or use its disabled telemetry as ammo. */
+    private void capPowerupMagazine(boolean secondary) {
+        int reloadState = secondary ? mSecondaryReloading : mReloading;
+        if (reloadState == RELOADING_STATE_STARTED || reloadState == RELOADING_STATE_ELIMINATED)
+            return;
+        int shots;
+        if (reloadState == RELOADING_STATE_FINISHING) {
+            byte[] pending = secondary ? mSecondaryPendingReloadCommand : mPendingReloadCommand;
+            if (pending == null || pending.length <= 6 || pending[2] != 0x04) return;
+            shots = pending[6] & 255;
+        } else {
+            shots = (secondary ? mSecondaryLastShotCount : mLastShotCount) & 255;
+        }
+        if (shots > activeMagazineSize()) programPowerupAmmo(shots, secondary);
+    }
+
+    private final Runnable mPowerupExpiryTick = new Runnable() {
+        @Override public void run() {
+            boolean empWasActive = mPowerupUntil[Powerups.EMP] != 0;
+            boolean largeMagazineWasActive = mPowerupUntil[Powerups.FULL_AUTO_90] != 0;
+            boolean shieldWasActive = mPowerupUntil[Powerups.SHIELD_PLAYER] != 0
+                    || mPowerupUntil[Powerups.SHIELD_TEAM] != 0;
+            long now = SystemClock.elapsedRealtime();
+            boolean active = false;
+            for (int i = 1; i < mPowerupUntil.length; i++) {
+                if (mPowerupUntil[i] <= now) mPowerupUntil[i] = 0;
+                active |= mPowerupUntil[i] != 0;
+            }
+            if (!hasPowerup(Powerups.SHIELD_PLAYER) && !hasPowerup(Powerups.SHIELD_TEAM)
+                    && shieldWasActive) {
+                mPowerupShieldBonus = 0;
+                mShieldBar.setMax(Globals.getInstance().mFullShields + mRespawnShieldBonus);
+                updateVitalStatBars();
+                publishPeerRuntimeState();
+            }
+            if (!hasPowerup(Powerups.FULL_AUTO) && !hasPowerup(Powerups.FULL_AUTO_90)
+                    && mPowerupSavedShotMode >= 0) {
+                int original = mPowerupSavedShotMode;
+                mPowerupSavedShotMode = -1;
+                setShotMode(original);
+            }
+            boolean empJustExpired = empWasActive && !hasPowerup(Powerups.EMP);
+            if (empJustExpired) {
+                if (mPowerupEmpOverlay != null) {
+                    mPowerupEmpOverlay.clearAnimation();
+                    mPowerupEmpOverlay.setVisibility(View.GONE);
+                }
+                programPowerupAmmo(mEmpSavedPrimaryAmmo, false);
+                programPowerupAmmo(mEmpSavedSecondaryAmmo, true);
+                mEmpSavedPrimaryAmmo = mEmpSavedSecondaryAmmo = -1;
+            }
+            if (largeMagazineWasActive && !hasPowerup(Powerups.FULL_AUTO_90)) {
+                // EMP's saved-ammo restoration already applies the new capacity.
+                // A second write here would replace it with the gun's locked zero.
+                if (!empJustExpired) {
+                    capPowerupMagazine(false);
+                    capPowerupMagazine(true);
+                }
+                mShotsRemainingLabelTV.setText(getString(R.string.shots_remaining_label,
+                        activeMagazineSize(), -Globals.getInstance().mDamage));
+            }
+            if (active) mPowerupHandler.postDelayed(this, 100);
+        }
+    };
+
+    private void resetPowerups(boolean roundEnded) {
+        mPowerupHandler.removeCallbacksAndMessages(null);
+        mPowerupRequestPending = false;
+        mPowerupRevealQueue.clear();
+        mPowerupRevealCurrent = 0;
+        Arrays.fill(mPowerupUntil, 0);
+        mPowerupShieldBonus = 0;
+        mEmpSavedPrimaryAmmo = mEmpSavedSecondaryAmmo = -1;
+        if (mShieldBar != null) {
+            mShieldBar.setMax(Globals.getInstance().mFullShields + mRespawnShieldBonus);
+            updateVitalStatBars();
+        }
+        if (mPowerupRoulette != null) mPowerupRoulette.cancel();
+        if (mPowerupEmpOverlay != null) {
+            mPowerupEmpOverlay.clearAnimation();
+            mPowerupEmpOverlay.setVisibility(View.GONE);
+        }
+        if (mPowerupSavedShotMode >= 0) {
+            int original = mPowerupSavedShotMode;
+            mPowerupSavedShotMode = -1;
+            setShotMode(original);
+        }
+        if (roundEnded) {
+            mPowerupDoubleDamage.clear();
+            mPowerupDoubleDamageOwners.clear();
+            mSeenPowerupGrants.clear();
+            mSoloPowerupAuthority.resetRound();
+        } else {
+            int localId = Globals.getInstance().mPlayerID & 255;
+            mPowerupDoubleDamage.remove(localId);
+            mPowerupDoubleDamageOwners.remove(localId);
+        }
+    }
+
+    private void applyPowerupDamage(int source, int points) {
+        if (hasPowerup(Powerups.INVULNERABLE)) return;
+        if (isOriginalZombieProtected()) drainOriginalZombieAmmo(points);
+        else {
+            takeDamage(-points);
+            if (mHealth <= 0) handlePlayerElimination((byte) source);
+        }
+        if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING)
+            showIncomingHitFeedback((byte) source, 0);
+    }
+
+    /** Every lethal hit, including a team damage reward, follows the same life/score path. */
+    private void handlePlayerElimination(byte attacker) {
+        mPowerupQrProgress.reset();
+        mKillStreakVoice.resetStreak();
+        resetGameStartCountdownSpeech();
+        vibrateOnHit();
+        playSound(R.raw.eliminated);
+        if (mHasLivesLimit)
+            mEliminationCount = Math.max(0, boundedCounter(mEliminationCount, Globals.MAX_SCOREBOARD_VALUE) - 1);
+        else mEliminationCount = incrementCounter(mEliminationCount, Globals.MAX_SCOREBOARD_VALUE);
+        mEliminationCountTV.setText(String.valueOf(mEliminationCount));
+        publishPeerRuntimeState();
+        boolean outOfLives = mHasLivesLimit && mEliminationCount <= 0;
+        if (!outOfLives)
+            startSpawn(mUseNetwork ? Globals.getInstance().getPlayerName(attacker) : "");
+        else resetPowerups(false);
+        if (mUseNetwork && attacker > 0 && attacker != Globals.getInstance().mPlayerID
+                && (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                || Globals.getInstance().calcNetworkTeam(attacker)
+                != Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID))) {
+            if (isDedicatedServerConnection())
+                mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG
+                        + NetMsg.NETMSG_ELIMINATED + attacker, true);
+            else if (mUDPListenerService != null) mUDPListenerService.publishPeerElimination(attacker);
+        }
+        if (outOfLives) finishOutOfLives();
     }
 
     private final BarcodeCallback mPowerupQrBarcodeCallback = new BarcodeCallback() {
@@ -5582,7 +5980,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 return;
             PowerupQrProgress.ScanResult scan = mPowerupQrProgress.scan(
                     result == null ? null : result.getText(),
-                    Globals.getInstance().mPowerupQrRequired);
+                    effectivePowerupRequired());
             if (scan == PowerupQrProgress.ScanResult.INVALID) {
                 Toast.makeText(FullscreenActivity.this, R.string.powerup_scan_invalid,
                         Toast.LENGTH_SHORT).show();
@@ -5600,13 +5998,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 return;
             }
             updatePowerupScanButton();
-            if (scan == PowerupQrProgress.ScanResult.UNLOCKED)
-                grantRandomPowerup();
-            else
+            grantRandomPowerup(); // The host awards only earned distinct-code thresholds.
+            if (scan != PowerupQrProgress.ScanResult.UNLOCKED)
                 Toast.makeText(FullscreenActivity.this, getString(R.string.powerup_scan_progress,
                         mPowerupQrProgress.progressCount(
-                                Globals.getInstance().mPowerupQrRequired),
-                        Globals.getInstance().mPowerupQrRequired), Toast.LENGTH_SHORT).show();
+                                effectivePowerupRequired()),
+                        effectivePowerupRequired()), Toast.LENGTH_SHORT).show();
         }
 
         @Override
@@ -5639,8 +6036,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mPowerupQrScannerActive = true;
         if (mPowerupQrPrompt != null)
             mPowerupQrPrompt.setText(getString(R.string.powerup_qr_prompt,
-                    mPowerupQrProgress.progressCount(Globals.getInstance().mPowerupQrRequired),
-                    Globals.getInstance().mPowerupQrRequired));
+                    mPowerupQrProgress.progressCount(effectivePowerupRequired()),
+                    effectivePowerupRequired()));
         mPowerupQrScannerWindow.setVisibility(View.VISIBLE);
         resumePowerupQrScanner();
     }
@@ -5957,19 +6354,19 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     /**
-     * Count toward the absolute host-derived deadline instead of trusting the
-     * duration captured when the timer was created.  If a later NTP probe
-     * refines that deadline, the next 100 ms tick follows it immediately.
+     * Count toward the absolute initial-start deadline instead of trusting the
+     * duration captured when the timer was created. A solo start uses its local
+     * deadline; network starts follow host-clock refinements on the next tick.
      */
     private void armSynchronizedSpawnTimer(final boolean notifyDedicatedHost) {
-        final long initialDelay = synchronizedStartRemaining();
+        final long initialDelay = gameStartRemaining();
         mSpawnTimer = new CountDownTimer(initialDelay, SYNCHRONIZED_COUNTDOWN_TICK_MS) {
             @Override
             public void onTick(long ignoredMillisUntilFinished) {
-                if (mSpawnTimer != this || !mStartGameTimer || !mHasSynchronizedStart
+                if (mSpawnTimer != this || !mStartGameTimer
                         || Globals.getInstance().mGameState != Globals.GAME_STATE_ELIMINATED)
                     return;
-                long remaining = synchronizedStartRemaining();
+                long remaining = gameStartRemaining();
                 updateSpawnCountdown(remaining, true, false);
                 announceGameStartCountdown(remaining);
                 if (remaining == 0) {
@@ -5982,10 +6379,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
             @Override
             public void onFinish() {
-                if (mSpawnTimer != this || !mStartGameTimer || !mHasSynchronizedStart
+                if (mSpawnTimer != this || !mStartGameTimer
                         || Globals.getInstance().mGameState != Globals.GAME_STATE_ELIMINATED)
                     return;
-                long remaining = synchronizedStartRemaining();
+                long remaining = gameStartRemaining();
                 if (remaining > 0) {
                     // A clock refinement moved the target later than this
                     // timer's original duration.  Re-arm from the same shared
@@ -6020,6 +6417,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         cancelHealthRegeneration();
         cancelRespawnShieldBoost();
         Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+        resetPowerups(false);
         if (mCarriedFlagTeam != 0) {
             mCarriedFlagTeam = 0;
             stopFlagSiren();
@@ -6036,21 +6434,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mEliminatedTV.setVisibility(View.VISIBLE);
         mEliminatedByTV.setText(eliminatedBy);
         mEliminatedByTV.setVisibility(View.VISIBLE);
-        final boolean synchronizedCountdown = mStartGameTimer && mHasSynchronizedStart;
-        final boolean teamQrRespawn = !synchronizedCountdown && isTeamQrRespawnEnabled();
-        if (synchronizedCountdown)
+        final boolean gameStartCountdown = mStartGameTimer;
+        final boolean teamQrRespawn = !gameStartCountdown && isTeamQrRespawnEnabled();
+        if (gameStartCountdown) {
             resetGameStartCountdownSpeech();
+            if (!mHasSynchronizedStart)
+                mLocalGameStartAt = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
+        }
         if (teamQrRespawn)
             mRespawnQrTeam = Globals.getInstance().mInfectionMode ? 1
                     : Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID);
-        final long spawnDelay = synchronizedCountdown
-                ? synchronizedStartRemaining()
+        final long spawnDelay = gameStartCountdown
+                ? gameStartRemaining()
                 : Globals.respawnWaitSeconds(mUseNetwork, mStartGameTimer,
                         Globals.getInstance().mGameMode, Globals.getInstance().mRespawnTime) * 1000;
         final boolean notifyDedicatedHost = !mStartGameTimer && isDedicatedServerConnection();
-        updateSpawnCountdown(spawnDelay, synchronizedCountdown, teamQrRespawn);
+        updateSpawnCountdown(spawnDelay, gameStartCountdown, teamQrRespawn);
         mSpawnInTV.setVisibility(View.VISIBLE);
-        if (synchronizedCountdown) {
+        if (gameStartCountdown) {
             announceGameStartCountdown(spawnDelay);
             armSynchronizedSpawnTimer(notifyDedicatedHost);
         } else {
@@ -6059,7 +6460,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 public void onTick(long millisUntilFinished) {
                     if (mSpawnTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_ELIMINATED)
                         return;
-                    updateSpawnCountdown(millisUntilFinished, synchronizedCountdown, teamQrRespawn);
+                    updateSpawnCountdown(millisUntilFinished, false, teamQrRespawn);
                     playSound(R.raw.beep);
                 }
 
@@ -6127,6 +6528,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mGameTimer.start();
             }
             announceRoundStart();
+            if (mTcpClient != null) mTcpClient.replayPowerups();
+            if (mIsServer && mTcpServer != null) mTcpServer.replayPowerups();
         }
         startInactivityVoiceReminder();
         updatePowerupScanButton();
@@ -6182,6 +6585,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private int resolveShotMode(int shotMode) {
         Globals globals = Globals.getInstance();
+        if (hasPowerup(Powerups.FULL_AUTO) || hasPowerup(Powerups.FULL_AUTO_90))
+            return Globals.SHOT_MODE_FULL_AUTO;
         if (Globals.getInstance().mTournamentMode && !isLocalBoss())
             return Globals.SHOT_MODE_SINGLE;
         switch (shotMode) {
@@ -6217,9 +6622,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mShotModeTV.setText(labelResource);
         if (mBossShotModeTV != null)
             mBossShotModeTV.setText(labelResource);
-        SharedPreferences.Editor editor = sharedPreferences.edit();
-        editor.putInt(PREF_SHOT_MODE, mCurrentShotMode);
-        editor.apply();
+        if (mPowerupSavedShotMode < 0) {
+            SharedPreferences.Editor editor = sharedPreferences.edit();
+            editor.putInt(PREF_SHOT_MODE, mCurrentShotMode);
+            editor.apply();
+        }
         // Keep the permitted selection even while disconnected so reconnects cannot restore a banned mode.
         byte[] config = new byte[20];
         config[0]  = WEAPON_PROFILE;
@@ -6411,6 +6818,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mBluetoothReceiverRegistered = true;
         ContextCompat.registerReceiver(this, mUDPUpdateReceiver, makeUDPUpdateIntentFilter(), ContextCompat.RECEIVER_NOT_EXPORTED);
         mNetworkReceiverRegistered = true;
+        if (mTcpClient != null) mTcpClient.replayPowerups();
+        if (mIsServer && mTcpServer != null) mTcpServer.replayPowerups();
         setupUDPServiceConnection();
         setupTcpClientServiceConnection();
         setupTcpServerServiceConnection();
@@ -6465,6 +6874,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onPause() {
+        if (mPowerupRevealCurrent != 0) {
+            speakRoundVoicePrompt(PowerupPresentation.voice(mPowerupRevealCurrent));
+            mPowerupRevealCurrent = 0;
+        }
+        while (!mPowerupRevealQueue.isEmpty())
+            speakRoundVoicePrompt(PowerupPresentation.voice(mPowerupRevealQueue.removeFirst()));
+        if (mPowerupRoulette != null) mPowerupRoulette.cancel();
         clearPrimaryReconnectCallback();
         if (mSecondaryReconnectRunnable != null) {
             mWeaponPairingHandler.removeCallbacks(mSecondaryReconnectRunnable);
@@ -6522,6 +6938,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        mPowerupHandler.removeCallbacksAndMessages(null);
+        if (mPowerupRoulette != null) mPowerupRoulette.cancel();
         cancelPrimaryReconnect();
         clearGrenadePairingSignal();
         clearPendingGrenadePairing();
@@ -7375,11 +7793,26 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mBluetoothLeService = null;
     }
 
+    private String powerupSeatOwner(int id) {
+        com.simplecoil.protocol.RoundRoster roster = Globals.getInstance().mRoundRoster;
+        com.simplecoil.protocol.RoundRoster.Member member = roster == null ? null : roster.seat(id);
+        return member == null ? null : member.identity;
+    }
+
     private int getPlayerDamage(byte playerID) {
         Globals.getmPlayerSettingsSemaphore();
         try {
             Globals.PlayerSettings playerSettings = Globals.getInstance().mPlayerSettings.get(playerID);
-            return playerSettings == null ? Globals.DAMAGE_PER_HIT : playerSettings.damage;
+            int damage = playerSettings == null ? Globals.DAMAGE_PER_HIT : playerSettings.damage;
+            Powerups.Grant boost = mPowerupDoubleDamage.get((int) playerID);
+            com.simplecoil.protocol.RoundRoster roster = Globals.getInstance().mRoundRoster;
+            com.simplecoil.protocol.RoundRoster.Member member = roster == null ? null : roster.seat(playerID);
+            String owner = member == null ? null : member.identity;
+            if (boost != null && boost.expiresAt > SystemClock.elapsedRealtime()
+                    && (member != null ? member.deaths == boost.sourceLife
+                        && owner.equals(mPowerupDoubleDamageOwners.get((int) playerID))
+                        : !mUseNetwork && mPowerupDoubleDamageOwners.get((int) playerID) == null)) damage *= 2;
+            return damage;
         } finally {
             Globals.getInstance().mPlayerSettingsSemaphore.release();
         }
@@ -7615,6 +8048,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             };
             mSecondaryReloadTimer.start();
         } else if (mSecondaryReloading == RELOADING_STATE_FINISHING) {
+            // The buff can expire between its deadline and the next expiry tick.
+            if ((completed[6] & 255) > activeMagazineSize()) {
+                programPowerupAmmo(completed[6] & 255, true);
+                return;
+            }
             mSecondaryReloading = RELOADING_STATE_NONE;
             mSecondaryLastShotCount = completed[6];
             publishPeerRuntimeState();
@@ -7664,6 +8102,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void finishSecondaryReload() {
+        if (hasPowerup(Powerups.EMP)) return;
         if ((mSecondaryReloading != RELOADING_STATE_STARTED
                 && mSecondaryReloading != RELOADING_STATE_ELIMINATED)
                 || mSecondaryBluetoothLeService == null
@@ -7678,7 +8117,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         command[2] = (byte) 0x04;
         command[4] = Globals.getInstance().mPlayerID;
         command[5] = WEAPON_PROFILE;
-        command[6] = Globals.getInstance().mFullReload;
+        command[6] = (byte) activeMagazineSize();
         mSecondaryPendingReloadCommand = command.clone();
         mSecondaryCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
         mSecondaryBluetoothLeService.writeCharacteristic(mSecondaryCommandCharacteristic, command);
@@ -7819,6 +8258,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     // own this field before the callback checks its identity.
                     mReloadTimer.start();
                 } else if (mReloading == RELOADING_STATE_FINISHING) {
+                    if ((completedCommand[6] & 255) > activeMagazineSize()) {
+                        programPowerupAmmo(completedCommand[6] & 255, false);
+                        return;
+                    }
                     mReloading = RELOADING_STATE_NONE;
                     setShotsRemaining(completedCommand[6]);
                     hideReloadProgress();
@@ -8002,9 +8445,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         while (!mPendingVoicePrompts.isEmpty())
                             speakRoundVoicePrompt(mPendingVoicePrompts.removeFirst());
                     }
-                    if (mStartGameTimer && mHasSynchronizedStart
+                    if (mStartGameTimer
                             && Globals.getInstance().mGameState == Globals.GAME_STATE_ELIMINATED)
-                        announceGameStartCountdown(synchronizedStartRemaining());
+                        announceGameStartCountdown(gameStartRemaining());
                     if (mRespawnQrVoiceReminderActive)
                         scheduleRespawnQrVoiceReminder(0);
                     if (mReloadVoiceReminderActive)
@@ -8162,21 +8605,36 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return Math.max(0, mSynchronizedStartAt - SystemClock.elapsedRealtime());
     }
 
-    /** Speak each number once, anchored to the shared deadline rather than timer ticks. */
+    private long gameStartRemaining() {
+        return Math.max(0, (mHasSynchronizedStart ? mSynchronizedStartAt : mLocalGameStartAt)
+                - SystemClock.elapsedRealtime());
+    }
+
+    /** Speak each Mississippi once, anchored to the start deadline rather than timer ticks. */
     private void announceGameStartCountdown(long millisUntilStart) {
-        long seconds = (Math.max(0, millisUntilStart) + 999) / 1000;
-        if (seconds > GAME_START_VOICE_COUNTDOWN_SECONDS || seconds >= mLastSpokenGameStartSecond)
+        int number = GameStartCountdown.numberForRemainingMillis(millisUntilStart);
+        if (number > GameStartCountdown.SPOKEN_MAX || number >= mLastSpokenGameStartSecond)
             return;
+        if (number == 0) {
+            // Begin the terminal line four seconds before the play deadline.
+            // Keep it even when the engine is still warming up.
+            // Queue it before the opening phrase so neither flushes the other.
+            mLastSpokenGameStartSecond = 0;
+            speakRoundVoicePrompt(R.string.game_start_countdown_finished_voice_prompt);
+            return;
+        }
         if (mCountdownSpeech == null)
             initializeCountdownSpeech();
         TextToSpeech speech = mCountdownSpeech;
         if (!mCountdownSpeechReady || speech == null)
             return;
         try {
-            int result = speakGameText(speech, Long.toString(seconds), 1.0f, TextToSpeech.QUEUE_FLUSH,
+            int result = speakGameText(speech,
+                    getString(R.string.game_start_mississippi_voice_prompt, number),
+                    1.0f, TextToSpeech.QUEUE_FLUSH,
                     GAME_START_COUNTDOWN_UTTERANCE_ID, false);
             if (result == TextToSpeech.SUCCESS)
-                mLastSpokenGameStartSecond = (int) seconds;
+                mLastSpokenGameStartSecond = number;
         } catch (RuntimeException e) {
             Log.w(TAG, "Unable to speak game-start countdown", e);
         }
@@ -8215,6 +8673,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 boolean killCue = prompt == R.string.enemy_destroyed_voice_prompt;
                 boolean killStreakPrompt = KillStreakVoice.isStreakPrompt(prompt);
                 boolean roundStartPrompt = prompt == R.string.game_start_voice_prompt;
+                boolean countdownFinishedPrompt =
+                        prompt == R.string.game_start_countdown_finished_voice_prompt;
+                boolean powerupPrompt = PowerupPresentation.isVoice(prompt);
                 if (killStreakPrompt) {
                     // The kill cue is queued immediately before this line. Queue
                     // silence after that utterance so the joke does not run into
@@ -8234,6 +8695,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         endPrompt ? ROUND_END_UTTERANCE_ID
                                 : killCue ? ENEMY_DESTROYED_UTTERANCE_ID
                                 : roundStartPrompt ? ROUND_START_UTTERANCE_ID
+                                : countdownFinishedPrompt ? GAME_START_COUNTDOWN_FINISHED_UTTERANCE_ID
+                                : powerupPrompt ? "simplecoil-powerup"
                                 : KILL_STREAK_UTTERANCE_ID, killStreakPrompt || endPrompt);
             } catch (RuntimeException e) {
                 Log.w(TAG, "Unable to speak round announcement", e);
@@ -8779,7 +9242,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     mSecondaryLastReloadButtonCount = reload_counter;
                 else
                     mLastReloadButtonCount = reload_counter;
-                if (shotsRemaining != Globals.getInstance().mFullReload) {
+                if ((shotsRemaining & 255) != activeMagazineSize()) {
                     if (secondary)
                         startSecondaryReload(RELOADING_STATE_STARTED);
                     else
@@ -8910,7 +9373,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                                             data[RECOIL_OFFSET_HIT_BY1_SHOTID], hitByPlayer1ID);
                                     if (hitByPlayer1ID > 0 && mLastHitMessage < System.currentTimeMillis()) {
                                         mLastHitMessage = System.currentTimeMillis() + HIT_ANIMATION_DURATION_MILLISECONDS;
-                                        if (survivesDamage(healthRemoved))
+                                if (survivesDamage(healthRemoved))
                                             sendUDPMessage(NetMsg.NETMSG_HIT, hitByPlayer1ID);
                                         else
                                             sendUDPMessage(NetMsg.NETMSG_OUT, hitByPlayer1ID);
@@ -8983,7 +9446,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     //TODO hit conformation for the other player vibration toogle
                     if (healthRemoved != 0) {
                         if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
-                            if (isOriginalZombieProtected()) {
+                            if (isOriginalZombieProtected() && !hasPowerup(Powerups.INVULNERABLE)) {
                                 drainOriginalZombieAmmo(Math.max(1, -healthRemoved));
                                 showIncomingHitFeedback(hit_by_id, incomingHitSensorMask);
                             } else {
@@ -8991,37 +9454,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             if (mHealth > 0) {
                                 showIncomingHitFeedback(hit_by_id, incomingHitSensorMask);
                             } else {
-                                mKillStreakVoice.resetStreak();
-                                // Drop any queued kill chatter before the team QR
-                                // respawn voice loop begins.
-                                resetGameStartCountdownSpeech();
-                                vibrateOnHit();
-                                playSound(R.raw.eliminated);
-                                if (mHasLivesLimit)
-                                    mEliminationCount = Math.max(0, boundedCounter(mEliminationCount,
-                                            Globals.MAX_SCOREBOARD_VALUE) - 1);
-                                else
-                                    mEliminationCount = incrementCounter(mEliminationCount,
-                                            Globals.MAX_SCOREBOARD_VALUE);
-                                String elimStr = "" + mEliminationCount;
-                                mEliminationCountTV.setText(elimStr);
-                                publishPeerRuntimeState();
-                                String eliminatedBy = "";
-                                if (mUseNetwork)
-                                    eliminatedBy = Globals.getInstance().getPlayerName(hit_by_id);
-                                boolean outOfLives = mHasLivesLimit && mEliminationCount <= 0;
-                                if (!outOfLives)
-                                    startSpawn(eliminatedBy);
-                                if (mUseNetwork) {
-                                    if (hit_by_id > 0 && hit_by_id != Globals.getInstance().mPlayerID && Globals.getInstance().calcNetworkTeam(hit_by_id) != Globals.getInstance().calcNetworkTeam(Globals.getInstance().mPlayerID)) {
-                                        if (isDedicatedServerConnection())
-                                            mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + hit_by_id, true);
-                                        else if (mUDPListenerService != null)
-                                            mUDPListenerService.publishPeerElimination(hit_by_id);
-                                    }
-                                }
-                                if (outOfLives)
-                                    finishOutOfLives();
+                                handlePlayerElimination(hit_by_id);
                             }
                             }
                         }
@@ -9062,8 +9495,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     setShotsRemaining(shotsRemaining);
                 }
                 int reloadState = secondary ? mSecondaryReloading : mReloading;
-                if (shotsRemaining != Globals.getInstance().mFullReload
-                        && reloadState == RELOADING_STATE_NONE) {
+                if ((shotsRemaining & 255) != activeMagazineSize()
+                        && reloadState == RELOADING_STATE_NONE
+                        // The deadline may pass before the expiry tick restores saved ammo.
+                        && mPowerupUntil[Powerups.EMP] == 0) {
                     if (shotDelta > 0)
                         reportHostedShots(shotDelta);
                     playSound(R.raw.shootingshort);
@@ -9178,6 +9613,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return; // Already handled, or belongs to an earlier session/service.
             }
             final String action = intent.getAction();
+            if (NetMsg.NETMSG_POWERUP.equals(action)) {
+                receivePowerup(intent);
+                return;
+            }
             if (NetMsg.NETMSG_ROUNDCOMPLETE.equals(action)) {
                 if (!mUseNetwork) return;
                 String token = intent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
@@ -9212,9 +9651,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (NetMsg.NETMSG_PEERHOSTCHANGED.equals(action) && mUDPListenerService != null) {
                     mIsServer = mUDPListenerService.isPeerStateAuthority();
                     if (mIsServer && mTcpServer != null) {
+                        JSONObject inheritedPowerups = mTcpClient == null ? null : mTcpClient.powerupAuthoritySnapshot();
                         if (mTcpClient != null) mTcpClient.stopTcpClient();
                         mTcpServer.resumePeerRound(mSynchronizedRoundID, mSynchronizedStartAt,
                                 mSynchronizedEndAt, mActivePeerRoundToken);
+                        mTcpServer.restorePowerupAuthority(inheritedPowerups);
                     } else if (mTcpClient != null) {
                         mTcpClient.restartAfterHostTakeover();
                     }
@@ -9802,6 +10243,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         intentFilter.addAction(NetMsg.NETMSG_TEAMELIMINATED);
         intentFilter.addAction(NetMsg.NETMSG_TEAMSCORESTATE);
         intentFilter.addAction(NetMsg.NETMSG_CTFSTATE);
+        intentFilter.addAction(NetMsg.NETMSG_POWERUP);
         intentFilter.addAction(NetMsg.NETMSG_INFECTIONSTATE);
         intentFilter.addAction(NetMsg.NETMSG_RESPAWNGRANTED);
         intentFilter.addAction(NetMsg.NETMSG_NETWORKCONNECTED);
@@ -9965,7 +10407,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         updateGameModeDisplay();
         mHealthLabelTV.setText(getString(R.string.health_label, Globals.getInstance().mFullHealth));
         mShotsRemainingLabelTV.setText(getString(R.string.shots_remaining_label,
-                Globals.getInstance().mFullReload & 0xff, (Globals.getInstance().mDamage * -1)));
+                activeMagazineSize(), (Globals.getInstance().mDamage * -1)));
         setGameLimit();
         // Firing range can change even when the current shot mode is still permitted.
         setShotMode(mCurrentShotMode);

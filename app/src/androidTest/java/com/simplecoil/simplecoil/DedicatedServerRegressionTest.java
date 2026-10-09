@@ -42,6 +42,11 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static androidx.test.espresso.Espresso.onView;
+import static androidx.test.espresso.Espresso.pressBack;
+import static androidx.test.espresso.action.ViewActions.click;
+import static androidx.test.espresso.matcher.RootMatchers.isDialog;
+import static androidx.test.espresso.matcher.ViewMatchers.withText;
 
 /** Exercises the dedicated server UI with recording services and synthetic callbacks. */
 @RunWith(AndroidJUnit4.class)
@@ -64,6 +69,7 @@ public class DedicatedServerRegressionTest {
     private boolean originalAllowPlayerSettings;
     private boolean originalTournamentMode;
     private int originalGameMode;
+    private boolean endGameDialogOpen;
 
     @Before
     public void setUp() {
@@ -125,6 +131,11 @@ public class DedicatedServerRegressionTest {
 
     @After
     public void tearDown() {
+        if (endGameDialogOpen) {
+            // Also close an unconfirmed dialog when an assertion interrupted a test.
+            pressBack();
+            endGameDialogOpen = false;
+        }
         if (scenario != null && scenario.getState() == Lifecycle.State.RESUMED) {
             scenario.onActivity(current -> {
                 if (activity != current) {
@@ -238,13 +249,22 @@ public class DedicatedServerRegressionTest {
     }
 
     @Test
-    public void endButtonStillEndsTheRoundIfTheTcpServiceDisconnects() {
+    public void disconnectedHostCannotEndTheRoundOrSendAVoteRequest() {
         scenario.onActivity(current -> {
             receive(NetMsg.NETMSG_STARTGAME);
             assertNotNull(get("mSpawnTimer"));
             disconnectTcpService();
             button(R.id.end_game_button).performClick();
-            assertRoundEnded();
+            endGameDialogOpen = true;
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(0, tcp.endVoteRequests);
+        });
+        answerEndGameDialog(R.string.yes);
+        scenario.onActivity(current -> {
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertNotNull(get("mSpawnTimer"));
+            assertFalse(button(R.id.start_game_button).isEnabled());
+            assertEquals(0, tcp.endVoteRequests);
             assertEquals(0, tcp.gameEnds);
         });
     }
@@ -293,15 +313,47 @@ public class DedicatedServerRegressionTest {
     }
 
     @Test
-    public void endButtonWithATcpServiceStillRequestsServerCleanup() {
+    public void confirmedEndButtonRequestsAVoteAndWaitsForTheAuthoritativeEnd() {
         scenario.onActivity(current -> {
             receive(NetMsg.NETMSG_STARTGAME);
             button(R.id.end_game_button).performClick();
-            assertEquals(1, tcp.gameEnds);
+            endGameDialogOpen = true;
+            assertEquals(0, tcp.endVoteRequests);
+            assertEquals(0, tcp.gameEnds);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        });
+        answerEndGameDialog(R.string.yes);
+        scenario.onActivity(current -> {
+            assertEquals(1, tcp.endVoteRequests);
+            assertEquals(0, tcp.gameEnds);
             assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
             receive(NetMsg.NETMSG_ENDGAME);
             assertRoundEnded();
         });
+    }
+
+    @Test
+    public void cancellingEndGameConfirmationDoesNotRequestAVoteOrEndTheRound() {
+        scenario.onActivity(current -> {
+            receive(NetMsg.NETMSG_STARTGAME);
+            button(R.id.end_game_button).performClick();
+            endGameDialogOpen = true;
+            assertEquals(0, tcp.endVoteRequests);
+            assertEquals(0, tcp.gameEnds);
+        });
+        answerEndGameDialog(R.string.cancel);
+        scenario.onActivity(current -> {
+            assertEquals(0, tcp.endVoteRequests);
+            assertEquals(0, tcp.gameEnds);
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertNotNull(get("mSpawnTimer"));
+        });
+    }
+
+    private void answerEndGameDialog(int label) {
+        onView(withText(label)).inRoot(isDialog()).perform(click());
+        endGameDialogOpen = false;
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
 
     @Test
@@ -599,12 +651,20 @@ public class DedicatedServerRegressionTest {
                 ? Configuration.ORIENTATION_PORTRAIT : Configuration.ORIENTATION_LANDSCAPE;
         String timerField = timed ? "mGameCountdownTimer" : "mSpawnTimer";
         scenario.onActivity(current -> {
+            // Rotation starts with an established host, not pending startup.
+            // A delayed real startup broadcast must not treat these recording
+            // services as an unready TCP listener and retire the fake UDP one.
+            tcp.ready = true;
+            set("mUdpServerStarting", false);
+            set("mUdpServerActive", true);
             Globals.getInstance().mRespawnTime = 60;
             Globals.getInstance().mGameLimit = timed ? Globals.GAME_LIMIT_TIME : Globals.GAME_LIMIT_NONE;
             Globals.getInstance().mTimeLimit = 5;
             receive(NetMsg.NETMSG_STARTGAME);
             timer[0] = get(timerField);
             assertNotNull(timer[0]);
+            tcp.listenerStops = 0;
+            udp.listenerStops = 0;
             current.setRequestedOrientation(targetOrientation == Configuration.ORIENTATION_LANDSCAPE
                     ? ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         });
@@ -921,6 +981,34 @@ public class DedicatedServerRegressionTest {
     private Button button(int id) { return activity.findViewById(id); }
 
     @Test
+    public void legacyHostStartKeepsTwentyFourSecondsWithAShortRespawnDelay() {
+        assertLegacyHostStartCountdown(1, false);
+    }
+
+    @Test
+    public void legacyHostStartKeepsTwentyFourSecondsWithALongRespawnDelay() {
+        assertLegacyHostStartCountdown(90, true);
+    }
+
+    private void assertLegacyHostStartCountdown(long respawnTime, boolean timed) {
+        scenario.onActivity(current -> {
+            Globals globals = Globals.getInstance();
+            globals.mRespawnTime = respawnTime;
+            globals.mGameLimit = timed ? Globals.GAME_LIMIT_TIME : Globals.GAME_LIMIT_NONE;
+            globals.mTimeLimit = 1;
+            long beforeStart = SystemClock.elapsedRealtime();
+            receive(NetMsg.NETMSG_STARTGAME);
+            long afterStart = SystemClock.elapsedRealtime();
+            long startAt = (long) get("mRoundStartAt");
+            assertTrue(startAt >= beforeStart + com.simplecoil.protocol.GameStartCountdown.DURATION_MS);
+            assertTrue(startAt <= afterStart + com.simplecoil.protocol.GameStartCountdown.DURATION_MS);
+            assertEquals(timed ? startAt + 60000L : 0L, get("mRoundEndAt"));
+            assertEquals("Starting a round changed the respawn delay", respawnTime, globals.mRespawnTime);
+            assertNotNull(get("mSpawnTimer"));
+        });
+    }
+
+    @Test
     public void synchronizedHostCountdownUsesBroadcastDeadline() {
         scenario.onActivity(current -> {
             long deadline = SystemClock.elapsedRealtime() + 4000;
@@ -1008,6 +1096,7 @@ public class DedicatedServerRegressionTest {
     private static final class RecordingTcpServer extends TcpServer {
         int gameStarts;
         int gameEnds;
+        int endVoteRequests;
         int gameInfoUpdates;
         int listenerStarts;
         int listenerStops;
@@ -1020,6 +1109,7 @@ public class DedicatedServerRegressionTest {
 
         @Override public boolean startGame() { gameStarts++; return acceptStart; }
         @Override public void endGame() { gameEnds++; }
+        @Override public void requestEndGameVote() { endVoteRequests++; }
         @Override void startTcpServer() { listenerStarts++; }
         @Override public void stopTcpServer() { listenerStops++; }
         @Override public void cancelServer() { cancellations++; }

@@ -17,9 +17,16 @@
 package com.simplecoil.simplecoil;
 
 import com.simplecoil.protocol.RoundRoster;
+import com.simplecoil.protocol.GpsOffset;
+import com.simplecoil.protocol.GameStartCountdown;
+import com.simplecoil.protocol.Powerups;
 
 import android.app.Service;
 import android.content.Intent;
+import android.content.Context;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import androidx.core.content.ContextCompat;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -63,7 +70,9 @@ public class TcpServer extends Service {
     public static final int SEND_ALL = -100;
     // Rejoin feedback is useful, but a disconnected player must not retain an
     // unlimited round's worth of game events in the host process.
-    static final int MAX_QUEUED_CLIENT_EVENTS = 64;
+    // One supported 32-player power-up burst must survive a short outage,
+    // including instant effects that recovery snapshots cannot replay.
+    static final int MAX_QUEUED_CLIENT_EVENTS = Powerups.MAX_ACTIVE_GRANTS;
 
     public static final int TCP_SERVER_PORT = 17510;
     // Amount of time to sleep before checking if data is available. Lower is more responsive but may gobble up more CPU time
@@ -107,6 +116,12 @@ public class TcpServer extends Service {
     public static final String JSON_BALANCED_MODE = "balancedrandom";
     public static final String JSON_BALANCED_QR = "balancedqr";
     public static final String JSON_POWERUP_QR_REQUIRED = "powerupqrrequired";
+    public static final String JSON_POWERUP_SCAN = "powerupscan";
+    public static final String JSON_POWERUP_LIFE = "poweruplife";
+    public static final String JSON_POWERUP_GRANT = "powerupgrant";
+    public static final String JSON_POWERUP_GRANTS = "powerupgrants";
+    public static final String JSON_POWERUP_STATE = "powerupstate";
+    public static final String JSON_POWERUP_CLOCK = "powerupclock";
     public static final String JSON_RESPAWN_QR_ENABLED = "respawnqrenabled";
     public static final String JSON_BALANCED_CHECKIN = "balancedcheckin";
     public static final String JSON_PRIOR_KILLS = "priorkills";
@@ -129,6 +144,7 @@ public class TcpServer extends Service {
     public static final String JSON_GPSLATITUDE = "gpslatitude";
     public static final String JSON_GPSUPDATE = "gpsupdate";
     public static final String JSON_GPSFULLUPDATE = "gpsfullupdate";
+    public static final String JSON_GPS_FIX_AGE = "gpsage";
 
     public static final String JSON_PLAYERDATA = "playerdata";
     public static final String JSON_PLAYERPOINTS = "points";
@@ -222,6 +238,11 @@ public class TcpServer extends Service {
     private final Handler mShutdownHandler = new Handler(Looper.getMainLooper());
     private long mNextGameStartAllowedAt;
     private boolean mRoundCooldownRecorded;
+    private final Powerups.Authority mPowerupAuthority = new Powerups.Authority();
+    private final Random mPowerupRandom = new Random();
+    private String mPowerupAuthorityToken;
+    private final String[] mPowerupIdentities = new String[Globals.MAX_PLAYER_ID + 1];
+    private final Set<Long> mUnacknowledgedLocalPowerups = new HashSet<>();
     private static final long CANCEL_FLUSH_TIMEOUT_MS = 1000;
     private volatile Map<Integer, ClientData> mClientData = null;
     // Explicitly leaving must not reset a player's score or spent lives in this round.
@@ -250,6 +271,62 @@ public class TcpServer extends Service {
     private static final int SEND_ALL_GPS_INTERVAL = 20; // We will send all GPS data regardless of whether there was a GPS change every xx intervals
     private volatile int mGPSIntervalCount = 0;
 
+    private boolean mGpsOriginReceiverRegistered;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        ContextCompat.registerReceiver(this, mGpsOriginReceiver,
+                new IntentFilter(NetMsg.NETMSG_GPSLOCUPDATE), ContextCompat.RECEIVER_NOT_EXPORTED);
+        mGpsOriginReceiverRegistered = true;
+    }
+
+    private final BroadcastReceiver mGpsOriginReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (!mIsDedicated && keepListening) {
+                Globals.LocalGpsFix fix = Globals.getInstance().mLocalGpsFix;
+                if (fix != null && Globals.isFreshGpsFix(fix.elapsedMs, SystemClock.elapsedRealtime()))
+                    considerGpsOrigin(fix.latitude, fix.longitude);
+            }
+        }
+    };
+
+    // Once chosen, the origin remains fixed through the lobby, match and host handoff.
+    private void considerGpsOrigin(double latitude, double longitude) {
+        GpsOffset candidate = GpsOffset.create(latitude, longitude);
+        if (candidate == null) return;
+        synchronized (mServerStateLock) {
+            if (!keepListening || mDestroyed || Globals.getInstance().mGpsOffset != null) return;
+            Globals.getInstance().mGpsOffset = candidate;
+        }
+        sendAllGameInfo(SEND_ALL);
+        requestFullGPSUpdate();
+    }
+
+    private void storeClientGps(ClientData client, double latitude, double longitude, long ageMs) {
+        if (client.lobbyBenched || client.mPlayerID <= 0
+                || ageMs < 0 || ageMs > Globals.GPS_DISPLAY_FIX_MAX_AGE_MS
+                || !Globals.isValidCoordinates(longitude, latitude)) return;
+        Globals globals = Globals.getInstance();
+        Globals.getmGPSDataSemaphore();
+        try {
+            Globals.GPSData gps = globals.mGPSData.get(client.mPlayerID);
+            if (gps == null) {
+                gps = new Globals.GPSData();
+                globals.mGPSData.put(client.mPlayerID, gps);
+            }
+            gps.longitude = longitude;
+            gps.latitude = latitude;
+            gps.team = client.getNetworkTeam();
+            gps.hasUpdate = true;
+            gps.fromPeerState = false;
+            gps.fixElapsedMs = SystemClock.elapsedRealtime() - ageMs;
+        } finally {
+            globals.mGPSDataSemaphore.release();
+        }
+        considerGpsOrigin(latitude, longitude);
+    }
+
     @Override
     public IBinder onBind(Intent intent) {
         return mBinder;
@@ -272,6 +349,10 @@ public class TcpServer extends Service {
         synchronized (mServerStateLock) {
             mDestroyed = true;
             stopGPSDataLocked();
+        }
+        if (mGpsOriginReceiverRegistered) {
+            unregisterReceiver(mGpsOriginReceiver);
+            mGpsOriginReceiverRegistered = false;
         }
         stopTcpServer();
         super.onDestroy();
@@ -321,12 +402,14 @@ public class TcpServer extends Service {
         final int team;
         final double longitude;
         final double latitude;
+        final long fixElapsedMs;
 
-        GPSUpdate(byte playerID, int team, double longitude, double latitude) {
+        GPSUpdate(byte playerID, int team, double longitude, double latitude, long fixElapsedMs) {
             this.playerID = playerID;
             this.team = team;
             this.longitude = longitude;
             this.latitude = latitude;
+            this.fixElapsedMs = fixElapsedMs;
         }
     }
 
@@ -610,18 +693,11 @@ public class TcpServer extends Service {
                             || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
                             || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
                         return;
-                    // A shared round start always leaves enough time for the
-                    // complete spoken 10-to-0 countdown, even if an operator
-                    // configured a shorter per-player respawn delay.  Longer
-                    // configured delays are still honored.
+                    // The initial round countdown is fixed and separate from
+                    // per-player respawn delays, including Balanced Random.
                     if (Globals.getInstance().mInfectionMode)
                         Globals.getInstance().applyInfectionGameLimits();
-                    long countdown = Globals.getInstance().mBalancedRandom ? 10
-                            : Math.max(Globals.RESPAWN_TIME_SECONDS,
-                            Math.max(Globals.MIN_RESPAWN_TIME_SECONDS,
-                                    Math.min(Globals.MAX_RESPAWN_TIME_SECONDS,
-                                            Globals.getInstance().mRespawnTime)));
-                    startAt = SystemClock.elapsedRealtime() + countdown * 1000;
+                    startAt = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
                     duration = (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0
                             ? Math.max(0, Math.min(Globals.MAX_GAME_LIMIT, Globals.getInstance().mTimeLimit)) * 60000L : 0;
                     roundID = ++mRoundSequence;
@@ -1032,6 +1108,282 @@ public class TcpServer extends Service {
         }
     }
 
+    static JSONObject powerupGrantJson(Powerups.Grant grant) throws JSONException {
+        String recipients;
+        try { recipients = Powerups.encodeRecipients(grant); }
+        catch (IllegalArgumentException invalid) { throw new JSONException("Invalid power-up recipients"); }
+        return new JSONObject().put("id", grant.id).put("source", grant.source)
+                .put("sourcelife", grant.sourceLife).put("kind", grant.kind)
+                .put("recipients", recipients).put("expires", grant.expiresAt).put("cost", grant.scanCost);
+    }
+
+    static Powerups.Grant readPowerupGrant(JSONObject object, long clock) throws JSONException {
+        long id = TcpJson.getLong(object, "id"), expiry = TcpJson.getLong(object, "expires");
+        int source = TcpJson.getInt(object, "source"), life = TcpJson.getInt(object, "sourcelife");
+        int kind = TcpJson.getInt(object, "kind");
+        int cost = TcpJson.getInt(object, "cost");
+        int[] targets, lives;
+        if (object.has("recipients")) {
+            Object encoded = object.get("recipients");
+            if (!(encoded instanceof String) || object.has("targets") || object.has("lives"))
+                throw new JSONException("Invalid compact power-up recipients");
+            try {
+                Powerups.Recipients recipients = Powerups.decodeRecipients((String) encoded);
+                targets = recipients.targets;
+                lives = recipients.targetLives;
+            } catch (IllegalArgumentException invalid) {
+                throw new JSONException("Invalid compact power-up recipients");
+            }
+        } else {
+            JSONArray targetArray = object.getJSONArray("targets"), lifeArray = object.getJSONArray("lives");
+            if (targetArray.length() < 1 || targetArray.length() > Globals.MAX_PLAYER_ID
+                    || targetArray.length() != lifeArray.length())
+                throw new JSONException("Invalid power-up recipient arrays");
+            targets = new int[targetArray.length()];
+            lives = new int[targets.length];
+            for (int n = 0; n < targets.length; n++) {
+                JSONObject row = new JSONObject().put("id", targetArray.get(n)).put("life", lifeArray.get(n));
+                targets[n] = TcpJson.getInt(row, "id");
+                lives[n] = TcpJson.getInt(row, "life");
+            }
+        }
+        if (id <= 0 || id > GameClock.MAX_TIMESTAMP || source < 1 || source > Globals.MAX_PLAYER_ID
+                || life < 0 || life > Globals.MAX_SCOREBOARD_VALUE || !Powerups.isValidKind(kind)
+                || !Powerups.isValidRequiredCount(cost)
+                || !GameClock.validTimestamp(expiry) || expiry - clock > Powerups.durationMillis(kind))
+            throw new JSONException("Invalid power-up grant");
+        Set<Integer> unique = new HashSet<>();
+        for (int n = 0; n < targets.length; n++) {
+            if (targets[n] < 1 || targets[n] > Globals.MAX_PLAYER_ID || !unique.add(targets[n])
+                    || lives[n] < 0 || lives[n] > Globals.MAX_SCOREBOARD_VALUE)
+                throw new JSONException("Invalid power-up target");
+        }
+        return new Powerups.Grant(id, source, life, kind, targets, lives, expiry, cost);
+    }
+
+    static JSONObject powerupSnapshotJson(String token, Powerups.Snapshot snapshot) throws JSONException {
+        JSONArray grants = new JSONArray(), players = new JSONArray();
+        for (Powerups.Grant grant : snapshot.grants) grants.put(powerupGrantJson(grant));
+        for (Powerups.ScanState player : snapshot.players)
+            players.put(new JSONObject().put("id", player.player).put("life", player.life)
+                    .put("mask", player.mask).put("earned", player.earned).put("required", player.required)
+                    .put("spent", player.spent));
+        return new JSONObject().put(JSON_ROUND_TOKEN, token).put(JSON_POWERUP_CLOCK, snapshot.capturedAt)
+                .put(JSON_POWERUP_GRANTS, grants).put(JSON_POWERUP_STATE,
+                        new JSONObject().put("nextid", snapshot.nextId).put("players", players));
+    }
+
+    static Powerups.Snapshot readPowerupSnapshot(JSONObject frame) throws JSONException {
+        long clock = TcpJson.getLong(frame, JSON_POWERUP_CLOCK);
+        if (!GameClock.validTimestamp(clock)) throw new JSONException("Invalid power-up clock");
+        JSONObject state = frame.getJSONObject(JSON_POWERUP_STATE);
+        long nextId = TcpJson.getLong(state, "nextid");
+        JSONArray grantArray = frame.getJSONArray(JSON_POWERUP_GRANTS), playerArray = state.getJSONArray("players");
+        if (nextId < 1 || nextId > GameClock.MAX_TIMESTAMP || grantArray.length() > Powerups.MAX_ACTIVE_GRANTS
+                || playerArray.length() > Globals.MAX_PLAYER_ID) throw new JSONException("Invalid power-up snapshot size");
+        List<Powerups.Grant> grants = new ArrayList<>();
+        List<Powerups.ScanState> players = new ArrayList<>();
+        Set<Integer> playerIDs = new HashSet<>();
+        Set<Long> grantIDs = new HashSet<>();
+        for (int n = 0; n < grantArray.length(); n++) {
+            Powerups.Grant grant = readPowerupGrant(grantArray.getJSONObject(n), clock);
+            if (!grantIDs.add(grant.id) || grant.id >= nextId) throw new JSONException("Invalid grant sequence");
+            grants.add(grant);
+        }
+        for (int n = 0; n < playerArray.length(); n++) {
+            JSONObject row = playerArray.getJSONObject(n);
+            int id = TcpJson.getInt(row, "id"), life = TcpJson.getInt(row, "life");
+            int mask = TcpJson.getInt(row, "mask"), earned = TcpJson.getInt(row, "earned");
+            int required = TcpJson.getInt(row, "required");
+            int spent = TcpJson.getInt(row, "spent");
+            if (id < 1 || id > Globals.MAX_PLAYER_ID || !playerIDs.add(id) || life < 0
+                    || life > Globals.MAX_SCOREBOARD_VALUE || mask < 0 || mask > 255 || earned < 0
+                    || earned > 4 || required != 0 && (required < Powerups.MIN_REQUIRED || required > Powerups.MAX_REQUIRED)
+                    || spent < 0 || spent > Integer.bitCount(mask)
+                    || required == 0 && (mask != 0 || earned != 0 || spent != 0)
+                    || earned > 0 && (spent < earned * Powerups.MIN_REQUIRED || spent > earned * Powerups.MAX_REQUIRED)
+                    || earned == 0 && spent != 0)
+                throw new JSONException("Invalid power-up scan state");
+            players.add(new Powerups.ScanState(id, life, mask, earned, required, spent));
+        }
+        return new Powerups.Snapshot(nextId, clock, grants, players);
+    }
+
+    static Intent powerupIntent(Powerups.Grant grant, String token, boolean snapshot) {
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        RoundRoster.Member source = roster != null && roster.token.equals(token) ? roster.seat(grant.source) : null;
+        return new Intent(NetMsg.NETMSG_POWERUP).putExtra(NetMsg.INTENT_ROUND_TOKEN, token)
+                .putExtra(NetMsg.INTENT_POWERUP_ID, grant.id).putExtra(NetMsg.INTENT_POWERUP_SOURCE, grant.source)
+                .putExtra(NetMsg.INTENT_POWERUP_SOURCE_LIFE, grant.sourceLife)
+                // Capture before Android queues the UI delivery. Looking this
+                // up in the activity could attach an old grant to a new owner.
+                .putExtra(NetMsg.INTENT_POWERUP_SOURCE_IDENTITY, source == null ? null : source.identity)
+                .putExtra(NetMsg.INTENT_POWERUP_KIND, grant.kind).putExtra(NetMsg.INTENT_POWERUP_TARGETS, grant.targets)
+                .putExtra(NetMsg.INTENT_POWERUP_COST, grant.scanCost)
+                .putExtra(NetMsg.INTENT_POWERUP_LIVES, grant.targetLives)
+                .putExtra(NetMsg.INTENT_POWERUP_EXPIRES, grant.expiresAt)
+                .putExtra(NetMsg.INTENT_POWERUP_SNAPSHOT, snapshot);
+    }
+
+    private void syncPowerupPlayersLocked() {
+        Globals globals = Globals.getInstance();
+        RoundRoster roster = globals.mRoundRoster;
+        if (roster == null || !roster.token.equals(mRoundToken)) return;
+        if (!roster.token.equals(mPowerupAuthorityToken)) {
+            mPowerupAuthority.resetRound();
+            mUnacknowledgedLocalPowerups.clear();
+            java.util.Arrays.fill(mPowerupIdentities, null);
+            mPowerupAuthorityToken = roster.token;
+        }
+        for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+            RoundRoster.Member member = roster.seat(id);
+            String identity = member == null ? null : member.identity;
+            if (mPowerupIdentities[id] != null && !mPowerupIdentities[id].equals(identity))
+                mPowerupAuthority.resetPlayer(id);
+            mPowerupIdentities[id] = identity;
+            if (member != null) {
+                ClientData client = mClientData == null ? null : mClientData.get(clientIDFromPlayerID((byte) id));
+                mPowerupAuthority.setPlayerLife(id, Math.max(globals.powerupPlayerLife(id),
+                        client == null ? 0 : client.eliminated));
+            }
+        }
+    }
+
+    /** Same source-bound authorization path as a remote TCP scan request. */
+    public boolean requestHostPowerup(int scannedMask, int life) {
+        final String token;
+        synchronized (mServerStateLock) {
+            if (mIsDedicated || !keepListening || mDestroyed || !mStartAnnounced) return false;
+            token = mRoundToken;
+        }
+        return runClientTask(() -> requestPowerupLocked(null, scannedMask, life, token));
+    }
+
+    private void requestPowerupLocked(ClientData client, int scannedMask, int life, String token) {
+        Globals globals = Globals.getInstance();
+        synchronized (mServerStateLock) {
+            RoundRoster roster = globals.mRoundRoster;
+            int source = client == null ? globals.mPlayerID & 0xff : client.mPlayerID & 0xff;
+            if (!keepListening || mDestroyed || mEndingGame || !mStartAnnounced || !hasRoundStarted()
+                    || token == null || !token.equals(mRoundToken) || roster == null || !token.equals(roster.token)
+                    || globals.mPowerupQrRequired < Powerups.MIN_REQUIRED || globals.mPowerupQrRequired > Powerups.MAX_REQUIRED
+                    || scannedMask < 1 || scannedMask > 255 || life < 0 || source < 1 || source > Globals.MAX_PLAYER_ID
+                    || !globals.isPowerupPlayerAlive(source) || life != globals.powerupPlayerLife(source)
+                    || roster.seat(source) == null
+                    || client != null && (client.lobbyBenched || client.clientSocket == null || client.awaitingRespawn
+                    || !client.playerIdentity.equals(roster.seat(source).identity)
+                    || mClientData == null || mClientData.get(client.clientID) != client
+                    || client.eliminated > life)) return;
+            syncPowerupPlayersLocked();
+            Map<Integer, Integer> teams = new HashMap<>(), scores = new HashMap<>();
+            Set<Integer> alive = new HashSet<>();
+            if (globals.mGameMode != Globals.GAME_MODE_FFA)
+                for (int team = 1; team <= 4; team++) scores.put(team, roster.archivedScore(team, globals.mCaptureTheFlag));
+            for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+                RoundRoster.Member member = roster.seat(id);
+                if (member == null) continue;
+                int team = globals.mGameMode == Globals.GAME_MODE_FFA ? 0 : globals.calcNetworkTeam((byte) id);
+                if (member.active) teams.put(id, team);
+                int key = team == 0 ? id : team;
+                int contribution = globals.mCaptureTheFlag ? member.captures : member.kills;
+                scores.put(key, (int) Math.min(Integer.MAX_VALUE,
+                        (long) (scores.containsKey(key) ? scores.get(key) : 0) + contribution));
+                ClientData target = mClientData.get(clientIDFromPlayerID((byte) id));
+                if (member.active && globals.isPowerupPlayerAlive(id) && (target == null
+                        || !target.awaitingRespawn && target.eliminated <= globals.powerupPlayerLife(id))) alive.add(id);
+            }
+            int ownTeam = teams.containsKey(source) ? teams.get(source) : 0;
+            int ownKey = ownTeam == 0 ? source : ownTeam;
+            int ownScore = scores.containsKey(ownKey) ? scores.get(ownKey) : 0;
+            int bestEnemyScore = 0;
+            for (Map.Entry<Integer, Integer> score : scores.entrySet())
+                if (score.getKey() != ownKey) bestEnemyScore = Math.max(bestEnemyScore, score.getValue());
+            int required = Powerups.effectiveRequired(globals.mPowerupQrRequired, ownScore, bestEnemyScore);
+            for (int credit = 0; credit < 4; credit++) {
+                Powerups.Grant grant = mPowerupAuthority.request(source, life, scannedMask, required,
+                        ownTeam, teams, scores, alive,
+                        SystemClock.elapsedRealtime(), mPowerupRandom);
+                // Publish incomplete progress too, so a peer takeover cannot
+                // forget already scanned checkpoints. Bulk catch-up is bounded.
+                if (credit == 0 || grant != null) publishPowerupStateLocked(grant);
+                if (grant == null) break;
+            }
+        }
+    }
+
+    private String powerupFrameLocked(Powerups.Grant grant) throws JSONException {
+        syncPowerupPlayersLocked();
+        JSONObject frame = powerupSnapshotJson(mRoundToken, mPowerupAuthority.snapshot(SystemClock.elapsedRealtime()));
+        if (grant != null) frame.put(JSON_POWERUP_GRANT, powerupGrantJson(grant));
+        return TCPMESSAGE_PREFIX + TCPPREFIX_JSON + frame;
+    }
+
+    private void publishPowerupStateLocked(Powerups.Grant grant) {
+        try {
+            String message = powerupFrameLocked(grant);
+            Set<Long> active = new HashSet<>();
+            for (Powerups.Grant current : mPowerupAuthority.activeGrants(SystemClock.elapsedRealtime())) active.add(current.id);
+            mUnacknowledgedLocalPowerups.retainAll(active);
+            for (ClientRecipient recipient : getClientRecipients())
+                if (recipient.isCurrent()) recipient.client.sendTCPMessage(message, true);
+            if (!mIsDedicated && grant != null) {
+                mUnacknowledgedLocalPowerups.add(grant.id);
+                sendBroadcast(powerupIntent(grant, mRoundToken, false));
+            }
+        } catch (JSONException e) { Log.w(TAG, "Unable to publish power-up state", e); }
+    }
+
+    /** The snapshot uses this device's monotonic clock; callers must convert remote clocks first. */
+    public boolean restorePowerupAuthority(JSONObject frame) {
+        if (frame == null) return false;
+        try {
+            Powerups.Snapshot snapshot = readPowerupSnapshot(frame);
+            String token = frame.getString(JSON_ROUND_TOKEN);
+            synchronized (mServerStateLock) {
+                RoundRoster roster = Globals.getInstance().mRoundRoster;
+                if (!token.equals(mRoundToken) || roster == null || !token.equals(roster.token)) return false;
+                long now = SystemClock.elapsedRealtime();
+                // Absolute local expiries are retained; re-import must never buy extra buff time.
+                if (!mPowerupAuthority.restore(new Powerups.Snapshot(snapshot.nextId, now,
+                        snapshot.grants, snapshot.players), now)) return false;
+                mPowerupAuthorityToken = token;
+                for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+                    RoundRoster.Member member = roster.seat(id);
+                    mPowerupIdentities[id] = member == null ? null : member.identity;
+                }
+                return true;
+            }
+        } catch (JSONException | IllegalArgumentException e) { return false; }
+    }
+
+    public void acknowledgePowerup(long id) {
+        synchronized (mServerStateLock) { mUnacknowledgedLocalPowerups.remove(id); }
+    }
+
+    public JSONObject powerupAuthoritySnapshot() {
+        synchronized (mServerStateLock) {
+            if (mDestroyed || !keepListening || !mStartAnnounced) return null;
+            syncPowerupPlayersLocked();
+            try { return powerupSnapshotJson(mRoundToken, mPowerupAuthority.snapshot(SystemClock.elapsedRealtime())); }
+            catch (JSONException e) { return null; }
+        }
+    }
+
+    /** Local playing hosts have no TcpClient receiver to replay missed UI events. */
+    public void replayPowerups() {
+        synchronized (mServerStateLock) {
+            if (mIsDedicated || mDestroyed || !keepListening || !mStartAnnounced) return;
+            syncPowerupPlayersLocked();
+            Set<Long> active = new HashSet<>();
+            for (Powerups.Grant grant : mPowerupAuthority.activeGrants(SystemClock.elapsedRealtime())) {
+                active.add(grant.id);
+                boolean live = mUnacknowledgedLocalPowerups.contains(grant.id);
+                if (live || !Powerups.isInstant(grant.kind)) sendBroadcast(powerupIntent(grant, mRoundToken, !live));
+            }
+            mUnacknowledgedLocalPowerups.retainAll(active);
+        }
+    }
+
     static String createRoundToken() {
         return UUID.randomUUID().toString();
     }
@@ -1389,6 +1741,7 @@ public class TcpServer extends Service {
             if (liveRoster != null && liveRoster.token.equals(mRoundToken))
                 game.put(LiveJoin.ROSTER, liveRoster.encode());
             game.put(JSON_PLAYERS, players);
+            GpsWire.putOrigin(game, Globals.getInstance().mGpsOffset);
             game.put(JSON_LOBBY_PLAYING, mStartAnnounced
                     || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE);
             game.put(JSON_HOST_KIND, (mIsDedicated ? SharedLobby.Kind.DEDICATED_PHONE
@@ -1472,8 +1825,15 @@ public class TcpServer extends Service {
             for (ClientRecipient recipient : recipients) {
                 if (!isClientTaskActive())
                     return;
-                if (recipient.isCurrent())
+                if (recipient.isCurrent()) {
                     recipient.client.sendTCPMessage(recipient.playerID == id ? idMessage : allMessage, false);
+                    synchronized (mServerStateLock) {
+                        if (mStartAnnounced && Globals.getInstance().mPowerupQrRequired >= Powerups.MIN_REQUIRED)
+                            // Keep this bounded authority snapshot in its own UTF frame.
+                            // A long roster history must not consume the grant frame's budget.
+                            recipient.client.sendTCPMessage(powerupFrameLocked(null), false);
+                    }
+                }
             }
         } catch (JSONException e) {
             e.printStackTrace();
@@ -1496,16 +1856,19 @@ public class TcpServer extends Service {
     private String createGPSMessage(List<GPSUpdate> updates, boolean fullUpdate, int recipientTeam,
                                     Set<Byte> revealedEnemyIDs) {
         try {
+            GpsOffset origin = Globals.getInstance().mGpsOffset;
             JSONArray players = new JSONArray();
             for (GPSUpdate update : updates) {
+                long now = SystemClock.elapsedRealtime();
+                if (!Globals.isFreshGpsFix(update.fixElapsedMs, now)) continue;
                 if (recipientTeam != SEND_ALL && update.team != recipientTeam
                         && (revealedEnemyIDs == null || !revealedEnemyIDs.contains(update.playerID)))
                     continue;
                 JSONObject player = new JSONObject();
                 player.put(JSON_PLAYERID, update.playerID);
                 player.put(JSON_TEAM, update.team);
-                player.put(JSON_GPSLONGITUDE, update.longitude);
-                player.put(JSON_GPSLATITUDE, update.latitude);
+                GpsWire.putPosition(player, origin, update.latitude, update.longitude);
+                player.put(JSON_GPS_FIX_AGE, now - update.fixElapsedMs);
                 players.put(player);
             }
             // An empty full snapshot intentionally clears departed or hidden markers.
@@ -1513,6 +1876,7 @@ public class TcpServer extends Service {
                 return null;
             JSONObject game = new JSONObject();
             game.put(JSON_GPSUPDATE, players);
+            GpsWire.putOrigin(game, origin);
             if (fullUpdate)
                 game.put(JSON_GPSFULLUPDATE, true);
             return TCPMESSAGE_PREFIX + TCPPREFIX_JSON + game.toString();
@@ -1664,7 +2028,7 @@ public class TcpServer extends Service {
             // Save the callback before posting, so even its first run can be cancelled.
             mGPSRunnable = new Runnable() {
                 public void run() {
-                    final boolean fullUpdate;
+                    boolean fullUpdate;
                     synchronized (mServerStateLock) {
                         if (!isCurrentGPSCallbackLocked(this))
                             return;
@@ -1689,12 +2053,21 @@ public class TcpServer extends Service {
                             gpsMode = Globals.getInstance().mGPSMode;
                             expireEnemyGPSRevealsLocked(SystemClock.elapsedRealtime());
                             if (Globals.getInstance().mGPSData != null) {
-                                for (Map.Entry<Byte, Globals.GPSData> entry
-                                        : Globals.getInstance().mGPSData.entrySet()) {
+                                Iterator<Map.Entry<Byte, Globals.GPSData>> locations =
+                                        Globals.getInstance().mGPSData.entrySet().iterator();
+                                while (locations.hasNext()) {
+                                    Map.Entry<Byte, Globals.GPSData> entry = locations.next();
                                     Byte playerID = entry.getKey();
                                     Globals.GPSData gps = entry.getValue();
                                     if (gps == null)
                                         continue;
+                                    if (!Globals.isFreshGpsFix(gps.fixElapsedMs, SystemClock.elapsedRealtime())) {
+                                        locations.remove();
+                                        // A stale last fix must disappear from recipients now,
+                                        // rather than being renewed by a periodic full snapshot.
+                                        fullUpdate = true;
+                                        continue;
+                                    }
                                     if (playerID != null && playerID > 0
                                             && Globals.isValidPlayerID(playerID)
                                             && Globals.isValidCoordinates(gps.longitude, gps.latitude)) {
@@ -1702,7 +2075,7 @@ public class TcpServer extends Service {
                                         // lobby game-mode change; use the current layout.
                                         GPSUpdate update = new GPSUpdate(playerID,
                                                 Globals.getInstance().calcNetworkTeam(playerID),
-                                                gps.longitude, gps.latitude);
+                                                gps.longitude, gps.latitude, gps.fixElapsedMs);
                                         fullSnapshot.add(update);
                                         if (gps.hasUpdate || fullUpdate)
                                             updates.add(update);
@@ -1726,7 +2099,8 @@ public class TcpServer extends Service {
                                 && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
                             sendTeamGPSData(updates, fullSnapshot, fullUpdate);
                         } else {
-                            String message = createGPSMessage(updates, fullUpdate, SEND_ALL, null);
+                            String message = createGPSMessage(fullUpdate ? fullSnapshot : updates,
+                                    fullUpdate, SEND_ALL, null);
                             if (message != null)
                                 sendTCPMessageAll(message, false);
                         }
@@ -2190,6 +2564,15 @@ public class TcpServer extends Service {
             else
                 mClientData.clear();
             if (!mResumingPeerRound) {
+                // Do not erase an active session's origin if opening this listener failed.
+                synchronized (mServerStateLock) {
+                    if (!keepListening || mDestroyed) return;
+                    Globals.getInstance().mGpsOffset = null;
+                    Globals.LocalGpsFix fix = Globals.getInstance().mLocalGpsFix;
+                    if (!mIsDedicated && fix != null
+                            && Globals.isFreshGpsFix(fix.elapsedMs, SystemClock.elapsedRealtime()))
+                        Globals.getInstance().mGpsOffset = GpsOffset.create(fix.latitude, fix.longitude);
+                }
                 clearSharedRosterState();
                 Globals.getInstance().mRoundRoster = null;
                 Globals.getInstance().clearBalancedAssignments();
@@ -2639,6 +3022,18 @@ public class TcpServer extends Service {
                                                     // player without waiting for the normal 10-second expiry.
                                                     clearEnemyGPSRevealsForPlayerLocked(entry.getValue().mPlayerID);
                                                     clearEnemyGPSRevealsForPlayerLocked(id);
+                                                    RoundRoster roster = Globals.getInstance().mRoundRoster;
+                                                    RoundRoster.Member member = roster == null ? null
+                                                            : roster.seat(entry.getValue().mPlayerID);
+                                                    if (member != null && roster.token.equals(mRoundToken)) {
+                                                        int life = Math.max(member.deaths, entry.getValue().eliminated);
+                                                        roster.update(member.id, member.generation, member.kills, life,
+                                                                member.captures, member.infected);
+                                                        Globals.getInstance().recordPowerupRuntime(roster.token, member.id,
+                                                                member.generation, life, Globals.GAME_STATE_ELIMINATED, 0, false);
+                                                        if (Globals.getInstance().mPowerupQrRequired >= Powerups.MIN_REQUIRED)
+                                                            publishPowerupStateLocked(null);
+                                                    }
                                                 }
                                                 sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + entry.getValue().mPlayerID, id, true);
                                                 if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
@@ -2780,6 +3175,15 @@ public class TcpServer extends Service {
                 e.printStackTrace();
                 return;
             }
+            if (player.has(JSON_POWERUP_SCAN)) {
+                try {
+                    Object token = player.get(JSON_ROUND_TOKEN);
+                    if (!(token instanceof String)) return;
+                    requestPowerupLocked(client, TcpJson.getInt(player, JSON_POWERUP_SCAN),
+                            TcpJson.getInt(player, JSON_POWERUP_LIFE), (String) token);
+                } catch (JSONException e) { Log.w(TAG, "Ignoring invalid power-up request", e); }
+                return;
+            }
             if (player.has(JSON_END_VOTE)) {
                 Object approve = player.opt(JSON_END_VOTE);
                 Object token = player.opt(JSON_ROUND_TOKEN);
@@ -2807,6 +3211,11 @@ public class TcpServer extends Service {
                         long sentAt = TcpJson.getLong(player, JSON_CLOCK_REQUEST);
                         if (!GameClock.validTimestamp(sentAt))
                             return;
+                        if (player.has(JSON_GPSLONGITUDE)) {
+                            storeClientGps(client, player.getDouble(JSON_GPSLATITUDE),
+                                    player.getDouble(JSON_GPSLONGITUDE), player.has(JSON_GPS_FIX_AGE)
+                                            ? TcpJson.getLong(player, JSON_GPS_FIX_AGE) : 0);
+                        }
                         if (player.has(JSON_GPS_CLOCK)) {
                             long gpsTime = TcpJson.getLong(player, JSON_GPS_CLOCK);
                             Globals.getInstance().mGpsGameTime.recordNetworkGpsTime(gpsTime, receivedAt);
@@ -2825,6 +3234,7 @@ public class TcpServer extends Service {
                         JSONObject reply = new JSONObject().put(JSON_CLOCK_REQUEST, sentAt)
                                 .put(JSON_CLOCK_RECEIVE, receivedAt)
                                 .put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime());
+                        GpsWire.putOrigin(reply, Globals.getInstance().mGpsOffset);
                         long gpsTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(
                                 SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime());
                         if (GpsGameTime.isValidUtcTime(gpsTime))
@@ -2944,37 +3354,23 @@ public class TcpServer extends Service {
                 }
                 return;
             }
-            if (player.has(JSON_GPSLONGITUDE)) {
+            if (player.has(JSON_GPSLONGITUDE) || player.has(GpsWire.NORTH) || player.has(GpsWire.EAST)) {
                 if (client.lobbyBenched) return;
                 if (client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)) {
                     Log.w(TAG, "Ignoring GPS data from an unregistered client");
                     return;
                 }
-                Globals.getmGPSDataSemaphore();
-                Globals.GPSData gps = Globals.getInstance().mGPSData.get(client.mPlayerID);
-                double longitude, latitude;
                 try {
-                    longitude = player.getDouble(JSON_GPSLONGITUDE);
-                    latitude = player.getDouble(JSON_GPSLATITUDE);
+                    GpsOffset origin = Globals.getInstance().mGpsOffset;
+                    if ((player.has(GpsWire.NORTH) || player.has(GpsWire.EAST))
+                            && (origin == null || !origin.sameOrigin(GpsWire.readOrigin(player))))
+                        throw new JSONException("GPS origin does not match the lobby");
+                    double[] position = GpsWire.readPosition(player, origin);
+                    storeClientGps(client, position[0], position[1], player.has(JSON_GPS_FIX_AGE)
+                            ? TcpJson.getLong(player, JSON_GPS_FIX_AGE) : 0);
                 } catch (JSONException e) {
-                    e.printStackTrace();
-                    Globals.getInstance().mGPSDataSemaphore.release();
-                    return;
+                    Log.w(TAG, "Ignoring invalid GPS report", e);
                 }
-                if (!Globals.isValidCoordinates(longitude, latitude)) {
-                    Log.w(TAG, "Ignoring GPS data with invalid coordinates from " + client.mPlayerID);
-                    Globals.getInstance().mGPSDataSemaphore.release();
-                    return;
-                }
-                if (gps == null) {
-                    gps = new Globals.GPSData();
-                    Globals.getInstance().mGPSData.put(client.mPlayerID, gps);
-                }
-                gps.longitude = longitude;
-                gps.latitude = latitude;
-                gps.team = client.getNetworkTeam();
-                gps.hasUpdate = true; // Client takes care of making sure that it is only sending us changes in coordinates
-                Globals.getInstance().mGPSDataSemaphore.release();
                 return;
             }
             if (player.has(JSON_PLAYERSETTINGS)) {

@@ -4,6 +4,7 @@ import android.content.Intent;
 import android.os.SystemClock;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
+import com.simplecoil.protocol.GameStartCountdown;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
@@ -28,7 +29,7 @@ public class GameStartSyncRegressionTest {
     }
 
     @Test public void fullClockSampleBurstIsRequiredBeforeStartIsPublished() throws Exception {
-        long deadline = SystemClock.elapsedRealtime() + 10000;
+        long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
         parse(plan(1, deadline, 60000));
         assertTrue(client.events.isEmpty());
         for (int i = 0; i < GameClock.SAMPLES_PER_SYNC - 1; i++) sample(OFFSET);
@@ -48,17 +49,17 @@ public class GameStartSyncRegressionTest {
 
     @Test public void duplicateAndOlderRoundCannotRestartCountdown() throws Exception {
         synchronize();
-        JSONObject start = plan(2, SystemClock.elapsedRealtime() + 10000, 0);
+        JSONObject start = plan(2, SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS, 0);
         parse(start);
         parse(start);
-        parse(plan(1, SystemClock.elapsedRealtime() + 20000, 0));
+        parse(plan(1, SystemClock.elapsedRealtime() + 2 * GameStartCountdown.DURATION_MS, 0));
         assertEquals(1, client.events.size());
     }
 
     @Test public void olderRoundCannotReplaceANewerPendingStartBeforeClockSync() throws Exception {
         long now = SystemClock.elapsedRealtime();
-        parse(plan(2, now + 10000, 0));
-        parse(plan(1, now + 20000, 0));
+        parse(plan(2, now + GameStartCountdown.DURATION_MS, 0));
+        parse(plan(1, now + 2 * GameStartCountdown.DURATION_MS, 0));
         synchronize();
         assertEquals(1, client.events.size());
         assertEquals(2, client.events.get(0).getLongExtra(NetMsg.INTENT_ROUND_ID, 0));
@@ -66,7 +67,7 @@ public class GameStartSyncRegressionTest {
 
     @Test public void startIsRetainedForPausedActivityAndConsumedOnlyOnce() throws Exception {
         synchronize();
-        parse(plan(1, SystemClock.elapsedRealtime() + 10000, 0));
+        parse(plan(1, SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS, 0));
         long id = client.events.get(0).getLongExtra(TcpClient.EXTRA_START_EVENT_ID, 0);
         assertTrue(id > 0);
         assertNull(client.consumePendingGameStart(id + 1));
@@ -78,7 +79,7 @@ public class GameStartSyncRegressionTest {
 
     @Test public void stoppingDiscardsClockAndPendingStart() throws Exception {
         synchronize();
-        parse(plan(1, SystemClock.elapsedRealtime() + 10000, 0));
+        parse(plan(1, SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS, 0));
         client.stopTcpClient();
         assertFalse(client.isClockSynchronized());
         assertNull(client.consumePendingGameStart(0));
@@ -86,7 +87,7 @@ public class GameStartSyncRegressionTest {
 
     @Test public void destructionDiscardsPendingStart() throws Exception {
         synchronize();
-        parse(plan(1, SystemClock.elapsedRealtime() + 10000, 0));
+        parse(plan(1, SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS, 0));
         InstrumentationRegistry.getInstrumentation().runOnMainSync(client::onDestroy);
         assertNull(client.consumePendingGameStart(0));
     }
@@ -107,9 +108,21 @@ public class GameStartSyncRegressionTest {
         assertEquals(startAt + 60000, client.events.get(0).getLongExtra(NetMsg.INTENT_END_AT, 0));
     }
 
+    @Test public void startReceivedDuringClosingLineKeepsHostDeadlineAndRoundDuration() throws Exception {
+        synchronize();
+        long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS;
+        parse(plan(1, deadline, 60000));
+        assertEquals(1, client.events.size());
+        Intent start = client.events.get(0);
+        assertEquals(NetMsg.NETMSG_STARTGAME, start.getAction());
+        assertEquals("The voice's zero is not the gameplay start deadline",
+                deadline, start.getLongExtra(NetMsg.INTENT_START_AT, 0));
+        assertEquals(deadline + 60000, start.getLongExtra(NetMsg.INTENT_END_AT, 0));
+    }
+
     @Test public void countdownProbeRefinesAnAlreadyPublishedDeadline() throws Exception {
         synchronize();
-        long deadline = SystemClock.elapsedRealtime() + 10000;
+        long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
         parse(plan(1, deadline, 60000));
         assertEquals(1, client.events.size());
 
@@ -142,7 +155,7 @@ public class GameStartSyncRegressionTest {
         parse(plan(1, now, 0).put(TcpServer.JSON_ROUND_TOKEN, "not-a-round-token"));
         parse(plan(1, now + Globals.MAX_RESPAWN_TIME_SECONDS * 1000 + 100000, 0));
         assertTrue(client.events.isEmpty());
-        parse(plan(1, now + 10000, 0));
+        parse(plan(1, now + GameStartCountdown.DURATION_MS, 0));
         assertEquals(1, client.events.size());
     }
 

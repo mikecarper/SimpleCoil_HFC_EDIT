@@ -883,6 +883,31 @@
         android:textStyle="bold"
         android:visibility="gone" />
 
+    <com.simplecoil.simplecoil.PowerupRouletteView
+        android:id="@+id/powerup_roulette"
+        android:layout_width="160dp"
+        android:layout_height="180dp"
+        android:layout_gravity="center"
+        android:clickable="false"
+        android:focusable="false"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/powerup_emp_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:layout_marginTop="64dp"
+        android:gravity="center"
+        android:background="#BB6A1B9A"
+        android:text="@string/powerup_emp_disrupted"
+        android:textColor="#FFFFFFFF"
+        android:textSize="24sp"
+        android:padding="12dp"
+        android:clickable="false"
+        android:focusable="false"
+        android:visibility="gone" />
+
     <!-- A gameplay-only camera preview. It does not cover the rest of the HUD. -->
     <FrameLayout
         android:id="@+id/powerup_qr_scanner_window"

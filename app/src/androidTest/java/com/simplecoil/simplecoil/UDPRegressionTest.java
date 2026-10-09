@@ -23,6 +23,8 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
@@ -52,6 +54,10 @@ public class UDPRegressionTest {
     private long originalEndVotes;
     private boolean originalEndVoteRequested;
     private com.simplecoil.protocol.RoundRoster originalRoundRoster;
+    private com.simplecoil.protocol.GpsOffset originalGpsOffset;
+    private Globals.LocalGpsFix originalLocalGpsFix;
+    private boolean originalUseGps;
+    private Map<Byte, Globals.GPSData> originalLocations;
 
     @Before
     public void setUp() throws Exception {
@@ -62,6 +68,16 @@ public class UDPRegressionTest {
         set(service, "mMyIP", InetAddress.getByName("127.0.0.1"));
         Globals globals = Globals.getInstance();
         originalRoundRoster = globals.mRoundRoster;
+        originalGpsOffset = globals.mGpsOffset;
+        originalLocalGpsFix = globals.mLocalGpsFix;
+        originalUseGps = globals.mUseGPS;
+        Globals.getmGPSDataSemaphore();
+        try {
+            originalLocations = new HashMap<>(globals.mGPSData);
+            globals.mGPSData.clear();
+        } finally { globals.mGPSDataSemaphore.release(); }
+        globals.mGpsOffset = null;
+        globals.mLocalGpsFix = null;
         globals.mRoundRoster = null;
         originalGameState = globals.mGameState;
         originalGameMode = globals.mGameMode;
@@ -91,6 +107,14 @@ public class UDPRegressionTest {
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
         Globals globals = Globals.getInstance();
         globals.mRoundRoster = originalRoundRoster;
+        globals.mGpsOffset = originalGpsOffset;
+        globals.mLocalGpsFix = originalLocalGpsFix;
+        globals.mUseGPS = originalUseGps;
+        Globals.getmGPSDataSemaphore();
+        try {
+            globals.mGPSData.clear();
+            globals.mGPSData.putAll(originalLocations);
+        } finally { globals.mGPSDataSemaphore.release(); }
         globals.mGameState = originalGameState;
         globals.mGameMode = originalGameMode;
         globals.mPlayerID = originalPlayerID;
@@ -99,6 +123,129 @@ public class UDPRegressionTest {
         globals.mEndGameVotes = originalEndVotes;
         globals.mEndGameVoteRequested = originalEndVoteRequested;
         clearPlayers();
+    }
+
+    @Test
+    public void conflictingPacketOriginKeepsScoresButCannotMoveMarkers() throws Exception {
+        register(teammate, 2);
+        register(enemy, 17);
+        Globals globals = Globals.getInstance();
+        globals.mUseGPS = true;
+        globals.mServerIP = enemy;
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        globals.mGpsOffset = origin;
+        service.startGame(false, PEER_ROUND_TOKEN);
+        receiveState(enemy, gpsPacket(0, 1, gpsRow(2, 1, 0, 0, origin), origin));
+        Globals.GPSData saved = globals.mGPSData.get((byte) 2);
+        assertNotNull(saved);
+        com.simplecoil.protocol.GpsOffset wrong = com.simplecoil.protocol.GpsOffset.create(48.6, -122.1);
+        receiveState(enemy, gpsPacket(0, 2, gpsRow(2, 2, 7, 0, wrong), wrong));
+        assertSame(origin, globals.mGpsOffset);
+        assertSame(saved, globals.mGPSData.get((byte) 2));
+        assertEquals(origin.latitude, saved.latitude, 0);
+        PeerStatePacket.PlayerState[] applied = (PeerStatePacket.PlayerState[]) get(service, "mAppliedPeerStates");
+        assertEquals(7, applied[2].score);
+    }
+
+    @Test
+    public void onlyHostAuthorityTickCanBootstrapTheOrigin() throws Exception {
+        register(teammate, 2);
+        register(enemy, 17);
+        Globals globals = Globals.getInstance();
+        globals.mUseGPS = true;
+        globals.mServerIP = enemy;
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        service.startGame(false, PEER_ROUND_TOKEN);
+        receiveState(teammate, gpsPacket(2, 1, gpsRow(2, 1, 0, 0, origin), origin));
+        assertNull(globals.mGpsOffset);
+        receiveState(enemy, gpsPacket(0, 1, gpsRow(2, 2, 0, 0, origin), origin));
+        assertTrue(origin.sameOrigin(globals.mGpsOffset));
+        assertNotNull(globals.mGPSData.get((byte) 2));
+    }
+
+    @Test
+    public void unchangedOwnerSequenceStillExpiresItsGpsMarker() throws Exception {
+        register(teammate, 2);
+        register(enemy, 17);
+        Globals globals = Globals.getInstance();
+        globals.mUseGPS = true;
+        globals.mServerIP = enemy;
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        globals.mGpsOffset = origin;
+        service.startGame(false, PEER_ROUND_TOKEN);
+        receiveState(enemy, gpsPacket(0, 1, gpsRow(2, 1, 0, 0, origin), origin));
+        assertNotNull(globals.mGPSData.get((byte) 2));
+        receiveState(enemy, gpsPacket(0, 2, gpsRow(2, 1, 0, 31, origin), origin));
+        assertNull(globals.mGPSData.get((byte) 2));
+    }
+
+    @Test
+    public void noCompactGpsDoesNotEraseTheFullPrecisionTcpFallback() throws Exception {
+        register(teammate, 2);
+        register(enemy, 17);
+        Globals globals = Globals.getInstance();
+        globals.mUseGPS = true;
+        globals.mServerIP = enemy;
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        globals.mGpsOffset = origin;
+        Globals.GPSData fallback = new Globals.GPSData();
+        fallback.latitude = 47.7;
+        fallback.longitude = -122.2;
+        globals.mGPSData.put((byte) 2, fallback);
+        service.startGame(false, PEER_ROUND_TOKEN);
+        PeerStatePacket.PlayerState row = gpsRow(2, 1, 0, 31, origin);
+        // Moving outside the compact square clears GPS_VALID on encoding.
+        row = new PeerStatePacket.PlayerState(2, row.flags, 1, 0, 0, 0,
+                Globals.GAME_STATE_RUNNING, 0, 0, 0, 5, 10, 30, 31, 47.7, -122.2);
+        receiveState(enemy, gpsPacket(0, 1, row, origin));
+        assertSame(fallback, globals.mGPSData.get((byte) 2));
+    }
+
+    @Test
+    public void stationaryFreshFixRefreshesTheLocalRow() throws Exception {
+        Globals globals = Globals.getInstance();
+        globals.mUseGPS = true;
+        service.startGame(true, PEER_ROUND_TOKEN);
+        service.updatePeerRuntimeState(0, 0, 5, 10, 30, Globals.GAME_STATE_RUNNING);
+        globals.mLocalGpsFix = new Globals.LocalGpsFix(47.6, -122.1, SystemClock.elapsedRealtime());
+        Method local = UDPListenerService.class.getDeclaredMethod("localPeerStateLocked", int.class);
+        local.setAccessible(true);
+        PeerStatePacket.PlayerState refreshed = (PeerStatePacket.PlayerState) local.invoke(service, 1);
+        assertTrue((refreshed.flags & PeerStatePacket.FLAG_GPS_VALID) != 0);
+        assertEquals(47.6, refreshed.latitude, 0);
+    }
+
+    @Test
+    public void cachedGossipGpsAgesWhileItsOwnerIsOffline() throws Exception {
+        register(teammate, 2);
+        Globals globals = Globals.getInstance();
+        globals.mUseGPS = true;
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        globals.mGpsOffset = origin;
+        service.startGame(true, PEER_ROUND_TOKEN, true);
+        receiveState(teammate, gpsPacket(2, 1, gpsRow(2, 1, 0, 0, origin), origin));
+        ((long[]) get(service, "mPeerStateReceivedAt"))[2] = SystemClock.elapsedRealtime() - 31_000;
+        Method snapshot = UDPListenerService.class.getDeclaredMethod("peerSnapshotLocked");
+        snapshot.setAccessible(true);
+        PeerStatePacket.PlayerState[] rows = (PeerStatePacket.PlayerState[]) snapshot.invoke(service);
+        assertTrue(rows[2].gpsAgeSeconds >= 31);
+    }
+
+    private static PeerStatePacket.PlayerState gpsRow(int id, long sequence, int score,
+            int age, com.simplecoil.protocol.GpsOffset origin) {
+        return new PeerStatePacket.PlayerState(id,
+                PeerStatePacket.FLAG_PRESENT | PeerStatePacket.FLAG_GPS_VALID,
+                sequence, 0, PeerStatePacket.EVENT_NONE, 0, Globals.GAME_STATE_RUNNING,
+                0, score, 0, 5, 10, 30, age, origin.latitude, origin.longitude);
+    }
+
+    private static byte[] gpsPacket(int senderID, long sequence, PeerStatePacket.PlayerState row,
+            com.simplecoil.protocol.GpsOffset origin) {
+        PeerStatePacket.PlayerState[] rows = new PeerStatePacket.PlayerState[33];
+        rows[row.playerID] = row;
+        return PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER,
+                java.util.UUID.fromString(PEER_ROUND_TOKEN), sequence, senderID,
+                Globals.GAME_MODE_2TEAMS, rows, origin);
     }
 
     @Test

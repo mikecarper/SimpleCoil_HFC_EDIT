@@ -6,6 +6,8 @@ import android.os.SystemClock;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import com.simplecoil.protocol.GameStartCountdown;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.After;
@@ -65,11 +67,17 @@ public class TcpServerDispatchRegressionTest {
     private long originalEndVotes;
     private boolean originalEndVoteRequested;
     private com.simplecoil.protocol.RoundRoster originalRoundRoster;
+    private byte originalPlayerID;
+    private boolean originalLocalLobbyReady;
 
     @Before
     public void setUp() throws Exception {
         Globals globals = Globals.getInstance();
         originalRoundRoster = globals.mRoundRoster;
+        originalPlayerID = globals.mPlayerID;
+        originalLocalLobbyReady = globals.mLocalLobbyReady;
+        globals.mPlayerID = 0;
+        globals.mLocalLobbyReady = false;
         globals.mRoundRoster = null;
         originalGameMode = globals.mGameMode;
         originalGameState = globals.mGameState;
@@ -111,6 +119,8 @@ public class TcpServerDispatchRegressionTest {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(server::onDestroy);
         Globals globals = Globals.getInstance();
         globals.mRoundRoster = originalRoundRoster;
+        globals.mPlayerID = originalPlayerID;
+        globals.mLocalLobbyReady = originalLocalLobbyReady;
         restore(globals.mTeamIPMap, originalAddresses, globals.mTeamIPMapSemaphore);
         restore(globals.mIPTeamMap, originalPlayers, globals.mIPTeamMapSemaphore);
         restore(globals.mTeamPlayerNameMap, originalNames, globals.mTeamPlayerNameSemaphore);
@@ -360,11 +370,22 @@ public class TcpServerDispatchRegressionTest {
 
     @Test
     public void hostCancellationAlsoClearsAStoppedPeerHostsCountdown() throws Exception {
+        // The local phone host is a distinct, gun-ready participant; client1
+        // remains the remote player whose start frame this fixture inspects.
+        Globals.getInstance().mPlayerID = 2;
+        Globals.getInstance().mLocalLobbyReady = true;
         server.setDedicated(false);
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         assertTrue(server.getScheduledGameStart() != null);
-        server.cancelServer();
-        assertTrue("A cancelled peer host retained its countdown", server.getScheduledGameStart() == null);
+        clientsLock.acquire();
+        Thread cancellation;
+        try {
+            server.cancelServer();
+            assertTrue("A cancelled peer host retained its countdown", server.getScheduledGameStart() == null);
+            cancellation = queuedWorker();
+        } finally { clientsLock.release(); }
+        cancellation.join(2000);
+        assertFalse("Peer-host cancellation did not finish", cancellation.isAlive());
         assertTrue(sockets.get(0).closed);
     }
 
@@ -1074,6 +1095,9 @@ public class TcpServerDispatchRegressionTest {
 
     @Test
     public void peerHostKeepsLobbyOpenWhenALateJoinCancelsQueuedStart() throws Exception {
+        // Client 2 joins later; the local host must occupy a different seat.
+        Globals.getInstance().mPlayerID = 3;
+        Globals.getInstance().mLocalLobbyReady = true;
         server.setDedicated(false);
         assertLateJoinCancelsQueuedStart(true);
     }
@@ -1161,18 +1185,81 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
-    public void sharedStartKeepsEnoughTimeForTheFullVoiceCountdown() throws Exception {
-        long originalRespawnTime = Globals.getInstance().mRespawnTime;
+    public void shortRespawnDoesNotShortenTheTwentyFourSecondGameStart() throws Exception {
+        assertFixedGameStartCountdown(1, false, false);
+    }
+
+    @Test
+    public void longRespawnDoesNotExtendTheTwentyFourSecondGameStart() throws Exception {
+        assertFixedGameStartCountdown(90, false, false);
+    }
+
+    @Test
+    public void balancedQrGameStartsWithTheSameTwentyFourSecondCountdown() throws Exception {
+        assertFixedGameStartCountdown(90, true, true);
+    }
+
+    @Test
+    public void balancedNoQrGameStartsWithTheSameTwentyFourSecondCountdown() throws Exception {
+        assertFixedGameStartCountdown(1, true, false);
+    }
+
+    private void assertFixedGameStartCountdown(long respawnTime, boolean balanced, boolean requireQr)
+            throws Exception {
+        Globals globals = Globals.getInstance();
+        long originalRespawnTime = globals.mRespawnTime;
+        boolean originalBalanced = globals.mBalancedRandom;
+        boolean originalRequireQr = globals.mBalancedRequireQr;
+        Map<Byte, Integer> originalTeams = globals.mBalancedTeams;
+        Set<Byte> originalCheckedIn = globals.mBalancedCheckedIn;
         try {
-            Globals.getInstance().mRespawnTime = 1;
+            globals.mRespawnTime = respawnTime;
+            globals.mBalancedRandom = balanced;
+            globals.mBalancedRequireQr = requireQr;
+            if (balanced) {
+                addClient(2, new MemorySocket());
+                addClient(17, new MemorySocket());
+                Map<Byte, Integer> teams = new HashMap<>();
+                teams.put((byte) 1, 1);
+                teams.put((byte) 2, 1);
+                teams.put((byte) 17, 2);
+                globals.setBalancedAssignments(teams, teams.keySet());
+            }
             long beforeStart = SystemClock.elapsedRealtime();
             dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+            long afterStart = SystemClock.elapsedRealtime();
             JSONObject start = readJson(sockets.get(0));
-            assertTrue(start.getLong(TcpServer.JSON_GAMESTART) >= beforeStart
-                    + Globals.RESPAWN_TIME_SECONDS * 1000);
+            long startAt = start.getLong(TcpServer.JSON_GAMESTART);
+            assertTrue("Initial countdown was shortened", startAt >= beforeStart
+                    + GameStartCountdown.DURATION_MS);
+            assertTrue("Respawn settings extended the initial countdown", startAt <= afterStart
+                    + GameStartCountdown.DURATION_MS);
+            assertEquals(startAt, server.getScheduledGameStart().getLongExtra(NetMsg.INTENT_START_AT, 0));
+            assertEquals("Starting a round changed the respawn delay", respawnTime, globals.mRespawnTime);
         } finally {
-            Globals.getInstance().mRespawnTime = originalRespawnTime;
+            globals.mRespawnTime = originalRespawnTime;
+            globals.mBalancedRandom = originalBalanced;
+            globals.mBalancedRequireQr = originalRequireQr;
+            globals.setBalancedAssignments(originalTeams, originalCheckedIn);
         }
+    }
+
+    @Test
+    public void closingAnnouncementCannotUnlockDedicatedCombatOrRespawnsBeforeTheDeadline() throws Exception {
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS);
+        set(clients.get(1), "awaitingRespawn", true);
+        Method roundStarted = TcpServer.class.getDeclaredMethod("hasRoundStarted");
+        roundStarted.setAccessible(true);
+        assertFalse("Combat was enabled during the closing announcement", (boolean) roundStarted.invoke(server));
+        assertTrue("Respawns became selectable during the closing announcement",
+                server.getGameMasterRespawnCandidates().isEmpty());
+        assertFalse("The Game Master enabled a weapon before the start deadline",
+                server.grantGameMasterRespawn((byte) 1));
+
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 1);
+        assertTrue((boolean) roundStarted.invoke(server));
+        assertEquals(1, server.getGameMasterRespawnCandidates().size());
     }
 
     @Test
@@ -1574,6 +1661,8 @@ public class TcpServerDispatchRegressionTest {
 
     @Test
     public void pausedPeerHostCanRecoverItsStartAfterLobbyConnectionCloses() throws Exception {
+        Globals.getInstance().mPlayerID = 2;
+        Globals.getInstance().mLocalLobbyReady = true;
         server.setDedicated(false);
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         Intent scheduled = server.getScheduledGameStart();

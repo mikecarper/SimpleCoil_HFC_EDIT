@@ -44,6 +44,9 @@ public class TcpClientSessionRegressionTest {
     private int originalGameState;
     private int originalGrenadePairing;
     private byte originalPairedGrenade;
+    private com.simplecoil.protocol.GpsOffset originalGpsOffset;
+    private Globals.LocalGpsFix originalLocalGpsFix;
+    private java.util.Map<Byte, Globals.GPSData> originalLocations;
 
     @Before
     public void setUp() {
@@ -53,6 +56,15 @@ public class TcpClientSessionRegressionTest {
         originalGameState = globals.mGameState;
         originalGrenadePairing = globals.mGrenadePairings[1];
         originalPairedGrenade = globals.mPairedGrenadeID;
+        originalGpsOffset = globals.mGpsOffset;
+        originalLocalGpsFix = globals.mLocalGpsFix;
+        Globals.getmGPSDataSemaphore();
+        try {
+            originalLocations = new java.util.HashMap<>(globals.mGPSData);
+            globals.mGPSData.clear();
+        } finally { globals.mGPSDataSemaphore.release(); }
+        globals.mGpsOffset = null;
+        globals.mLocalGpsFix = null;
         globals.mPairedGrenadeID = 0;
         globals.mGameState = Globals.GAME_STATE_NONE;
     }
@@ -71,6 +83,13 @@ public class TcpClientSessionRegressionTest {
             globals.mGameState = originalGameState;
             globals.mGrenadePairings[1] = originalGrenadePairing;
             globals.mPairedGrenadeID = originalPairedGrenade;
+            globals.mGpsOffset = originalGpsOffset;
+            globals.mLocalGpsFix = originalLocalGpsFix;
+            Globals.getmGPSDataSemaphore();
+            try {
+                globals.mGPSData.clear();
+                globals.mGPSData.putAll(originalLocations);
+            } finally { globals.mGPSDataSemaphore.release(); }
         }
     }
 

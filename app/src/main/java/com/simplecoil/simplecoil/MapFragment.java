@@ -29,6 +29,8 @@ import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.LayoutInflater;
@@ -39,6 +41,7 @@ import com.mousebird.maply.ComponentObject;
 import com.mousebird.maply.GlobeMapFragment;
 import com.mousebird.maply.MapController;
 import com.mousebird.maply.MaplyBaseController;
+import com.mousebird.maply.MaplyLifecycleCleanup;
 import com.mousebird.maply.MarkerInfo;
 import com.mousebird.maply.Point2d;
 import com.mousebird.maply.Point3d;
@@ -70,6 +73,7 @@ public class MapFragment extends GlobeMapFragment {
     // free to deliver more slowly when their hardware or power policy requires it.
     private static final long LOCATION_UPDATE_INTERVAL_MS = 250;
     private static final float LOCATION_UPDATE_MIN_DISTANCE_METERS = 0.5f;
+    private static final long LOCATION_HEARTBEAT_INTERVAL_MS = 5000;
 
     private LocationListener mLocationListener = null;
     private boolean mResumed;
@@ -80,6 +84,15 @@ public class MapFragment extends GlobeMapFragment {
     private double mLongitude = 0;
     private double mLatitude = 0;
     private Location mLastBroadcastLocation;
+    private long mLastLocationBroadcastElapsedMs;
+    private final Handler mLocationHeartbeatHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mLocationHeartbeat = new Runnable() {
+        @Override public void run() {
+            if (!isGPSActive() || mLocationListener == null) return;
+            sendLocation(currentBestLocation);
+            mLocationHeartbeatHandler.postDelayed(this, LOCATION_HEARTBEAT_INTERVAL_MS);
+        }
+    };
 
     private void sendLocation(Location location) {
         sendLocation(location, false);
@@ -104,11 +117,13 @@ public class MapFragment extends GlobeMapFragment {
         Context activity = getActivity();
         if (!isValidLocation(location) || activity == null) return;
         long fixElapsedMs = location.getElapsedRealtimeNanos() / 1_000_000L;
-        if (fixElapsedMs > 0 && !Globals.isFreshGpsFix(fixElapsedMs, SystemClock.elapsedRealtime()))
+        long now = SystemClock.elapsedRealtime();
+        if (!Globals.isFreshGpsFix(fixElapsedMs, now))
             return;
-        if (!force && mLastBroadcastLocation != null) {
-            if (location.getLatitude() == mLatitude && location.getLongitude() == mLongitude)
-                return;
+        Globals.getInstance().mLocalGpsFix = new Globals.LocalGpsFix(location.getLatitude(),
+                location.getLongitude(), fixElapsedMs);
+        if (!force && mLastBroadcastLocation != null
+                && now - mLastLocationBroadcastElapsedMs < LOCATION_HEARTBEAT_INTERVAL_MS) {
             // Providers can report slightly different fixes for a stationary phone.  Avoid
             // turning that noise into a full team-map update while retaining meaningful motion.
             if (location.distanceTo(mLastBroadcastLocation) < LOCATION_UPDATE_MIN_DISTANCE_METERS)
@@ -117,6 +132,7 @@ public class MapFragment extends GlobeMapFragment {
         mLongitude = location.getLongitude();
         mLatitude = location.getLatitude();
         mLastBroadcastLocation = new Location(location);
+        mLastLocationBroadcastElapsedMs = now;
         Intent intent = new Intent(NetMsg.NETMSG_GPSLOCUPDATE);
         intent.putExtra(NetMsg.INTENT_LATITUDE, mLatitude);
         intent.putExtra(NetMsg.INTENT_LONGITUDE, mLongitude);
@@ -256,6 +272,13 @@ public class MapFragment extends GlobeMapFragment {
     }
 
     @Override
+    protected void preControlCreated() {
+        // GlobeMapFragment invokes this before constructing the bundled controller.
+        MaplyLifecycleCleanup.suppressLegacyAnalytics(getActivity());
+        super.preControlCreated();
+    }
+
+    @Override
     public View onCreateView(LayoutInflater inflater, ViewGroup container,
                              Bundle inState) {
         super.onCreateView(inflater, container, inState);
@@ -295,6 +318,17 @@ public class MapFragment extends GlobeMapFragment {
         if (isAdded())
             requireActivity().unregisterReceiver(mGPSDataReceiver);
         super.onPause();
+    }
+
+    @Override
+    public void onDestroyView() {
+        MaplyLifecycleCleanup.stopUnrenderedLayerThread(baseControl);
+        // These handles belong to the controller destroyed with this view.
+        // A recreated view must rebuild even when the laptop tile URL is unchanged.
+        mBaseLayer = null;
+        mBaseTileUrl = null;
+        mPlayerMarkers = null;
+        super.onDestroyView();
     }
 
     @Override
@@ -351,6 +385,7 @@ public class MapFragment extends GlobeMapFragment {
                 mLongitude = 0;
                 mLatitude = 0;
                 mLastBroadcastLocation = null;
+                mLastLocationBroadcastElapsedMs = 0;
                 LocationListener listener = new MyLocationListener();
                 // Set it before requesting updates. Some providers can deliver
                 // a cached fix as soon as registration returns.
@@ -371,7 +406,10 @@ public class MapFragment extends GlobeMapFragment {
             // Joining/rejoining or changing GPS settings may require republishing a stationary
             // fix whose earlier broadcast was sent before the TCP connection was ready.
             sendLocation(currentBestLocation, true);
+            mLocationHeartbeatHandler.removeCallbacks(mLocationHeartbeat);
+            mLocationHeartbeatHandler.postDelayed(mLocationHeartbeat, LOCATION_HEARTBEAT_INTERVAL_MS);
         } else {
+            mLocationHeartbeatHandler.removeCallbacks(mLocationHeartbeat);
             LocationListener listener = mLocationListener;
             mLocationListener = null;
             // Remote markers do not depend on a local location subscription.
@@ -393,7 +431,7 @@ public class MapFragment extends GlobeMapFragment {
     private boolean registerLocationProvider(LocationListener listener, String provider) {
         try {
             mLocationManager.requestLocationUpdates(provider, LOCATION_UPDATE_INTERVAL_MS,
-                    LOCATION_UPDATE_MIN_DISTANCE_METERS, listener);
+                    0, listener);
             return true;
         } catch (SecurityException | IllegalArgumentException e) {
             Log.w(TAG, "Unable to register location provider: " + provider, e);

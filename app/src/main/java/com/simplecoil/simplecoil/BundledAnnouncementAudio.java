@@ -11,6 +11,7 @@ import java.util.Map;
 
 /** English announcements extracted from the supplied Roman recording. */
 final class BundledAnnouncementAudio {
+    private static final String TAG = "BundledAnnouncements";
     private static final int[][] CLIPS = {
             {R.string.game_end_won_voice_prompt, R.raw.game_end_won},
             {R.string.game_end_lost_voice_prompt, R.raw.game_end_lost},
@@ -69,7 +70,7 @@ final class BundledAnnouncementAudio {
                         == TextToSpeech.SUCCESS)
                     keys.put(context.getString(clip[0]), key);
             } catch (RuntimeException e) {
-                Log.w("BundledAnnouncementAudio", "Unable to register announcement " + clip[0], e);
+                Log.w(TAG, "Unable to register announcement " + clip[0], e);
             }
         }
         return keys;

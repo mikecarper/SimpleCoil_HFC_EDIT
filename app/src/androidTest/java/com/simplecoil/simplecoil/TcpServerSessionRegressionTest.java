@@ -40,6 +40,7 @@ public class TcpServerSessionRegressionTest {
     private int originalGPSMode;
     private int originalGameState;
     private int originalGrenadePairing;
+    private com.simplecoil.protocol.GpsOffset originalGpsOffset;
 
     @Before
     public void setUp() {
@@ -49,6 +50,7 @@ public class TcpServerSessionRegressionTest {
         originalGPSMode = globals.mGPSMode;
         originalGameState = globals.mGameState;
         originalGrenadePairing = globals.mGrenadePairings[1];
+        originalGpsOffset = globals.mGpsOffset;
         globals.mUseGPS = false;
         globals.mGPSMode = Globals.GPS_ALL;
         globals.mGameState = Globals.GAME_STATE_NONE;
@@ -65,6 +67,7 @@ public class TcpServerSessionRegressionTest {
         globals.mGPSMode = originalGPSMode;
         globals.mGameState = originalGameState;
         globals.mGrenadePairings[1] = originalGrenadePairing;
+        globals.mGpsOffset = originalGpsOffset;
         Globals.getmGPSDataSemaphore();
         try { globals.mGPSData.clear(); } finally { globals.mGPSDataSemaphore.release(); }
     }
@@ -316,6 +319,8 @@ public class TcpServerSessionRegressionTest {
     @Test
     public void failedBindDoesNotResetExistingGameState() throws Exception {
         connect();
+        com.simplecoil.protocol.GpsOffset origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+        Globals.getInstance().mGpsOffset = origin;
         Globals.GPSData gps = new Globals.GPSData();
         Globals.getmGPSDataSemaphore();
         try { Globals.getInstance().mGPSData.put((byte) 1, gps); }
@@ -329,6 +334,7 @@ public class TcpServerSessionRegressionTest {
             assertTrue("Failed listener did not announce startup failure",
                     competingServer.broadcasts.contains(NetMsg.NETMSG_TCPSERVERFAILED));
             assertSame(gps, Globals.getInstance().mGPSData.get((byte) 1));
+            assertSame(origin, Globals.getInstance().mGpsOffset);
             assertEquals(9, Globals.getInstance().mGrenadePairings[1]);
             assertTrue((boolean) get(server, "keepListening"));
             server.sendTCPMessageAll("original-session");
@@ -566,6 +572,7 @@ public class TcpServerSessionRegressionTest {
             Globals.GPSData location = new Globals.GPSData();
             location.longitude = 10;
             location.latitude = 20;
+            location.fixElapsedMs = SystemClock.elapsedRealtime();
             location.team = 1; // Player 10's old team in a two-team lobby.
             location.hasUpdate = true;
             Globals.getInstance().mGPSData.put((byte) 10, location);
@@ -612,6 +619,7 @@ public class TcpServerSessionRegressionTest {
         Globals.GPSData location = new Globals.GPSData();
         location.longitude = 10;
         location.latitude = 20;
+        location.fixElapsedMs = SystemClock.elapsedRealtime();
         location.hasUpdate = false;
         Globals.getInstance().mGPSData.put((byte) 2, location);
         set(server, "mGPSIntervalCount", 20);
@@ -645,6 +653,29 @@ public class TcpServerSessionRegressionTest {
         InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
         assertEquals(1, server.messages.size());
         assertTrue(gpsMessage(0).getBoolean(TcpServer.JSON_GPSFULLUPDATE));
+    }
+
+    @Test
+    public void expiredTcpCacheForcesAFullSnapshotAndKeepsOtherFreshPlayers() throws Exception {
+        Runnable update = scheduleGpsUpdate();
+        Globals.GPSData fresh = new Globals.GPSData();
+        fresh.latitude = 20;
+        fresh.longitude = 10;
+        fresh.fixElapsedMs = SystemClock.elapsedRealtime();
+        Globals.GPSData stale = new Globals.GPSData();
+        stale.latitude = 21;
+        stale.longitude = 11;
+        stale.fixElapsedMs = SystemClock.elapsedRealtime() - 31_000;
+        Globals.getInstance().mGPSData.put((byte) 2, fresh);
+        Globals.getInstance().mGPSData.put((byte) 3, stale);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(update);
+        JSONObject snapshot = gpsMessage(0);
+        assertTrue(snapshot.getBoolean(TcpServer.JSON_GPSFULLUPDATE));
+        assertEquals(1, snapshot.getJSONArray(TcpServer.JSON_GPSUPDATE).length());
+        assertEquals(2, snapshot.getJSONArray(TcpServer.JSON_GPSUPDATE).getJSONObject(0)
+                .getInt(TcpServer.JSON_PLAYERID));
+        assertNull(Globals.getInstance().mGPSData.get((byte) 3));
+        assertSame(fresh, Globals.getInstance().mGPSData.get((byte) 2));
     }
 
     @Test
@@ -692,6 +723,7 @@ public class TcpServerSessionRegressionTest {
         Globals.GPSData location = new Globals.GPSData();
         location.longitude = 10;
         location.latitude = 20;
+        location.fixElapsedMs = SystemClock.elapsedRealtime();
         location.hasUpdate = true;
         Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
         CopyOnWriteArrayList<Throwable> failures = new CopyOnWriteArrayList<>();

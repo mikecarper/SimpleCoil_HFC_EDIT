@@ -7,6 +7,8 @@
 
 package com.simplecoil.simplecoil;
 
+import com.simplecoil.protocol.GpsOffset;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.UUID;
@@ -15,15 +17,15 @@ import java.util.UUID;
  * Fixed-size, allocation-light wire format used while a peer game is running.
  * Lobby data such as names and IP addresses is deliberately kept in TCP setup.
  *
- * <p>The payload is 1,376 bytes: a 32-byte round header followed by thirty-two
- * 42-byte player records. That leaves 96 bytes below the 1,472-byte UDP
+ * <p>The payload is 1,264 bytes: a 48-byte round/origin header followed by thirty-two
+ * 38-byte player records. That leaves 208 bytes below the 1,472-byte UDP
  * payload ceiling while allowing every packet to carry a complete state view.</p>
  */
 final class PeerStatePacket {
     static final int MAX_UDP_PAYLOAD_BYTES = 1472;
     static final int PLAYER_CAPACITY = 32;
-    static final int HEADER_BYTES = 32;
-    static final int PLAYER_BYTES = 42;
+    static final int HEADER_BYTES = 48;
+    static final int PLAYER_BYTES = 38;
     static final int PACKET_BYTES = HEADER_BYTES + PLAYER_CAPACITY * PLAYER_BYTES;
 
     static final int FLAG_PRESENT = 1;
@@ -43,8 +45,7 @@ final class PeerStatePacket {
     static final int EVENT_QUIT = 8;
 
     private static final int MAGIC = 0x53434F49; // "SCOI"
-    private static final int FORMAT_VERSION = 3;
-    private static final double GPS_SCALE = 100_000.0;
+    private static final int FORMAT_VERSION = 4;
 
     static {
         if (PLAYER_CAPACITY != Globals.MAX_PLAYER_ID)
@@ -57,6 +58,11 @@ final class PeerStatePacket {
 
     static byte[] encode(int networkVersion, UUID roundToken, long snapshotSequence,
                          int senderID, int gameMode, PlayerState[] players) {
+        return encode(networkVersion, roundToken, snapshotSequence, senderID, gameMode, players, null);
+    }
+
+    static byte[] encode(int networkVersion, UUID roundToken, long snapshotSequence,
+                         int senderID, int gameMode, PlayerState[] players, GpsOffset origin) {
         // Sender zero is reserved for the authoritative host tick. Player
         // gossip always uses the sender's real 1..32 identity.
         if (roundToken == null || senderID < 0 || senderID > PLAYER_CAPACITY
@@ -72,11 +78,16 @@ final class PeerStatePacket {
         buffer.putLong(snapshotSequence);
         buffer.putLong(roundToken.getMostSignificantBits());
         buffer.putLong(roundToken.getLeastSignificantBits());
+        buffer.putDouble(origin == null ? Double.NaN : origin.latitude);
+        buffer.putDouble(origin == null ? Double.NaN : origin.longitude);
 
         for (int playerID = 1; playerID <= PLAYER_CAPACITY; playerID++) {
             PlayerState state = players != null && playerID < players.length
                     ? players[playerID] : null;
             int flags = state == null ? 0 : state.flags | FLAG_PRESENT;
+            GpsOffset.Position position = state == null || origin == null
+                    || (flags & FLAG_GPS_VALID) == 0 ? null : origin.encode(state.latitude, state.longitude);
+            if (position == null) flags &= ~FLAG_GPS_VALID;
             buffer.put((byte) flags);
             buffer.put((byte) playerID);
             buffer.put((byte) (state == null ? 0 : state.gameState));
@@ -93,8 +104,8 @@ final class PeerStatePacket {
             buffer.putShort((short) clampUnsignedShort(state == null ? 0 : state.shield));
             buffer.putShort((short) clampUnsignedShort(state == null ? 0 : state.shotsRemaining));
             buffer.putShort((short) clampUnsignedShort(state == null ? 0 : state.gpsAgeSeconds));
-            buffer.putInt(state == null ? 0 : encodeCoordinate(state.latitude));
-            buffer.putInt(state == null ? 0 : encodeCoordinate(state.longitude));
+            buffer.putShort((short) (position == null ? 0 : position.north));
+            buffer.putShort((short) (position == null ? 0 : position.east));
             buffer.put((byte) (state == null ? 0 : state.generation));
             buffer.put((byte) (state == null ? 0 : state.targetGeneration));
         }
@@ -113,6 +124,11 @@ final class PeerStatePacket {
         int gameMode = unsigned(buffer.get());
         long snapshotSequence = buffer.getLong();
         UUID roundToken = new UUID(buffer.getLong(), buffer.getLong());
+        double originLatitude = buffer.getDouble();
+        double originLongitude = buffer.getDouble();
+        GpsOffset origin = GpsOffset.create(originLatitude, originLongitude);
+        if (origin == null && !(Double.isNaN(originLatitude) && Double.isNaN(originLongitude)))
+            return null;
         if (senderID < 0 || senderID > PLAYER_CAPACITY || snapshotSequence <= 0
                 || !Globals.isValidGameMode(gameMode))
             return null;
@@ -135,8 +151,12 @@ final class PeerStatePacket {
             int shield = unsigned(buffer.getShort());
             int shotsRemaining = unsigned(buffer.getShort());
             int gpsAgeSeconds = unsigned(buffer.getShort());
-            double latitude = decodeCoordinate(buffer.getInt());
-            double longitude = decodeCoordinate(buffer.getInt());
+            int north = buffer.getShort();
+            int east = buffer.getShort();
+            double[] position = (flags & FLAG_GPS_VALID) == 0 || origin == null
+                    ? null : origin.decode(north, east);
+            double latitude = position == null ? Double.NaN : position[0];
+            double longitude = position == null ? Double.NaN : position[1];
             int generation = unsigned(buffer.get());
             int targetGeneration = unsigned(buffer.get());
 
@@ -160,23 +180,13 @@ final class PeerStatePacket {
                     shotsRemaining, gpsAgeSeconds, latitude, longitude,
                     carriedFlagTeam, ctfCaptures).withGeneration(generation, targetGeneration);
         }
-        return new Decoded(networkVersion, roundToken, snapshotSequence, senderID, gameMode, players);
+        return new Decoded(networkVersion, roundToken, snapshotSequence, senderID, gameMode, players, origin);
     }
 
     static boolean looksLikePeerState(byte[] payload, int offset, int length) {
         if (payload == null || length < 4 || offset < 0 || offset > payload.length - length)
             return false;
         return ByteBuffer.wrap(payload, offset, 4).order(ByteOrder.BIG_ENDIAN).getInt() == MAGIC;
-    }
-
-    static int encodeCoordinate(double coordinate) {
-        if (Double.isNaN(coordinate) || Double.isInfinite(coordinate))
-            return 0;
-        return (int) Math.round(coordinate * GPS_SCALE);
-    }
-
-    static double decodeCoordinate(int coordinate) {
-        return coordinate / GPS_SCALE;
     }
 
     private static int clampUnsignedShort(int value) {
@@ -202,15 +212,17 @@ final class PeerStatePacket {
         final int senderID;
         final int gameMode;
         final PlayerState[] players;
+        final GpsOffset origin;
 
         Decoded(int networkVersion, UUID roundToken, long snapshotSequence, int senderID,
-                int gameMode, PlayerState[] players) {
+                int gameMode, PlayerState[] players, GpsOffset origin) {
             this.networkVersion = networkVersion;
             this.roundToken = roundToken;
             this.snapshotSequence = snapshotSequence;
             this.senderID = senderID;
             this.gameMode = gameMode;
             this.players = players;
+            this.origin = origin;
         }
     }
 

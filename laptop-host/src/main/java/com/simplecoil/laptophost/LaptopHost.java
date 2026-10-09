@@ -17,6 +17,9 @@
 package com.simplecoil.laptophost;
 
 import com.simplecoil.protocol.RoundRoster;
+import com.simplecoil.protocol.GpsOffset;
+import com.simplecoil.protocol.GameStartCountdown;
+import com.simplecoil.protocol.Powerups;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -75,7 +78,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * of the combat path means it remains useful with a full 32-player game.</p>
  */
 public final class LaptopHost {
-    private static final int NETWORK_VERSION = 28;
+    private static final int NETWORK_VERSION = 30;
     private static final String MESSAGE_PREFIX = "SimpleCoil:";
     private static final String TCP_PREFIX = MESSAGE_PREFIX + NETWORK_VERSION;
     private static final String TCP_JSON_PREFIX = TCP_PREFIX + "JSON";
@@ -86,12 +89,13 @@ public final class LaptopHost {
     // selects the lowest-delay measurement and rejects RTTs above 80 ms, which
     // bounds its network timing uncertainty to less than 50 ms.
     private static final int CLOCK_SAMPLES_REQUIRED = 12;
+    private static final int ROSTER_UTF_BUDGET = 60_000;
 
     private static final int MAX_PLAYERS = 32;
-    private static final int STATE_PACKET_BYTES = 32 + MAX_PLAYERS * 42;
+    private static final int STATE_PACKET_BYTES = 48 + MAX_PLAYERS * 38;
     private static final int UDP_RECEIVE_BYTES = 1_472;
     private static final int STATE_PACKET_MAGIC = 0x53434F49;
-    private static final int STATE_PACKET_FORMAT = 3;
+    private static final int STATE_PACKET_FORMAT = 4;
     private static final int COMBAT_PACKET_BYTES = 32;
     private static final int COMBAT_PACKET_MAGIC = 0x53434F43;
     private static final int COMBAT_PACKET_FORMAT = 2;
@@ -101,6 +105,7 @@ public final class LaptopHost {
     private static final long GPS_PUBLISH_INTERVAL_MS = 250;
     private static final int GPS_FULL_UPDATE_EVERY_TICKS = 20;
     private static final long GPS_STALE_AFTER_MS = 15_000;
+    private static final long GPS_MAX_REPORTED_FIX_AGE_MS = 30_000;
     private static final long GPS_CLOCK_MAX_AGE_MS = 60_000;
     private static final long EARLIEST_GPS_UTC_MS = 1_577_836_800_000L; // 2020-01-01
     private static final long HIT_ENEMY_GPS_REVEAL_MS = 10_000;
@@ -136,6 +141,7 @@ public final class LaptopHost {
     private final Object stateLock = new Object();
     private final Map<Integer, Player> players = new LinkedHashMap<>();
     private RoundRoster roundRoster;
+    private final Powerups.Authority powerupAuthority = new Powerups.Authority();
     private volatile Map<Integer, Integer> balancedTeams = Collections.emptyMap();
     private final Set<Integer> balancedCheckedIn = new HashSet<>();
     // Relative to clockOriginNanos; zero when no QR lobby is waiting.
@@ -147,6 +153,7 @@ public final class LaptopHost {
     private final Deque<LaserEvent> lasers = new ArrayDeque<>();
     private final Deque<GrenadeBurst> grenadeBursts = new ArrayDeque<>();
     private final StateRow[] gossipState = new StateRow[MAX_PLAYERS + 1];
+    private final long[] gossipStateReceivedAt = new long[MAX_PLAYERS + 1];
     private final long[] lastGossipPacketSequence = new long[MAX_PLAYERS + 1];
     // A compact combat event can beat its sender's first full state row to the
     // laptop. Retain only the latest fixed-width event per player so the next
@@ -156,6 +163,7 @@ public final class LaptopHost {
     private final int[] observedCombatTarget = new int[MAX_PLAYERS + 1];
     private final int[] observedCombatTargetGeneration = new int[MAX_PLAYERS + 1];
     private long authorityTickSequence;
+    private volatile GpsOffset gpsOffset;
     private long endVotes;
     private boolean endVoteRequested;
     // Recipient player ID -> the enemy player IDs that a confirmed IR hit may
@@ -531,6 +539,12 @@ public final class LaptopHost {
             lastGossipPacketSequence[decoded.senderID] = decoded.packetSequence;
             StateRow current = gossipState[decoded.senderID];
             if (current == null || owned.ownerSequence > current.ownerSequence) {
+                // The TCP lobby owns the fixed origin. A delayed or inconsistent
+                // GPS header must not move a marker, but its combat counters can
+                // still repair phones that missed the sender's earlier state.
+                if ((owned.flags & StatePacket.FLAG_GPS_VALID) != 0
+                        && (gpsOffset == null || !gpsOffset.sameOrigin(decoded.origin)))
+                    owned = owned.withoutGps();
                 if (config.infection && current != null
                         && (current.flags & StatePacket.FLAG_INFECTED) != 0
                         && (owned.flags & StatePacket.FLAG_INFECTED) == 0)
@@ -543,6 +557,7 @@ public final class LaptopHost {
                 }
                 gossipState[decoded.senderID] = mergeObservedCombatLocked(
                         decoded.senderID, owned);
+                gossipStateReceivedAt[decoded.senderID] = elapsedMillis();
                 if (roundRoster != null) roundRoster.update(decoded.senderID, owned.generation,
                         player.kills, player.deaths, owned.ctfCaptures,
                         (owned.flags & StatePacket.FLAG_INFECTED) != 0);
@@ -603,8 +618,18 @@ public final class LaptopHost {
             }
             if (authorityTickSequence >= 0xffffffffL)
                 return;
+            long now = elapsedMillis();
+            StateRow[] snapshot = gossipState.clone();
+            for (int playerID = 1; playerID <= MAX_PLAYERS; playerID++) {
+                StateRow row = snapshot[playerID];
+                if (row != null && (row.flags & StatePacket.FLAG_GPS_VALID) != 0) {
+                    long elapsedSeconds = Math.max(0, now - gossipStateReceivedAt[playerID]) / 1_000;
+                    snapshot[playerID] = row.withGpsAge((int) Math.min(0xffff,
+                            row.gpsAgeSeconds + elapsedSeconds));
+                }
+            }
             payload = StatePacket.encode(NETWORK_VERSION, token, ++authorityTickSequence,
-                    config.gameMode.wireValue, gossipState);
+                    config.gameMode.wireValue, snapshot, gpsOffset);
             // Broadcast lets every nearby phone hear the same tick. Targeted
             // copies retain normal Wi-Fi unicast acknowledgements and make a
             // congested access point's broadcast loss much less noticeable.
@@ -709,6 +734,10 @@ public final class LaptopHost {
     }
 
     private void handleJson(ClientConnection client, Map<String, Object> json) {
+        if (json.containsKey("powerupscan")) {
+            handlePowerupScan(client, json);
+            return;
+        }
         if (json.containsKey("endvote")) {
             if (json.get("endvote") instanceof Boolean && json.get("roundtoken") instanceof String)
                 requestEndVote(client, (String) json.get("roundtoken"), (Boolean) json.get("endvote"));
@@ -728,7 +757,7 @@ public final class LaptopHost {
             handleClockSync(client, json);
             return;
         }
-        if (json.containsKey("gpslongitude")) {
+        if (json.containsKey("gpslongitude") || json.containsKey("gpsn") || json.containsKey("gpse")) {
             handleGps(client, json);
             return;
         }
@@ -762,7 +791,9 @@ public final class LaptopHost {
             if (sentAt < 0 || sentAt > CLOCK_MAX_VALUE || client.playerID <= 0)
                 return;
             long received = elapsedMillis();
+            if (json.containsKey("gpslongitude")) handleGps(client, json);
             Map<String, Object> reply = new LinkedHashMap<>();
+            reply.put("gpsoffset", gpsOriginMap(gpsOffset));
             reply.put("clocksync", sentAt);
             reply.put("clockreceive", received);
             reply.put("clocksend", elapsedMillis());
@@ -783,21 +814,184 @@ public final class LaptopHost {
         }
     }
 
+    private void handlePowerupScan(ClientConnection client, Map<String, Object> json) {
+        List<String> frames = new ArrayList<>();
+        List<ClientConnection> recipients;
+        synchronized (stateLock) {
+            updateRoundStateLocked();
+            Player source = playerForClientLocked(client);
+            int mask = intValue(json.get("powerupscan"), -1);
+            int life = intValue(json.get("poweruplife"), -1);
+            if (roundState != RoundState.RUNNING || roundToken == null
+                    || !roundToken.equals(json.get("roundtoken"))
+                    || config.powerupQrRequired < Powerups.MIN_REQUIRED
+                    || config.powerupQrRequired > Powerups.MAX_REQUIRED
+                    || source == null || !powerupPlayerAliveLocked(source)
+                    || mask < 1 || mask > 255 || life != powerupPlayerLifeLocked(source))
+                return;
+            Map<Integer, Integer> teams = new HashMap<>();
+            Map<Integer, Integer> scores = new HashMap<>();
+            Set<Integer> alive = new HashSet<>();
+            refreshPowerupLivesLocked();
+            if (config.gameMode != GameMode.FFA)
+                for (int team = 1; team <= config.gameMode.wireValue; team++)
+                    scores.put(team, powerupTeamScoreLocked(team));
+            for (Player player : players.values()) {
+                if (player.benched()) continue;
+                if (config.gameMode == GameMode.FFA) scores.put(player.id, player.kills);
+                if (!player.connected) continue;
+                int team = config.gameMode == GameMode.FFA ? 0 : teamFor(player.id);
+                teams.put(player.id, team);
+                if (powerupPlayerAliveLocked(player)) alive.add(player.id);
+            }
+            long now = elapsedMillis();
+            int ownTeam = config.gameMode == GameMode.FFA ? 0 : teamFor(source.id);
+            int ownScoreKey = ownTeam == 0 ? source.id : ownTeam;
+            int bestEnemyScore = 0;
+            for (Map.Entry<Integer, Integer> score : scores.entrySet())
+                if (score.getKey() != ownScoreKey) bestEnemyScore = Math.max(bestEnemyScore, score.getValue());
+            int required = Powerups.effectiveRequired(config.powerupQrRequired,
+                    scores.getOrDefault(ownScoreKey, 0), bestEnemyScore);
+            List<Powerups.Grant> grants = new ArrayList<>();
+            // A reconnect may report several newly scanned codes at once.
+            // At most four two-code rewards can be earned from an eight-bit set.
+            for (int count = 0; count < 4; count++) {
+                Powerups.Grant grant = powerupAuthority.request(source.id, life, mask,
+                        required, ownTeam, teams, scores, alive, now, balanceRandom);
+                if (grant == null) break;
+                grants.add(grant);
+            }
+            Map<String, Object> snapshot = new LinkedHashMap<>();
+            putPowerupSnapshotLocked(snapshot, now);
+            snapshot.put("roundtoken", roundToken);
+            if (grants.isEmpty()) frames.add(jsonFrame(snapshot));
+            for (Powerups.Grant grant : grants) {
+                Map<String, Object> payload = new LinkedHashMap<>(snapshot);
+                payload.put("powerupgrant", powerupGrantMap(grant));
+                frames.add(jsonFrame(payload));
+            }
+            recipients = connectedClientsLocked();
+        }
+        // All phones need attacker buff records, even if they are not a target.
+        for (String frame : frames)
+            for (ClientConnection recipient : recipients) recipient.send(frame);
+    }
+
+    /** Caller holds stateLock. A request cannot advance its own life counter. */
+    private int powerupPlayerLifeLocked(Player player) {
+        StateRow row = gossipState[player.id];
+        return Math.max(player.deaths, row == null ? 0 : row.deaths);
+    }
+
+    /** Caller holds stateLock. Source-owned health repairs delayed death reports. */
+    private boolean powerupPlayerAliveLocked(Player player) {
+        if (!player.connected || player.benched() || player.awaitingRespawn || player.eliminated)
+            return false;
+        StateRow row = gossipState[player.id];
+        return row == null || (row.flags & StatePacket.FLAG_LEFT) == 0
+                && row.gameState == 1 && row.health > 0;
+    }
+
+    /** Caller holds stateLock. Keep each grant's original source and target lives. */
+    private void refreshPowerupLivesLocked() {
+        for (Player player : players.values())
+            powerupAuthority.setPlayerLife(player.id, powerupPlayerLifeLocked(player));
+    }
+
+    /** Caller holds stateLock. Use the current game's objective, not prior-round skill. */
+    private int powerupTeamScoreLocked(int team) {
+        if (!config.captureTheFlag) return teamKillsLocked(team);
+        long total = roundRoster == null ? 0 : roundRoster.archivedScore(team, true);
+        for (Player player : players.values()) {
+            StateRow row = gossipState[player.id];
+            if (teamFor(player.id) == team && row != null) total += row.ctfCaptures;
+        }
+        return (int) Math.min(Integer.MAX_VALUE, total);
+    }
+
+    private static Map<String, Object> powerupGrantMap(Powerups.Grant grant) {
+        return mapOf("id", grant.id, "source", grant.source, "sourcelife", grant.sourceLife,
+                "kind", grant.kind, "recipients", Powerups.encodeRecipients(grant), "expires", grant.expiresAt,
+                "cost", grant.scanCost);
+    }
+
+    /** Caller holds stateLock. Expiry is absolute in the clock accompanying this snapshot. */
+    private void putPowerupSnapshotLocked(Map<String, Object> game, long now) {
+        refreshPowerupLivesLocked();
+        Powerups.Snapshot snapshot = powerupAuthority.snapshot(now);
+        List<Object> grants = new ArrayList<>();
+        List<Object> scanned = new ArrayList<>();
+        for (Powerups.Grant grant : snapshot.grants) grants.add(powerupGrantMap(grant));
+        for (Powerups.ScanState player : snapshot.players)
+            scanned.add(mapOf("id", player.player, "life", player.life, "mask", player.mask,
+                    "earned", player.earned, "required", player.required, "spent", player.spent));
+        game.put("powerupgrants", grants);
+        game.put("powerupclock", snapshot.capturedAt);
+        game.put("powerupstate", mapOf("nextid", snapshot.nextId, "players", scanned));
+    }
+
+    private static Map<String, Object> gpsOriginMap(GpsOffset origin) {
+        return origin == null ? null : mapOf("gpslatitude", origin.latitude,
+                "gpslongitude", origin.longitude);
+    }
+
+    private static GpsOffset readGpsOrigin(Object value) {
+        if (!(value instanceof Map)) return null;
+        Map<String, Object> map = castObject(value);
+        return GpsOffset.create(doubleValue(map.get("gpslatitude"), Double.NaN),
+                doubleValue(map.get("gpslongitude"), Double.NaN));
+    }
+
+    private static void putGpsPosition(Map<String, Object> update, GpsOffset origin,
+                                       double latitude, double longitude) {
+        GpsOffset.Position position = origin == null ? null : origin.encode(latitude, longitude);
+        if (position == null) {
+            update.put("gpslatitude", latitude);
+            update.put("gpslongitude", longitude);
+        } else {
+            update.put("gpsn", position.north);
+            update.put("gpse", position.east);
+        }
+    }
+
     private void handleGps(ClientConnection client, Map<String, Object> json) {
-        double longitude = doubleValue(json.get("gpslongitude"), Double.NaN);
-        double latitude = doubleValue(json.get("gpslatitude"), Double.NaN);
-        if (!validCoordinates(longitude, latitude))
-            return;
+        boolean originChosen = false;
         synchronized (stateLock) {
             Player player = playerForClientLocked(client);
-            if (player == null)
-                return;
+            if (player == null || player.benched()) return;
+            int ageMs = json.containsKey("gpsage") ? intValue(json.get("gpsage"), -1) : 0;
+            if (ageMs < 0 || ageMs > GPS_MAX_REPORTED_FIX_AGE_MS) return;
+            double longitude, latitude;
+            if (json.containsKey("gpsn") || json.containsKey("gpse")) {
+                if (gpsOffset == null || !gpsOffset.sameOrigin(readGpsOrigin(json.get("gpsoffset"))))
+                    return;
+                double n = doubleValue(json.get("gpsn"), Double.NaN);
+                double e = doubleValue(json.get("gpse"), Double.NaN);
+                if (!Double.isFinite(n) || !Double.isFinite(e) || n != Math.rint(n) || e != Math.rint(e)
+                        || n < Short.MIN_VALUE || n > Short.MAX_VALUE
+                        || e < Short.MIN_VALUE || e > Short.MAX_VALUE) return;
+                double[] position = gpsOffset.decode((int) n, (int) e);
+                if (position == null) return;
+                latitude = position[0];
+                longitude = position[1];
+            } else {
+                longitude = doubleValue(json.get("gpslongitude"), Double.NaN);
+                latitude = doubleValue(json.get("gpslatitude"), Double.NaN);
+            }
+            if (!validCoordinates(longitude, latitude)) return;
+            if (gpsOffset == null) {
+                gpsOffset = GpsOffset.create(latitude, longitude);
+                originChosen = true;
+            }
             player.longitude = longitude;
             player.latitude = latitude;
-            player.lastGpsAt = elapsedMillis();
+            // A valid phone fix can predate this host process. Negative sample
+            // times are real ages, so reserve a separate unset sentinel.
+            player.lastGpsAt = elapsedMillis() - ageMs;
             player.gpsDirty = true;
             player.addTrail(longitude, latitude, player.lastGpsAt);
         }
+        if (originChosen) broadcastRoster();
     }
 
     private void handleCombatTelemetry(ClientConnection client, Map<String, Object> json) {
@@ -955,6 +1149,8 @@ public final class LaptopHost {
                 requestedID = joined.id;
                 Player old = players.get(requestedID);
                 if (old != null && old.connection != null) replaced = old.connection;
+                if (old == null || !old.identity.equals(identity))
+                    powerupAuthority.resetPlayer(requestedID);
                 players.remove(requestedID);
                 activeClients.remove(requestedID);
                 gossipState[requestedID] = new StateRow(1 | (joined.infected ? 8 : 0), 1, 0,
@@ -1228,6 +1424,7 @@ public final class LaptopHost {
             grenadeBursts.clear();
             roundToken = UUID.randomUUID().toString();
             roundRoster = new RoundRoster(roundToken);
+            powerupAuthority.resetRound();
             for (ClientConnection client : recipients) {
                 Player player = players.get(client.playerID);
                 RoundRoster.Member member = new RoundRoster.Member(player.identity, player.id,
@@ -1241,12 +1438,14 @@ public final class LaptopHost {
             authorityTickSequence = 0;
             for (int playerID = 0; playerID <= MAX_PLAYERS; playerID++) {
                 gossipState[playerID] = null;
+                gossipStateReceivedAt[playerID] = 0;
                 lastGossipPacketSequence[playerID] = 0;
                 observedCombatSequence[playerID] = 0;
                 observedCombatType[playerID] = 0;
                 observedCombatTarget[playerID] = 0;
             }
-            roundStartAt = elapsedMillis() + (config.balanced ? 10 : config.startDelaySeconds) * 1_000L;
+            roundStartAt = elapsedMillis() + (config.balanced ? GameStartCountdown.DURATION_MS
+                    : config.startDelaySeconds * 1_000L);
             roundDuration = config.durationMinutes * 60_000L;
             roundEndAt = roundDuration == 0 ? 0 : roundStartAt + roundDuration;
             roundState = RoundState.COUNTDOWN;
@@ -1610,9 +1809,11 @@ public final class LaptopHost {
             expireEnemyGpsRevealsLocked(now);
             for (Player player : players.values()) {
                 if (!player.connected || player.benched() || !validCoordinates(player.longitude, player.latitude)
+                        || player.lastGpsAt == Long.MIN_VALUE
                         || now - player.lastGpsAt > GPS_STALE_AFTER_MS)
                     continue;
-                Position position = new Position(player.id, teamFor(player.id), player.longitude, player.latitude);
+                Position position = new Position(player.id, teamFor(player.id), player.longitude,
+                        player.latitude, player.lastGpsAt);
                 fullSnapshot.add(position);
                 if (player.gpsDirty || fullUpdate)
                     changedPositions.add(position);
@@ -1623,6 +1824,7 @@ public final class LaptopHost {
                 return;
             recipients = connectedClientsLocked();
         }
+        GpsOffset origin = gpsOffset;
         for (ClientConnection client : recipients) {
             int recipientTeam = teamFor(client.playerID);
             final Set<Integer> revealedEnemies;
@@ -1635,20 +1837,23 @@ public final class LaptopHost {
             List<Position> source = recipientFullUpdate ? fullSnapshot : changedPositions;
             List<Object> updates = new ArrayList<>();
             for (Position position : source) {
+                long ageMs = elapsedMillis() - position.fixAt;
+                if (ageMs < 0 || ageMs > GPS_STALE_AFTER_MS) continue;
                 if (config.gpsMode == GpsMode.TEAMMATE && config.gameMode != GameMode.FFA
                         && position.team != recipientTeam && !revealedEnemies.contains(position.playerID))
                     continue;
                 Map<String, Object> update = new LinkedHashMap<>();
                 update.put("playerID", position.playerID);
                 update.put("team", position.team);
-                update.put("gpslongitude", position.longitude);
-                update.put("gpslatitude", position.latitude);
+                putGpsPosition(update, origin, position.latitude, position.longitude);
+                update.put("gpsage", ageMs);
                 updates.add(update);
             }
             if (updates.isEmpty() && !recipientFullUpdate)
                 continue;
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("gpsupdate", updates);
+            payload.put("gpsoffset", gpsOriginMap(origin));
             if (recipientFullUpdate)
                 payload.put("gpsfullupdate", true);
             client.send(jsonFrame(payload));
@@ -1657,7 +1862,7 @@ public final class LaptopHost {
 
     private void broadcastRoster() {
         for (ClientConnection client : connectedClients())
-            client.send(rosterFrame(client.playerID));
+            for (String frame : rosterFrames(client.playerID)) client.send(frame);
     }
 
     private void broadcastSettings() {
@@ -1678,7 +1883,7 @@ public final class LaptopHost {
             client.send(frame);
     }
 
-    private String rosterFrame(int targetPlayerID) {
+    private List<String> rosterFrames(int targetPlayerID) {
         synchronized (stateLock) {
             updateRoundStateLocked();
             rememberRoundStatsLocked();
@@ -1711,6 +1916,7 @@ public final class LaptopHost {
 
             Map<String, Object> game = new LinkedHashMap<>();
             game.put("players", roster);
+            game.put("gpsoffset", gpsOriginMap(gpsOffset));
             game.put("lobbyplaying", isRoundActiveLocked());
             game.put("hostkind", "L");
             game.put("hostage", Math.min(365L * 24 * 60 * 60 * 1000, elapsedMillis()));
@@ -1733,6 +1939,7 @@ public final class LaptopHost {
             game.put("onlyserversettings", config.onlyServerSettings || config.tournament);
             game.put("tournamentmode", config.tournament);
             if (isRoundActiveLocked()) {
+                putPowerupSnapshotLocked(game, elapsedMillis());
                 if (roundRoster != null) game.put("roundroster", roundRoster.encode());
                 game.put("roundid", roundID);
                 game.put("roundtoken", roundToken);
@@ -1752,8 +1959,26 @@ public final class LaptopHost {
                     update.put("timeremaining", secondsRemainingLocked());
                 game.put("playergameupdate", update);
             }
-            return jsonFrame(game);
+            String frame = jsonFrame(game);
+            if (!game.containsKey("powerupstate") || modifiedUtfBytes(frame) <= ROSTER_UTF_BUDGET)
+                return Collections.singletonList(frame);
+            // Archived round history and many team-wide grants can together
+            // exceed writeUTF's 65,535-byte framing limit. Preserve the exact
+            // snapshot clock/expiry, but send it separately after the roster.
+            Map<String, Object> snapshot = mapOf("powerupgrants", game.remove("powerupgrants"),
+                    "powerupstate", game.remove("powerupstate"), "powerupclock", game.remove("powerupclock"),
+                    "roundtoken", roundToken);
+            return List.of(jsonFrame(game), jsonFrame(snapshot));
         }
+    }
+
+    private static int modifiedUtfBytes(String value) {
+        int bytes = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            bytes += character >= 1 && character <= 0x7f ? 1 : character <= 0x7ff ? 2 : 3;
+        }
+        return bytes;
     }
 
     private String settingsFrame() {
@@ -1865,8 +2090,17 @@ public final class LaptopHost {
         // Store a position snapshot with the event. Rendering against a
         // player's later live marker makes a verified hit line appear to bend
         // toward movement that happened after the shot.
+        boolean shooterFresh = shooter.lastGpsAt != Long.MIN_VALUE
+                && now - shooter.lastGpsAt <= GPS_STALE_AFTER_MS
+                && validCoordinates(shooter.longitude, shooter.latitude);
+        boolean targetFresh = target.lastGpsAt != Long.MIN_VALUE
+                && now - target.lastGpsAt <= GPS_STALE_AFTER_MS
+                && validCoordinates(target.longitude, target.latitude);
         lasers.addLast(new LaserEvent(shooter.id, target.id, kind, now,
-                shooter.longitude, shooter.latitude, target.longitude, target.latitude));
+                shooterFresh ? shooter.longitude : Double.NaN,
+                shooterFresh ? shooter.latitude : Double.NaN,
+                targetFresh ? target.longitude : Double.NaN,
+                targetFresh ? target.latitude : Double.NaN));
         while (lasers.size() > 100)
             lasers.removeFirst();
     }
@@ -1893,7 +2127,8 @@ public final class LaptopHost {
         // the hit by too long cannot be used to estimate the grenade's center.
         if (burst.hits.containsKey(target.id))
             return false;
-        boolean fresh = target.lastGpsAt > 0 && now - target.lastGpsAt <= GPS_STALE_AFTER_MS
+        boolean fresh = target.lastGpsAt != Long.MIN_VALUE
+                && now - target.lastGpsAt <= GPS_STALE_AFTER_MS
                 && validCoordinates(target.longitude, target.latitude);
         burst.hits.put(target.id, new GrenadeHit(target.id,
                 fresh ? target.longitude : Double.NaN,
@@ -1947,6 +2182,8 @@ public final class LaptopHost {
     }
 
     private void resetForNewLobbyLocked() {
+        powerupAuthority.resetRound();
+        gpsOffset = null;
         players.clear();
         activeClients.clear();
         pendingAssignments.clear();
@@ -1970,6 +2207,7 @@ public final class LaptopHost {
         authorityTickSequence = 0;
         for (int playerID = 0; playerID <= MAX_PLAYERS; playerID++) {
             gossipState[playerID] = null;
+            gossipStateReceivedAt[playerID] = 0;
             lastGossipPacketSequence[playerID] = 0;
             observedCombatSequence[playerID] = 0;
             observedCombatType[playerID] = 0;
@@ -2080,12 +2318,7 @@ public final class LaptopHost {
     }
 
     private static boolean validCoordinates(double longitude, double latitude) {
-        // Match the Android app's policy: (0, 0), a zero latitude, or a zero
-        // longitude is an unusable GPS fix for a real game field.
-        return Double.isFinite(longitude) && Double.isFinite(latitude)
-                && longitude != 0.0 && latitude != 0.0
-                && longitude >= -180.0 && longitude <= 180.0
-                && latitude >= -90.0 && latitude <= 90.0;
+        return GpsOffset.validCoordinates(longitude, latitude);
     }
 
     private static boolean validRoundToken(String token) {
@@ -2268,12 +2501,14 @@ public final class LaptopHost {
         final int team;
         final double longitude;
         final double latitude;
+        final long fixAt;
 
-        Position(int playerID, int team, double longitude, double latitude) {
+        Position(int playerID, int team, double longitude, double latitude, long fixAt) {
             this.playerID = playerID;
             this.team = team;
             this.longitude = longitude;
             this.latitude = latitude;
+            this.fixAt = fixAt;
         }
     }
 
@@ -2347,7 +2582,7 @@ public final class LaptopHost {
         Settings settings;
         double longitude = Double.NaN;
         double latitude = Double.NaN;
-        long lastGpsAt;
+        long lastGpsAt = Long.MIN_VALUE;
         long lastGrenadeHitAt;
         int lastGrenadeOwnerID;
         boolean gpsDirty;
@@ -2395,15 +2630,17 @@ public final class LaptopHost {
         final int senderID;
         final int gameMode;
         final StateRow[] rows;
+        final GpsOffset origin;
 
         StatePacket(int networkVersion, UUID roundToken, long packetSequence, int senderID,
-                    int gameMode, StateRow[] rows) {
+                    int gameMode, StateRow[] rows, GpsOffset origin) {
             this.networkVersion = networkVersion;
             this.roundToken = roundToken;
             this.packetSequence = packetSequence;
             this.senderID = senderID;
             this.gameMode = gameMode;
             this.rows = rows;
+            this.origin = origin;
         }
 
         static boolean looksLike(byte[] payload, int offset, int length) {
@@ -2426,6 +2663,11 @@ public final class LaptopHost {
             int gameMode = u8(buffer.get());
             long packetSequence = buffer.getLong();
             UUID token = new UUID(buffer.getLong(), buffer.getLong());
+            double originLatitude = buffer.getDouble();
+            double originLongitude = buffer.getDouble();
+            GpsOffset origin = GpsOffset.create(originLatitude, originLongitude);
+            if (origin == null && !(Double.isNaN(originLatitude) && Double.isNaN(originLongitude)))
+                return null;
             if (senderID < 0 || senderID > MAX_PLAYERS || packetSequence <= 0
                     || gameMode != 1 && gameMode != 2 && gameMode != 4)
                 return null;
@@ -2447,8 +2689,12 @@ public final class LaptopHost {
                 int shield = u16(buffer.getShort());
                 int shotsRemaining = u16(buffer.getShort());
                 int gpsAgeSeconds = u16(buffer.getShort());
-                int latitude = buffer.getInt();
-                int longitude = buffer.getInt();
+                int north = buffer.getShort();
+                int east = buffer.getShort();
+                double[] position = (flags & FLAG_GPS_VALID) == 0 || origin == null
+                        ? null : origin.decode(north, east);
+                double latitude = position == null ? Double.NaN : position[0];
+                double longitude = position == null ? Double.NaN : position[1];
                 int generation = u8(buffer.get());
                 int targetGeneration = u8(buffer.get());
                 if (playerID != slot)
@@ -2463,18 +2709,18 @@ public final class LaptopHost {
                         || deaths > MAX_SCOREBOARD_VALUE)
                     return null;
                 if ((flags & FLAG_GPS_VALID) != 0
-                        && !validCoordinates(longitude / 100_000.0, latitude / 100_000.0))
+                        && !validCoordinates(longitude, latitude))
                     return null;
                 rows[playerID] = new StateRow(flags, ownerSequence, eventSequence, gameState,
                         grenadeID, eventType, eventTargetID, score, deaths, health, shield,
                         shotsRemaining, gpsAgeSeconds, latitude, longitude,
                         carriedFlagTeam, ctfCaptures).withGeneration(generation, targetGeneration);
             }
-            return new StatePacket(networkVersion, token, packetSequence, senderID, gameMode, rows);
+            return new StatePacket(networkVersion, token, packetSequence, senderID, gameMode, rows, origin);
         }
 
         static byte[] encode(int networkVersion, UUID token, long sequence, int gameMode,
-                             StateRow[] rows) {
+                             StateRow[] rows, GpsOffset origin) {
             ByteBuffer buffer = ByteBuffer.allocate(STATE_PACKET_BYTES).order(ByteOrder.BIG_ENDIAN);
             buffer.putInt(STATE_PACKET_MAGIC);
             buffer.put((byte) STATE_PACKET_FORMAT);
@@ -2484,9 +2730,15 @@ public final class LaptopHost {
             buffer.putLong(sequence);
             buffer.putLong(token.getMostSignificantBits());
             buffer.putLong(token.getLeastSignificantBits());
+            buffer.putDouble(origin == null ? Double.NaN : origin.latitude);
+            buffer.putDouble(origin == null ? Double.NaN : origin.longitude);
             for (int playerID = 1; playerID <= MAX_PLAYERS; playerID++) {
                 StateRow row = rows == null ? null : rows[playerID];
-                buffer.put((byte) (row == null ? 0 : row.flags | FLAG_PRESENT));
+                int flags = row == null ? 0 : row.flags | FLAG_PRESENT;
+                GpsOffset.Position position = row == null || origin == null
+                        || (flags & FLAG_GPS_VALID) == 0 ? null : origin.encode(row.latitude, row.longitude);
+                if (position == null) flags &= ~FLAG_GPS_VALID;
+                buffer.put((byte) flags);
                 buffer.put((byte) playerID);
                 buffer.put((byte) (row == null ? 0 : row.gameState));
                 buffer.put((byte) (row == null ? 0 : row.grenadeID));
@@ -2502,8 +2754,8 @@ public final class LaptopHost {
                 buffer.putShort((short) clamp16(row == null ? 0 : row.shield));
                 buffer.putShort((short) clamp16(row == null ? 0 : row.shotsRemaining));
                 buffer.putShort((short) clamp16(row == null ? 0 : row.gpsAgeSeconds));
-                buffer.putInt(row == null ? 0 : row.latitude);
-                buffer.putInt(row == null ? 0 : row.longitude);
+                buffer.putShort((short) (position == null ? 0 : position.north));
+                buffer.putShort((short) (position == null ? 0 : position.east));
                 buffer.put((byte) (row == null ? 0 : row.generation));
                 buffer.put((byte) (row == null ? 0 : row.targetGeneration));
             }
@@ -2530,15 +2782,15 @@ public final class LaptopHost {
         final int shield;
         final int shotsRemaining;
         final int gpsAgeSeconds;
-        final int latitude;
-        final int longitude;
+        final double latitude;
+        final double longitude;
         final int carriedFlagTeam;
         final int ctfCaptures;
         int generation, targetGeneration;
 
         StateRow(int flags, long ownerSequence, long eventSequence, int gameState, int grenadeID,
                  int eventType, int eventTargetID, int score, int deaths, int health, int shield,
-                 int shotsRemaining, int gpsAgeSeconds, int latitude, int longitude,
+                 int shotsRemaining, int gpsAgeSeconds, double latitude, double longitude,
                  int carriedFlagTeam, int ctfCaptures) {
             this.flags = flags;
             this.ownerSequence = ownerSequence;
@@ -2563,6 +2815,20 @@ public final class LaptopHost {
             return new StateRow(replacementFlags, ownerSequence, eventSequence, gameState,
                     grenadeID, eventType, eventTargetID, score, deaths, health, shield,
                     shotsRemaining, gpsAgeSeconds, latitude, longitude,
+                    carriedFlagTeam, ctfCaptures).withGeneration(generation, targetGeneration);
+        }
+
+        StateRow withoutGps() {
+            return new StateRow(flags & ~StatePacket.FLAG_GPS_VALID, ownerSequence, eventSequence,
+                    gameState, grenadeID, eventType, eventTargetID, score, deaths, health, shield,
+                    shotsRemaining, gpsAgeSeconds, Double.NaN, Double.NaN,
+                    carriedFlagTeam, ctfCaptures).withGeneration(generation, targetGeneration);
+        }
+
+        StateRow withGpsAge(int ageSeconds) {
+            return new StateRow(flags, ownerSequence, eventSequence, gameState,
+                    grenadeID, eventType, eventTargetID, score, deaths, health, shield,
+                    shotsRemaining, ageSeconds, latitude, longitude,
                     carriedFlagTeam, ctfCaptures).withGeneration(generation, targetGeneration);
         }
 
@@ -2981,8 +3247,10 @@ public final class LaptopHost {
                 item.put("hits", player.hits);
                 item.put("accuracy", player.shots == 0 ? null
                         : Math.min(100.0, (100.0 * player.hits) / player.shots));
-                item.put("gpsAgeMs", player.lastGpsAt == 0 ? null : now - player.lastGpsAt);
-                if (validCoordinates(player.longitude, player.latitude)) {
+                long gpsAgeMs = player.lastGpsAt == Long.MIN_VALUE ? -1 : Math.max(0, now - player.lastGpsAt);
+                item.put("gpsAgeMs", gpsAgeMs < 0 ? null : gpsAgeMs);
+                if (gpsAgeMs >= 0 && gpsAgeMs <= GPS_STALE_AFTER_MS
+                        && validCoordinates(player.longitude, player.latitude)) {
                     item.put("longitude", player.longitude);
                     item.put("latitude", player.latitude);
                 }
@@ -3205,7 +3473,7 @@ public final class LaptopHost {
         boolean respawnQrEnabled = true;
         boolean allowLateJoin = true;
         boolean takeover;
-        int startDelaySeconds = 10;
+        int startDelaySeconds = GameStartCountdown.DURATION_SECONDS;
         int durationMinutes = 5;
         int scoreLimit;
         int livesLimit;
@@ -3328,7 +3596,7 @@ public final class LaptopHost {
                         config.livesLimit = bounded(value, argument, 0, 100);
                         break;
                     case "--powerup-qr":
-                        config.powerupQrRequired = bounded(value, argument, 4, 8);
+                        config.powerupQrRequired = bounded(value, argument, 2, 8);
                         break;
                     default:
                         throw new IllegalArgumentException("Unknown option " + argument + "\n\n" + usage());
@@ -3380,11 +3648,13 @@ public final class LaptopHost {
                     + "  --duration-minutes 0..100   0 means unlimited (default: 5)\n"
                     + "  --score-limit 0..100        0 means unlimited\n"
                     + "  --lives-limit 0..100        0 means unlimited\n"
-                    + "  --powerup-qr 4..8           Enable QR power-ups (default: off)\n"
+                    + "  --powerup-qr 2..8           Enable QR power-ups (default: off)\n"
                     + "  --timer-respawn            Three-minute team respawns without QR scanning\n"
                     + "  --qr-respawn               QR checkpoint or timer respawns (default)\n"
                     + "  --gps all|team              Phone GPS visibility (default: team)\n"
-                    + "  --start-delay 1..1000       Shared countdown seconds (default: 10)\n"
+                    + "  --start-delay 1..1000       Normal countdown seconds (default: "
+                    + GameStartCountdown.DURATION_SECONDS + "; balanced: fixed "
+                    + GameStartCountdown.DURATION_SECONDS + ")\n"
                     + "  --tcp-port PORT             Must remain 17510 for stock phones\n"
                     + "  --udp-port PORT             Must remain 17500 for stock phones\n"
                     + "  --dashboard-port PORT       Local dashboard (default: 17511)\n"
@@ -3625,7 +3895,10 @@ public final class LaptopHost {
                 }
                 String raw = text.substring(start, position);
                 try {
-                    return decimal ? Double.valueOf(raw) : Long.valueOf(raw);
+                    // A numeric Double/Long ternary promotes both branches to
+                    // double, losing integer precision for long grant IDs.
+                    if (decimal) return Double.valueOf(raw);
+                    return Long.valueOf(raw);
                 } catch (NumberFormatException e) {
                     throw new IllegalArgumentException("invalid JSON number");
                 }
@@ -3681,7 +3954,7 @@ public final class LaptopHost {
             const status=document.querySelector('#status'),start=document.querySelector('#start'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status'),lobbyPlayers=document.querySelector('#lobby-players');let lobbySignature='';
             const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:false}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],grenadeLayers=[],fitted=false,mapConfig={maxZoom:19};
             function color(team){return team===1?'#49a5ff':team===2?'#ff5d67':`hsl(${(team*57)%360} 90% 63%)`}
-            function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)}function ll(p){return[p.latitude,p.longitude]}
+            function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)&&(p.longitude!==0||p.latitude!==0)&&p.longitude>=-180&&p.longitude<=180&&p.latitude>=-90&&p.latitude<=90}function ll(p){return[p.latitude,p.longitude]}
             async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tiles=L.tileLayer('/tiles/{z}/{x}/{y}.png',{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom,maxNativeZoom:mapConfig.maxZoom,noWrap:true,keepBuffer:4,updateWhenIdle:false}).addTo(map);let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent=`Offline map loaded (zoom ${mapConfig.minZoom}-${mapConfig.maxZoom})`}});tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.'}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
             async function control(path){try{const r=await fetch(path,{method:'POST'}),j=await r.json();status.textContent=j.message||(j.ok?'Done.':'Unable to complete action.')}catch(e){status.textContent='Host control error.'}}
             start.onclick=()=>control('/api/start');end.onclick=()=>{if(confirm('Ask two participating players to approve ending the round?'))control('/api/end')};fitButton.onclick=()=>fitPlayers(true);
@@ -3689,7 +3962,7 @@ public final class LaptopHost {
             function drawLobby(s){const visible=s.state==='lobby';lobbyPlayers.hidden=!visible;if(!visible){lobbySignature='';return}const list=[...(s.players||[])].sort((a,b)=>Number(a.benched)-Number(b.benched)||a.team-b.team||a.id-b.id);const sig=JSON.stringify(list.map(p=>[p.id,p.name,p.team,p.connected,p.gunReady,p.clockReady,p.benched]));if(sig===lobbySignature)return;lobbySignature=sig;lobbyPlayers.replaceChildren();for(const p of list){const row=document.createElement('div'),name=document.createElement('span'),b=document.createElement('button');row.style.cssText='display:flex;gap:8px;align-items:center;margin-top:6px';name.style.flex='1';const status=p.benched?'Sitting out':!p.connected?'Reconnecting':!p.gunReady?'Needs gun':!p.clockReady?'Syncing clock':'Ready';name.textContent=`Team ${p.team} / ${p.name} #${p.id} - ${status}`;b.textContent=p.benched?'Play':'Sit out';b.disabled=!p.connected;b.onclick=()=>{b.disabled=true;control('/api/bench?id='+encodeURIComponent(p.id)+'&benched='+(!p.benched)).finally(()=>{lobbySignature=''})};row.append(name,b);lobbyPlayers.append(row)}}
             function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores visible';if(s.balancedQr&&s.assignedCount)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount}`;const missing=(s.players||[]).filter(x=>x.connected&&!x.benched&&!x.gunReady).map(x=>x.name+' #'+x.id);return `${p} players - guns ${s.gunsReady||0}/${p} - clocks ${ready}/${p}`+(missing.length?' - Needs gun: '+missing.join(', '):'')}
             function fitPlayers(force){const points=(state?.players||[]).filter(valid).map(ll),maxZoom=Number.isFinite(mapConfig.maxZoom)?mapConfig.maxZoom:18;if(!points.length)return;if(points.length===1)map.setView(points[0],Math.min(18,maxZoom));else map.fitBounds(points,{padding:[70,70],maxZoom:Math.min(18,maxZoom)});if(force||!fitted)fitted=true}
-            function drawPlayers(s){const visible=new Set();for(const p of s.players.filter(p=>!p.benched&&valid(p))){visible.add(p.id);let item=players.get(p.id);if(!item){const trail=L.polyline([],{color:color(p.team),weight:3,opacity:.48,interactive:false}).addTo(map);const marker=L.circleMarker(ll(p),{radius:11,color:'#fff',weight:2,fillColor:color(p.team),fillOpacity:1}).addTo(map).bindTooltip('',{permanent:true,direction:'top',className:'player-label',offset:[0,-9]});item={marker,trail};players.set(p.id,item)}const opacity=p.connected?1:.4;item.marker.setLatLng(ll(p)).setRadius(p.awaitingRespawn?8:11).setStyle({fillColor:color(p.team),opacity,fillOpacity:opacity});const label=document.createElement('span');label.textContent=`${p.name} #${p.id}${p.awaitingRespawn?' - RESPAWN':''}`;item.marker.setTooltipContent(label);item.trail.setStyle({color:color(p.team),opacity:.48*opacity});item.trail.setLatLngs((p.trail||[]).filter(valid).map(ll))}for(const [id,item] of players){if(visible.has(id))continue;map.removeLayer(item.marker);map.removeLayer(item.trail);players.delete(id)}}
+            function drawPlayers(s){const visible=new Set();for(const p of s.players.filter(p=>!p.benched)){const points=(p.trail||[]).filter(valid).map(ll);if(!valid(p)&&!points.length)continue;visible.add(p.id);let item=players.get(p.id);if(!item){const trail=L.polyline([],{color:color(p.team),weight:3,opacity:.48,interactive:false}).addTo(map);item={marker:null,trail};players.set(p.id,item)}const opacity=p.connected?1:.4;if(valid(p)){if(!item.marker)item.marker=L.circleMarker(ll(p),{radius:11,color:'#fff',weight:2,fillColor:color(p.team),fillOpacity:1}).addTo(map).bindTooltip('',{permanent:true,direction:'top',className:'player-label',offset:[0,-9]});item.marker.setLatLng(ll(p)).setRadius(p.awaitingRespawn?8:11).setStyle({fillColor:color(p.team),opacity,fillOpacity:opacity});const label=document.createElement('span');label.textContent=`${p.name} #${p.id}${p.awaitingRespawn?' - RESPAWN':''}`;item.marker.setTooltipContent(label)}else if(item.marker){map.removeLayer(item.marker);item.marker=null}item.trail.setStyle({color:color(p.team),opacity:.48*opacity});item.trail.setLatLngs(points)}for(const [id,item] of players){if(visible.has(id))continue;if(item.marker)map.removeLayer(item.marker);map.removeLayer(item.trail);players.delete(id)}}
             function drawLasers(s){for(const layer of laserLayers)map.removeLayer(layer);laserLayers=[];const byId=Object.fromEntries(s.players.filter(valid).map(p=>[p.id,p]));function point(event,prefix,fallback){const p={longitude:event[prefix+'Longitude'],latitude:event[prefix+'Latitude']};return valid(p)?p:fallback}for(const event of s.lasers||[]){const a=point(event,'shooter',byId[event.shooter]),b=point(event,'target',byId[event.target]);if(!valid(a)||!valid(b))continue;const kill=event.kind==='kill',opacity=Math.max(0,1-event.ageMs/1500);laserLayers.push(L.polyline([ll(a),ll(b)],{color:kill?'#ff3047':'#fff36b',weight:kill?7:5,opacity,interactive:false}).addTo(map))}}
             function drawGrenades(s){for(const layer of grenadeLayers)map.removeLayer(layer);grenadeLayers=[];for(const burst of s.grenadeBursts||[]){const opacity=Math.max(0,1-burst.ageMs/8000);for(const hit of burst.hits||[]){if(!valid(hit))continue;grenadeLayers.push(L.circleMarker(ll(hit),{radius:17,color:'#ff3047',weight:3,opacity,fillColor:'#ff3047',fillOpacity:.24*opacity,interactive:true}).addTo(map).bindTooltip(`Grenade #${burst.grenadeID} hit player #${hit.playerID}`))}const center={latitude:burst.centerLatitude,longitude:burst.centerLongitude};if(!valid(center))continue;grenadeLayers.push(L.circleMarker(ll(center),{radius:8,color:'#fff',weight:2,opacity,fillColor:'#ff3047',fillOpacity:opacity,interactive:true}).addTo(map).bindTooltip(`Estimated grenade #${burst.grenadeID} center (${burst.hits.length} mapped hits)`))}}
             function draw(s){status.textContent=label(s);start.disabled=!s.canStart;end.disabled=!['countdown','running'].includes(s.state);end.textContent=!end.disabled&&s.endVoteRequested?`End game (${s.endVoteCount}/2)`:'End game';drawRespawns(s);drawLobby(s);drawPlayers(s);drawLasers(s);drawGrenades(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}

@@ -50,6 +50,8 @@ import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
 
+import com.simplecoil.protocol.GameStartCountdown;
+
 import java.net.InetAddress;
 import java.util.HashMap;
 import java.util.List;
@@ -1006,7 +1008,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
         mRoundStartAt = start.hasExtra(NetMsg.INTENT_START_AT)
                 ? start.getLongExtra(NetMsg.INTENT_START_AT, 0)
-                : SystemClock.elapsedRealtime() + Globals.getInstance().mRespawnTime * 1000;
+                : SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
         mRoundEndAt = start.hasExtra(NetMsg.INTENT_START_AT)
                 ? start.getLongExtra(NetMsg.INTENT_END_AT, 0)
                 : (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0

@@ -136,7 +136,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.32 on every phone for this build.
+messages cannot end a new round. Install 1.34 on every phone for this build.
 
 If a round is stopped before its first 60 seconds of play have elapsed, the
 next round can start without the usual 30-second between-game wait. Canceling
@@ -177,12 +177,26 @@ of every address. While looking for Wi-Fi, fresh radio scans are limited to
 once every three seconds; scan results can still trigger an immediate join,
 and tapping Wi-Fi requests an immediate scan. The AP must allow client-to-client traffic and subnet
 broadcasts; turn off guest/client isolation. All phones and the laptop host
-must run this protocol-28 build. A phone arriving during an active game offers
+must run this protocol-30 build. A phone arriving during an active game offers
 team-QR admission or waits for the next round instead of creating a separate lobby.
 
 Network games use TCP for the lobby and an NTP-style exchange of monotonic-clock
 timestamps to synchronize a start deadline. The app never changes a phone's
 system clock and does not use a public NTP server.
+
+The lobby also shares a fixed GPS origin, chosen from the host's fresh fix or
+its first player's fresh fix. Positions use north/east offsets in 2.5 cm units
+across a 1,638.4 m square (about 1.02 miles), centered on that origin. The
+origin stays fixed during the match and host handoff. Each update refers to
+the origin, so packet loss cannot accumulate position drift. Before an origin
+is available, or outside that square, TCP carries full absolute coordinates;
+the UDP record omits the unrepresentable GPS fix without changing combat data.
+This is encoding resolution, not improved GPS measurement accuracy. Invalid
+fixes, including (0, 0), never establish an origin or a map marker. An offset
+of (0, 0) is valid and means the player's position equals the real origin.
+Stationary players refresh their position every five seconds while GPS samples
+remain fresh. TCP updates retain the measurement's age, so relaying a position
+does not turn an old fix into a new one. Expired fixes are removed from the map.
 
 - Lobby join immediately begins a 12-exchange clock-calibration burst before a
   start is accepted.
@@ -190,20 +204,26 @@ system clock and does not use a public NTP server.
   valid sample is used to estimate clock offset. That bounds the network-path
   uncertainty of an accepted estimate to 40 ms relative to the host.
 - The host sends one shared start deadline and every phone shows a countdown to
-  it. Timed games also use a shared end deadline.
+  it, normally 24 seconds away. The voice counts "10 Mississippi" through
+  "0 Mississippi" every two seconds, then says "All out of Mississippi's."
+  The count takes 20 seconds, leaving four seconds for the closing line before
+  play starts. Solo starts use the same timing. Timed games also use a shared
+  end deadline.
 - The network-offset target is below 50 ms on a healthy local network. Wi-Fi
   congestion, device suspension, and normal UI scheduling can still affect the
   moment a device visibly reacts.
-- All participants must use network protocol 28 (this build). Older protocol
+- All participants must use network protocol 30 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
 During every network game, each phone sends one subnet-directed IPv4 state
 broadcast per second instead of one unicast packet per player. The fixed
-1,376-byte protocol-28 snapshot fits 32 player records below the 1,472-byte UDP
+1,264-byte protocol-30 snapshot fits 32 player records below the 1,472-byte UDP
 payload ceiling and avoids normal IPv4 fragmentation. Each record carries
 cumulative score/deaths,
 health, shield, shots, player state, grenade pairing, a deduplicated important
-event, and GPS rounded to 0.00001 degrees (about one metre). Everyone caches
+event, and two signed 16-bit GPS offsets with 2.5 cm encoding resolution. The
+48-byte header carries the agreed origin so every snapshot is independently
+decodable. Everyone caches
 the newer player rows they hear. The host still publishes an authoritative tick
 every second; after a missing tick's 20% grace window (200 ms), a phone fills
 only newer portions of that tick from its overheard cache. Late or stale data
@@ -213,15 +233,54 @@ the multicast lock also stays active during lobby discovery so idle phones can
 hear the shared host.
 
 QR power-ups are off by default. Before starting a game, the lobby host can
-choose Off or 4 through 8 different codes with the Power-ups control. All phones
+choose Off or 2 through 8 different codes with the Power-ups control. All phones
 receive the host's choice. During play, Scan power-up opens a small camera window
 without replacing the game screen. Print eight QR codes with these exact text
 payloads: `SIMPLECOIL:POWERUP:1` through `SIMPLECOIL:POWERUP:8`. A code counts
 only once per life; team respawn codes never count. Every configured number of
-different codes grants a random health refill, shield refill, or five-second
-temporary shield boost. Death clears unused progress and allows the codes to
+different codes unlocks a spinning mystery box with original arcade sounds and
+a spoken reward. Death clears progress and personal buffs, allowing the codes to
 be collected again. With power-ups off, this gameplay scanner stays closed;
 the full-screen team QR scanner still opens after death when QR respawns are enabled.
+
+The host chooses the reward from current match scores, not prior player history.
+Teams behind by 1-4 points get twice the normal weight for EMP, team shield,
+team heal, enemy-team damage, and invulnerability; a gap of 5+ gives four times
+the weight. It is still random, not a guaranteed comeback reward. CTF uses flag
+captures. Personal rewards retain their base weights. Free-for-all excludes
+teammate-only shields/healing.
+
+Scan effort also adjusts to the live score gap: every five points behind the
+leading opponent reduces the required scans by one, down to a minimum of two.
+For example, a configured six scans becomes five when five points behind,
+four when ten points behind, and two when twenty points behind. Catching up
+restores the configured requirement. Progress is retained while the requirement
+changes, but codes already spent on a reward cannot be spent again this life.
+
+| Reward | Effect |
+| --- | --- |
+| EMP | Opposing blasters and game displays disrupted for 10 seconds; phone/network remain working |
+| Player shield boost | 50% extra shields as a disposable buffer for 15 seconds |
+| Team shield boost | Same buffer for living teammates for 15 seconds |
+| Full auto | Temporary full-auto permission for 15 seconds, including tournament play |
+| Full auto / 90 rounds | Full auto and a 90-round magazine for 15 seconds, then restore normal limits |
+| Double damage | Twice normal shot damage for 15 seconds |
+| Heal team | Restore every living teammate's health; does not respawn dead players |
+| Damage enemy team | Hit living opponents for 25% of normal health, absorbed by shields first |
+| Invulnerability | Ignore incoming damage for 15 seconds |
+
+Rare grants and bounded recovery snapshots use reliable TCP without increasing
+the gameplay UDP packet size. Recovery retains 128 grants, enough for all 32
+players to unlock four rewards in one life. Compact recipient masks and life
+counters keep even the largest recovery message below the 60 KB TCP budget.
+The retry queue also holds a full 128-reward burst, including instant effects.
+Recovery history is bounded to the most recent 128 records; unusually rapid
+unlocks across multiple respawns can exceed that history, while effects already
+applied still honor their original expiry.
+Round tokens, per-life scan masks, grant IDs, and
+original expiry times prevent stale or duplicated rewards. Instant healing and
+damage are not replayed from recovery snapshots. Everyone must update to the
+protocol-30 build before joining the same match.
 
 Combat feedback does not wait for that one-second state cadence. `HIT`, `OUT`,
 `ALREADY DEAD`, and elimination use a 32-byte subnet broadcast that every phone
@@ -300,7 +359,7 @@ The team sizes differ by no more than two players. Player IDs no longer imply a
 team in this mode, and lobby joins can take any free ID; each phone displays its
 assigned team. With **QR Check-in**,
 every player, including a playing phone host, scans the printed Team 1 or Team 2
-respawn QR that matches their assignment. The shared 10-second countdown begins
+respawn QR that matches their assignment. The shared 24-second countdown begins
 after the final check-in, or after a 90-second check-in timeout if someone has
 not scanned. Everyone keeps their assigned team when the timeout starts the game.
 **No QR** starts that countdown as soon as the teams are assigned. Names can be
@@ -311,7 +370,7 @@ While a QR check-in is pending, the phone repeats the assigned team number in
 its spoken scan reminder. Respawn QR reminders also say the player's team.
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-28 host automatically
+team before starting. If an ID conflicts, a protocol-30 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and
@@ -360,14 +419,14 @@ The host selects **Match options > Respawn mode** in the lobby:
 
 This is a match-wide setting; joined players cannot override the host. Solo
 practice and free-for-all use the configured respawn duration, **10 seconds**
-by default. This setting does not lengthen the initial game-start countdown.
+by default. Initial game-start countdowns are independently set to 24 seconds.
 The dedicated-phone host has the same respawn-mode control; the laptop uses
 `./laptop-host/run.sh --timer-respawn` (or `--qr-respawn` for the default).
 CTF flag/base scans, optional power-ups, and optional QR team check-in remain
 separate features; timer-only disables the respawn scanner, not those objectives.
 
 With QR respawns enabled, network two-team and four-team games use team QR checkpoints after a player is
-eliminated. The first game-start countdown remains unchanged. On later deaths,
+eliminated. Initial game starts still use the 24-second countdown. On later deaths,
 the app opens its built-in phone-camera scanner automatically and gives the
 player a choice:
 
@@ -395,7 +454,14 @@ is disabled, or **GPS acquiring...** until a recent location arrives. A fix
 expires after 30 seconds without an update, including after GPS is disabled and
 re-enabled. The app accepts Android's GPS and network-location providers; the coordinate readout
 can therefore contain a network-based fix, not necessarily a satellite fix.
-Zero latitude or longitude is treated as invalid rather than displayed.
+The placeholder pair `(0,0)` is rejected. A zero latitude or longitude on its
+own is valid, so locations on the equator or prime meridian still work.
+
+The bundled map library's hidden-map startup worker is explicitly retired when
+its view is destroyed before a rendering surface exists. Optional legacy map
+analytics are suppressed before controller creation because those requests are
+not owned or cancelled by the controller. UDP service teardown also prevents a
+sender from reopening its outbound socket after destruction.
 
 ## Build
 
@@ -415,6 +481,33 @@ for a particular build with the `appName` Gradle property:
 
 The debug APK is written to
 `app/build/outputs/apk/debug/app-debug.apk`.
+
+## Printable QR posters
+
+The [1.34 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.34)
+includes a labeled 15-page QR PDF in US Letter landscape format (11 x 8.5 in).
+Print at 100% / Actual Size and keep the white QR margins unobstructed.
+
+- Page 1: APK download (use a normal QR reader, not the in-game scanner).
+- Pages 2-5: Teams 1-4. The same codes serve team selection, joining,
+  Balanced Random check-in, respawn, and CTF home bases.
+- Pages 6-7: Team 1 and Team 2 CTF flags.
+- Pages 8-15: Power-up checkpoints 1-8. These identify distinct checkpoints,
+  not fixed rewards; each can unlock any eligible random power-up.
+
+Gun pairing codes contain each individual gun's Bluetooth MAC address, so
+there is no universal printable gun-pairing QR. Team posters do not contain
+a host address or Wi-Fi credentials; connect to the game network first.
+
+To regenerate the PDF, use a virtual environment with `reportlab` and `qrcode`
+installed, then run:
+
+```sh
+python tools/build_release_qrs.py --version 1.34
+```
+
+The generator writes `output/pdf/SimpleCoil-1.34-QR-Codes-US-Letter.pdf` with
+vector QR graphics, large purpose labels, instructions, and exact payload text.
 
 ## Release signing
 

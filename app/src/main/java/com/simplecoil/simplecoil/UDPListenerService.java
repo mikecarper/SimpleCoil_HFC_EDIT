@@ -179,6 +179,7 @@ public class UDPListenerService extends Service {
     private final int[] mSeatGenerations = new int[Globals.MAX_PLAYER_ID + 1];
     private final PeerStatePacket.PlayerState[] mPeerStates =
             new PeerStatePacket.PlayerState[PeerStatePacket.PLAYER_CAPACITY + 1];
+    private final long[] mPeerStateReceivedAt = new long[PeerStatePacket.PLAYER_CAPACITY + 1];
     // Last cumulative rows accepted from an authoritative host tick, or from
     // the gossip fallback after its 20% grace window elapsed.
     private final PeerStatePacket.PlayerState[] mAppliedPeerStates =
@@ -359,7 +360,9 @@ public class UDPListenerService extends Service {
                 return;
             if (NetMsg.NETMSG_GPSLOCUPDATE.equals(intent.getAction())) {
                 publishPeerLocation(intent.getDoubleExtra(NetMsg.INTENT_LONGITUDE, Double.NaN),
-                        intent.getDoubleExtra(NetMsg.INTENT_LATITUDE, Double.NaN));
+                        intent.getDoubleExtra(NetMsg.INTENT_LATITUDE, Double.NaN),
+                        intent.getLongExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS,
+                                SystemClock.elapsedRealtime()));
             } else if (NetMsg.NETMSG_STARTGAME.equals(intent.getAction())
                     && intent.getBooleanExtra(NetMsg.INTENT_PEER_GAME, false)) {
                 preparePeerRound(intent.getStringExtra(NetMsg.INTENT_ROUND_TOKEN));
@@ -896,6 +899,19 @@ public class UDPListenerService extends Service {
                 // even if TCP clears the live roster before the end receipt.
                 mLastRoundParticipants.put(ip, decoded.senderID);
             }
+            // The TCP host chooses the fixed lobby origin. A self-contained UDP
+            // header must not let another player relocate everybody's map markers.
+            if (authorityTick && globals.mGpsOffset == null && decoded.origin != null)
+                globals.mGpsOffset = decoded.origin;
+            if (decoded.origin != null && (globals.mGpsOffset == null
+                    || !globals.mGpsOffset.sameOrigin(decoded.origin))) {
+                for (int id = 1; id < decoded.players.length; id++) {
+                    PeerStatePacket.PlayerState row = decoded.players[id];
+                    if (row != null) decoded.players[id] = withGps(row,
+                            row.flags & ~PeerStatePacket.FLAG_GPS_VALID,
+                            row.gpsAgeSeconds, Double.NaN, Double.NaN);
+                }
+            }
             synchronized (mPeerRuntimeLock) {
                 syncSeatGenerationsLocked();
                 if (decoded.snapshotSequence <= mLastPeerSnapshotSequences[decoded.senderID])
@@ -921,7 +937,7 @@ public class UDPListenerService extends Service {
                         // here or hits, GPS, and team totals would disappear only
                         // for the hosting player. A dedicated host has no player UI.
                         if (mPeerGame || globals.mInfectionMode)
-                            applied = applyCumulativeRowsLocked(mPeerStates, knownPlayers,
+                            applied = applyCumulativeRowsLocked(peerSnapshotLocked(), knownPlayers,
                                     localPlayerID, mPeerGame, roundToken);
                     } else {
                         gossipEvents = new StateMergeResult();
@@ -970,9 +986,20 @@ public class UDPListenerService extends Service {
                         incoming.shotsRemaining, incoming.gpsAgeSeconds,
                         incoming.latitude, incoming.longitude, incoming.carriedFlagTeam,
                         incoming.ctfCaptures).withGeneration(incoming.generation, incoming.targetGeneration);
-            if (current == null || incoming.ownerSequence > current.ownerSequence)
+            long receivedAt = SystemClock.elapsedRealtime();
+            if (current == null || incoming.ownerSequence > current.ownerSequence) {
                 mPeerStates[playerID] = incoming;
-            rememberMemberState(incoming);
+                mPeerStateReceivedAt[playerID] = receivedAt;
+                rememberMemberState(incoming);
+            } else if (incoming.gpsAgeSeconds > agedPeerState(current, receivedAt).gpsAgeSeconds) {
+                // GPS age advances even while the owner is stationary and its
+                // gameplay sequence does not change. Gossip must not reset that age.
+                mPeerStates[playerID] = withGps(current,
+                        (current.flags & ~PeerStatePacket.FLAG_GPS_VALID)
+                                | (incoming.flags & PeerStatePacket.FLAG_GPS_VALID),
+                        incoming.gpsAgeSeconds, incoming.latitude, incoming.longitude);
+                mPeerStateReceivedAt[playerID] = receivedAt;
+            }
             if (dispatchPeerEvents && markCombatEventSeenLocked(playerID,
                     incoming.eventSequence)) {
                 Intent event = peerEventIntent(getPlayerEndpoint((byte) playerID), incoming,
@@ -1000,15 +1027,16 @@ public class UDPListenerService extends Service {
                 continue;
             if (current == null || incoming.ownerSequence > current.ownerSequence) {
                 mAppliedPeerStates[playerID] = incoming;
+                rememberMemberState(incoming);
                 if (Globals.getInstance().mInfectionMode
                         && (incoming.flags & PeerStatePacket.FLAG_INFECTED) != 0)
                     Globals.getInstance().setPlayerInfected((byte) playerID,
                             true);
                 updateGrenadePairing((byte) playerID, incoming.grenadeID);
-                if (playerID != localPlayerID
-                        && (incoming.flags & PeerStatePacket.FLAG_GPS_VALID) != 0)
-                    result.gpsChanged |= updatePeerGps(incoming);
             }
+            // An unchanged owner sequence can still carry an expired GPS fix.
+            if (playerID != localPlayerID)
+                result.gpsChanged |= updatePeerGps(incoming);
             if (dispatchPeerEvents && playerID != localPlayerID
                     && markCombatEventSeenLocked(playerID, incoming.eventSequence)) {
                 Intent event = peerEventIntent(getPlayerEndpoint((byte) playerID), incoming,
@@ -1101,7 +1129,7 @@ public class UDPListenerService extends Service {
             if (!isCurrentStateRoundLocked(roundToken) || mStateAuthority)
                 return;
             synchronized (mPeerRuntimeLock) {
-                result = applyCumulativeRowsLocked(mPeerStates, knownPlayers, localPlayerID,
+                result = applyCumulativeRowsLocked(peerSnapshotLocked(), knownPlayers, localPlayerID,
                         false, roundToken);
             }
         }
@@ -1136,7 +1164,10 @@ public class UDPListenerService extends Service {
             }, 150);
         }
         if (result.gpsChanged)
-            sendBroadcast(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
+            // Expiring a compact GPS row removes it from the cache. The map
+            // needs a reconciliation event to remove its existing native marker.
+            sendBroadcast(new Intent(NetMsg.NETMSG_GPSDATAUPDATE)
+                    .putExtra(NetMsg.INTENT_FULLUPDATE, true));
         if (result.teamScore >= 0)
             sendBroadcast(new Intent(NetMsg.NETMSG_TEAMSCORESTATE)
                     .putExtra(NetMsg.INTENT_TEAMSCORE, result.teamScore)
@@ -1371,11 +1402,33 @@ public class UDPListenerService extends Service {
 
     private boolean updatePeerGps(PeerStatePacket.PlayerState state) {
         Globals globals = Globals.getInstance();
-        if (!globals.mUseGPS || !Globals.isValidCoordinates(state.longitude, state.latitude))
+        if (!globals.mUseGPS)
             return false;
         Globals.getmGPSDataSemaphore();
         try {
             Globals.GPSData gps = globals.mGPSData.get((byte) state.playerID);
+            long now = SystemClock.elapsedRealtime();
+            int age = state.gpsAgeSeconds;
+            PeerStatePacket.PlayerState cached = mPeerStates[state.playerID];
+            if (cached != null && cached.ownerSequence == state.ownerSequence)
+                age = Math.max(age, agedPeerState(cached, now).gpsAgeSeconds);
+            long fixAt = now - age * 1000L;
+            boolean usable = (state.flags & (PeerStatePacket.FLAG_GPS_VALID | PeerStatePacket.FLAG_LEFT))
+                    == PeerStatePacket.FLAG_GPS_VALID
+                    && age * 1000L <= Globals.GPS_DISPLAY_FIX_MAX_AGE_MS
+                    && Globals.isValidCoordinates(state.longitude, state.latitude);
+            if (!usable) {
+                // An out-of-area row lacks compact GPS but can have a fresh TCP
+                // location. Remove only the expired compact position, not that fallback.
+                if (gps != null && gps.fromPeerState
+                        && (!Globals.isFreshGpsFix(gps.fixElapsedMs, now)
+                        || age * 1000L > Globals.GPS_DISPLAY_FIX_MAX_AGE_MS
+                        || (state.flags & PeerStatePacket.FLAG_LEFT) != 0)) {
+                    globals.mGPSData.remove((byte) state.playerID);
+                    return true;
+                }
+                return false;
+            }
             if (gps == null) {
                 gps = new Globals.GPSData();
                 globals.mGPSData.put((byte) state.playerID, gps);
@@ -1385,11 +1438,44 @@ public class UDPListenerService extends Service {
             gps.longitude = state.longitude;
             gps.latitude = state.latitude;
             gps.team = globals.calcNetworkTeam((byte) state.playerID);
+            if (gps.fromPeerState && state.ownerSequence == gps.ownerSequence)
+                fixAt = Math.min(fixAt, gps.fixElapsedMs);
+            gps.fromPeerState = true;
+            gps.fixElapsedMs = fixAt;
+            gps.ownerSequence = state.ownerSequence;
             gps.hasUpdate |= changed;
             return changed;
         } finally {
             globals.mGPSDataSemaphore.release();
         }
+    }
+
+    private static PeerStatePacket.PlayerState withGps(PeerStatePacket.PlayerState state,
+            int flags, int age, double latitude, double longitude) {
+        return new PeerStatePacket.PlayerState(state.playerID, flags, state.ownerSequence,
+                state.eventSequence, state.eventType, state.eventTargetID, state.gameState,
+                state.grenadeID, state.score, state.deaths, state.health, state.shield,
+                state.shotsRemaining, age, latitude, longitude, state.carriedFlagTeam,
+                state.ctfCaptures).withGeneration(state.generation, state.targetGeneration);
+    }
+
+    // Caller holds mPeerRuntimeLock. Relayed GPS must age while its owner is offline.
+    private PeerStatePacket.PlayerState agedPeerState(PeerStatePacket.PlayerState state, long now) {
+        long receivedAt = mPeerStateReceivedAt[state.playerID];
+        int age = (int) Math.min(0xffff, state.gpsAgeSeconds
+                + (receivedAt <= 0 ? 0 : Math.max(0, now - receivedAt) / 1000));
+        return age == state.gpsAgeSeconds ? state
+                : withGps(state, state.flags, age, state.latitude, state.longitude);
+    }
+
+    private PeerStatePacket.PlayerState[] peerSnapshotLocked() {
+        PeerStatePacket.PlayerState[] snapshot = mPeerStates.clone();
+        long now = SystemClock.elapsedRealtime();
+        int localID = Globals.getInstance().mPlayerID & 0xff;
+        for (int id = 1; id < snapshot.length; id++)
+            if (snapshot[id] != null && id != localID)
+                snapshot[id] = agedPeerState(snapshot[id], now);
+        return snapshot;
     }
 
     // Caller holds mPeerRuntimeLock.
@@ -2047,8 +2133,9 @@ public class UDPListenerService extends Service {
         return scores;
     }
 
-    private void publishPeerLocation(double longitude, double latitude) {
-        if (!Globals.isValidCoordinates(longitude, latitude))
+    private void publishPeerLocation(double longitude, double latitude, long fixAt) {
+        if (!Globals.isValidCoordinates(longitude, latitude)
+                || !Globals.isFreshGpsFix(fixAt, SystemClock.elapsedRealtime()))
             return;
         int playerID = Globals.getInstance().mPlayerID & 0xff;
         synchronized (mListenerStateLock) {
@@ -2057,7 +2144,7 @@ public class UDPListenerService extends Service {
                 return;
             synchronized (mPeerRuntimeLock) {
                 PeerStatePacket.PlayerState current = localPeerStateLocked(playerID);
-                mLocalGpsUpdatedAt = SystemClock.elapsedRealtime();
+                mLocalGpsUpdatedAt = fixAt;
                 mPeerStates[playerID] = copyLocalState(current, nextLocalStateSequenceLocked(),
                         current.eventSequence, current.eventType, current.eventTargetID,
                         current.score, current.deaths, current.health, current.shield,
@@ -2253,17 +2340,34 @@ public class UDPListenerService extends Service {
     private PeerStatePacket.PlayerState localPeerStateLocked(int playerID) {
         syncSeatGenerationsLocked();
         PeerStatePacket.PlayerState current = mPeerStates[playerID];
-        if (current != null)
-            return current;
         Globals globals = Globals.getInstance();
+        Globals.LocalGpsFix fix = globals.mLocalGpsFix;
+        boolean freshFix = globals.mUseGPS && fix != null
+                && Globals.isValidCoordinates(fix.longitude, fix.latitude)
+                && Globals.isFreshGpsFix(fix.elapsedMs, SystemClock.elapsedRealtime());
+        if (current != null) {
+            if (freshFix && fix.elapsedMs > mLocalGpsUpdatedAt) {
+                mLocalGpsUpdatedAt = fix.elapsedMs;
+                current = withGps(current.withOwnerSequence(nextLocalStateSequenceLocked()),
+                        current.flags | PeerStatePacket.FLAG_GPS_VALID, 0,
+                        fix.latitude, fix.longitude);
+                mPeerStates[playerID] = current;
+            }
+            return current;
+        }
         int flags = PeerStatePacket.FLAG_PRESENT;
+        if (freshFix) {
+            flags |= PeerStatePacket.FLAG_GPS_VALID;
+            mLocalGpsUpdatedAt = fix.elapsedMs;
+        }
         if (globals.isPlayerInfected((byte) playerID))
             flags |= PeerStatePacket.FLAG_INFECTED;
         return new PeerStatePacket.PlayerState(playerID, flags,
                 Math.max(1, mNextLocalPeerStateSequence), 0, PeerStatePacket.EVENT_NONE, 0,
                 globals.mGameState, globals.mPairedGrenadeID & 0xff, 0, 0,
                 globals.mFullHealth, globals.mFullShields, globals.mFullReload & 0xff,
-                0, 0, 0).withGeneration(LiveJoin.generation(playerID), 0);
+                0, freshFix ? fix.latitude : Double.NaN, freshFix ? fix.longitude : Double.NaN)
+                .withGeneration(LiveJoin.generation(playerID), 0);
     }
 
     private PeerStatePacket.PlayerState copyLocalState(PeerStatePacket.PlayerState current,
@@ -2285,9 +2389,13 @@ public class UDPListenerService extends Service {
 
     private void rememberMemberState(PeerStatePacket.PlayerState state) {
         com.simplecoil.protocol.RoundRoster roster = Globals.getInstance().mRoundRoster;
-        if (roster != null && roster.token.equals(mStateRoundToken))
+        if (roster != null && roster.token.equals(mStateRoundToken)) {
             roster.update(state.playerID, state.generation, state.score, state.deaths,
                     state.ctfCaptures, (state.flags & PeerStatePacket.FLAG_INFECTED) != 0);
+            Globals.getInstance().recordPowerupRuntime(mStateRoundToken, state.playerID,
+                    state.generation, state.deaths, state.gameState, state.health,
+                    (state.flags & PeerStatePacket.FLAG_LEFT) != 0);
+        }
     }
 
     // Caller holds mPeerRuntimeLock. TCP changes ownership, never UDP. Clear
@@ -2301,6 +2409,7 @@ public class UDPListenerService extends Service {
             if (generation != mSeatGenerations[id] || member == null && mPeerStates[id] != null) {
                 mSeatGenerations[id] = generation;
                 mPeerStates[id] = mAppliedPeerStates[id] = mEndVoteRows[id] = null;
+                mPeerStateReceivedAt[id] = 0;
                 mLastPeerSnapshotSequences[id] = mCombatHighestSequences[id] = mCombatSeenMasks[id] = 0;
             }
             if (member != null && mPeerStates[id] == null) {
@@ -2373,6 +2482,7 @@ public class UDPListenerService extends Service {
             }
             for (int playerID = 0; playerID < mPeerStates.length; playerID++) {
                 mPeerStates[playerID] = null;
+                mPeerStateReceivedAt[playerID] = 0;
                 mSeatGenerations[playerID] = 0;
                 mAppliedPeerStates[playerID] = null;
                 mEndVoteRows[playerID] = null;
@@ -3308,7 +3418,7 @@ public class UDPListenerService extends Service {
                             local.eventTargetID, local.score, local.deaths, local.health,
                             local.shield, local.shotsRemaining, local.gameState, local.grenadeID,
                             local.flags, local.latitude, local.longitude);
-                PeerStatePacket.PlayerState[] snapshot = mPeerStates.clone();
+                PeerStatePacket.PlayerState[] snapshot = peerSnapshotLocked();
                 if (mPeerVoteEndCommitted) {
                     for (int id = 1; id < snapshot.length; id++) {
                         PeerStatePacket.PlayerState voteRow = mEndVoteRows[id];
@@ -3326,7 +3436,7 @@ public class UDPListenerService extends Service {
                             local.longitude);
                 payload = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER, token,
                         ++mNextPeerSnapshotSequence, localPlayerID,
-                        Globals.getInstance().mGameMode, snapshot);
+                        Globals.getInstance().mGameMode, snapshot, Globals.getInstance().mGpsOffset);
             }
         }
         sendDatagrams(payload, recipients, LISTEN_PORT, repeatCount, generation);
@@ -3375,7 +3485,7 @@ public class UDPListenerService extends Service {
                 }
                 payload = PeerStatePacket.encode(NetMsg.NETWORK_VERSION_NUMBER, token,
                         ++mNextAuthorityTickSequence, 0, Globals.getInstance().mGameMode,
-                        mPeerStates.clone());
+                        peerSnapshotLocked(), Globals.getInstance().mGpsOffset);
             }
         }
         sendDatagrams(payload, recipients, LISTEN_PORT, 1, generation);
@@ -3444,17 +3554,27 @@ public class UDPListenerService extends Service {
     }
 
     private DatagramSocket getSendSocketLocked() throws SocketException {
-        if (mSendSocket == null || mSendSocket.isClosed()) {
-            mSendSocket = new DatagramSocket();
-            mSendSocket.setBroadcast(true);
+        // The send lock serializes packets; the lifecycle lock makes creation
+        // atomic with destruction without making cleanup wait for a sender.
+        synchronized (mListenerStateLock) {
+            if (mDestroyed)
+                throw new SocketException("UDP service has been destroyed");
+            if (mSendSocket == null || mSendSocket.isClosed()) {
+                DatagramSocket socket = new DatagramSocket();
+                try {
+                    socket.setBroadcast(true);
+                } catch (SocketException | RuntimeException e) {
+                    socket.close();
+                    throw e;
+                }
+                mSendSocket = socket;
+            }
+            return mSendSocket;
         }
-        return mSendSocket;
     }
 
     private void closeSendSocketLocked() {
-        if (mSendSocket != null)
-            mSendSocket.close();
-        mSendSocket = null;
+        closeSendSocketDuringDestroy();
     }
 
     private void closeSendSocket() {
@@ -3467,13 +3587,16 @@ public class UDPListenerService extends Service {
      * Service destruction must not wait for a sender that is waiting on
      * mSendLock. In particular, Android can call onDestroy on the main thread
      * while a game event is queued from another thread. The executor has
-     * already been stopped and mDestroyed prevents queued work from opening a
-     * replacement socket, so closing the current DatagramSocket directly is
-     * both safe and prompt.
+     * already been stopped. The lifecycle lock prevents a sender from opening
+     * a replacement after destruction and detaches the published socket before
+     * the close, which also wakes an in-flight native send.
      */
     private void closeSendSocketDuringDestroy() {
-        DatagramSocket socket = mSendSocket;
-        mSendSocket = null;
+        final DatagramSocket socket;
+        synchronized (mListenerStateLock) {
+            socket = mSendSocket;
+            mSendSocket = null;
+        }
         if (socket != null)
             socket.close();
     }

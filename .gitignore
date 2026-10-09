@@ -7,6 +7,8 @@
 .DS_Store
 /build
 /output/
+/tmp/pdfs/
+__pycache__/
 /captures
 .externalNativeBuild
 /laptop-host/out/

@@ -57,6 +57,7 @@ public class MapRegressionTest {
     private int originalGameState;
     private InetAddress originalServerIP;
     private int originalMapTilePort;
+    private Globals.LocalGpsFix originalLocalGpsFix;
     private Map<Byte, Globals.GPSData> originalLocations;
     private final List<Intent> locationUpdates = new CopyOnWriteArrayList<>();
     private Context receiverContext;
@@ -90,6 +91,7 @@ public class MapRegressionTest {
         originalGameState = globals.mGameState;
         originalServerIP = globals.mServerIP;
         originalMapTilePort = globals.mMapTilePort;
+        originalLocalGpsFix = globals.mLocalGpsFix;
         Globals.getmGPSDataSemaphore();
         try {
             originalLocations = new HashMap<>(globals.mGPSData);
@@ -101,6 +103,8 @@ public class MapRegressionTest {
         globals.mMapTilePort = 0;
         scenario = ActivityScenario.launch(FullscreenActivity.class);
         scenario.onActivity(current -> {
+            // Keep lobby refreshes from hiding the map while its controller starts.
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
             current.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                     | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED);
@@ -108,6 +112,9 @@ public class MapRegressionTest {
             current.findViewById(R.id.lobby_action_bar).setVisibility(View.GONE);
             current.findViewById(R.id.connect_layout).setVisibility(View.GONE);
             current.findViewById(R.id.play_layout).setVisibility(View.VISIBLE);
+            // The gameplay map starts hidden. Its native controller needs a
+            // visible surface before it can initialize the test's markers.
+            current.findViewById(R.id.map_fragment).setVisibility(View.VISIBLE);
             current.getSupportFragmentManager().executePendingTransactions();
         });
         long deadline = SystemClock.elapsedRealtime() + 5000;
@@ -162,6 +169,7 @@ public class MapRegressionTest {
         globals.mGameState = originalGameState;
         globals.mServerIP = originalServerIP;
         globals.mMapTilePort = originalMapTilePort;
+        globals.mLocalGpsFix = originalLocalGpsFix;
         if (originalLocations != null) {
             Globals.getmGPSDataSemaphore();
             try {
@@ -385,11 +393,11 @@ public class MapRegressionTest {
     }
 
     @Test
-    public void zeroLatitudeOrLongitudeIsRejectedAsAnInvalidFix() {
-        assertFalse(Globals.isValidCoordinates(10, 0));
-        assertFalse(Globals.isValidCoordinates(0, 20));
-        assertFalse(Globals.isValidCoordinates(-0.0, 20));
-        assertFalse(Globals.isValidCoordinates(10, -0.0));
+    public void equatorAndPrimeMeridianAreAcceptedAsValidFixes() {
+        assertTrue(Globals.isValidCoordinates(10, 0));
+        assertTrue(Globals.isValidCoordinates(0, 20));
+        assertTrue(Globals.isValidCoordinates(-0.0, 20));
+        assertTrue(Globals.isValidCoordinates(10, -0.0));
         assertFalse(Globals.isValidCoordinates(0, 0));
     }
 
@@ -401,6 +409,45 @@ public class MapRegressionTest {
             for (int i = 1; i <= 5; i++)
                 map.makeUseOfNewLocation(location(10, 20, 1000 + i));
         });
+        assertNoAdditionalLocationUpdates();
+    }
+
+    @Test
+    public void freshStationaryLocationPublishesAFiveSecondHeartbeat() throws Exception {
+        scenario.onActivity(current -> map.makeUseOfNewLocation(location(10, 20, 1000)));
+        awaitLocationUpdates(1);
+        scenario.onActivity(current -> {
+            set("mLastLocationBroadcastElapsedMs", SystemClock.elapsedRealtime() - 5000);
+            map.makeUseOfNewLocation(location(10, 20, 1001));
+        });
+        awaitLocationUpdates(2);
+        Intent heartbeat = locationUpdates.get(1);
+        assertTrue(Globals.isFreshGpsFix(heartbeat.getLongExtra(
+                NetMsg.INTENT_GPS_FIX_ELAPSED_MS, 0), SystemClock.elapsedRealtime()));
+        assertEquals(10, heartbeat.getDoubleExtra(NetMsg.INTENT_LONGITUDE, 0), 0);
+        assertEquals(20, heartbeat.getDoubleExtra(NetMsg.INTENT_LATITUDE, 0), 0);
+    }
+
+    @Test
+    public void cachedHeartbeatPreservesMeasurementAgeAndStopsWhenStale() throws Exception {
+        scenario.onActivity(current -> {
+            Location fix = location(10, 20, 1000);
+            long fixAt = SystemClock.elapsedRealtime() - 10_000;
+            fix.setElapsedRealtimeNanos(fixAt * 1_000_000L);
+            map.makeUseOfNewLocation(fix);
+            assertEquals(fixAt, Globals.getInstance().mLocalGpsFix.elapsedMs);
+            Location stale = new Location(fix);
+            stale.setElapsedRealtimeNanos((SystemClock.elapsedRealtime() - 31_000) * 1_000_000L);
+            set("currentBestLocation", stale);
+            set("mLastLocationBroadcastElapsedMs", SystemClock.elapsedRealtime() - 5000);
+            try {
+                java.lang.reflect.Method send = MapFragment.class.getDeclaredMethod("sendLocation", Location.class);
+                send.setAccessible(true);
+                send.invoke(map, stale);
+            } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
+            assertEquals(fixAt, Globals.getInstance().mLocalGpsFix.elapsedMs);
+        });
+        awaitLocationUpdates(1);
         assertNoAdditionalLocationUpdates();
     }
 
@@ -417,10 +464,10 @@ public class MapRegressionTest {
     }
 
     @Test
-    public void cachedPlayerUpdateWithAZeroCoordinateDoesNotCreateAMarker() {
+    public void cachedPlayerUpdateAtNullIslandDoesNotCreateAMarker() {
         scenario.onActivity(current -> {
             showPlayers();
-            double[][] placeholders = {{0, 0}, {10, 0}, {0, 20}};
+            double[][] placeholders = {{0, 0}};
             for (double[] coordinates : placeholders) {
                 Globals.GPSData location = Globals.getInstance().mGPSData.get((byte) 2);
                 location.longitude = coordinates[0];
@@ -429,6 +476,21 @@ public class MapRegressionTest {
                 receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
                 assertNull(marker(2));
                 assertNotNull(marker(17));
+            }
+        });
+    }
+
+    @Test
+    public void cachedPlayerOnAnAxisRetainsItsMapMarker() {
+        scenario.onActivity(current -> {
+            showPlayers();
+            for (double[] coordinates : new double[][]{{10, 0}, {0, 20}}) {
+                Globals.GPSData location = Globals.getInstance().mGPSData.get((byte) 2);
+                location.longitude = coordinates[0];
+                location.latitude = coordinates[1];
+                location.hasUpdate = true;
+                receive(new Intent(NetMsg.NETMSG_GPSDATAUPDATE));
+                assertNotNull(marker(2));
             }
         });
     }
@@ -518,12 +580,13 @@ public class MapRegressionTest {
         location.setLongitude(longitude);
         location.setLatitude(latitude);
         location.setTime(time);
+        location.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
         location.setAccuracy(5);
         return location;
     }
 
     private static double[][] invalidCoordinates() {
-        return new double[][]{{0, 0}, {0, 20}, {10, 0}, {Double.NaN, 20}, {10, Double.NaN},
+        return new double[][]{{0, 0}, {Double.NaN, 20}, {10, Double.NaN},
                 {Double.POSITIVE_INFINITY, 20}, {10, Double.NEGATIVE_INFINITY},
                 {181, 20}, {-181, 20}, {10, 91}, {10, -91}};
     }

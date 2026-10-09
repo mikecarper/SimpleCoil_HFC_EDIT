@@ -1,5 +1,9 @@
 package com.simplecoil.laptophost;
 
+import com.simplecoil.protocol.GpsOffset;
+import com.simplecoil.protocol.GameStartCountdown;
+import com.simplecoil.protocol.Powerups;
+
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -29,11 +33,35 @@ public final class LaptopHostProtocolSmokeTest {
     private static final int UDP_PORT = 19_500;
     private static final int DASHBOARD_PORT = 19_511;
     private static final int TILE_PORT = 19_512;
-    private static final String JSON_PREFIX = "SimpleCoil:28JSON";
-    private static final String MESSAGE_PREFIX = "SimpleCoil:28MESG";
+    private static final String JSON_PREFIX = "SimpleCoil:30JSON";
+    private static final String MESSAGE_PREFIX = "SimpleCoil:30MESG";
     private static final long GPS_UTC_BASE = 1_800_000_000_000L;
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && "--powerups-only".equals(args[0])) {
+            verifyPowerupRecipientWire();
+            verifyPowerupStandaloneFrameBound();
+            verifyPowerupSnapshotFraming();
+            verifyPowerupRequests(2);
+            verifyPowerupRequests(8);
+            verifyPowerupRequests(0);
+            verifyDynamicPowerupRequirement();
+            System.out.println("Host-authoritative power-up protocol smoke tests passed");
+            return;
+        }
+        if (args.length == 1 && "--countdown-only".equals(args[0])) {
+            verifyNormalStartCountdown(false);
+            verifyNormalStartCountdown(true);
+            verifyBalancedQr();
+            verifyBalancedNoQr();
+            System.out.println("Game-start countdown protocol smoke tests passed");
+            return;
+        }
+        if (args.length == 1 && "--gps-only".equals(args[0])) {
+            verifyGpsOffsets();
+            System.out.println("GPS offset protocol smoke test passed");
+            return;
+        }
         if (args.length == 1 && "--dead-rejoin-only".equals(args[0])) {
             verifyDeadRejoin();
             System.out.println("Dead-player reconnect smoke test passed");
@@ -283,10 +311,23 @@ public final class LaptopHostProtocolSmokeTest {
             if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS))
                 host.destroyForcibly();
         }
+        verifyNormalStartCountdown(false);
+        verifyNormalStartCountdown(true);
+        System.out.println("LaptopHost normal start countdown smoke tests passed.");
+        verifyGpsOffsets();
+        System.out.println("LaptopHost GPS offset smoke test passed.");
         verifyBalancedQr();
         System.out.println("LaptopHost balanced QR smoke test passed.");
         verifyBalancedNoQr();
         System.out.println("LaptopHost balanced no-QR smoke test passed.");
+        verifyPowerupRecipientWire();
+        verifyPowerupStandaloneFrameBound();
+        verifyPowerupSnapshotFraming();
+        verifyPowerupRequests(2);
+        verifyPowerupRequests(8);
+        verifyPowerupRequests(0);
+        verifyDynamicPowerupRequirement();
+        System.out.println("LaptopHost host-authoritative power-up smoke tests passed.");
         verifyDeadRejoin();
         verifyRespawnMode(false);
         verifyRespawnMode(true);
@@ -302,13 +343,697 @@ public final class LaptopHostProtocolSmokeTest {
         }
     }
 
+    private static void verifyGpsOffsets() throws Exception {
+        Path classes = Path.of("laptop-host", "out").toAbsolutePath();
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+                "--gps", "all", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
+                String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
+                "--start-delay", "1").redirectErrorStream(true).start();
+        try {
+            waitForHost();
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "GPS Blue");
+                 FakePhone second = new FakePhone("127.0.0.2", 17, "GPS Red")) {
+                require(first.lastRoster.contains("\"gpsoffset\":null"), "missing fix created an origin");
+                String reply = first.probeClock(",\"gpslatitude\":0,\"gpslongitude\":0");
+                require(reply.contains("\"gpsoffset\":null"), "Null Island created a lobby origin");
+                require(!get("/api/state").contains("\"latitude\":"),
+                        "Null Island created a map marker or trail");
+                for (String age : List.of("-1", "1.5", "30001", "1e309", "\"0\"", "null")) {
+                    reply = first.probeClock(",\"gpslatitude\":47.6,\"gpslongitude\":-122.1,\"gpsage\":" + age);
+                    require(reply.contains("\"gpsoffset\":null"),
+                            "invalid GPS age created an origin: " + age);
+                }
+                reply = first.probeClock(",\"gpslatitude\":47.6,\"gpslongitude\":-122.1,\"gpsage\":10000");
+                String originJson = "{\"gpslatitude\":47.6,\"gpslongitude\":-122.1}";
+                require(reply.contains("\"gpsoffset\":" + originJson), "clock sync did not share the GPS origin");
+                require(second.readUntil(frame -> frame.contains("\"gpsoffset\":" + originJson)) != null,
+                        "lobby did not distribute its chosen origin");
+                double bootstrapAge = jsonNumber(currentPlayerState(get("/api/state"), 1), "gpsAgeMs");
+                require(bootstrapAge >= 10000 && bootstrapAge < 12000,
+                        "clock bootstrap renewed the measurement age at receipt");
+                String agedUpdate = second.readUntil(frame -> gpsFrameContainsPlayer(frame, 1)
+                        && jsonNumber(frame, "gpsage") >= 10000);
+                require(agedUpdate != null && jsonNumber(agedUpdate, "gpsage") < 15000,
+                        "GPS snapshot did not preserve the original measurement age");
+                GpsOffset origin = GpsOffset.create(47.6, -122.1);
+                double[] expected = origin.decode(-30001, 31002);
+                first.send(JSON_PREFIX + "{\"gpsoffset\":" + originJson
+                        + ",\"gpsn\":-30001,\"gpse\":31002}");
+                first.probeClock("");
+                require(closeTo(jsonNumber(get("/api/state"), "latitude"), expected[0])
+                        && closeTo(jsonNumber(get("/api/state"), "longitude"), expected[1]),
+                        "signed two-byte GPS offsets lost precision");
+                require(second.readUntil(frame -> gpsFrameContainsPlayer(frame, 1)
+                        && frame.contains("\"gpsn\":-30001") && frame.contains("\"gpse\":31002")) != null,
+                        "host did not forward compact GPS offsets");
+                first.send(JSON_PREFIX + "{\"gpsoffset\":{\"gpslatitude\":48,\"gpslongitude\":-122.1},"
+                        + "\"gpsn\":0,\"gpse\":0}");
+                first.send(JSON_PREFIX + "{\"gpsoffset\":" + originJson + ",\"gpsn\":32768,\"gpse\":0}");
+                first.send(JSON_PREFIX + "{\"gpslatitude\":0,\"gpslongitude\":0}");
+                for (String age : List.of("-1", "1.5", "30001", "1e309", "\"0\"", "null"))
+                    first.send(JSON_PREFIX + "{\"gpslatitude\":48,\"gpslongitude\":-123,\"gpsage\":" + age + "}");
+                first.probeClock("");
+                require(closeTo(jsonNumber(get("/api/state"), "latitude"), expected[0]),
+                        "invalid or mismatched offsets replaced the valid fix");
+                first.send(JSON_PREFIX + "{\"gpslatitude\":47.7123456789,\"gpslongitude\":-122.2123456789}");
+                first.probeClock("");
+                require(second.readUntil(frame -> gpsFrameContainsPlayer(frame, 1)
+                        && frame.contains("\"gpslatitude\":47.7123456789")) != null,
+                        "out-of-area GPS did not retain absolute precision");
+                first.send(JSON_PREFIX + "{\"gpsoffset\":" + originJson + ",\"gpsn\":0,\"gpse\":0}");
+                first.probeClock("");
+                require(closeTo(jsonNumber(get("/api/state"), "latitude"), 47.6),
+                        "zero offsets were confused with Null Island");
+                first.synchronizeClock();
+                second.synchronizeClock();
+                require(post("/api/start").contains("\"ok\":true"), "GPS test round could not start");
+                String start = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                String token = jsonString(start, "roundtoken");
+                first.sendStateGossip(token, 88, 17, 4, origin, -30001, 31002);
+                require(first.receivesAuthorityGps(token, -30001, 31002),
+                        "binary GPS state did not round-trip through the laptop host");
+                require(first.receivesAuthorityGps(token, -30001, 31002, 1),
+                        "cached authority ticks kept an old GPS fix permanently fresh");
+                first.sendStateGossip(token, 89, 18, 4, GpsOffset.create(47.6001, -122.1), 0, 0);
+                require(first.receivesAuthorityState(token, 89, 18, false),
+                        "foreign-origin GPS was relayed, or its combat state was discarded");
+                first.sendStateGossip(token, 90, 19, 4, origin, 0, 0);
+                require(first.receivesAuthorityGps(token, 0, 0),
+                        "valid GPS did not recover after a foreign-origin packet");
+                String state = get("/api/state");
+                long ageMs = (long) jsonNumber(currentPlayerState(state, 1), "gpsAgeMs");
+                Thread.sleep(Math.max(1, 15_050 - ageMs));
+                state = get("/api/state");
+                require(!Double.isFinite(jsonNumber(currentPlayerState(state, 1), "latitude")),
+                        "dashboard kept a stale GPS fix as a current marker");
+                require(state.contains("\"trail\":[{\"longitude\":-122.1,\"latitude\":47.6}"),
+                        "expired GPS deleted the player's historical trail");
+                second.send(JSON_PREFIX + "{\"telemetry\":\"hit\",\"attacker\":1}");
+                second.probeClock("");
+                state = get("/api/state");
+                require(!state.contains("\"shooterLatitude\":") && !state.contains("\"targetLatitude\":"),
+                        "new hit lines used stale or missing GPS coordinates");
+                first.send(JSON_PREFIX + "{\"gpslatitude\":47.8,\"gpslongitude\":-122.3,\"gpsage\":20000}");
+                first.probeClock("");
+                state = get("/api/state");
+                require(jsonNumber(currentPlayerState(state, 1), "gpsAgeMs") >= 20000
+                                && !Double.isFinite(jsonNumber(currentPlayerState(state, 1), "latitude")),
+                        "an already stale measurement was renewed into a current marker");
+            }
+        } finally {
+            host.destroy();
+            if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) host.destroyForcibly();
+        }
+    }
+
+    private static double jsonNumber(String text, String key) {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                "\"" + key + "\":([-0-9.eE+]+)").matcher(text);
+        return matcher.find() ? Double.parseDouble(matcher.group(1)) : Double.NaN;
+    }
+
+    private static String currentPlayerState(String state, int playerID) {
+        String prefix = "{\"id\":" + playerID + ",";
+        int begin = state.indexOf(prefix);
+        int end = begin < 0 ? -1 : state.indexOf("\"trail\":", begin);
+        require(end >= 0, "dashboard did not contain player " + playerID);
+        return state.substring(begin, end);
+    }
+
+    private static boolean closeTo(double actual, double expected) {
+        return Math.abs(actual - expected) < 1e-8;
+    }
+
+    private static void verifyNormalStartCountdown(boolean explicitOverride) throws Exception {
+        require(GameStartCountdown.DURATION_SECONDS == 24 && GameStartCountdown.DURATION_MS == 24_000,
+                "the shared default start countdown must be twenty-four seconds");
+        Path classes = Path.of("laptop-host", "out").toAbsolutePath();
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        List<String> command = new ArrayList<>(List.of(javaExecutable, "--add-modules", "jdk.httpserver",
+                "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT)));
+        if (explicitOverride) {
+            command.add("--start-delay");
+            command.add("1");
+        }
+        Process host = new ProcessBuilder(command).redirectErrorStream(true).start();
+        try {
+            waitForHost();
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
+                 FakePhone second = new FakePhone("127.0.0.2", 17, "Red")) {
+                first.synchronizeClock();
+                second.synchronizeClock();
+                String before = first.probeClock("");
+                require(post("/api/start").contains("\"ok\":true"),
+                        "normal countdown could not start");
+                String start = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                require(start != null, "normal countdown was not sent");
+                requireCountdownDuration(first, before, start,
+                        explicitOverride ? 1_000 : GameStartCountdown.DURATION_MS);
+                String otherStart = second.readUntil(frame -> frame.contains("\"gamestart\""));
+                require(otherStart != null && jsonNumber(start, "gamestart")
+                                == jsonNumber(otherStart, "gamestart"),
+                        "phones did not receive the same start deadline");
+                if (!explicitOverride) {
+                    String state = get("/api/state");
+                    require(state.contains("\"state\":\"countdown\"")
+                                    && jsonNumber(state, "startInMs") > 0
+                                    && jsonNumber(state, "startInMs") <= GameStartCountdown.DURATION_MS,
+                            "normal default countdown was not twenty-four seconds");
+                }
+            }
+        } finally {
+            host.destroy();
+            if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) host.destroyForcibly();
+        }
+    }
+
+    private static void verifyPowerupRequests(int required) throws Exception {
+        Path classes = Path.of("laptop-host", "out").toAbsolutePath();
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        List<String> command = new ArrayList<>(List.of(javaExecutable, "--add-modules", "jdk.httpserver",
+                "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1"));
+        if (required > 0) {
+            command.add("--powerup-qr");
+            command.add(String.valueOf(required));
+        }
+        Process host = new ProcessBuilder(command).redirectErrorStream(true).start();
+        try {
+            waitForHost();
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
+                 FakePhone teammate = new FakePhone("127.0.0.4", 2, "Blue Teammate");
+                 FakePhone enemy = new FakePhone("127.0.0.2", 17, "Red")) {
+                require(first.lastRoster.contains("\"powerupqrrequired\":" + required),
+                        "the two-to-eight-code setting was not advertised");
+                first.synchronizeClock();
+                teammate.synchronizeClock();
+                enemy.synchronizeClock();
+                require(post("/api/start").contains("\"ok\":true"), "power-up round did not start");
+                String start = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                String token = jsonString(start, "roundtoken");
+                require(token != null, "power-up test did not receive a round identity");
+                sendPowerupScan(first, token, "255", "0");
+                require(!first.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                        "a countdown scan earned a reward before actual play");
+                long runningDeadline = System.nanoTime() + 2_000_000_000L;
+                while (!get("/api/state").contains("\"state\":\"running\"")
+                        && System.nanoTime() < runningDeadline) Thread.sleep(25);
+                require(get("/api/state").contains("\"state\":\"running\""),
+                        "power-up test round did not enter active play");
+                if (required == 0) {
+                    sendPowerupScan(first, token, "255", "0");
+                    require(!first.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                            "disabled power-ups still granted a reward");
+                    return;
+                }
+                for (String mask : List.of("0", "256", "1.5", "null", "\"255\""))
+                    sendPowerupScan(first, token, mask, "0");
+                sendPowerupScan(first, UUID.randomUUID().toString(), "255", "0");
+                for (String life : List.of("-1", "1", "0.5", "null", "\"0\""))
+                    sendPowerupScan(first, token, "255", life);
+                int partialMask = (1 << (required - 1)) - 1;
+                sendPowerupScan(first, token, String.valueOf(partialMask), "0");
+                sendPowerupScan(first, token, String.valueOf(partialMask), "0");
+                require(!first.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                        "malformed, stale, repeated, or incomplete scans granted a reward");
+                int completedMask = (1 << required) - 1;
+                sendPowerupScan(first, token, String.valueOf(completedMask), "0");
+                String grant = first.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                require(grant != null, "the completed distinct scan set did not earn a reward");
+                assertPowerupGrant(grant, token, 0);
+                double id = jsonNumber(powerupGrantObject(grant), "id");
+                double expiry = jsonNumber(powerupGrantObject(grant), "expires");
+                String teammateGrant = teammate.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                String enemyGrant = enemy.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                require(teammateGrant != null && enemyGrant != null
+                                && jsonNumber(powerupGrantObject(teammateGrant), "id") == id
+                                && jsonNumber(powerupGrantObject(enemyGrant), "id") == id,
+                        "the host did not send the same grant to every phone");
+                sendPowerupScan(teammate, token, "255", "0");
+                long lastBulkId = (long) id;
+                for (int credit = 0; credit < 8 / required; credit++) {
+                    String bulk = teammate.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                    require(bulk != null && jsonNumber(powerupGrantObject(bulk), "source") == 2
+                                    && jsonNumber(powerupGrantObject(bulk), "id") > lastBulkId,
+                            "the host did not drain each earned credit from a catch-up mask");
+                    lastBulkId = (long) jsonNumber(powerupGrantObject(bulk), "id");
+                    final long expectedId = lastBulkId;
+                    require(first.readUntil(frame -> isPowerupGrant(frame)
+                                    && jsonNumber(powerupGrantObject(frame), "id") == expectedId) != null
+                                    && enemy.readUntil(frame -> isPowerupGrant(frame)
+                                    && jsonNumber(powerupGrantObject(frame), "id") == expectedId) != null,
+                            "a catch-up grant was not broadcast to all phones");
+                }
+                sendPowerupScan(teammate, token, "255", "0");
+                require(!teammate.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                        "the same catch-up mask earned extra rewards");
+                first.close();
+                String identity = UUID.nameUUIDFromBytes("127.0.0.3:1".getBytes(StandardCharsets.UTF_8)).toString();
+                try (FakePhone returned = new FakePhone("127.0.0.3", 1, "Blue Reconnected", identity, 0, true)) {
+                    String snapshot = returned.lastRoster;
+                    require(snapshot.contains("\"powerupgrants\":[{\"id\":" + (long) id + ",")
+                                    && jsonNumber(snapshot, "expires") == expiry
+                                    && snapshot.contains("\"powerupstate\":{\"nextid\":")
+                                    && snapshot.contains("\"mask\":" + completedMask + ",\"earned\":1"),
+                            "reconnect lost original expiry or the consumed scan set");
+                    sendPowerupScan(returned, token, String.valueOf(completedMask), "0");
+                    require(!returned.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                            "reconnect awarded the completed set twice");
+                    returned.close();
+                    try (FakePhone qrReturned = new FakePhone("127.0.0.3", 1, "Blue QR Resume", identity, 1, true)) {
+                        qrReturned.sendStateGossip(token, 2, 0);
+                        require(qrReturned.receivesAuthorityState(token, 2, 0),
+                                "the QR-resumed player's living state did not arrive");
+                        sendPowerupScan(qrReturned, token, String.valueOf(completedMask), "0");
+                        require(!qrReturned.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                                "same-identity QR resume awarded the completed set twice");
+                        qrReturned.send(MESSAGE_PREFIX + "ELIMINATED17");
+                        qrReturned.probeClock("");
+                        sendPowerupScan(qrReturned, token, "255", "1");
+                        require(!qrReturned.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                                "an eliminated player earned a reward");
+                        qrReturned.send(MESSAGE_PREFIX + "RESPAWNREQUEST");
+                        require(qrReturned.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "RESPAWNGRANTED")) != null,
+                                "the power-up test player did not respawn");
+                        sendPowerupScan(qrReturned, token, "255", "0");
+                        sendPowerupScan(qrReturned, token, String.valueOf(partialMask), "1");
+                        require(!qrReturned.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                                "death retained old progress or accepted the previous life");
+                        sendPowerupScan(qrReturned, token, String.valueOf(completedMask), "1");
+                        String nextGrant = qrReturned.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                        require(nextGrant != null && jsonNumber(powerupGrantObject(nextGrant), "id") > id,
+                                "a fresh-life completed set did not get a new grant identity");
+                        assertPowerupGrant(nextGrant, token, 1);
+                    }
+                }
+            }
+        } finally {
+            host.destroy();
+            if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) host.destroyForcibly();
+        }
+    }
+
+    private static void sendPowerupScan(FakePhone phone, String token, String mask, String life) throws IOException {
+        phone.send(JSON_PREFIX + "{\"powerupscan\":" + mask + ",\"poweruplife\":" + life
+                + ",\"roundtoken\":\"" + token + "\"}");
+    }
+
+    private static boolean isPowerupGrant(String frame) {
+        return frame.startsWith(JSON_PREFIX) && frame.contains("\"powerupgrant\":{");
+    }
+
+    private static String powerupGrantObject(String frame) {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                "\"powerupgrant\":(\\{[^}]*\\})").matcher(frame);
+        require(matcher.find(), "frame did not contain a live power-up grant");
+        return matcher.group(1);
+    }
+
+    private static void assertPowerupGrant(String frame, String token, int life) throws Exception {
+        assertPowerupGrant(frame, token, 1, life);
+    }
+
+    private static void assertPowerupGrant(String frame, String token, int source, int life) throws Exception {
+        String grant = powerupGrantObject(frame);
+        int kind = (int) jsonNumber(grant, "kind");
+        require(kind >= 1 && kind <= 9 && jsonNumber(grant, "id") > 0
+                        && jsonNumber(grant, "source") == source && jsonNumber(grant, "sourcelife") == life
+                        && token.equals(jsonString(frame, "roundtoken")),
+                "the reward did not contain a valid source, life, kind, and round");
+        require(jsonNumber(grant, "cost") >= 2 && jsonNumber(grant, "cost") <= 8,
+                "the reward did not retain its original scan cost");
+        require(jsonNumber(grant, "expires") - jsonNumber(frame, "powerupclock") == Powerups.durationMillis(kind),
+                "the reward expiry did not use the authoritative duration");
+        Powerups.Grant decoded = readPowerupGrant(grant);
+        int[] expectedTargets = kind == 1 || kind == 8 ? new int[]{17}
+                : kind == 3 || kind == 7 ? new int[]{1, 2} : new int[]{source};
+        require(java.util.Arrays.equals(decoded.targets, expectedTargets),
+                "the reward used the wrong team targets");
+        int[] expectedLives = kind == 1 || kind == 8 ? new int[]{0}
+                : kind == 3 || kind == 7 ? source == 1 ? new int[]{life, 0} : new int[]{0, life}
+                : new int[]{life};
+        require(java.util.Arrays.equals(decoded.targetLives, expectedLives),
+                "the reward lost the targets' original lives");
+        require(grant.contains("\"recipients\":") && !grant.contains("\"targets\":")
+                        && !grant.contains("\"lives\":"),
+                "the laptop did not emit only compact recipients");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Map<String, Object> parseHostObject(String text) throws Exception {
+        Class<?> jsonClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Json");
+        java.lang.reflect.Method parse = jsonClass.getDeclaredMethod("parse", String.class);
+        parse.setAccessible(true);
+        return (java.util.Map<String, Object>) parse.invoke(null, text);
+    }
+
+    private static long hostJsonNumber(java.util.Map<String, Object> object, String field) {
+        Object value = object.get(field);
+        if (!(value instanceof Number)) throw new IllegalArgumentException("Missing numeric " + field);
+        return ((Number) value).longValue();
+    }
+
+    /** The laptop emits grants; this phone-side smoke decoder also accepts legacy recipient arrays. */
+    private static Powerups.Grant readPowerupGrant(String text) throws Exception {
+        java.util.Map<String, Object> object = parseHostObject(text);
+        int[] targets, lives;
+        if (object.containsKey("recipients")) {
+            if (object.containsKey("targets") || object.containsKey("lives")
+                    || !(object.get("recipients") instanceof String))
+                throw new IllegalArgumentException("Ambiguous compact power-up recipients");
+            Powerups.Recipients recipients = Powerups.decodeRecipients((String) object.get("recipients"));
+            targets = recipients.targets;
+            lives = recipients.targetLives;
+        } else {
+            Object targetValue = object.get("targets"), lifeValue = object.get("lives");
+            if (!(targetValue instanceof List) || !(lifeValue instanceof List))
+                throw new IllegalArgumentException("Missing legacy power-up recipients");
+            List<?> targetList = (List<?>) targetValue, lifeList = (List<?>) lifeValue;
+            if (targetList.size() != lifeList.size() || targetList.isEmpty() || targetList.size() > 32)
+                throw new IllegalArgumentException("Invalid legacy power-up recipients");
+            targets = new int[targetList.size()];
+            lives = new int[targets.length];
+            for (int index = 0; index < targets.length; index++) {
+                if (!(targetList.get(index) instanceof Number) || !(lifeList.get(index) instanceof Number))
+                    throw new IllegalArgumentException("Invalid legacy power-up recipient");
+                targets[index] = ((Number) targetList.get(index)).intValue();
+                lives[index] = ((Number) lifeList.get(index)).intValue();
+            }
+            // Canonical validation is shared with the compact encoder.
+            Powerups.Recipients recipients = Powerups.decodeRecipients(Powerups.encodeRecipients(
+                    new Powerups.Grant(1, 1, 0, Powerups.SHIELD_TEAM, targets, lives, 1, 2)));
+            targets = recipients.targets;
+            lives = recipients.targetLives;
+        }
+        return new Powerups.Grant(hostJsonNumber(object, "id"), (int) hostJsonNumber(object, "source"),
+                (int) hostJsonNumber(object, "sourcelife"), (int) hostJsonNumber(object, "kind"),
+                targets, lives, hostJsonNumber(object, "expires"), (int) hostJsonNumber(object, "cost"));
+    }
+
+    private static String powerupWireObject(Powerups.Grant grant) throws Exception {
+        java.lang.reflect.Method grantMap = LaptopHost.class.getDeclaredMethod("powerupGrantMap", Powerups.Grant.class);
+        grantMap.setAccessible(true);
+        java.lang.reflect.Method jsonFrame = LaptopHost.class.getDeclaredMethod("jsonFrame", Object.class);
+        jsonFrame.setAccessible(true);
+        return ((String) jsonFrame.invoke(null, grantMap.invoke(null, grant))).substring(JSON_PREFIX.length());
+    }
+
+    private static void verifyPowerupRecipientWire() throws Exception {
+        Powerups.Grant original = new Powerups.Grant(1_000_000_000_000_000_123L, 32, Integer.MAX_VALUE / 32,
+                Powerups.SHIELD_TEAM, new int[]{32, 1, 17}, new int[]{Integer.MAX_VALUE, 0, 67_108_863},
+                1_000_000_000_000_010_000L, 2);
+        String compact = powerupWireObject(original);
+        Powerups.Grant decoded = readPowerupGrant(compact);
+        require(decoded.id == original.id && decoded.expiresAt == original.expiresAt
+                        && decoded.source == original.source && decoded.sourceLife == original.sourceLife
+                        && decoded.kind == original.kind && decoded.scanCost == original.scanCost
+                        && java.util.Arrays.equals(decoded.targets, new int[]{1, 17, 32})
+                        && java.util.Arrays.equals(decoded.targetLives, new int[]{0, 67_108_863, Integer.MAX_VALUE}),
+                "compact recipient round trip changed a grant or its corresponding lives");
+        String legacy = "{\"id\":1,\"source\":1,\"sourcelife\":0,\"kind\":3,"
+                + "\"targets\":[32,1],\"lives\":[67108863,0],\"expires\":15000,\"cost\":2}";
+        Powerups.Grant legacyGrant = readPowerupGrant(legacy);
+        require(java.util.Arrays.equals(legacyGrant.targets, new int[]{1, 32})
+                        && java.util.Arrays.equals(legacyGrant.targetLives, new int[]{0, 67_108_863}),
+                "legacy recipient arrays lost their corresponding life generations");
+        for (String ambiguous : new String[]{compact.substring(0, compact.length() - 1) + ",\"targets\":[1]}",
+                compact.substring(0, compact.length() - 1) + ",\"lives\":[0]}"}) {
+            boolean rejected = false;
+            try { readPowerupGrant(ambiguous); } catch (IllegalArgumentException expected) { rejected = true; }
+            require(rejected, "mixed compact and legacy recipients were accepted");
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void verifyPowerupStandaloneFrameBound() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Object config = parse.invoke(null, (Object) new String[]{"--powerup-qr", "2"});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method stop = LaptopHost.class.getDeclaredMethod("stop");
+        stop.setAccessible(true);
+        try {
+            require(Powerups.MAX_ACTIVE_GRANTS == 128, "recovery no longer retains all four rewards for 32 lives");
+            int maxLife = Integer.MAX_VALUE / 32;
+            long clock = 1_000_000_000_000_000_000L;
+            long firstId = 1_000_000_000_000_000_001L;
+            int[] targets = new int[32], lives = new int[32];
+            List<Powerups.ScanState> players = new ArrayList<>();
+            List<Powerups.Grant> grants = new ArrayList<>();
+            for (int id = 1; id <= 32; id++) {
+                targets[id - 1] = id;
+                lives[id - 1] = maxLife;
+                players.add(new Powerups.ScanState(id, maxLife, 255, 4, 2, 8));
+            }
+            for (int index = 0; index < Powerups.MAX_ACTIVE_GRANTS; index++)
+                grants.add(new Powerups.Grant(firstId + index, index % 32 + 1, maxLife,
+                        Powerups.SHIELD_TEAM, targets, lives, clock + Powerups.BUFF_MS, 2));
+            java.lang.reflect.Field authorityField = LaptopHost.class.getDeclaredField("powerupAuthority");
+            authorityField.setAccessible(true);
+            Powerups.Authority authority = (Powerups.Authority) authorityField.get(host);
+            require(authority.restore(new Powerups.Snapshot(firstId + grants.size(), clock, grants, players), clock),
+                    "the 128-grant bound fixture could not be restored");
+            java.util.Map<String, Object> snapshot = new java.util.LinkedHashMap<>();
+            java.lang.reflect.Method putSnapshot = LaptopHost.class.getDeclaredMethod(
+                    "putPowerupSnapshotLocked", java.util.Map.class, long.class);
+            putSnapshot.setAccessible(true);
+            putSnapshot.invoke(host, snapshot, clock);
+            snapshot.put("roundtoken", UUID.randomUUID().toString());
+            java.lang.reflect.Method grantMap = LaptopHost.class.getDeclaredMethod("powerupGrantMap", Powerups.Grant.class);
+            grantMap.setAccessible(true);
+            snapshot.put("powerupgrant", grantMap.invoke(null, grants.get(grants.size() - 1)));
+            java.lang.reflect.Method jsonFrame = LaptopHost.class.getDeclaredMethod("jsonFrame", Object.class);
+            jsonFrame.setAccessible(true);
+            String frame = (String) jsonFrame.invoke(null, snapshot);
+            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+            try (DataOutputStream output = new DataOutputStream(bytes)) { output.writeUTF(frame); }
+            require(bytes.size() - 2 < 60_000,
+                    "128 all-player grants exceeded the standalone modified-UTF frame budget: " + (bytes.size() - 2));
+            try (DataInputStream input = new DataInputStream(new java.io.ByteArrayInputStream(bytes.toByteArray()))) {
+                require(frame.equals(input.readUTF()), "writeUTF/readUTF changed the standalone recovery frame");
+            }
+            java.util.Map<String, Object> decoded = parseHostObject(frame.substring(JSON_PREFIX.length()));
+            List<?> grantObjects = (List<?>) decoded.get("powerupgrants");
+            require(grantObjects.size() == 128 && hostJsonNumber(decoded, "powerupclock") == clock,
+                    "standalone recovery lost active grants or the original 19-digit clock");
+            List<Powerups.Grant> restored = new ArrayList<>();
+            for (int index = 0; index < grantObjects.size(); index++) {
+                String object = ((String) jsonFrame.invoke(null, grantObjects.get(index))).substring(JSON_PREFIX.length());
+                Powerups.Grant grant = readPowerupGrant(object);
+                require(grant.id == firstId + index && grant.expiresAt == clock + Powerups.BUFF_MS
+                                && grant.targets.length == 32 && grant.targetLives[31] == maxLife
+                                && jsonString(object, "recipients").length() == 264,
+                        "standalone recovery changed a full-recipient grant");
+                restored.add(grant);
+            }
+            Powerups.Authority recovered = new Powerups.Authority();
+            require(recovered.restore(new Powerups.Snapshot(firstId + grants.size(), clock, restored, players), clock),
+                    "compact standalone recovery failed authority validation");
+            require(recovered.activeGrants(clock).size() == 128,
+                    "compact standalone recovery evicted valid current-life rewards");
+            System.out.println("128-grant standalone modified-UTF bytes: " + (bytes.size() - 2));
+        } finally {
+            stop.invoke(host);
+        }
+    }
+
+    private static void verifyDynamicPowerupRequirement() throws Exception {
+        Path classes = Path.of("laptop-host", "out").toAbsolutePath();
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1", "--powerup-qr", "8")
+                .redirectErrorStream(true).start();
+        try {
+            waitForHost();
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
+                 FakePhone teammate = new FakePhone("127.0.0.4", 2, "Blue Teammate");
+                 FakePhone enemy = new FakePhone("127.0.0.2", 17, "Red")) {
+                first.synchronizeClock();
+                teammate.synchronizeClock();
+                enemy.synchronizeClock();
+                require(post("/api/start").contains("\"ok\":true"), "adaptive power-up round did not start");
+                String start = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                String token = jsonString(start, "roundtoken");
+                long deadline = System.nanoTime() + 2_000_000_000L;
+                while (!get("/api/state").contains("\"state\":\"running\"")
+                        && System.nanoTime() < deadline) Thread.sleep(25);
+                require(get("/api/state").contains("\"state\":\"running\""), "adaptive round stayed in countdown");
+                sendPowerupScan(first, token, "255", "0");
+                String initial = first.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                require(initial != null && jsonNumber(powerupGrantObject(initial), "cost") == 8,
+                        "equal teams did not pay the configured eight-code cost");
+                require(teammate.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant) != null
+                                && enemy.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant) != null,
+                        "initial adaptive reward was not broadcast");
+                int previousScore = 0;
+                for (int score : new int[]{5, 10, 30}) {
+                    for (int kill = previousScore; kill < score; kill++) {
+                        teammate.send(MESSAGE_PREFIX + "ELIMINATED17");
+                        teammate.send(MESSAGE_PREFIX + "RESPAWNREQUEST");
+                        require(teammate.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "RESPAWNGRANTED")) != null,
+                                "score-gap fixture could not respawn its victim");
+                    }
+                    previousScore = score;
+                    require(jsonNumber(currentPlayerState(get("/api/state"), 17), "kills") == score,
+                            "the host did not retain the opponent's current team score");
+                    int required = score == 5 ? 7 : score == 10 ? 6 : 2;
+                    sendPowerupScan(first, token, "255", "0");
+                    require(!first.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                            "a cheaper requirement reused the eight already-spent codes");
+                    int partial = (1 << (required - 1)) - 1;
+                    int complete = (1 << required) - 1;
+                    sendPowerupScan(teammate, token, String.valueOf(partial), String.valueOf(score));
+                    require(!teammate.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                            "the adaptive threshold granted too early");
+                    sendPowerupScan(teammate, token, String.valueOf(complete), String.valueOf(score));
+                    String grant = teammate.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                    require(grant != null && jsonNumber(powerupGrantObject(grant), "cost") == required
+                                    && grant.contains("\"required\":" + required + ",\"spent\":" + required),
+                            "the host did not apply the adaptive threshold or retain spent-code accounting");
+                    assertPowerupGrant(grant, token, 2, score);
+                    long id = (long) jsonNumber(powerupGrantObject(grant), "id");
+                    require(first.readUntil(frame -> isPowerupGrant(frame)
+                                    && jsonNumber(powerupGrantObject(frame), "id") == id) != null
+                                    && enemy.readUntil(frame -> isPowerupGrant(frame)
+                                    && jsonNumber(powerupGrantObject(frame), "id") == id) != null,
+                            "an adaptive reward was not broadcast to every phone");
+                }
+                enemy.send(MESSAGE_PREFIX + "LEAVE");
+                enemy.close();
+                require(waitForDashboard(state -> currentPlayerState(state, 17)
+                        .contains("\"connected\":false")) != null, "the opponent did not leave");
+                sendPowerupScan(teammate, token, "7", "30");
+                require(!teammate.receivesFor(LaptopHostProtocolSmokeTest::isPowerupGrant, 100),
+                        "the departed opponent caused spent codes to be reused");
+                sendPowerupScan(teammate, token, "15", "30");
+                String afterDeparture = teammate.readUntil(LaptopHostProtocolSmokeTest::isPowerupGrant);
+                require(afterDeparture != null && jsonNumber(powerupGrantObject(afterDeparture), "cost") == 2,
+                        "departed opponent scores stopped counting toward the catch-up threshold");
+            }
+        } finally {
+            host.destroy();
+            if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) host.destroyForcibly();
+        }
+    }
+
+    private static void verifyPowerupSnapshotFraming() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Object config = parse.invoke(null, (Object) new String[]{"--powerup-qr", "2"});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method stop = LaptopHost.class.getDeclaredMethod("stop");
+        stop.setAccessible(true);
+        try {
+            String token = UUID.randomUUID().toString();
+            com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(token);
+            int maxScore = Integer.MAX_VALUE / 32;
+            for (int index = 0; index < com.simplecoil.protocol.RoundRoster.HISTORY_LIMIT; index++) {
+                int id = index % 32 + 1;
+                com.simplecoil.protocol.RoundRoster.Member member = new com.simplecoil.protocol.RoundRoster.Member(
+                        UUID.randomUUID().toString(), id, id <= 16 ? 1 : 2, index / 32);
+                member.kills = member.deaths = maxScore;
+                member.captures = 255;
+                member.active = false;
+                roster.restore(member);
+            }
+            setHostField(host, "roundRoster", roster);
+            setHostField(host, "roundToken", token);
+            Object running = java.util.Arrays.stream(Class.forName(
+                    "com.simplecoil.laptophost.LaptopHost$RoundState").getEnumConstants())
+                    .filter(value -> "RUNNING".equals(value.toString())).findFirst().orElseThrow();
+            setHostField(host, "roundState", running);
+            Class<?> settingsClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Settings");
+            java.lang.reflect.Method settingsMethod = settingsClass.getDeclaredMethod("tournament");
+            settingsMethod.setAccessible(true);
+            Class<?> playerClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Player");
+            java.lang.reflect.Constructor<?> playerConstructor = playerClass.getDeclaredConstructor(
+                    int.class, String.class, InetAddress.class, settingsClass);
+            playerConstructor.setAccessible(true);
+            java.lang.reflect.Field playersField = LaptopHost.class.getDeclaredField("players");
+            playersField.setAccessible(true);
+            Object hostPlayers = playersField.get(host);
+            java.lang.reflect.Method putPlayer = java.util.Map.class.getMethod("put", Object.class, Object.class);
+            for (int id = 1; id <= 32; id++) {
+                Object player = playerConstructor.newInstance(id, String.format(java.util.Locale.ROOT, "%020d", id),
+                        InetAddress.getByName("127.0.0." + id), settingsMethod.invoke(null));
+                setHostField(player, "connected", true);
+                setHostField(player, "identity", roster.seat(id).identity);
+                setHostField(player, "kills", maxScore);
+                setHostField(player, "deaths", maxScore);
+                putPlayer.invoke(hostPlayers, id, player);
+            }
+            java.lang.reflect.Field authorityField = LaptopHost.class.getDeclaredField("powerupAuthority");
+            authorityField.setAccessible(true);
+            Powerups.Authority authority = (Powerups.Authority) authorityField.get(host);
+            java.util.Map<Integer, Integer> teams = new java.util.HashMap<>();
+            java.util.Set<Integer> alive = new java.util.HashSet<>();
+            for (int id = 1; id <= 32; id++) {
+                authority.setPlayerLife(id, maxScore);
+                teams.put(id, id <= 16 ? 1 : 2);
+                alive.add(id);
+            }
+            java.util.Random empOnly = new java.util.Random(0) {
+                @Override public int nextInt(int bound) { return 0; }
+            };
+            for (int id = 1; id <= 32; id++)
+                for (int credit = 0; credit < 4; credit++)
+                    require(authority.request(id, maxScore, 255, 2, teams.get(id), teams,
+                            java.util.Collections.emptyMap(), alive, 0, empOnly) != null,
+                            "large snapshot fixture did not earn its grant");
+            java.lang.reflect.Method framesMethod = LaptopHost.class.getDeclaredMethod("rosterFrames", int.class);
+            framesMethod.setAccessible(true);
+            Object delivered = framesMethod.invoke(host, 0);
+            require(delivered instanceof List, "roster delivery did not return framed snapshots");
+            List<?> frames = (List<?>) delivered;
+            require(frames.size() == 2 && ((String) frames.get(0)).contains("\"roundroster\":")
+                            && !((String) frames.get(0)).contains("\"powerupgrants\":")
+                            && ((String) frames.get(1)).contains("\"powerupgrants\":[")
+                            && token.equals(jsonString((String) frames.get(1), "roundtoken")),
+                    "oversized roster and active grants were not split without losing round scope");
+            try (DataOutputStream output = new DataOutputStream(new java.io.ByteArrayOutputStream())) {
+                for (Object frame : frames) output.writeUTF((String) frame);
+            }
+        } finally {
+            stop.invoke(host);
+        }
+    }
+
+    private static void setHostField(Object host, String name, Object value) throws ReflectiveOperationException {
+        java.lang.reflect.Field field = host.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(host, value);
+    }
+
+    private static void requireCountdownDuration(FakePhone phone, String before, String start,
+                                                 long durationMs) throws IOException {
+        String after = phone.probeClock("");
+        require(before != null && after != null, "countdown clock probes were not answered");
+        double deadline = jsonNumber(start, "gamestart");
+        require(deadline >= jsonNumber(before, "clockreceive") + durationMs
+                        && deadline <= jsonNumber(after, "clockreceive") + durationMs,
+                "start deadline did not include the required " + durationMs + " ms countdown");
+    }
+
     private static void verifyBalancedQr() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--balanced-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
-                "--dashboard-port", String.valueOf(DASHBOARD_PORT))
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
                 .redirectErrorStream(true).start();
         try {
             waitForHost();
@@ -325,9 +1050,12 @@ public final class LaptopHostProtocolSmokeTest {
                 first.send(JSON_PREFIX + "{\"balancedcheckin\":true}");
                 require(!first.receivesFor(frame -> frame.contains("\"gamestart\""), 300),
                         "one QR check-in started the game early");
+                String before = first.probeClock("");
                 second.send(JSON_PREFIX + "{\"balancedcheckin\":true}");
-                require(first.readUntil(frame -> frame.contains("\"gamestart\"")) != null,
+                String start = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                require(start != null,
                         "the final QR check-in did not start the shared countdown");
+                requireCountdownDuration(first, before, start, GameStartCountdown.DURATION_MS);
             }
         } finally {
             host.destroy();
@@ -345,7 +1073,7 @@ public final class LaptopHostProtocolSmokeTest {
                 socket.bind(new InetSocketAddress("127.0.0." + (20 + index), UDP_PORT));
                 socket.setSoTimeout(1_000);
                 pendingJoins.add(socket);
-                byte[] request = "SimpleCoil:JOIN281".getBytes(StandardCharsets.UTF_8);
+                byte[] request = "SimpleCoil:JOIN301".getBytes(StandardCharsets.UTF_8);
                 socket.send(new DatagramPacket(request, request.length,
                         InetAddress.getByName("127.0.0.1"), UDP_PORT));
                 byte[] reply = new byte[128];
@@ -369,7 +1097,7 @@ public final class LaptopHostProtocolSmokeTest {
         Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--balanced-no-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
-                "--dashboard-port", String.valueOf(DASHBOARD_PORT))
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
                 .redirectErrorStream(true).start();
         try {
             waitForHost();
@@ -377,10 +1105,13 @@ public final class LaptopHostProtocolSmokeTest {
                  FakePhone second = new FakePhone("127.0.0.2", 17, "Red")) {
                 first.synchronizeClock();
                 second.synchronizeClock();
+                String before = first.probeClock("");
                 require(post("/api/start").contains("\"ok\":true"),
                         "balanced no-QR mode did not start without check-in");
-                require(first.readUntil(frame -> frame.contains("\"gamestart\"")) != null,
+                String start = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                require(start != null,
                         "balanced no-QR countdown was not sent");
+                requireCountdownDuration(first, before, start, GameStartCountdown.DURATION_MS);
                 require(get("/api/state").contains("\"balancedQr\":false"),
                         "balanced no-QR state was not exposed");
                 verifyDirectLateJoinBlocked();
@@ -693,7 +1424,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.3", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN281".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN301".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -709,14 +1440,14 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.9", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] query = "SimpleCoil:LOBBYQUERY:28".getBytes(StandardCharsets.UTF_8);
+            byte[] query = "SimpleCoil:LOBBYQUERY:30".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(query, query.length, InetAddress.getLoopbackAddress(), UDP_PORT));
             DatagramPacket reply = new DatagramPacket(new byte[128], 128);
             socket.receive(reply);
             require(new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8)
-                            .matches("SimpleCoil:LOBBYSTATE:28:L:OPEN:[0-9]+"),
+                            .matches("SimpleCoil:LOBBYSTATE:30:L:OPEN:[0-9]+"),
                     "shared lobby did not advertise a compatible dedicated host");
-            byte[] join = "SimpleCoil:JOIN280".getBytes(StandardCharsets.UTF_8);
+            byte[] join = "SimpleCoil:JOIN300".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(join, join.length, InetAddress.getLoopbackAddress(), UDP_PORT));
             socket.receive(reply);
             String assignment = new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8);
@@ -735,7 +1466,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.4", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN282".getBytes(StandardCharsets.UTF_8);
+            byte[] request = "SimpleCoil:JOIN302".getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -838,7 +1569,7 @@ public final class LaptopHostProtocolSmokeTest {
     }
 
     private static final class FakePhone implements AutoCloseable {
-        private static final int STATE_PACKET_BYTES = 1_376;
+        private static final int STATE_PACKET_BYTES = 1_264;
         private static final int STATE_PACKET_MAGIC = 0x53434F49;
         private final Socket socket = new Socket();
         private final DatagramSocket udp;
@@ -847,6 +1578,7 @@ public final class LaptopHostProtocolSmokeTest {
         private int playerID;
         private int seatGeneration;
         private String lastRoster;
+        private long statePacketSequence;
 
         FakePhone(String localAddress, int playerID, String name) throws IOException {
             this(localAddress, playerID, name, UUID.nameUUIDFromBytes((localAddress + ":" + playerID)
@@ -897,16 +1629,23 @@ public final class LaptopHostProtocolSmokeTest {
 
         void sendStateGossip(String roundToken, long ownerSequence, int score, int extraFlags)
                 throws IOException {
+            sendStateGossip(roundToken, ownerSequence, score, extraFlags, null, 0, 0);
+        }
+
+        void sendStateGossip(String roundToken, long ownerSequence, int score, int extraFlags,
+                             GpsOffset origin, int north, int east) throws IOException {
             ByteBuffer packet = ByteBuffer.allocate(STATE_PACKET_BYTES).order(ByteOrder.BIG_ENDIAN);
             UUID token = UUID.fromString(roundToken);
             packet.putInt(STATE_PACKET_MAGIC);
-            packet.put((byte) 3); // state-packet format
-            packet.put((byte) 28); // network protocol
+            packet.put((byte) 4); // state-packet format
+            packet.put((byte) 30); // network protocol
             packet.put((byte) playerID);
             packet.put((byte) 2); // two-team mode
-            packet.putLong(1); // sender packet sequence
+            packet.putLong(++statePacketSequence);
             packet.putLong(token.getMostSignificantBits());
             packet.putLong(token.getLeastSignificantBits());
+            packet.putDouble(origin == null ? Double.NaN : origin.latitude);
+            packet.putDouble(origin == null ? Double.NaN : origin.longitude);
             for (int id = 1; id <= 32; id++) {
                 boolean present = id == playerID;
                 packet.put((byte) (present ? 1 | extraFlags : 0));
@@ -924,8 +1663,8 @@ public final class LaptopHostProtocolSmokeTest {
                 packet.putShort((short) (present ? 10 : 0));
                 packet.putShort((short) (present ? 29 : 0));
                 packet.putShort((short) 0);
-                packet.putInt(0);
-                packet.putInt(0);
+                packet.putShort((short) (present ? north : 0));
+                packet.putShort((short) (present ? east : 0));
                 packet.put((byte) (present ? seatGeneration : 0));
                 packet.put((byte) 0); // event-target generation
             }
@@ -940,7 +1679,7 @@ public final class LaptopHostProtocolSmokeTest {
             UUID token = UUID.fromString(roundToken);
             packet.putInt(0x53434F43); // SCOC
             packet.put((byte) 2); // combat-packet format
-            packet.put((byte) 28); // network protocol
+            packet.put((byte) 30); // network protocol
             packet.put((byte) 1); // event, not ACK
             packet.put((byte) eventType);
             packet.put((byte) playerID);
@@ -956,6 +1695,11 @@ public final class LaptopHostProtocolSmokeTest {
 
         boolean receivesAuthorityState(String roundToken, long ownerSequence, int score)
                 throws IOException {
+            return receivesAuthorityState(roundToken, ownerSequence, score, null);
+        }
+
+        boolean receivesAuthorityState(String roundToken, long ownerSequence, int score,
+                                       Boolean gpsValid) throws IOException {
             UUID expectedToken = UUID.fromString(roundToken);
             long deadline = System.nanoTime() + 4_000_000_000L;
             while (System.nanoTime() < deadline) {
@@ -974,10 +1718,11 @@ public final class LaptopHostProtocolSmokeTest {
                 UUID token = new UUID(packet.getLong(16), packet.getLong(24));
                 if (!expectedToken.equals(token))
                     continue;
-                int rowOffset = 32 + (playerID - 1) * 42;
+                int rowOffset = 48 + (playerID - 1) * 38;
                 if ((packet.get(rowOffset) & 1) != 0
                         && (packet.getInt(rowOffset + 8) & 0xffffffffL) == ownerSequence
-                        && packet.getInt(rowOffset + 16) == score)
+                        && packet.getInt(rowOffset + 16) == score
+                        && (gpsValid == null || ((packet.get(rowOffset) & 4) != 0) == gpsValid))
                     return true;
             }
             return false;
@@ -1003,7 +1748,7 @@ public final class LaptopHostProtocolSmokeTest {
                 UUID token = new UUID(packet.getLong(16), packet.getLong(24));
                 if (!expectedToken.equals(token))
                     continue;
-                int rowOffset = 32 + (senderID - 1) * 42;
+                int rowOffset = 48 + (senderID - 1) * 38;
                 if ((packet.get(rowOffset) & 1) != 0
                         && (packet.getInt(rowOffset + 12) & 0xffffffffL) == eventSequence
                         && (packet.get(rowOffset + 4) & 0xff) == eventType
@@ -1011,6 +1756,37 @@ public final class LaptopHostProtocolSmokeTest {
                     return true;
             }
             return false;
+        }
+
+        boolean receivesAuthorityGps(String roundToken, int north, int east) throws IOException {
+            return receivesAuthorityGps(roundToken, north, east, 0);
+        }
+
+        boolean receivesAuthorityGps(String roundToken, int north, int east, int minimumAgeSeconds)
+                throws IOException {
+            UUID token = UUID.fromString(roundToken);
+            long deadline = System.nanoTime() + 4_000_000_000L;
+            while (System.nanoTime() < deadline) {
+                byte[] bytes = new byte[STATE_PACKET_BYTES];
+                DatagramPacket datagram = new DatagramPacket(bytes, bytes.length);
+                try { udp.receive(datagram); } catch (SocketTimeoutException e) { continue; }
+                if (datagram.getLength() != STATE_PACKET_BYTES) continue;
+                ByteBuffer packet = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+                int row = 48 + (playerID - 1) * 38;
+                if (packet.getInt(0) == STATE_PACKET_MAGIC && packet.get(6) == 0
+                        && new UUID(packet.getLong(16), packet.getLong(24)).equals(token)
+                        && packet.getDouble(32) == 47.6 && packet.getDouble(40) == -122.1
+                        && (packet.get(row) & 4) != 0 && packet.getShort(row + 32) == north
+                        && packet.getShort(row + 34) == east
+                        && (packet.getShort(row + 30) & 0xffff) >= minimumAgeSeconds) return true;
+            }
+            return false;
+        }
+
+        String probeClock(String additionalFields) throws IOException {
+            long stamp = System.nanoTime() / 1_000_000L;
+            send(JSON_PREFIX + "{\"clocksync\":" + stamp + additionalFields + "}");
+            return readUntil(frame -> frame.contains("\"clockreceive\""));
         }
 
         void synchronizeClock() throws IOException {

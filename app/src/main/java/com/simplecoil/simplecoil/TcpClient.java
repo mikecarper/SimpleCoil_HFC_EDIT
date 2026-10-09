@@ -16,7 +16,9 @@
 
 package com.simplecoil.simplecoil;
 
+import com.simplecoil.protocol.GpsOffset;
 import com.simplecoil.protocol.RoundRoster;
+import com.simplecoil.protocol.Powerups;
 
 import android.app.Service;
 import android.content.BroadcastReceiver;
@@ -46,6 +48,9 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.UnknownHostException;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.Collections;
 import java.util.HashSet;
@@ -135,6 +140,16 @@ public class TcpClient extends Service {
     private long mActiveLocalStartAt = -1;
     private long mActiveStartRound;
     private String mActiveStartToken;
+    // Local-clock snapshots survive a transport reconnect, but never a new
+    // round. They carry scan credits as well as buffs for peer-host takeover.
+    private final Powerups.Authority mPowerupCache = new Powerups.Authority();
+    private String mPowerupRoundToken;
+    private final String[] mPowerupSeatIdentities = new String[Globals.MAX_PLAYER_ID + 1];
+    private JSONObject mPendingPowerupFrame;
+    private final Set<Long> mPendingLivePowerups = new LinkedHashSet<>();
+    private final Set<Long> mUnacknowledgedPowerups = new LinkedHashSet<>();
+    private final Set<Long> mSeenLivePowerups = new LinkedHashSet<>();
+    private long mLastPowerupHostClock = -1;
 
     private volatile DataOutputStream out = null;
     private Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
@@ -369,6 +384,9 @@ public class TcpClient extends Service {
         mPendingGameStartEvent = null;
         clearActiveStartLocked();
         mPongQueued = false;
+        mPendingPowerupFrame = null;
+        mPendingLivePowerups.clear();
+        mLastPowerupHostClock = -1;
     }
 
     public synchronized boolean isClockSynchronized() { return mClockSynchronized; }
@@ -430,6 +448,13 @@ public class TcpClient extends Service {
                 }
                 try {
                     JSONObject request = new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, sentAt);
+                    Globals.LocalGpsFix fix = Globals.getInstance().mLocalGpsFix;
+                    if (Globals.getInstance().mUseGPS
+                            && (!mClockSynchronized || Globals.getInstance().mGpsOffset == null) && fix != null
+                            && Globals.isFreshGpsFix(fix.elapsedMs, sentAt)) {
+                        GpsWire.putPosition(request, null, fix.latitude, fix.longitude);
+                        request.put(TcpServer.JSON_GPS_FIX_AGE, sentAt - fix.elapsedMs);
+                    }
                     long gpsTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(sentAt, sentAt);
                     if (GpsGameTime.isValidUtcTime(gpsTime))
                         request.put(TcpServer.JSON_GPS_CLOCK, gpsTime);
@@ -443,6 +468,7 @@ public class TcpClient extends Service {
     }
 
     private void receiveClockSync(JSONObject reply, long receivedAt, long generation) throws JSONException {
+        GpsOffset gpsOrigin = reply.has(GpsWire.ORIGIN) ? GpsWire.readOrigin(reply) : null;
         long sentAt = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_REQUEST);
         long hostReceived = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_RECEIVE);
         long hostSent = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_SEND);
@@ -460,6 +486,7 @@ public class TcpClient extends Service {
                     mLastClockSync = receivedAt;
                 return;
             }
+            commitGpsOriginLocked(gpsOrigin);
             ready = mGameClock.samples() >= GameClock.SAMPLES_PER_SYNC;
             if (ready) {
                 announceReady = !mClockSynchronized;
@@ -474,6 +501,7 @@ public class TcpClient extends Service {
         if (ready) {
             publishPendingStart(generation);
             publishClockAdjustedStart(generation);
+            publishPendingPowerups(generation);
         } else {
             requestClockSync();
         }
@@ -648,6 +676,8 @@ public class TcpClient extends Service {
             mIsDedicatedServer = false;
             resetClockSyncLocked();
             mSessionGeneration++;
+            if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
+                Globals.getInstance().mGpsOffset = null;
             keepListening = true;
             isListening = true;
             mClientThread = new Thread(() -> runTcpClient(serverAddress), "SimpleCoil TCP client");
@@ -866,6 +896,10 @@ public class TcpClient extends Service {
             // old dedicated flag makes the next peer-host lobby send its
             // gameplay traffic down a stopped TCP connection.
             mIsDedicatedServer = false;
+            mPowerupCache.resetRound();
+            mPowerupRoundToken = null;
+            mSeenLivePowerups.clear();
+            mUnacknowledgedPowerups.clear();
             notification = new Intent(action).putExtra(EXTRA_TERMINAL_EVENT_ID, terminalEventIds.incrementAndGet());
             mPendingTerminalEvent = notification;
             resetClockSyncLocked();
@@ -929,6 +963,148 @@ public class TcpClient extends Service {
         } catch (JSONException e) {
             Log.w(TAG, "Unable to send balanced team check-in", e);
         }
+    }
+
+    /** Requests are retryable, source-bound, and scoped to the current life. */
+    public synchronized boolean requestPowerup(int scannedMask, int life) {
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        if (mDestroyed || !keepListening || out == null || sendExecutor.isShutdown()
+                || roster == null || scannedMask < 1 || scannedMask > 255 || life < 0
+                || life > MAX_SCOREBOARD_VALUE) return false;
+        try {
+            String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(TcpServer.JSON_POWERUP_SCAN, scannedMask)
+                    .put(TcpServer.JSON_POWERUP_LIFE, life).put(TcpServer.JSON_ROUND_TOKEN, roster.token);
+            final DataOutputStream writer = out;
+            return scheduleSendTask(() -> {
+                if (writer == out) writeMessage(writer, message);
+            }, mSendTaskSlots);
+        } catch (JSONException e) { return false; }
+    }
+
+    private static boolean samePowerup(Powerups.Grant first, Powerups.Grant second) {
+        return first.id == second.id && first.source == second.source && first.sourceLife == second.sourceLife
+                && first.kind == second.kind && first.scanCost == second.scanCost && first.expiresAt == second.expiresAt
+                && Arrays.equals(first.targets, second.targets) && Arrays.equals(first.targetLives, second.targetLives);
+    }
+
+    private void receivePowerupFrame(JSONObject frame, long generation) throws JSONException {
+        Object tokenValue = frame.get(TcpServer.JSON_ROUND_TOKEN);
+        if (!(tokenValue instanceof String) || !TcpServer.isValidRoundToken((String) tokenValue))
+            throw new JSONException("Invalid power-up round token");
+        String token = (String) tokenValue;
+        Powerups.Snapshot snapshot = TcpServer.readPowerupSnapshot(frame);
+        // Validate relationships and target ordering before touching any cache.
+        if (!new Powerups.Authority().restore(snapshot, snapshot.capturedAt))
+            throw new JSONException("Invalid power-up authority snapshot");
+        Powerups.Grant live = frame.has(TcpServer.JSON_POWERUP_GRANT)
+                ? TcpServer.readPowerupGrant(frame.getJSONObject(TcpServer.JSON_POWERUP_GRANT), snapshot.capturedAt) : null;
+        if (live != null) {
+            boolean found = false;
+            for (Powerups.Grant grant : snapshot.grants) if (samePowerup(live, grant)) found = true;
+            if (!found) throw new JSONException("Live power-up missing from authority snapshot");
+        }
+        synchronized (this) {
+            RoundRoster roster = Globals.getInstance().mRoundRoster;
+            if (!isCurrentSession(generation) || roster == null || !token.equals(roster.token)) return;
+            if (!token.equals(mPowerupRoundToken)) {
+                mPowerupCache.resetRound();
+                Arrays.fill(mPowerupSeatIdentities, null);
+                mSeenLivePowerups.clear();
+                mUnacknowledgedPowerups.clear();
+                mPendingLivePowerups.clear();
+                mPowerupRoundToken = token;
+                mLastPowerupHostClock = -1;
+            }
+            // Calibration can precede a reconnect snapshot. Retain one complete
+            // bounded snapshot and its live-event IDs until the clock is ready.
+            if (snapshot.capturedAt < mLastPowerupHostClock) return;
+            if (mPendingPowerupFrame != null && (snapshot.nextId < TcpServer.readPowerupSnapshot(mPendingPowerupFrame).nextId
+                    || snapshot.capturedAt < TcpServer.readPowerupSnapshot(mPendingPowerupFrame).capturedAt))
+                return;
+            mPendingPowerupFrame = new JSONObject(frame.toString());
+            if (live != null && !mSeenLivePowerups.contains(live.id)) {
+                mPendingLivePowerups.add(live.id);
+                while (mPendingLivePowerups.size() > Powerups.MAX_ACTIVE_GRANTS)
+                    mPendingLivePowerups.remove(mPendingLivePowerups.iterator().next());
+            }
+        }
+        publishPendingPowerups(generation);
+    }
+
+    private synchronized void publishPendingPowerups(long generation) throws JSONException {
+        if (!isCurrentSession(generation) || !mClockSynchronized || mPendingPowerupFrame == null) return;
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        if (roster == null || !roster.token.equals(mPowerupRoundToken)) {
+            mPendingPowerupFrame = null;
+            mPendingLivePowerups.clear();
+            return;
+        }
+        Powerups.Snapshot remote = TcpServer.readPowerupSnapshot(mPendingPowerupFrame);
+        long now = SystemClock.elapsedRealtime();
+        syncPowerupSeatsLocked(roster);
+        List<Powerups.Grant> local = new ArrayList<>();
+        for (Powerups.Grant grant : remote.grants) {
+            long expiry = Math.min(mGameClock.toLocalTime(grant.expiresAt), now + Powerups.durationMillis(grant.kind));
+            // Even delayed delivery/import keeps the original absolute expiry.
+            if (expiry <= now) continue;
+            local.add(new Powerups.Grant(grant.id, grant.source, grant.sourceLife, grant.kind,
+                    grant.targets, grant.targetLives, expiry, grant.scanCost));
+        }
+        boolean accepted = mPowerupCache.restore(new Powerups.Snapshot(remote.nextId, now, local, remote.players), now);
+        mPendingPowerupFrame = null;
+        if (accepted) {
+            mLastPowerupHostClock = remote.capturedAt;
+            for (Powerups.Grant grant : mPowerupCache.activeGrants(now)) {
+                if (mPendingLivePowerups.contains(grant.id) && !mSeenLivePowerups.contains(grant.id))
+                    mUnacknowledgedPowerups.add(grant.id);
+                boolean live = mUnacknowledgedPowerups.contains(grant.id);
+                if (live || !Powerups.isInstant(grant.kind))
+                    broadcastIfCurrentSession(generation, TcpServer.powerupIntent(grant, mPowerupRoundToken, !live));
+            }
+            while (mUnacknowledgedPowerups.size() > Powerups.MAX_ACTIVE_GRANTS)
+                mUnacknowledgedPowerups.remove(mUnacknowledgedPowerups.iterator().next());
+        }
+        mPendingLivePowerups.clear();
+    }
+
+    /** Only an applied live event is acknowledged; a missed broadcast remains retryable. */
+    public synchronized void acknowledgePowerup(long id) {
+        if (!mUnacknowledgedPowerups.remove(id)) return;
+        mSeenLivePowerups.add(id);
+        while (mSeenLivePowerups.size() > Powerups.MAX_ACTIVE_GRANTS)
+            mSeenLivePowerups.remove(mSeenLivePowerups.iterator().next());
+    }
+
+    private void syncPowerupSeatsLocked(RoundRoster roster) {
+        for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+            RoundRoster.Member member = roster.seat(id);
+            String identity = member == null ? null : member.identity;
+            if (mPowerupSeatIdentities[id] != null && !mPowerupSeatIdentities[id].equals(identity))
+                mPowerupCache.resetPlayer(id);
+            mPowerupSeatIdentities[id] = identity;
+        }
+    }
+
+    /** A paused activity restores buffs and unacknowledged, unexpired live events. */
+    public synchronized void replayPowerups() {
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        if (mDestroyed || roster == null || !roster.token.equals(mPowerupRoundToken)) return;
+        syncPowerupSeatsLocked(roster);
+        for (Powerups.Grant grant : mPowerupCache.activeGrants(SystemClock.elapsedRealtime())) {
+            boolean live = mUnacknowledgedPowerups.contains(grant.id);
+            if (live || !Powerups.isInstant(grant.kind))
+                sendBroadcast(TcpServer.powerupIntent(grant, mPowerupRoundToken, !live));
+        }
+    }
+
+    /** Export local absolute deadlines for a seamless playing-phone takeover. */
+    public synchronized JSONObject powerupAuthoritySnapshot() {
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        if (mDestroyed || roster == null || !roster.token.equals(mPowerupRoundToken)) return null;
+        syncPowerupSeatsLocked(roster);
+        try { return TcpServer.powerupSnapshotJson(mPowerupRoundToken, mPowerupCache.snapshot(SystemClock.elapsedRealtime())); }
+        catch (JSONException e) { return null; }
     }
 
     private void sendPlayerInfo(boolean rejoin) {
@@ -1206,6 +1382,10 @@ public class TcpClient extends Service {
         }
         try {
             JSONObject game = TcpJson.parseObject(message);
+            // Parse the origin now, but commit only with the validated message.
+            // A malformed snapshot must not leave a new decoding frame behind.
+            final GpsOffset gpsOrigin = game.has(GpsWire.ORIGIN)
+                    ? GpsWire.readOrigin(game) : Globals.getInstance().mGpsOffset;
             if (Boolean.TRUE.equals(game.opt(LiveJoin.REJECTED))) {
                 synchronized (this) {
                     if (!isCurrentSession(generation)) return;
@@ -1257,6 +1437,10 @@ public class TcpClient extends Service {
             }
             if (game.has(TcpServer.JSON_CLOCK_REQUEST)) {
                 receiveClockSync(game, receivedAt, generation);
+                return;
+            }
+            if (game.has(TcpServer.JSON_POWERUP_STATE) && !game.has(TcpServer.JSON_PLAYERS)) {
+                receivePowerupFrame(game, generation);
                 return;
             }
             JSONObject startInfo = game.has(TcpServer.JSON_GAMESTART) ? readStartInfo(game) : null;
@@ -1318,13 +1502,19 @@ public class TcpClient extends Service {
                     seenPlayers[rawPlayerID] = true;
                     byte playerID = (byte) rawPlayerID;
                     if (playerID != Globals.getInstance().mPlayerID) {
-                        double longitude = update.getDouble(TcpServer.JSON_GPSLONGITUDE);
-                        double latitude = update.getDouble(TcpServer.JSON_GPSLATITUDE);
+                        double[] position = GpsWire.readPosition(update, gpsOrigin);
+                        double latitude = position[0];
+                        double longitude = position[1];
                         if (!Globals.isValidCoordinates(longitude, latitude))
                             throw new JSONException("Invalid GPS coordinates");
                         Globals.GPSData gps = new Globals.GPSData();
                         gps.longitude = longitude;
                         gps.latitude = latitude;
+                        long ageMs = update.has(TcpServer.JSON_GPS_FIX_AGE)
+                                ? TcpJson.getLong(update, TcpServer.JSON_GPS_FIX_AGE) : 0;
+                        if (ageMs < 0 || ageMs > Globals.GPS_DISPLAY_FIX_MAX_AGE_MS)
+                            throw new JSONException("Invalid GPS fix age");
+                        gps.fixElapsedMs = receivedAt - ageMs;
                         // Refresh team membership too: the host may have changed game modes.
                         gps.team = TcpJson.getInt(update, TcpServer.JSON_TEAM);
                         gps.hasUpdate = true; // Anything that the server sends us is considered an update
@@ -1336,6 +1526,7 @@ public class TcpClient extends Service {
                     synchronized (this) {
                         if (!isCurrentSession(generation))
                             return;
+                        commitGpsOriginLocked(gpsOrigin);
                         Map<Byte, Globals.GPSData> currentLocations = Globals.getInstance().mGPSData;
                         if (currentLocations == null) {
                             currentLocations = new HashMap<>();
@@ -1356,6 +1547,11 @@ public class TcpClient extends Service {
                             Globals.GPSData current = currentLocations.get(entry.getKey());
                             if (!isSameGPSData(current, entry.getValue())) {
                                 currentLocations.put(entry.getKey(), entry.getValue());
+                            } else {
+                                // A compact no-GPS row must not expire this full-precision
+                                // fallback merely because its coordinates are unchanged.
+                                current.fromPeerState = false;
+                                current.fixElapsedMs = entry.getValue().fixElapsedMs;
                             }
                             // If the previous event is still waiting for the UI, preserve its
                             // update marker; otherwise identical data needs no map rebuild.
@@ -1669,6 +1865,9 @@ public class TcpClient extends Service {
                     else
                         Log.w(TAG, "Ignoring invalid game state from server: " + gameState);
                 }
+                if (roundRoster != null && (startInfo == null || !roundRoster.token.equals(
+                        startInfo.getString(TcpServer.JSON_ROUND_TOKEN))))
+                    throw new JSONException("Mismatched round roster");
                 Globals.getmTeamPlayerNameSemaphore();
                 try {
                     Globals.getmTeamIPMapSemaphore();
@@ -1685,11 +1884,9 @@ public class TcpClient extends Service {
                                 synchronized (this) {
                                     if (!isCurrentSession(generation))
                                         return;
+                                    commitGpsOriginLocked(gpsOrigin);
                                     globals.mTournamentMode = tournamentMode;
                                     if (roundRoster != null) {
-                                        if (startInfo == null || !roundRoster.token.equals(
-                                                startInfo.getString(TcpServer.JSON_ROUND_TOKEN)))
-                                            throw new JSONException("Mismatched round roster");
                                         globals.installRoundRoster(roundRoster);
                                     }
                                     globals.mBossMode = bossMode;
@@ -1800,6 +1997,7 @@ public class TcpClient extends Service {
                 else
                     broadcastIfCurrentSession(generation, rosterIntent);
             }
+            if (game.has(TcpServer.JSON_POWERUP_STATE)) receivePowerupFrame(game, generation);
         } catch (JSONException | RuntimeException e) {
             e.printStackTrace();
         }
@@ -1858,6 +2056,15 @@ public class TcpClient extends Service {
         return !mDestroyed && generation == mSessionGeneration;
     }
 
+    // Caller holds the service monitor. The origin stays fixed for this lobby.
+    private void commitGpsOriginLocked(GpsOffset origin) throws JSONException {
+        if (origin == null) return;
+        GpsOffset current = Globals.getInstance().mGpsOffset;
+        if (current != null && !current.sameOrigin(origin))
+            throw new JSONException("GPS origin changed during the lobby");
+        Globals.getInstance().mGpsOffset = origin;
+    }
+
     private synchronized void broadcastIfCurrentSession(long generation, Intent intent) {
         if (isCurrentSession(generation))
             sendBroadcast(intent);
@@ -1878,10 +2085,15 @@ public class TcpClient extends Service {
                     Log.w(TAG, "Ignoring local GPS update without a usable fix");
                     return;
                 }
+                long now = SystemClock.elapsedRealtime();
+                long fixAt = intent.getLongExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS, now);
+                if (!Globals.isFreshGpsFix(fixAt, now)) return;
                 JSONObject gpsUpdate = new JSONObject();
                 try {
-                    gpsUpdate.put(TcpServer.JSON_GPSLONGITUDE, longitude);
-                    gpsUpdate.put(TcpServer.JSON_GPSLATITUDE, latitude);
+                    GpsOffset origin = Globals.getInstance().mGpsOffset;
+                    GpsWire.putOrigin(gpsUpdate, origin);
+                    GpsWire.putPosition(gpsUpdate, origin, latitude, longitude);
+                    gpsUpdate.put(TcpServer.JSON_GPS_FIX_AGE, now - fixAt);
                     sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + gpsUpdate.toString());
                 } catch (JSONException e) {
                     e.printStackTrace();

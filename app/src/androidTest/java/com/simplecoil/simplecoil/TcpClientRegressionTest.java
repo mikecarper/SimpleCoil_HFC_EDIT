@@ -2,6 +2,7 @@ package com.simplecoil.simplecoil;
 
 import android.content.BroadcastReceiver;
 import android.content.Intent;
+import android.os.SystemClock;
 
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 
@@ -37,6 +38,7 @@ public class TcpClientRegressionTest {
     private Queue<?> pending;
     private byte originalPairedGrenade;
     private Globals.PlayerSettings originalLocalSettings;
+    private com.simplecoil.protocol.GpsOffset originalGpsOffset;
 
     @Before
     public void setUp() throws Exception {
@@ -45,6 +47,8 @@ public class TcpClientRegressionTest {
         pending = (Queue<?>) field("messageQueue").get(client);
         originalPairedGrenade = Globals.getInstance().mPairedGrenadeID;
         originalLocalSettings = TcpServer.localPlayerSettingsSnapshot(Globals.getInstance());
+        originalGpsOffset = Globals.getInstance().mGpsOffset;
+        Globals.getInstance().mGpsOffset = null;
         Globals.getInstance().mPairedGrenadeID = 0;
     }
 
@@ -53,6 +57,7 @@ public class TcpClientRegressionTest {
         sender.shutdownNow();
         assertTrue(sender.awaitTermination(3, TimeUnit.SECONDS));
         Globals.getInstance().mPairedGrenadeID = originalPairedGrenade;
+        Globals.getInstance().mGpsOffset = originalGpsOffset;
         restoreLocalSettings(originalLocalSettings);
     }
 
@@ -257,7 +262,7 @@ public class TcpClientRegressionTest {
     public void invalidLocalGpsBroadcastsAreNotSent() throws Exception {
         ByteArrayOutputStream delivered = new ByteArrayOutputStream();
         field("out").set(client, new DataOutputStream(delivered));
-        double[][] invalid = {{0, 0}, {0, 20}, {10, 0}, {Double.NaN, 20}, {10, Double.POSITIVE_INFINITY},
+        double[][] invalid = {{0, 0}, {Double.NaN, 20}, {10, Double.POSITIVE_INFINITY},
                 {181, 20}, {-181, 20}, {10, 91}, {10, -91}};
         for (double[] coordinates : invalid)
             receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
@@ -282,7 +287,7 @@ public class TcpClientRegressionTest {
     public void validLocalGpsBroadcastsPreserveTheirCoordinates() throws Exception {
         ByteArrayOutputStream delivered = new ByteArrayOutputStream();
         field("out").set(client, new DataOutputStream(delivered));
-        double[][] valid = {{10, 20}, {-10, -20}};
+        double[][] valid = {{10, 20}, {-10, -20}, {0, 20}, {10, 0}};
         for (double[] coordinates : valid)
             receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
                     .putExtra(NetMsg.INTENT_LONGITUDE, coordinates[0])
@@ -296,6 +301,29 @@ public class TcpClientRegressionTest {
             assertEquals(coordinates[0], gps.getDouble(TcpServer.JSON_GPSLONGITUDE), 0);
             assertEquals(coordinates[1], gps.getDouble(TcpServer.JSON_GPSLATITUDE), 0);
         }
+        assertEquals(0, messages.available());
+    }
+
+    @Test
+    public void gpsReportsPreserveMeasurementAgeAndDropStaleBroadcasts() throws Exception {
+        ByteArrayOutputStream delivered = new ByteArrayOutputStream();
+        field("out").set(client, new DataOutputStream(delivered));
+        long now = SystemClock.elapsedRealtime();
+        receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                .putExtra(NetMsg.INTENT_LONGITUDE, 10.0)
+                .putExtra(NetMsg.INTENT_LATITUDE, 20.0)
+                .putExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS, now - 10_000));
+        receiveLocation(new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                .putExtra(NetMsg.INTENT_LONGITUDE, 10.0)
+                .putExtra(NetMsg.INTENT_LATITUDE, 20.0)
+                .putExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS, now - 31_000));
+        awaitSender();
+        DataInputStream messages = messages(delivered);
+        String message = messages.readUTF();
+        JSONObject gps = new JSONObject(message.substring(TcpServer.TCPMESSAGE_PREFIX.length()
+                + TcpServer.TCPPREFIX_JSON.length()));
+        assertTrue(gps.getLong(TcpServer.JSON_GPS_FIX_AGE) >= 10_000);
+        assertTrue(gps.getLong(TcpServer.JSON_GPS_FIX_AGE) <= 30_000);
         assertEquals(0, messages.available());
     }
 
