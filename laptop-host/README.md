@@ -190,6 +190,65 @@ the game. To show it on another trusted display, use
 `--dashboard-bind 0.0.0.0`; do not expose that option to an untrusted network,
 because the local dashboard intentionally has no login prompt.
 
+## Host the game Wi-Fi
+
+On Linux with NetworkManager, open **Wi-Fi hotspot** on the landing page or
+**Wi-Fi** on the tactical map (`http://127.0.0.1:17511/wifi`). Choose an
+AP-capable adapter, set the network name and 2.4 GHz channel, then
+select **Start hotspot**. The default is an open network named
+`Recoil-SimpleCoil`, with no password, so the Android app can find and join it
+automatically. Keep the `Recoil` prefix so game phones recognize the network.
+You can choose **WPA2 — password protected** under **Wi-Fi access** instead;
+save its password once in each phone's Wi-Fi settings before opening the game.
+The laptop's game
+address is `10.42.0.1`; DHCP, DNS, and optional internet sharing are provided by
+NetworkManager. Wi-Fi client isolation is disabled so phones can exchange
+combat events directly. A second adapter can keep the laptop connected to the
+internet.
+
+**Stop hotspot** disconnects the phones and restores the adapter's previous
+connection, when there was one. An unsuccessful start also attempts to restore
+that connection. Wi-Fi changes are blocked during countdowns and running
+rounds. These controls remain restricted to this laptop even if the rest of
+the dashboard is bound to all interfaces. Saved settings, including the
+password, are private to the current user in
+`~/.config/simplecoil/hotspot.properties`. The host does not start the hotspot
+automatically at launch; the saved adapter selection is retained without
+falling back to another adapter.
+
+### TP-Link TL-WN722N v2/v3 on Ubuntu 24.04
+
+Check the hardware revision: the USB device `2357:010c` uses the RTL8188EUS
+chipset. The stock `rtl8xxxu` driver on this computer's Ubuntu 6.8 kernel
+reports no AP capability. The following optional setup uses the
+[rtl8188eus driver](https://github.com/aircrack-ng/rtl8188eus) with AP support.
+The included patch handles Ubuntu's backported monitor-channel callback,
+corrects the driver's variable-length IE declaration for kernel bounds checks,
+and gives this build its own DKMS version. It was built and tested on kernel
+`6.8.0-147-generic` with Secure Boot disabled.
+
+Install DKMS, the compiler tools, `bc`, and headers for the running kernel if
+needed. Build as your normal user, from the repository root:
+
+```bash
+git clone https://github.com/aircrack-ng/rtl8188eus.git /tmp/simplecoil-rtl8188eus
+git -C /tmp/simplecoil-rtl8188eus checkout af3bf004458f76b7aec33e9ba552cd382ed1f5c3
+git -C /tmp/simplecoil-rtl8188eus apply "$PWD/tools/tlwn722n-ubuntu-compat.patch"
+make -C /tmp/simplecoil-rtl8188eus -j4 KVER="$(uname -r)" KSRC="/lib/modules/$(uname -r)/build"
+sudo ./tools/install-tlwn722n-driver.sh /tmp/simplecoil-rtl8188eus
+```
+
+Installing and loading a kernel driver requires administrator authentication.
+The installer registers a root-owned source copy with DKMS for kernel updates
+and prefers `8188eu` over `rtl8xxxu`; it leaves the Intel adapter alone. Stop
+any connection using the TP-Link before installing, then select the TP-Link
+in the game's Wi-Fi controls. To restore the stock driver, stop the hotspot
+and run:
+
+```bash
+sudo ./tools/install-tlwn722n-driver.sh --remove
+```
+
 ## Install offline map tiles
 
 The host reads standard XYZ PNG tiles from this directory layout:
@@ -205,6 +264,29 @@ The numbers are `zoom/x/y.png`. Put the game area's tiles in
 have GPS fixes. The map reports whether it found tiles and their zoom range.
 Downloaded maps are ignored by Git because even a small high-detail area can
 contain many large files.
+
+To show the installed area before phones have GPS fixes, add an optional
+`laptop-host/maps/map.json` alongside the zoom directories:
+
+```json
+{
+  "center": [47.6221479, -122.1028626],
+  "zoom": 18,
+  "bounds": [[47.613, -122.117], [47.632, -122.089]],
+  "attribution": "&copy; OpenStreetMap contributors",
+  "version": "park-map-1"
+}
+```
+
+Coordinates use `[latitude, longitude]`; bounds are southwest and northeast.
+The display opens at the configured center and zoom, then fits players when
+their first fresh GPS fixes arrive. Attribution appears on the map. Invalid
+metadata is ignored, and the initial zoom stays within the installed tile range.
+Change `version` when replacing existing tiles so the browser fetches the new
+images instead of reusing its cached map.
+
+Use **+** or the mouse wheel on the tactical map to magnify imagery up to 8×
+beyond its native size. Extra zoom enlarges the existing pixels.
 
 The laptop also exposes those tiles to joined phones on read-only TCP port
 `17512`. The lobby tells each phone which tile port to use, so the native phone

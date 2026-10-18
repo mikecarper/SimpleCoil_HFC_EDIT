@@ -17,11 +17,16 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -36,6 +41,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static final String JSON_PREFIX = "SimpleCoil:30JSON";
     private static final String MESSAGE_PREFIX = "SimpleCoil:30MESG";
     private static final long GPS_UTC_BASE = 1_800_000_000_000L;
+    private static final HttpClient WIFI_HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).build();
 
     public static void main(String[] args) throws Exception {
         if (args.length == 1 && "--powerups-only".equals(args[0])) {
@@ -105,13 +111,48 @@ public final class LaptopHostProtocolSmokeTest {
                     "bundled map renderer was unavailable");
             require(get("/api/map-config").contains("\"available\":true"),
                     "offline map tile configuration was not detected");
+            Path mapMetadata = tiles.resolve("map.json");
+            Files.writeString(mapMetadata, "{\"center\":[47.6221479,-122.1028626],\"zoom\":18,"
+                    + "\"bounds\":[[47.61,-122.12],[47.64,-122.08]],"
+                    + "\"version\":\"test-map-1\",\"attribution\":\"OpenStreetMap contributors\"}");
+            String mapConfig = get("/api/map-config");
+            require(mapConfig.contains("\"center\":[47.6221479,-122.1028626]")
+                            && mapConfig.contains("\"zoom\":0")
+                            && mapConfig.contains("\"bounds\":[[47.61,-122.12],[47.64,-122.08]]")
+                            && mapConfig.contains("\"version\":\"test-map-1\"")
+                            && mapConfig.contains("OpenStreetMap contributors"),
+                    "offline map view and attribution were not published with a supported zoom");
+            require(new String(getBytes(TILE_PORT, "/api/map-config"), StandardCharsets.UTF_8)
+                            .equals(mapConfig),
+                    "phones and dashboard received different map configuration");
+            Files.writeString(mapMetadata, "{invalid");
+            require(get("/api/map-config").contains("\"available\":true"),
+                    "invalid optional metadata prevented offline tiles from loading");
+            Files.delete(mapMetadata);
             require(java.util.Arrays.equals(getBytes("/tiles/0/0/0.png"), testTileBytes),
                     "offline map tile was not served intact");
+            require(java.util.Arrays.equals(getBytes("/tiles/0/0/0.png?v=test-map-1"), testTileBytes),
+                    "versioned offline map tile was not served intact");
             require(java.util.Arrays.equals(getBytes(TILE_PORT, "/tiles/0/0/0.png"), testTileBytes),
                     "read-only phone map tile service was unavailable");
             require(responseCode("/tiles/0/0/1.png") == 404,
                     "invalid tile coordinates were accepted");
             require(get("/leaderboard").contains("Leaderboard"), "leaderboard display was unavailable");
+            require(get("/wifi").contains("Start hotspot"), "Wi-Fi controls were unavailable");
+            require(get("/api/wifi").contains("\"devices\":"), "Wi-Fi adapter status was unavailable");
+            HttpURLConnection phoneWifi = open(TILE_PORT, "/api/wifi", "GET");
+            require(phoneWifi.getResponseCode() == 404, "phone map service exposed Wi-Fi controls");
+            phoneWifi.disconnect();
+            require(wifiResponseCode("GET", null, "https://untrusted.example", false) == 403,
+                    "another website could read Wi-Fi credentials");
+            require(wifiResponseCode("POST", "{\"action\":\"stop\"}", null, false) == 403,
+                    "Wi-Fi mutation did not require its control header");
+            require(wifiResponseCode("POST", "{invalid", null, true) == 400,
+                    "invalid Wi-Fi JSON was accepted");
+            require(wifiResponseCode("POST", "x".repeat(4097), null, true) == 413,
+                    "oversized Wi-Fi settings were accepted");
+            require(wifiResponseCode("POST", "{\"action\":\"invalid\"}", null, true) == 400,
+                    "unknown Wi-Fi actions were accepted");
             verifyUdpDiscovery();
             verifySharedLobbyDiscovery();
             String completedToken;
@@ -175,6 +216,8 @@ public final class LaptopHostProtocolSmokeTest {
                 Thread.sleep(1_150);
                 require(get("/api/state").contains("\"state\":\"running\""),
                         "round did not leave the start countdown");
+                require(wifiResponseCode("POST", "{\"action\":\"stop\"}", null, true) == 409,
+                        "Wi-Fi could be changed during an active round");
                 verifyLateJoinBlocked();
                 verifyDirectLateJoinBlocked();
 
@@ -311,6 +354,7 @@ public final class LaptopHostProtocolSmokeTest {
             if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS))
                 host.destroyForcibly();
         }
+        if (args.length == 1 && "--core-only".equals(args[0])) return;
         verifyNormalStartCountdown(false);
         verifyNormalStartCountdown(true);
         System.out.println("LaptopHost normal start countdown smoke tests passed.");
@@ -1497,6 +1541,18 @@ public final class LaptopHostProtocolSmokeTest {
                 // The host closes a direct registration that bypasses discovery.
             }
         }
+    }
+
+    private static int wifiResponseCode(String method, String body, String origin, boolean controlHeader)
+            throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:"
+                + DASHBOARD_PORT + "/api/wifi")).timeout(Duration.ofSeconds(30));
+        if (origin != null) request.header("Origin", origin);
+        if (controlHeader) request.header("X-SimpleCoil-Control", "1");
+        if (body != null) request.header("Content-Type", "application/json");
+        request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+                : HttpRequest.BodyPublishers.ofString(body));
+        return WIFI_HTTP.send(request.build(), HttpResponse.BodyHandlers.discarding()).statusCode();
     }
 
     private static String get(String path) throws IOException {

@@ -9,6 +9,7 @@ source_file="$script_dir/src/main/java/com/simplecoil/laptophost/LaptopHost.java
 
 mkdir -p "$output_dir"
 javac --release 17 --add-modules jdk.httpserver -d "$output_dir" "$source_file" \
+    "$script_dir/src/main/java/com/simplecoil/laptophost/HotspotManager.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/GameStartCountdown.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/Powerups.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/GpsOffset.java" \

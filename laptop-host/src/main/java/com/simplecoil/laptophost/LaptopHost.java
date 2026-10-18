@@ -171,6 +171,7 @@ public final class LaptopHost {
     // each participant shares the reveal, but no other enemy is exposed.
     private final Map<Integer, Map<Integer, Long>> enemyGpsRevealUntil = new HashMap<>();
     private final Set<Integer> gpsVisibilityRefreshPlayers = new HashSet<>();
+    private final HotspotManager hotspot = new HotspotManager();
     private final AtomicInteger nextClientID = new AtomicInteger();
     private final ExecutorService clientExecutor = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "SimpleCoil laptop client");
@@ -252,6 +253,8 @@ public final class LaptopHost {
         dashboard.createContext("/", this::handleDashboardIndex);
         dashboard.createContext("/map", exchange -> sendHtml(exchange, MAP_PAGE));
         dashboard.createContext("/leaderboard", exchange -> sendHtml(exchange, LEADERBOARD_PAGE));
+        dashboard.createContext("/wifi", this::handleWifiPage);
+        dashboard.createContext("/api/wifi", this::handleWifiApi);
         dashboard.createContext("/assets/leaflet/", this::handleLeafletAsset);
         dashboard.createContext("/tiles/", this::handleMapTile);
         dashboard.createContext("/api/map-config", this::handleMapConfigApi);
@@ -1364,6 +1367,8 @@ public final class LaptopHost {
         String token;
         boolean publishedAssignment = false;
         synchronized (stateLock) {
+            if (hotspot.isBusy())
+                return StartResult.error("Wait for the Wi-Fi change to finish.", false);
             updateRoundStateLocked();
             long cooldown = Math.max(0, nextRoundStartAllowedAt - elapsedMillis());
             if (cooldown > 0)
@@ -1395,6 +1400,8 @@ public final class LaptopHost {
         if (publishedAssignment)
             broadcastRoster();
         synchronized (stateLock) {
+            if (hotspot.isBusy())
+                return StartResult.error("Wait for the Wi-Fi change to finish.", false);
             updateRoundStateLocked();
             long cooldown = Math.max(0, nextRoundStartAllowedAt - elapsedMillis());
             if (cooldown > 0)
@@ -3027,6 +3034,97 @@ public final class LaptopHost {
         sendJson(exchange, 200, dashboardState());
     }
 
+    private boolean localWifiRequest(HttpExchange exchange) {
+        if (!exchange.getRemoteAddress().getAddress().isLoopbackAddress()) return false;
+        String host = exchange.getRequestHeaders().getFirst("Host");
+        try {
+            URI address = URI.create("http://" + host);
+            if (!Set.of("127.0.0.1", "localhost", "[::1]", "::1").contains(address.getHost())
+                    || address.getPort() != exchange.getLocalAddress().getPort()
+                    || address.getRawUserInfo() != null || !address.getRawPath().isEmpty()) return false;
+            String origin = exchange.getRequestHeaders().getFirst("Origin");
+            if (origin != null && !origin.equalsIgnoreCase("http://" + host)) return false;
+            String site = exchange.getRequestHeaders().getFirst("Sec-Fetch-Site");
+            return site == null || "same-origin".equals(site) || "none".equals(site);
+        } catch (IllegalArgumentException | NullPointerException exception) {
+            return false;
+        }
+    }
+
+    private void handleWifiPage(HttpExchange exchange) throws IOException {
+        if (!localWifiRequest(exchange)) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Open Wi-Fi controls on this laptop."));
+            return;
+        }
+        sendFile(exchange, config.webDirectory.resolve("wifi.html"), "text/html; charset=utf-8", "no-store");
+    }
+
+    private void handleWifiApi(HttpExchange exchange) throws IOException {
+        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        if (!localWifiRequest(exchange)) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Wi-Fi controls are available only on this laptop."));
+            return;
+        }
+        if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 200, hotspot.status());
+            return;
+        }
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("ok", false, "message", "Use GET or POST."));
+            return;
+        }
+        String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+        if (contentType == null || !contentType.split(";", 2)[0].trim().equalsIgnoreCase("application/json")
+                || !"1".equals(exchange.getRequestHeaders().getFirst("X-SimpleCoil-Control"))) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Use the laptop's Wi-Fi controls."));
+            return;
+        }
+        byte[] body = exchange.getRequestBody().readNBytes(4097);
+        if (body.length > 4096) {
+            sendJson(exchange, 413, mapOf("ok", false, "message", "Wi-Fi settings are too large."));
+            return;
+        }
+        Map<?, ?> request;
+        try {
+            Object parsed = Json.parse(new String(body, StandardCharsets.UTF_8));
+            if (!(parsed instanceof Map<?, ?>)) throw new IllegalArgumentException();
+            request = (Map<?, ?>) parsed;
+        } catch (IllegalArgumentException exception) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Provide valid Wi-Fi settings."));
+            return;
+        }
+        synchronized (stateLock) {
+            if (isRoundActiveLocked()) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "Finish the round before changing Wi-Fi."));
+                return;
+            }
+            if (!hotspot.beginChange()) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "A Wi-Fi change is already in progress."));
+                return;
+            }
+        }
+        int code = 200;
+        String action = String.valueOf(request.get("action"));
+        String message;
+        try {
+            hotspot.control(action, request);
+            message = switch (action) {
+                case "start" -> "Hotspot started. Connect the phones to this network.";
+                case "stop" -> "Hotspot stopped.";
+                default -> "Wi-Fi settings saved.";
+            };
+        } catch (IllegalArgumentException exception) {
+            code = 400;
+            message = exception.getMessage();
+        } catch (IOException exception) {
+            code = 503;
+            message = exception.getMessage();
+        } finally {
+            hotspot.endChange();
+        }
+        sendJson(exchange, code, mapOf("ok", code == 200, "message", message, "status", hotspot.status()));
+    }
+
     private void handleMapConfigApi(HttpExchange exchange) throws IOException {
         if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
             sendJson(exchange, 405, mapOf("error", "Use GET."));
@@ -3052,9 +3150,43 @@ public final class LaptopHost {
             }
         }
         boolean available = maximumZoom >= 0;
-        sendJson(exchange, 200, mapOf("available", available,
+        Map<String, Object> mapConfig = mapOf("available", available,
                 "minZoom", available ? minimumZoom : 0,
-                "maxZoom", available ? maximumZoom : 19));
+                "maxZoom", available ? maximumZoom : 19);
+        Path metadataFile = config.tileDirectory.resolve("map.json");
+        if (available && Files.isRegularFile(metadataFile)) {
+            try {
+                if (Files.size(metadataFile) <= 16_384
+                        && Json.parse(Files.readString(metadataFile)) instanceof Map<?, ?> metadata) {
+                    if (validMapPoint(metadata.get("center"))) {
+                        mapConfig.put("center", metadata.get("center"));
+                        mapConfig.put("zoom", Math.max(minimumZoom, Math.min(maximumZoom,
+                                intValue(metadata.get("zoom"), Math.min(18, maximumZoom)))));
+                    }
+                    if (metadata.get("bounds") instanceof List<?> bounds && bounds.size() == 2
+                            && validMapPoint(bounds.get(0)) && validMapPoint(bounds.get(1))) {
+                        List<?> southwest = (List<?>) bounds.get(0);
+                        List<?> northeast = (List<?>) bounds.get(1);
+                        if (doubleValue(southwest.get(0), 0) < doubleValue(northeast.get(0), 0)
+                                && doubleValue(southwest.get(1), 0) < doubleValue(northeast.get(1), 0))
+                            mapConfig.put("bounds", bounds);
+                    }
+                    if (metadata.get("attribution") instanceof String attribution)
+                        mapConfig.put("attribution", attribution);
+                    if (metadata.get("version") instanceof String version)
+                        mapConfig.put("version", version);
+                }
+            } catch (IOException | IllegalArgumentException ignored) {
+                // Optional metadata must not prevent existing XYZ tiles from loading.
+            }
+        }
+        sendJson(exchange, 200, mapConfig);
+    }
+
+    private static boolean validMapPoint(Object value) {
+        return value instanceof List<?> point && point.size() == 2
+                && validCoordinates(doubleValue(point.get(1), Double.NaN),
+                        doubleValue(point.get(0), Double.NaN));
     }
 
     private void handleLeafletAsset(HttpExchange exchange) throws IOException {
@@ -3217,7 +3349,7 @@ public final class LaptopHost {
             state.put("remainingMs", roundEndAt > 0 && isRoundActiveLocked()
                     ? Math.max(0, roundEndAt - now) : 0);
             state.put("cooldownMs", Math.max(0, nextRoundStartAllowedAt - now));
-            state.put("canStart", roundState == RoundState.LOBBY && playing.size() >= 2
+            state.put("canStart", !hotspot.isBusy() && roundState == RoundState.LOBBY && playing.size() >= 2
                     && now >= nextRoundStartAllowedAt
                     && (!config.boss || hasPlayingLeaderLocked())
                     && (!config.infection || hasPlayingLeaderLocked())
@@ -3939,7 +4071,7 @@ public final class LaptopHost {
             <!doctype html><html><head><meta charset="utf-8"><title>SimpleCoil Laptop Host</title>
             <style>body{margin:0;background:#10141b;color:#eef3f8;font:18px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}main{max-width:660px;padding:32px}h1{margin-top:0}.buttons{display:flex;gap:14px;flex-wrap:wrap}a,button{border:0;border-radius:8px;background:#2585d8;color:white;padding:14px 18px;font:inherit;text-decoration:none;cursor:pointer}p{line-height:1.5;color:#c6d1dc}.note{font-size:.9em;color:#9dadbc}</style></head>
             <body><main><h1>SimpleCoil Laptop Host</h1><p>Open the live map and leaderboard as two independent display windows. Keep this page local to the laptop; game controls are available on the map display.</p>
-            <div class="buttons"><a href="/map" target="simplecoil-map">Open map display</a><a href="/leaderboard" target="simplecoil-leaderboard">Open leaderboard</a><button onclick="openDisplays()">Open both displays</button></div>
+            <div class="buttons"><a href="/map" target="simplecoil-map">Open map display</a><a href="/leaderboard" target="simplecoil-leaderboard">Open leaderboard</a><button onclick="openDisplays()">Open both displays</button><a href="/wifi" target="simplecoil-wifi">Wi-Fi hotspot</a></div>
             <p class="note">Phones join the laptop's printed LAN IP from <em>Join Game</em>. The dashboard uses the local browser only unless the host was started with <code>--dashboard-bind 0.0.0.0</code>.</p>
             <script>function openDisplays(){window.open('/map','simplecoil-map','popup=yes');window.open('/leaderboard','simplecoil-leaderboard','popup=yes')}</script></main></body></html>
             """;
@@ -3949,13 +4081,13 @@ public final class LaptopHost {
             <link rel="stylesheet" href="/assets/leaflet/leaflet.css">
             <style>
             :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:15px system-ui,sans-serif;overflow:hidden}header{height:60px;display:flex;align-items:center;gap:12px;padding:9px 14px;background:#111c27;border-bottom:1px solid #274257}h1{font-size:20px;margin:0;white-space:nowrap}#status{color:#b8c8d8;flex:1}button{border:0;border-radius:7px;padding:9px 12px;background:#267ec8;color:#fff;font:inherit;cursor:pointer}button.danger{background:#b83d46}button:disabled{opacity:.45;cursor:not-allowed}#map{width:100vw;height:calc(100vh - 60px);background-color:#0d1720;background-image:linear-gradient(#203445 1px,transparent 1px),linear-gradient(90deg,#203445 1px,transparent 1px);background-size:50px 50px}.legend{position:fixed;z-index:1000;right:16px;bottom:16px;max-width:340px;background:#101a25e8;border:1px solid #34516a;border-radius:8px;padding:10px;line-height:1.7}.swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.team1{background:#49a5ff}.team2{background:#ff5d67}#tile-status{color:#ffd98a;font-size:12px}#respawns:empty{display:none}#respawns{border-top:1px solid #34516a;margin-top:7px;padding-top:7px}.respawn{font-size:12px;padding:5px 7px;margin:3px 3px 0 0;background:#466c32}.player-label{background:#101a25e8;border:1px solid #7890a5;color:#fff;font-weight:700;box-shadow:none}.player-label:before{border-top-color:#7890a5}.leaflet-control-zoom a{background:#152332;color:#fff;border-color:#35516a}.leaflet-control-zoom a:hover{background:#22384b;color:#fff}@media(max-width:760px){header{gap:6px;padding:7px}h1{font-size:15px}#status{font-size:11px}button{padding:7px 8px;font-size:12px}}
-            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
+            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button onclick="window.open('/wifi','simplecoil-wifi')">Wi-Fi</button><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
             <script src="/assets/leaflet/leaflet.js"></script><script>
             const status=document.querySelector('#status'),start=document.querySelector('#start'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status'),lobbyPlayers=document.querySelector('#lobby-players');let lobbySignature='';
-            const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:false}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],grenadeLayers=[],fitted=false,mapConfig={maxZoom:19};
+            const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:true}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],grenadeLayers=[],fitted=false,mapConfig={maxZoom:19};
             function color(team){return team===1?'#49a5ff':team===2?'#ff5d67':`hsl(${(team*57)%360} 90% 63%)`}
             function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)&&(p.longitude!==0||p.latitude!==0)&&p.longitude>=-180&&p.longitude<=180&&p.latitude>=-90&&p.latitude<=90}function ll(p){return[p.latitude,p.longitude]}
-            async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tiles=L.tileLayer('/tiles/{z}/{x}/{y}.png',{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom,maxNativeZoom:mapConfig.maxZoom,noWrap:true,keepBuffer:4,updateWhenIdle:false}).addTo(map);let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent=`Offline map loaded (zoom ${mapConfig.minZoom}-${mapConfig.maxZoom})`}});tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.'}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
+            async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tileUrl='/tiles/{z}/{x}/{y}.png'+(mapConfig.version?'?v='+encodeURIComponent(mapConfig.version):'');const tiles=L.tileLayer(tileUrl,{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom+3,maxNativeZoom:mapConfig.maxZoom,bounds:mapConfig.bounds,attribution:mapConfig.attribution||'',noWrap:true,keepBuffer:4,updateWhenIdle:false});let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent='Offline map loaded.'}});tiles.addTo(map);tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.';if(!(state?.players||[]).some(valid)){if(mapConfig.center)map.setView(mapConfig.center,mapConfig.zoom);else if(mapConfig.bounds)map.fitBounds(mapConfig.bounds,{padding:[30,30],maxZoom:18})}}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
             async function control(path){try{const r=await fetch(path,{method:'POST'}),j=await r.json();status.textContent=j.message||(j.ok?'Done.':'Unable to complete action.')}catch(e){status.textContent='Host control error.'}}
             start.onclick=()=>control('/api/start');end.onclick=()=>{if(confirm('Ask two participating players to approve ending the round?'))control('/api/end')};fitButton.onclick=()=>fitPlayers(true);
             function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.awaitingRespawn||p.benched||!p.connected)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}

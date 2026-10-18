@@ -1,0 +1,60 @@
+diff --git a/Makefile b/Makefile
+index 2aa7eef..48909fa 100755
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,8 @@
+ EXTRA_CFLAGS += $(USER_EXTRA_CFLAGS) -fno-pie
++# Ubuntu backports the per-interface monitor callback to its 6.8 kernel.
++ifneq (,$(shell sed -n '/(\*set_monitor_channel)/,+3p' $(KSRC)/include/net/cfg80211.h 2>/dev/null | grep 'struct net_device'))
++EXTRA_CFLAGS += -DRTW_CFG80211_MONITOR_HAS_NETDEV
++endif
+ EXTRA_CFLAGS += -O1
+ #EXTRA_CFLAGS += -O3
+ EXTRA_CFLAGS += -Wno-unused-variable
+diff --git a/dkms.conf b/dkms.conf
+index 2c60a99..df4236f 100644
+--- a/dkms.conf
++++ b/dkms.conf
+@@ -1,5 +1,5 @@
+ PACKAGE_NAME="realtek-rtl8188eus"
+-PACKAGE_VERSION="5.3.9~20221105"
++PACKAGE_VERSION="5.3.9~20221105+simplecoil1"
+ CLEAN="'make' clean"
+ BUILT_MODULE_NAME[0]=8188eu
+ PROCS_NUM=`nproc`
+diff --git a/include/wlan_bssdef.h b/include/wlan_bssdef.h
+index e7ae359..539efb2 100644
+--- a/include/wlan_bssdef.h
++++ b/include/wlan_bssdef.h
+@@ -95,7 +95,7 @@ typedef struct _NDIS_802_11_FIXED_IEs {
+ typedef struct _NDIS_802_11_VARIABLE_IEs {
+ 	UCHAR  ElementID;
+ 	UCHAR  Length;
+-	UCHAR  data[1];
++	UCHAR  data[];
+ } NDIS_802_11_VARIABLE_IEs, *PNDIS_802_11_VARIABLE_IEs;
+ 
+ 
+@@ -343,7 +343,7 @@ typedef struct _NDIS_802_11_FIXED_IEs {
+ typedef struct _NDIS_802_11_VARIABLE_IEs {
+ 	UCHAR  ElementID;
+ 	UCHAR  Length;
+-	UCHAR  data[1];
++	UCHAR  data[];
+ } NDIS_802_11_VARIABLE_IEs, *PNDIS_802_11_VARIABLE_IEs;
+ 
+ 
+diff --git a/os_dep/linux/ioctl_cfg80211.c b/os_dep/linux/ioctl_cfg80211.c
+index 69abf47..5032f95 100644
+--- a/os_dep/linux/ioctl_cfg80211.c
++++ b/os_dep/linux/ioctl_cfg80211.c
+@@ -5659,6 +5659,9 @@ static int	cfg80211_rtw_set_channel(struct wiphy *wiphy
+ }
+ 
+ static int cfg80211_rtw_set_monitor_channel(struct wiphy *wiphy
++#ifdef RTW_CFG80211_MONITOR_HAS_NETDEV
++	, struct net_device *dev
++#endif
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	, struct cfg80211_chan_def *chandef
+ #else
