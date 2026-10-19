@@ -149,7 +149,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.50 on every phone for this build.
+messages cannot end a new round. Install 1.51 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
 remains the primary connection. If it fails, Bluetooth Classic links can forward
@@ -161,6 +161,23 @@ Wi-Fi Direct connections and their Android invitations. Leave Bluetooth enabled
 on all phones and Wi-Fi enabled on the phones within hub range. No phone-to-phone
 pairing or confirmation is required on the tested LG Android 5.1.1 phones. The
 app keeps these connections alive in the background.
+
+Version 1.51 checks the current Wi-Fi RSSI once per second and prepares one
+Bluetooth buddy at -67 dBm or weaker, before hub coverage disappears. The weak
+signal state clears at -62 dBm; an established buddy stays connected, so signal
+fluctuations do not repeatedly tear down and rebuild the path. Wi-Fi remains
+primary. Missing RSSI readings are ignored. Wi-Fi disconnection starts
+preparation immediately on the next check, and expired host heartbeats try other
+buddies without the previous additional five-second wait. Cold Bluetooth setup
+can still take time; its 15-second cancellation limit and reliable-stream retry
+window remain in place.
+
+Three stationary version 1.51 Wi-Fi-off cuts returned confirmed bidirectional
+controls and gun reports in 6.1-8.4 seconds from the radio-off command
+(2.9-4.6 seconds after the radio was confirmed off). All 18 battery checks
+passed, with no game reconnects, link closures or congestion during the three
+steady windows. Wi-Fi was restored after each cut. Automated tests cover the
+RSSI thresholds; gradual signal loss and outdoor range remain untested.
 
 Version 1.43 keeps an admitted lobby connected to its original host while a
 Bluetooth fallback forms, including past the initial lobby timeout and changes
@@ -561,8 +578,9 @@ The debug APK is written to
 
 ## Printable QR posters
 
-The [1.34 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.34)
-includes a labeled 15-page QR PDF in US Letter landscape format (11 x 8.5 in).
+The [1.51 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.51)
+includes a labeled 20-page QR PDF in US Letter landscape format (11 x 8.5 in),
+plus a ZIP with the complete PDF, individual posters, and a payload index.
 Print at 100% / Actual Size and keep the white QR margins unobstructed.
 
 - Page 1: APK download (use a normal QR reader, not the in-game scanner).
@@ -571,20 +589,28 @@ Print at 100% / Actual Size and keep the white QR margins unobstructed.
 - Pages 6-7: Team 1 and Team 2 CTF flags.
 - Pages 8-15: Power-up checkpoints 1-8. These identify distinct checkpoints,
   not fixed rewards; each can unlock any eligible random power-up.
+- Pages 16-20: Pairing codes for the five event blasters, labeled Gun 1-5.
+  Each contains only its Bluetooth MAC address. Use **Connect gun > QR weapon**;
+  this path requires an external ZXing-compatible Barcode Scanner app. These
+  labels identify physical blasters and do not assign player slots or names.
 
-Gun pairing codes contain each individual gun's Bluetooth MAC address, so
-there is no universal printable gun-pairing QR. Team posters do not contain
-a host address or Wi-Fi credentials; connect to the game network first.
+Gun pairing codes are specific to each blaster; use different addresses for
+another gun set. Team posters do not contain a host address or Wi-Fi
+credentials; connect to the game network first.
 
 To regenerate the PDF, use a virtual environment with `reportlab` and `qrcode`
 installed, then run:
 
 ```sh
-python tools/build_release_qrs.py --version 1.34
+python tools/build_release_qrs.py --version 1.51
 ```
 
-The generator writes `output/pdf/SimpleCoil-1.34-QR-Codes-US-Letter.pdf` with
-vector QR graphics, large purpose labels, instructions, and exact payload text.
+This generates the 15 universal posters. Append a gun poster with
+`--gun 'Gun 1=AA:BB:CC:DD:EE:FF'`, repeating the option for each blaster.
+The generator writes `output/pdf/LAZER-GUN-RUN-1.51-QR-Codes-US-Letter.pdf`
+with vector QR graphics, large purpose labels, instructions, and exact payload
+text. The download QR expects the release asset `LAZER-GUN-RUN-1.51.apk`;
+use `--apk-name` when publishing a different filename.
 
 ## Release signing
 

@@ -41,8 +41,9 @@ public final class GameRelayService extends Service {
     private final ConcurrentHashMap<String, BluetoothLink> bluetoothLinks = new ConcurrentHashMap<>();
     private volatile BluetoothServerSocket bluetoothServer;
     private volatile boolean bluetoothStarting, bluetoothConnecting, destroyed;
-    private long nextBluetoothAttempt, hostMissingSince;
+    private long nextBluetoothAttempt;
     private int nextBuddy;
+    private RelayPreparationPolicy preparation;
 
     private static boolean attached(Context context) {
         return context != null && (!(context instanceof ContextWrapper) || ((ContextWrapper) context).getBaseContext() != null);
@@ -139,6 +140,7 @@ public final class GameRelayService extends Service {
                     && config.members.get(self).address.equals(next.members.get(self).address)) mesh.update(next);
             else {
                 if (mesh != null) mesh.close();
+                preparation = new RelayPreparationPolicy(SystemClock.elapsedRealtime());
                 mesh = new RelayMesh(self, next, new InetSocketAddress(17514), new RelayMesh.Listener() {
                     @Override public void datagram(InetAddress source, InetAddress target, int port, byte[] payload) {
                         UDPListenerService listener = udp;
@@ -165,7 +167,6 @@ public final class GameRelayService extends Service {
                 });
             }
             config = next;
-            if (hostMissingSince == 0) hostMissingSince = SystemClock.elapsedRealtime();
             getSharedPreferences("GameRelay", MODE_PRIVATE).edit().putString("config", next.encode()).apply();
             prioritizeConnection();
             startBluetoothRelay();
@@ -185,8 +186,16 @@ public final class GameRelayService extends Service {
                         try { link.close(); } catch (IOException ignored) { }
                     }
                 }
-                if (mesh.hostReachable()) hostMissingSince = now;
-                else if (now - hostMissingSince >= 5000) connectBluetoothBuddy();
+                WifiInfo connection = wifi == null ? null : wifi.getConnectionInfo();
+                boolean associated = wifi != null && wifi.isWifiEnabled() && connection != null
+                        && connection.getNetworkId() >= 0 && connection.getSupplicantState() == SupplicantState.COMPLETED;
+                int rssi = connection == null ? -127 : connection.getRssi();
+                boolean hostReachable = mesh.hostReachable();
+                // Prepare one buddy before weak Wi-Fi drops. Keep established
+                // links when signal recovers; try other peers if the host is lost.
+                if (preparation.shouldConnect(now, associated, rssi, hostReachable, !bluetoothLinks.isEmpty()))
+                    connectBluetoothBuddy(!associated ? "Wi-Fi disconnected"
+                            : !hostReachable ? "host heartbeat missing" : "Wi-Fi RSSI " + rssi + " dBm");
             }
             main.postDelayed(this, 1000);
         }
@@ -255,7 +264,7 @@ public final class GameRelayService extends Service {
         });
     }
     @SuppressWarnings("deprecation")
-    private void connectBluetoothBuddy() {
+    private void connectBluetoothBuddy(String reason) {
         if (bluetoothConnecting || config == null || mesh == null || destroyed
                 || SystemClock.elapsedRealtime() < nextBluetoothAttempt) return;
         java.util.List<RelayConfig.Member> peers = new java.util.ArrayList<>(config.members.values());
@@ -266,6 +275,7 @@ public final class GameRelayService extends Service {
             BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
             if (adapter == null || !adapter.isEnabled()) return;
             bluetoothConnecting = true;nextBluetoothAttempt = SystemClock.elapsedRealtime() + 3000;
+            Log.i("GameRelay", "Preparing Bluetooth relay: " + reason);
             bluetoothWorkers.execute(() -> {
                 BluetoothSocket socket = null;
                 Runnable cancel = null;

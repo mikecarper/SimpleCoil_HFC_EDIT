@@ -127,7 +127,7 @@ The laptop starts in **Event Mode**: the operator starts and ends rounds, edits
 players, and controls the event. **End game** ends the round directly. Phone
 start commands and name/rule edits cannot override the operator. Use
 `--no-event-mode` for the ordinary phone controls and two-player end-approval
-workflow. Use protocol-30 phones; update every phone to version 1.50 for the
+workflow. Use protocol-30 phones; update every phone to version 1.51 for the
 new Event Mode, kiosk, battery, and player-transfer controls.
 
 The laptop sends the phone scoreboard only after a player-list request. Host edits,
@@ -135,6 +135,17 @@ reconnections and round changes do not open that dialog, including on older phon
 Updated phones show actual players without empty player slots.
 
 Nearby phone relays prepare automatically after admission.
+Version 1.51 prepares one Bluetooth buddy when a phone's Wi-Fi RSSI reaches
+-67 dBm or weaker, sampling once per second. Signal recovery at -62 dBm stops
+new preparation attempts, while existing links remain available. Wi-Fi stays
+primary. Association loss triggers preparation on the next check; expired host
+heartbeats no longer add a five-second wait before searching other buddies.
+Cold Bluetooth setup still has a 15-second cancellation limit.
+Three stationary 1.51 Wi-Fi-off cuts returned confirmed bidirectional traffic
+in 6.1-8.4 seconds from the radio-off command, with 18 fresh battery checks and
+no further game reconnects during the steady windows. Wi-Fi was restored after
+each cut. RSSI thresholds have automated coverage; fading signal and outdoor
+range remain untested.
 Keep one or more phones within reach of the laptop's Wi-Fi. Phones beyond that
 coverage can forward the same game's UDP traffic and TCP host controls through
 nearby phones over Bluetooth Classic. A nearby phone forwards Bluetooth traffic
