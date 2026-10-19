@@ -123,20 +123,30 @@ the round; they receive no start command and do not affect scoring, teams, or
 Boss health. Change participation before starting, with no extra Ready button
 needed on the phones.
 
-The map's **End game** button asks participating players to approve an early
-end. Two different players must agree; the non-playing laptop operator and
-sitting-out phones do not count. The button shows the approval count. Players
-can withdraw approval or confirm **Leave game** on their phone at any time;
-leaving does not end the shared round. Timer and victory-condition endings
-remain automatic. Use protocol-30 phones with this host. Update the
-laptop and every phone together; the previous protocol is not compatible.
+The laptop starts in **Event Mode**: the operator starts and ends rounds, edits
+players, and controls the event. **End game** ends the round directly. Phone
+start commands and name/rule edits cannot override the operator. Use
+`--no-event-mode` for the ordinary phone controls and two-player end-approval
+workflow. Use protocol-30 phones; update every phone to version 1.39 for the
+new Event Mode, kiosk, battery, and player-transfer controls.
+
+Version 1.39 also prepares nearby phone relays automatically after admission.
+Keep one or more phones within reach of the laptop's Wi-Fi. Phones beyond that
+coverage can forward the same game's UDP traffic and TCP host controls through
+nearby phones over Wi-Fi Direct or Bluetooth Classic. Accept the Android direct
+connection invitation during setup, and enable Bluetooth on the phones.
+The laptop listens for game relays on TCP 17514 (the configured game TCP port + 4).
+Phones retain their admitted logical addresses and identities across radio loss.
+The private player-control API reports `viaRelay` for a relayed control connection.
+A continuous chain back to the laptop is required; an isolated group cannot
+reach a host outside every available radio path.
 
 A round stopped before 60 seconds of actual play can be restarted without
 the usual 30-second between-game wait. A canceled countdown can also be
 restarted immediately. The synchronized countdown remains in place for the
 next round; a round lasting 60 seconds or longer still requires the wait.
 
-During a running match, a new or returning phone can scan its team's base QR
+Outside Event Mode, during a running match, a new or returning phone can scan its team's base QR
 to join. This explicit QR admission also works with `--no-late-join`, which
 still blocks ordinary discovery/manual late joins. Returning phones preserve
 their round counters and current team (including infection), while new players
@@ -148,7 +158,7 @@ The launcher also prints each usable laptop IPv4 address. If automatic
 discovery is blocked, open **Equipment and advanced options > Advanced: enter
 host address** on the phone. The app's UDP join step and TCP lobby connection
 then happen automatically. Disable AP client isolation and allow the laptop through its firewall
-on TCP port `17510` and UDP port `17500` if prompted.
+on TCP ports `17510` and `17514`, and UDP port `17500` if prompted.
 
 Idle phone lobbies migrate automatically to the laptop, including manually
 selected phone hosts, regardless of their hosting age. A laptop always has
@@ -170,8 +180,8 @@ already in progress, it finishes on that host first; the phones move to the
 laptop afterward. This also applies to `--takeover`. Among multiple laptops,
 phones prefer the oldest host, with lowest IP breaking near-simultaneous ties.
 Discovery leases and stalled lobby joins expire after 15 seconds; failed
-endpoints are skipped for 30 seconds. Phones can fall back to automatic
-hosting if the laptop disappears, without leaving a permanent host lock.
+endpoints are skipped for 30 seconds. Outside Event Mode, phones can fall back to automatic hosting if the laptop
+disappears. Event phones keep the organizer restrictions while disconnected.
 
 The launcher opens a local landing page at `http://127.0.0.1:17511/`. Use its
 buttons to open the two independent display windows:
@@ -189,6 +199,74 @@ The dashboard binds to `127.0.0.1` by default, so only the laptop can control
 the game. To show it on another trusted display, use
 `--dashboard-bind 0.0.0.0`; do not expose that option to an untrusted network,
 because the local dashboard intentionally has no login prompt.
+
+## Players, saved profiles, and Event Mode
+
+Open **Players & Event Mode** from the host home page or **Players** on the map
+(`http://127.0.0.1:17511/players`). Select a connected player or a saved profile.
+The laptop can edit names, teams, participation, health, ammunition, reload
+behavior/time, respawn time, damage, lives, firing modes, and firing range.
+Names can change during a round; teams, participation, gameplay profiles,
+and phone transfers change in the lobby. Boss, CTF, and Infection retain their
+mode-specific teams and weapon rules.
+
+Saving a gameplay profile enables custom host rules so phones apply the profile
+rather than replacing it with tournament defaults. **Restore default gameplay**
+removes that player's override. Once every override has been removed, ordinary
+tournament rules apply again. Game Master respawns respect the player's lives
+limit. Custom respawn times require the updated phone app.
+
+Profiles and recorded game statistics are saved privately on the laptop at
+`~/.local/share/simplecoil/players.json`, using atomic writes. They survive phone
+disconnects and host restarts. To replace a phone, connect the replacement to the
+lobby, select the saved player, and use **Move to another phone**. The profile,
+team, settings, and history move together; the previous phone is unassigned.
+Transfers require a current roster selection and cannot happen during a round.
+
+The roster and editor show the phone's battery percentage, charging state,
+and battery condition for each connected blaster (including both Boss guns).
+Blaster levels are estimates, with voltage shown only for calibrated hardware.
+Phones report every five seconds; **Check batteries now** requests a fresh report.
+Disconnected or old readings are marked stale; an unknown reading is not zero.
+
+**Lowest gun voltage per round** saves each calibrated gun’s minimum displayed
+estimate with its Bluetooth ID and player. Values at or below 4.5 V are flagged
+for a battery check in the roster and player editor. The minimum survives gun
+reconnects and stays low if batteries are replaced mid-round; the next round
+starts a new record. Both Boss guns and guns swapped during a round are tracked
+independently. Unknown readings and uncalibrated rifles cannot create a voltage
+record. These are minima of the existing smoothed estimate, not raw recoil dips.
+Phones retain their latest 20 rounds and resend them when connected. The laptop
+keeps 100 rounds per player in its private player directory, including after a
+phone transfer or host restart. A replacement phone’s old player readings are
+not assigned to its new player. Update phones to 1.37 to send round history.
+
+Expand **Event name, Event Mode & Kiosk Mode** to rename the event and control
+phone restrictions. The launcher is **LAZER GUN RUN**; the event name changes
+inside the phone app and on the host displays. The event settings and organizer
+PIN are kept privately in `~/.config/simplecoil/event.properties`.
+
+Kiosk Mode uses Android lock task mode on provisioned device-owner phones.
+Ordinary phones show Android's screen-pinning confirmation and retain the
+system unpin gesture. The host reports **locked**, **screen pinned**, or
+**unlocked** separately. Release one phone by clearing its pinning checkbox,
+or turn off Kiosk Mode / Event Mode and apply to release everyone. Restrictions
+survive a lost Wi-Fi connection and app restart. The organizer PIN also unlocks
+offline, using the lobby's **Organizer unlock** button or Back during play.
+Three incorrect attempts impose a one-minute retry delay.
+
+See the host's **Phone setup** page (`/event-setup`) and
+[Android's lock task guide](https://developer.android.com/work/dpc/dedicated-devices/lock-task-mode).
+For a prepared, event-owned phone with USB debugging enabled and no personal
+accounts/device owner, install the app and provision its optional admin component:
+
+```sh
+adb shell dpm set-device-owner com.simplecoil.simplecoil/.EventDeviceAdminReceiver
+```
+
+This setup does not erase or remove accounts from phones. Android may reject
+provisioning on a phone that is already set up. Enabling an ordinary device-admin
+permission alone does not grant device-owner kiosk authority.
 
 ## Host the game Wi-Fi
 
@@ -208,13 +286,22 @@ internet.
 
 **Stop hotspot** disconnects the phones and restores the adapter's previous
 connection, when there was one. An unsuccessful start also attempts to restore
-that connection. Wi-Fi changes are blocked during countdowns and running
+that connection. Edit the settings while the hotspot is running and select
+**Apply changes** to stop and restart it with the new settings. Draft edits
+remain in the form when status refreshes. Invalid settings are rejected before
+the hotspot stops; if restarting fails, the host attempts to restore the
+previous working hotspot. Apply also works during a game round and leaves the
+game host running, while phones disconnect until they rejoin. Starting or
+stopping the hotspot separately is blocked during countdowns and running
 rounds. These controls remain restricted to this laptop even if the rest of
 the dashboard is bound to all interfaces. Saved settings, including the
 password, are private to the current user in
 `~/.config/simplecoil/hotspot.properties`. The host does not start the hotspot
 automatically at launch; the saved adapter selection is retained without
 falling back to another adapter.
+The NetworkManager hotspot profile is created in memory from those saved
+settings, avoiding Ubuntu Netplan's profile rewrites when the SSID changes.
+After a NetworkManager restart or reboot, use **Start hotspot** to recreate it.
 
 ### TP-Link TL-WN722N v2/v3 on Ubuntu 24.04
 
@@ -335,13 +422,14 @@ large high-zoom downloads from public community tile servers.
 ```
 
 Run `./laptop-host/run.sh --help` for every option. Keep the default TCP and
-UDP ports for stock SimpleCoil phones. Tournament mode is always enabled and
-locks the two-team health, ammunition, reload, damage, recoil, and single-shot
-rules. `--tournament` remains accepted only for compatibility with old scripts.
+UDP ports for stock SimpleCoil phones. Tournament rules are the default. The laptop player editor can enable custom
+profiles for ordinary two-team events. `--tournament` remains accepted for
+compatibility with old scripts.
 
 ## Respawn mode
 
-Team respawns take three minutes. Add `--timer-respawn` to keep the camera
+Default team respawns take three minutes. A saved custom host profile can
+set a different wait in the updated phone app. Add `--timer-respawn` to keep the camera
 closed and disable early checkpoint respawns; `--qr-respawn` restores the
 default QR-or-timer choice. The host publishes this rule to every phone.
 Game Master respawn remains available in either mode. CTF objectives and

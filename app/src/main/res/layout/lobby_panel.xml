@@ -37,6 +37,7 @@
         style="@style/LobbyBody"
         android:layout_marginTop="4dp"
         android:text="@string/lobby_searching" />
+    <TextView android:id="@+id/lobby_relay_status" style="@style/LobbyBody" />
 
     <LinearLayout android:id="@+id/lobby_last_game" style="@style/LobbyCard"
         android:orientation="vertical" android:visibility="gone">
@@ -139,6 +140,8 @@
             android:layout_height="wrap_content" android:orientation="vertical" />
     </LinearLayout>
 
+    <Button android:id="@+id/lobby_event_button" style="@style/LobbyTextButton"
+        android:layout_width="match_parent" android:text="@string/event_organizer_unlock" android:visibility="gone" />
     <Button android:id="@+id/lobby_more_button" style="@style/LobbyTextButton"
         android:layout_width="match_parent" android:text="@string/lobby_more" />
 </LinearLayout>

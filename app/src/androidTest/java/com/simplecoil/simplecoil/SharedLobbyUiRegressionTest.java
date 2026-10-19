@@ -26,6 +26,179 @@ import static androidx.test.espresso.matcher.ViewMatchers.withText;
 
 @RunWith(AndroidJUnit4.class)
 public class SharedLobbyUiRegressionTest {
+    @Test public void joiningLobbyDisablesAutomaticHostingEvenIfStartIsMissed() throws Exception {
+        SharedPreferences prefs = InstrumentationRegistry.getInstrumentation().getTargetContext()
+                .getSharedPreferences(FullscreenActivity.PREF_NAME, 0);
+        String key = FullscreenActivity.PREF_PHONE_HOSTING_ENABLED;
+        boolean existed = prefs.contains(key), previous = prefs.getBoolean(key, true);
+        Globals g = Globals.getInstance();
+        g.mGameState = Globals.GAME_STATE_NONE;
+        g.mWaitingForLobbyRoundEnd = false;
+        java.net.InetAddress local = java.net.InetAddress.getByName("192.0.2.20");
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                invoke(activity, "leaveSharedLobby");
+                set(activity, "mUseNetwork", true);
+                set(activity, "mIsServer", false);
+                set(activity, "mPhoneHostingEnabled", true);
+                assertTrue(canHost(activity, local, android.os.SystemClock.elapsedRealtime()));
+                android.content.BroadcastReceiver receiver = (android.content.BroadcastReceiver) get(activity, "mUDPUpdateReceiver");
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_LISTPLAYERS));
+                invoke(activity, "leaveSharedLobby");
+                assertFalse("Missed START allowed automatic hosting",
+                        canHost(activity, local, android.os.SystemClock.elapsedRealtime() + 120_000));
+                assertFalse(prefs.getBoolean(key, true));
+            });
+            scenario.recreate();
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                assertFalse((Boolean) get(activity, "mPhoneHostingEnabled"));
+                assertFalse(canHost(activity, local, android.os.SystemClock.elapsedRealtime() + 120_000));
+            });
+        } finally {
+            SharedPreferences.Editor edit = prefs.edit();
+            if (existed) edit.putBoolean(key, previous); else edit.remove(key);
+            edit.commit();
+        }
+    }
+
+    @Test public void disconnectedParticipantCannotHostEvenAfterReopening() throws Exception {
+        SharedPreferences prefs = InstrumentationRegistry.getInstrumentation().getTargetContext()
+                .getSharedPreferences("MatchSession", 0);
+        Map<String, ?> saved = new HashMap<>(prefs.getAll());
+        prefs.edit().clear().commit();
+        Globals g = Globals.getInstance();
+        java.net.InetAddress previousHost = g.mServerIP;
+        java.net.InetAddress host = java.net.InetAddress.getByName("192.0.2.10");
+        java.net.InetAddress local = java.net.InetAddress.getByName("192.0.2.20");
+        String token = "11111111-2222-3333-4444-555555555555";
+        g.mGameState = Globals.GAME_STATE_NONE;
+        g.mWaitingForLobbyRoundEnd = false;
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                invoke(activity, "leaveSharedLobby");
+                set(activity, "mUseNetwork", true);
+                set(activity, "mIsServer", false);
+                set(activity, "mPhoneHostingEnabled", true);
+                long now = android.os.SystemClock.elapsedRealtime();
+                assertTrue(canHost(activity, local, now));
+                invoke(activity, "rememberMatch", new Class<?>[]{java.net.InetAddress.class, String.class}, host, token);
+                // This is the failure path: local state and all discovered
+                // hosts disappear while the shared round is still running.
+                invoke(activity, "leaveSharedLobby");
+                ((SharedLobby) get(activity, "mSharedLobby")).clear();
+                assertFalse(canHost(activity, local, now + 120_000));
+                set(activity, "mManualPhoneHost", true);
+                assertFalse(canHost(activity, local, now + 120_000));
+                invoke(activity, "setLobbyPracticeMode");
+                assertTrue((Boolean) get(activity, "mUseNetwork"));
+                invoke(activity, "renderLobby");
+                assertFalse(activity.findViewById(R.id.lobby_host_button).isEnabled());
+                assertFalse(activity.findViewById(R.id.lobby_more_button).isEnabled());
+                g.mServerIP = host;
+                android.content.BroadcastReceiver receiver = (android.content.BroadcastReceiver) get(activity, "mUDPUpdateReceiver");
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_SERVERCANCEL));
+                assertTrue(((MatchSessionLock) get(activity, "mMatchSession")).active());
+                assertFalse(canHost(activity, local, now + 120_000));
+                invoke(activity, "endGame");
+                assertTrue("A local finish enabled a side game",
+                        ((MatchSessionLock) get(activity, "mMatchSession")).active());
+                assertFalse(canHost(activity, local, now + 120_000));
+            });
+            scenario.recreate();
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                invoke(activity, "leaveSharedLobby");
+                set(activity, "mUseNetwork", true);
+                set(activity, "mPhoneHostingEnabled", true);
+                long later = android.os.SystemClock.elapsedRealtime() + 120_000;
+                assertFalse("Reopening enabled a side game", canHost(activity, local, later));
+                assertEquals(host.getHostAddress(), ((MatchSessionLock) get(activity, "mMatchSession")).host());
+                android.content.BroadcastReceiver receiver = (android.content.BroadcastReceiver) get(activity, "mUDPUpdateReceiver");
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_ROUNDCOMPLETE)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+                assertFalse(canHost(activity, local, later));
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_ROUNDCOMPLETE)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+                assertTrue("Confirmed match completion did not unlock the lobby", canHost(activity, local, later));
+            });
+        } finally {
+            restoreMatchPreferences(prefs, saved);
+            g.mGameState = Globals.GAME_STATE_NONE;
+            g.mWaitingForLobbyRoundEnd = g.mLocalLobbyBenched = false;
+            g.mSittingOutRoundToken = null;
+            g.mServerIP = previousHost;
+        }
+    }
+
+    @Test public void onlyTheOriginalHostCanConfirmThatTheMatchIsOver() throws Exception {
+        SharedPreferences hostingPrefs = InstrumentationRegistry.getInstrumentation().getTargetContext()
+                .getSharedPreferences(FullscreenActivity.PREF_NAME, 0);
+        boolean hostingExisted = hostingPrefs.contains(FullscreenActivity.PREF_PHONE_HOSTING_ENABLED);
+        boolean previousHosting = hostingPrefs.getBoolean(FullscreenActivity.PREF_PHONE_HOSTING_ENABLED, true);
+        SharedPreferences prefs = InstrumentationRegistry.getInstrumentation().getTargetContext()
+                .getSharedPreferences("MatchSession", 0);
+        Map<String, ?> saved = new HashMap<>(prefs.getAll());
+        prefs.edit().clear().commit();
+        Globals g = Globals.getInstance();
+        java.net.InetAddress previousHost = g.mServerIP;
+        java.net.InetAddress host = java.net.InetAddress.getByName("192.0.2.10");
+        java.net.InetAddress foreign = java.net.InetAddress.getByName("192.0.2.99");
+        g.mGameState = Globals.GAME_STATE_NONE;
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                invoke(activity, "leaveSharedLobby");
+                set(activity, "mUseNetwork", true);
+                set(activity, "mIsServer", false);
+                invoke(activity, "rememberMatch", new Class<?>[]{java.net.InetAddress.class, String.class},
+                        host, "11111111-2222-3333-4444-555555555555");
+                android.content.BroadcastReceiver receiver = (android.content.BroadcastReceiver) get(activity, "mUDPUpdateReceiver");
+                g.mServerIP = foreign;
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_LISTPLAYERS)
+                        .putExtra(NetMsg.INTENT_LOBBY_PLAYING, false)
+                        .putExtra(UDPListenerService.INTENT_SERVERIP, foreign.getHostAddress()));
+                assertTrue(((MatchSessionLock) get(activity, "mMatchSession")).active());
+                g.mServerIP = host;
+                // A late server-start callback cannot promote a locked client.
+                set(activity, "mPeerHostCreationPending", true);
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_TCPSERVERREADY));
+                assertFalse((Boolean) get(activity, "mPeerHostCreationPending"));
+                set(activity, "mPeerHostCreationPending", true);
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_SERVERCREATED));
+                assertFalse((Boolean) get(activity, "mIsServer"));
+                assertFalse((Boolean) get(activity, "mPeerHostCreationPending"));
+                g.mLocalLobbyBenched = true;
+                receiver.onReceive(activity, new android.content.Intent(NetMsg.NETMSG_LISTPLAYERS)
+                        .putExtra(NetMsg.INTENT_LOBBY_PLAYING, false)
+                        .putExtra(UDPListenerService.INTENT_SERVERIP, host.getHostAddress()));
+                assertFalse(((MatchSessionLock) get(activity, "mMatchSession")).active());
+                assertTrue("Lobby confirmation discarded the host's sit-out setting", g.mLocalLobbyBenched);
+            });
+        } finally {
+            restoreMatchPreferences(prefs, saved);
+            SharedPreferences.Editor hostingEdit = hostingPrefs.edit();
+            if (hostingExisted) hostingEdit.putBoolean(FullscreenActivity.PREF_PHONE_HOSTING_ENABLED, previousHosting);
+            else hostingEdit.remove(FullscreenActivity.PREF_PHONE_HOSTING_ENABLED);
+            hostingEdit.commit();
+            g.mGameState = Globals.GAME_STATE_NONE;
+            g.mWaitingForLobbyRoundEnd = g.mLocalLobbyBenched = false;
+            g.mSittingOutRoundToken = null;
+            g.mServerIP = previousHost;
+        }
+    }
+
+    private static void restoreMatchPreferences(SharedPreferences prefs, Map<String, ?> saved) {
+        SharedPreferences.Editor edit = prefs.edit().clear();
+        for (Map.Entry<String, ?> item : saved.entrySet()) {
+            if (item.getValue() instanceof String) edit.putString(item.getKey(), (String) item.getValue());
+            else if (item.getValue() instanceof Boolean) edit.putBoolean(item.getKey(), (Boolean) item.getValue());
+        }
+        edit.commit();
+    }
+
     @Test public void hostBannerConfirmsOptOutAndRemembersItAfterReopening() throws Exception {
         SharedPreferences preferences = InstrumentationRegistry.getInstrumentation()
                 .getTargetContext().getSharedPreferences(FullscreenActivity.PREF_NAME, 0);

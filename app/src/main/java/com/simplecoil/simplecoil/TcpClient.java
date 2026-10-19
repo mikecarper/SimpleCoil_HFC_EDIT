@@ -16,6 +16,8 @@
 
 package com.simplecoil.simplecoil;
 
+import com.simplecoil.protocol.EventMode;
+
 import com.simplecoil.protocol.GpsOffset;
 import com.simplecoil.protocol.RoundRoster;
 import com.simplecoil.protocol.Powerups;
@@ -109,6 +111,7 @@ public class TcpClient extends Service {
     // second TCP reader. Let the retiring reader finish, then open one fresh
     // session to the replacement host.
     private boolean mRestartAfterHostTakeover;
+    private InetAddress mSessionServerAddress;
     private boolean mReceiverRegistered;
     private Socket mActiveSocket;
     private Thread mClientThread;
@@ -668,6 +671,7 @@ public class TcpClient extends Service {
                 Log.w(TAG, "Cannot start TCP client without a server address");
                 return;
             }
+            mSessionServerAddress = serverAddress;
             // An explicit start joins a new session. Only automatic reconnects
             // inside runTcpClientSession may replay events from the previous link.
             messageQueue = new ConcurrentLinkedQueue<>();
@@ -748,7 +752,18 @@ public class TcpClient extends Service {
                 }
                 // Discovery may find another host while this session is reconnecting.
                 // Pending events belong only to the server selected at explicit start.
-                s.connect(new InetSocketAddress(serverAddress, TcpServer.TCP_SERVER_PORT), CONNECTION_TIMEOUT_MS);
+                try {
+                    s.connect(new InetSocketAddress(serverAddress, TcpServer.TCP_SERVER_PORT), CONNECTION_TIMEOUT_MS);
+                } catch (IOException wifiUnavailable) {
+                    try { s.close(); } catch (IOException ignored) { }
+                    Socket fallback = GameRelayService.open(serverAddress, TcpServer.TCP_SERVER_PORT, CONNECTION_TIMEOUT_MS);
+                    if (fallback == null) throw wifiUnavailable;
+                    s = fallback;
+                    synchronized (this) {
+                        if (!keepListening || mDestroyed) { s.close();break; }
+                        mActiveSocket = s;
+                    }
+                }
                 s.setTcpNoDelay(true);
                 is = s.getInputStream();
                 in = new DataInputStream(is);
@@ -1112,7 +1127,14 @@ public class TcpClient extends Service {
             JSONObject playerInfo = new JSONObject();
             playerInfo.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
             playerInfo.put(TcpServer.JSON_PLAYERNAME, Globals.getInstance().mPlayerName);
-            playerInfo.put(LiveJoin.IDENTITY, LiveJoin.identity(this));
+            // A laptop resolves this device to its saved person. Peer hosts
+            // must keep the original device identity across reconnects too.
+            playerInfo.put(LiveJoin.IDENTITY, LiveJoin.deviceIdentity(this));
+            playerInfo.put(EventMode.DEVICE_IDENTITY, LiveJoin.deviceIdentity(this));
+            playerInfo.put(EventMode.CAPABILITY, 2);
+            playerInfo.put(com.simplecoil.protocol.RelayConfig.NODE, GameRelayService.node(this));
+            playerInfo.put(com.simplecoil.protocol.RelayConfig.P2P, GameRelayService.p2p());
+            playerInfo.put(com.simplecoil.protocol.RelayConfig.BLUETOOTH, GameRelayService.bluetoothAddress());
             if (Globals.getInstance().mRequestedJoinTeam > 0)
                 playerInfo.put(LiveJoin.TEAM, Globals.getInstance().mRequestedJoinTeam);
             playerInfo.put(TcpServer.JSON_LOBBY_READY, Globals.getInstance().mLocalLobbyReady);
@@ -1143,10 +1165,27 @@ public class TcpClient extends Service {
         try {
             sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                     + new JSONObject().put(TcpServer.JSON_LOBBY_READY,
-                    Globals.getInstance().mLocalLobbyReady), false);
+                    Globals.getInstance().mLocalLobbyReady)
+                            .put(com.simplecoil.protocol.RelayConfig.NODE, GameRelayService.node(this))
+                            .put(com.simplecoil.protocol.RelayConfig.P2P, GameRelayService.p2p())
+                            .put(com.simplecoil.protocol.RelayConfig.BLUETOOTH, GameRelayService.bluetoothAddress()), false);
         } catch (JSONException e) {
             Log.w(TAG, "Unable to publish lobby readiness", e);
         }
+    }
+
+    public void sendEventLockStatus(String status) {
+        if (!java.util.Arrays.asList("locked", "pinned", "none", "error").contains(status)) return;
+        try {
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(EventMode.LOCK_STATUS, status), false);
+        } catch (JSONException exception) { Log.w(TAG, "Unable to publish event lock status", exception); }
+    }
+
+    public void sendBatteryStatus(JSONObject report) {
+        try { sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + new JSONObject().put(EventMode.BATTERY, report), false); }
+        catch (JSONException exception) { Log.w(TAG, "Unable to publish battery status", exception); }
     }
 
     public boolean voteToEndGame(String roundToken, boolean approve) {
@@ -1163,6 +1202,10 @@ public class TcpClient extends Service {
     }
 
     /** A lobby snapshot may arrive while its activity is paused for gun pairing. */
+    synchronized boolean hasClientSession() {
+        return !mDestroyed && (keepListening || isListening);
+    }
+
     public synchronized boolean hasLobbyConnection() {
         return !mDestroyed && keepListening && out != null && mLobbyRegistered;
     }
@@ -1382,6 +1425,20 @@ public class TcpClient extends Service {
         }
         try {
             JSONObject game = TcpJson.parseObject(message);
+            if (Boolean.TRUE.equals(game.opt(EventMode.BATTERY_REQUEST))) {
+                broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_BATTERYREQUEST));
+                return;
+            }
+            if (Boolean.TRUE.equals(game.opt(EventMode.TRANSFERRED_OUT))) {
+                synchronized (this) {
+                    if (!isCurrentSession(generation)) return;
+                    Globals.getInstance().mEventMode = false;
+                    Globals.getInstance().mEventPinning = false;
+                    Globals.getInstance().mHostPlayerIdentity = null;
+                }
+                finishServerSession(NetMsg.NETMSG_PLAYERTRANSFERRED);
+                return;
+            }
             // Parse the origin now, but commit only with the validated message.
             // A malformed snapshot must not leave a new decoding frame behind.
             final GpsOffset gpsOrigin = game.has(GpsWire.ORIGIN)
@@ -1868,6 +1925,28 @@ public class TcpClient extends Service {
                 if (roundRoster != null && (startInfo == null || !roundRoster.token.equals(
                         startInfo.getString(TcpServer.JSON_ROUND_TOKEN))))
                     throw new JSONException("Mismatched round roster");
+                com.simplecoil.protocol.RelayConfig relayConfig = null;
+                if (game.has(com.simplecoil.protocol.RelayConfig.WIRE)) {
+                    try { relayConfig = com.simplecoil.protocol.RelayConfig.decode(game.getString(com.simplecoil.protocol.RelayConfig.WIRE)); }
+                    catch (IllegalArgumentException invalid) { throw new JSONException("Invalid relay membership"); }
+                }
+                final com.simplecoil.protocol.RelayConfig admittedRelay = relayConfig;
+                String hostPlayerIdentity = game.has(EventMode.PLAYER_IDENTITY)
+                        ? game.getString(EventMode.PLAYER_IDENTITY) : null;
+                if (hostPlayerIdentity != null && !RoundRoster.validIdentity(hostPlayerIdentity))
+                    throw new JSONException("Invalid hosted player identity");
+                boolean eventMode = hostKind == SharedLobby.Kind.LAPTOP && game.optBoolean(EventMode.ENABLED, false);
+                String eventTitle = hostKind == SharedLobby.Kind.LAPTOP ? game.optString(EventMode.TITLE, EventMode.APP_NAME) : EventMode.APP_NAME;
+                if (!EventMode.validTitle(eventTitle)) throw new JSONException("Invalid event name");
+                boolean eventPinning = eventMode && game.optBoolean(EventMode.PINNING, false);
+                String eventRevision = game.optString(EventMode.REVISION, "");
+                String eventPinHash = game.optString(EventMode.PIN_HASH, "");
+                if (eventMode && (!RoundRoster.validIdentity(eventRevision) || !EventMode.validHash(eventPinHash)
+                        || hostPlayerIdentity == null)) throw new JSONException("Invalid event policy");
+                boolean hostCustomRules = hostKind == SharedLobby.Kind.LAPTOP && !tournamentMode
+                        && game.optBoolean(EventMode.CUSTOM_RULES, false);
+                boolean hostAssignedTeams = hostKind == SharedLobby.Kind.LAPTOP && balancedMode
+                        && game.optBoolean(EventMode.ASSIGNED_TEAMS, false);
                 Globals.getmTeamPlayerNameSemaphore();
                 try {
                     Globals.getmTeamIPMapSemaphore();
@@ -1886,6 +1965,15 @@ public class TcpClient extends Service {
                                         return;
                                     commitGpsOriginLocked(gpsOrigin);
                                     globals.mTournamentMode = tournamentMode;
+                                    globals.mHostCustomRules = hostCustomRules;
+                                    globals.mHostAssignedTeams = hostAssignedTeams;
+                                    globals.mHostPlayerIdentity = hostPlayerIdentity;
+                                    if (admittedRelay != null) GameRelayService.configure(this, admittedRelay);
+                                    globals.mEventMode = eventMode;
+                                    globals.mEventTitle = eventTitle;
+                                    globals.mEventPinning = eventPinning;
+                                    globals.mEventRevision = eventRevision;
+                                    globals.mEventPinHash = eventPinHash;
                                     if (roundRoster != null) {
                                         globals.installRoundRoster(roundRoster);
                                     }
@@ -1919,8 +2007,21 @@ public class TcpClient extends Service {
                                     globals.mLobbyPlayerReady = Collections.unmodifiableMap(lobbyReadiness);
                                     globals.mLobbyPlayers = Collections.unmodifiableMap(lobbyPlayers);
                                     LobbyPlayer localPresence = lobbyPlayers.get(globals.mPlayerID);
+                                    // A peer roster can arrive before this phone is admitted,
+                                    // while another player still occupies its requested number.
+                                    // Only the laptop's identity-bound editor owns local names.
+                                    if (hostPlayerIdentity != null && localPresence != null)
+                                        globals.mPlayerName = localPresence.name;
                                     globals.mLocalLobbyBenched = localPresence != null && localPresence.benched;
                                     globals.mLobbyRoundActive = game.optBoolean(TcpServer.JSON_LOBBY_PLAYING, false);
+                                    // Only a completely validated TCP roster can confirm
+                                    // that the original host has reopened its lobby.
+                                    if (game.has(TcpServer.JSON_LOBBY_PLAYING)) {
+                                        intent.putExtra(NetMsg.INTENT_LOBBY_PLAYING, globals.mLobbyRoundActive);
+                                        if (mSessionServerAddress != null)
+                                            intent.putExtra(UDPListenerService.INTENT_SERVERIP,
+                                                    mSessionServerAddress.getHostAddress());
+                                    }
                                     mLobbyRegistered = true;
                                     mLobbyHostKind = hostKind;
                                     mLobbyHostAddress = globals.mServerIP;

@@ -63,7 +63,9 @@ public class TcpGameInfoRegressionTest {
     private static final String[] LOCAL_SETTINGS = {"mFullHealth", "mFullShields", "mFullReload", "mReloadTime",
             "mReloadOnEmpty", "mRespawnTime", "mDamage", "mOverrideLives", "mOverrideLivesVal",
             "mAllowSingleShotMode", "mAllowBurst3ShotMode", "mAllowAutoShotMode",
-            "mCurrentFiringMode", "mAllowPlayerSettings"};
+            "mCurrentFiringMode", "mAllowPlayerSettings", "mPlayerName", "mHostPlayerIdentity",
+            "mHostCustomRules", "mHostAssignedTeams", "mEventMode", "mEventPinning",
+            "mEventRevision", "mEventPinHash", "mEventTitle"};
 
     @Before
     public void setUp() throws Exception {
@@ -1275,6 +1277,53 @@ public class TcpGameInfoRegressionTest {
         return settings(id).put(TcpServer.JSON_SHOT_MODE_SINGLE, true)
                 .put(TcpServer.JSON_SHOT_MODE_BURST3, true)
                 .put(TcpServer.JSON_SHOT_MODE_AUTO, true);
+    }
+
+    @Test public void peerRosterCannotRenameThePhoneWhenItsPlayerNumberIsOccupied() throws Exception {
+        globals.mPlayerName = "Chris";
+        parse(roster(new JSONArray().put(player(1).put(TcpServer.JSON_PLAYERNAME, "Other player")).put(player(3))));
+        assertEquals("Chris", globals.mPlayerName);
+        assertNull(globals.mHostPlayerIdentity);
+    }
+
+    @Test public void laptopEventPolicyAndOwnNameCommitWithTheValidatedRoster() throws Exception {
+        String identity = "00000000-0000-0000-0000-000000000099";
+        String revision = "00000000-0000-0000-0000-000000000088";
+        JSONObject game = roster(new JSONArray().put(player(1).put(TcpServer.JSON_PLAYERNAME, "Host name")).put(player(3)))
+                .put(TcpServer.JSON_DEDICATED, true).put(TcpServer.JSON_HOST_KIND, "L")
+                .put(TcpServer.JSON_GAMESTATE, Globals.GAME_STATE_NONE)
+                .put(com.simplecoil.protocol.EventMode.PLAYER_IDENTITY, identity)
+                .put(com.simplecoil.protocol.EventMode.ENABLED, true)
+                .put(com.simplecoil.protocol.EventMode.PINNING, true)
+                .put(com.simplecoil.protocol.EventMode.REVISION, revision)
+                .put(com.simplecoil.protocol.EventMode.PIN_HASH, com.simplecoil.protocol.EventMode.pinHash(identity, "123456"))
+                .put(com.simplecoil.protocol.EventMode.TITLE, "LAZER GUN RUN Finals");
+        parse(game);
+        assertEquals("Host name", globals.mPlayerName);
+        assertEquals(identity, globals.mHostPlayerIdentity);
+        assertTrue(globals.mEventMode);assertTrue(globals.mEventPinning);
+        assertEquals("LAZER GUN RUN Finals", globals.mEventTitle);
+        assertTrue(com.simplecoil.protocol.EventMode.matchesPin(identity, "123456", globals.mEventPinHash));
+        game.put(TcpServer.JSON_PLAYERS, new JSONArray().put(player(1).put(TcpServer.JSON_PLAYERNAME, "Rejected name")))
+                .put(com.simplecoil.protocol.EventMode.PIN_HASH, "invalid");
+        parse(game);
+        assertEquals("Host name", globals.mPlayerName);
+        assertEquals(1, globals.mTeamIPMap.size());
+    }
+
+    @Test public void laptopCustomProfilesSurviveTournamentDefaultsAndUseTheEditedRespawn() throws Exception {
+        parse(roster(new JSONArray().put(player(1)).put(player(3)))
+                .put(TcpServer.JSON_DEDICATED, true).put(TcpServer.JSON_HOST_KIND, "L")
+                .put(TcpServer.JSON_GAMESTATE, Globals.GAME_STATE_NONE)
+                .put(TcpServer.JSON_TOURNAMENT_MODE, false).put(TcpServer.JSON_ONLY_SERVER_SETTINGS, true)
+                .put(com.simplecoil.protocol.EventMode.CUSTOM_RULES, true)
+                .put(TcpServer.JSON_PLAYERSETTINGS, new JSONArray().put(classicSettings(1)))
+                .put(TcpServer.JSON_ALLOWPLAYERSETTINGS, false));
+        assertTrue(globals.mHostCustomRules);assertFalse(globals.mTournamentMode);
+        assertEquals(50, globals.mFullHealth);assertEquals(200, globals.mFullReload & 255);
+        assertEquals(20, globals.mRespawnTime);assertEquals(-10, globals.mDamage);
+        assertFalse(globals.mAllowPlayerSettings);
+        assertEquals(20, Globals.respawnWaitSeconds(true, false, globals.mGameMode, globals.mRespawnTime, globals.mHostCustomRules));
     }
 
     private static JSONObject player(int id) throws Exception {

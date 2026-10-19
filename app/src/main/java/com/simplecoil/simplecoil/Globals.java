@@ -151,8 +151,13 @@ public class Globals {
 
     public static long respawnWaitSeconds(boolean networked, boolean startingGame,
                                          int gameMode, long configuredSeconds) {
+        return respawnWaitSeconds(networked, startingGame, gameMode, configuredSeconds, false);
+    }
+
+    public static long respawnWaitSeconds(boolean networked, boolean startingGame,
+                                         int gameMode, long configuredSeconds, boolean hostCustomRules) {
         if (startingGame) return GameStartCountdown.DURATION_SECONDS;
-        if (networked
+        if (networked && !hostCustomRules
                 && (gameMode == GAME_MODE_2TEAMS || gameMode == GAME_MODE_4TEAMS))
             return TEAM_QR_RESPAWN_WAIT_SECONDS;
         return Math.max(MIN_RESPAWN_TIME_SECONDS, Math.min(MAX_RESPAWN_TIME_SECONDS, configuredSeconds));
@@ -193,6 +198,14 @@ public class Globals {
     public volatile boolean mOverrideLives = false;
     public volatile int mOverrideLivesVal = 0;
     public volatile boolean mAllowPlayerSettings = false;
+    public volatile boolean mHostCustomRules;
+    public volatile boolean mHostAssignedTeams;
+    public volatile String mHostPlayerIdentity;
+    public volatile boolean mEventMode;
+    public volatile boolean mEventPinning;
+    public volatile String mEventPinHash = "";
+    public volatile String mEventRevision = "";
+    public volatile String mEventTitle = com.simplecoil.protocol.EventMode.APP_NAME;
     /** Tournament remains the default, but classic FFA/team modes may be selected in the lobby. */
     public static final boolean TOURNAMENT_RULES_REQUIRED = false;
     public volatile boolean mTournamentMode = true;
@@ -741,6 +754,8 @@ public class Globals {
      * substitute when a phone has more than one active network interface.
      */
     public static InetAddress getIPAddress(Context context) {
+        InetAddress relayAddress = GameRelayService.canonicalAddress();
+        if (relayAddress != null) return relayAddress;
         if (context != null) {
             try {
                 Context applicationContext = context.getApplicationContext();

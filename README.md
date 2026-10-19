@@ -70,6 +70,19 @@ precise voltages outside the measured 2.0-6.0 V range. These are coarse
 voltage-based conditions, not a percentage or a per-cell safety monitor.
 The earlier 2.25 V electronics test is not a suitable NiMH empty threshold.
 
+Each phone saves the lowest reported calibrated voltage for each physical gun
+in every round. Reconnecting or replacing batteries cannot erase that round’s
+low. The laptop’s **Players → Phone & gun batteries** shows these readings by
+player and gun Bluetooth ID, flagging 4.5 V or below for a battery check. Phones
+retain 20 rounds for later delivery; the laptop keeps the latest 100 rounds per
+player across restarts and phone transfers. These are minima of the smoothed
+displayed estimate, not instantaneous raw voltage dips.
+
+Gun telemetry and same-host network recovery continue when another app covers
+the game. Connected guns use an ongoing notification and a partial wake lock;
+returning to the game does not reconnect a healthy Bluetooth session. Quitting
+the app releases those resources.
+
 The reading waits for the gun type and 20 real samples. It uses a rolling
 15-second window, discards the lowest 75% of readings, and averages the highest
 25% (rounding the retained sample count up). The display and recoil cutoff use
@@ -136,7 +149,31 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.34 on every phone for this build.
+messages cannot end a new round. Install 1.39 on every phone for this build.
+
+Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
+remains the primary connection. If it fails, Wi-Fi Direct and, when necessary,
+Bluetooth Classic links can forward game traffic through other admitted phones.
+The original host, player identities, round and operator controls stay in use;
+losing the hub does not create a separate game. Accept Android's Wi-Fi Direct
+invitation when setting up the phones. Bluetooth and Wi-Fi must be enabled for
+both fallback options. The app keeps these connections alive in the background.
+
+This requires a continuous path of nearby phones back to the original host.
+Wi-Fi Direct uses one group owner; Bluetooth provides additional neighbor links.
+A completely isolated phone must move back into reach. The relay carries game
+traffic only, and does not extend Internet access. Radio range depends on the
+phones, obstacles and interference; there is no guaranteed distance increase.
+
+Once a network match starts, each participant stays bound to that match's host.
+Joining a host also disables automatic hosting on that participant, including
+when it loses Wi-Fi before receiving the start. To choose a different phone host
+for a later game, use **Make this phone host** in the idle lobby.
+Losing Wi-Fi or the gun connection, sitting out, leaving the round, and reopening
+the player app cannot enable a separate phone-hosted game. The phone reconnects
+to the original host, and keeps hosting, practice, and new-game controls locked
+until the match ends or that host confirms its lobby is open again. A deliberate
+handoff of the same running match remains supported.
 
 If a round is stopped before its first 60 seconds of play have elapsed, the
 next round can start without the usual 30-second between-game wait. Canceling
@@ -472,8 +509,10 @@ Install JDK 17 and Android SDK Platform 34, then set `JAVA_HOME` and
 ./gradlew assembleDebug
 ```
 
-The launcher name defaults to `Dean's 11th Birthday Blaster Bash`. Override it
-for a particular build with the `appName` Gradle property:
+The launcher name defaults to `LAZER GUN RUN`. Override it
+for a particular build with the `appName` Gradle property. The laptop’s
+**Players & Event Mode** page can change the event name displayed inside the
+app at runtime, while the launcher name stays fixed:
 
 ```bash
 ./gradlew assembleDebug -PappName="Your Event Name"

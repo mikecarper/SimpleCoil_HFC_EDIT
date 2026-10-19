@@ -91,8 +91,8 @@ public final class LaptopHostProtocolSmokeTest {
         byte[] testTileBytes = new byte[] {(byte) 0x89, 0x50, 0x4e, 0x47};
         Files.write(testTile, testTileBytes);
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1",
                 "--powerup-qr", "4",
@@ -218,6 +218,8 @@ public final class LaptopHostProtocolSmokeTest {
                         "round did not leave the start countdown");
                 require(wifiResponseCode("POST", "{\"action\":\"stop\"}", null, true) == 409,
                         "Wi-Fi could be changed during an active round");
+                require(wifiResponseCode("POST", "{\"action\":\"apply\",\"ssid\":\"\"}", null, true) == 400,
+                        "Apply was blocked during a round instead of validating the requested settings");
                 verifyLateJoinBlocked();
                 verifyDirectLateJoinBlocked();
 
@@ -390,8 +392,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyGpsOffsets() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--gps", "all", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
                 String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
                 "--start-delay", "1").redirectErrorStream(true).start();
@@ -515,8 +517,8 @@ public final class LaptopHostProtocolSmokeTest {
                 "the shared default start countdown must be twenty-four seconds");
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        List<String> command = new ArrayList<>(List.of(javaExecutable, "--add-modules", "jdk.httpserver",
-                "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        List<String> command = new ArrayList<>(List.of(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver",
+                "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT)));
         if (explicitOverride) {
@@ -558,8 +560,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyPowerupRequests(int required) throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        List<String> command = new ArrayList<>(List.of(javaExecutable, "--add-modules", "jdk.httpserver",
-                "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        List<String> command = new ArrayList<>(List.of(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver",
+                "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1"));
         if (required > 0) {
@@ -892,8 +894,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyDynamicPowerupRequirement() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1", "--powerup-qr", "8")
                 .redirectErrorStream(true).start();
@@ -1074,8 +1076,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBalancedQr() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--balanced-qr",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--balanced-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
                 .redirectErrorStream(true).start();
@@ -1138,8 +1140,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBalancedNoQr() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--balanced-no-qr",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--balanced-no-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
                 .redirectErrorStream(true).start();
@@ -1170,8 +1172,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBalancedQrTimeout() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--balanced-qr",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--balanced-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT))
                 .redirectErrorStream(true).start();
@@ -1217,8 +1219,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyDeadRejoin() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--timer-respawn", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
                 String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
                 "--start-delay", "1").redirectErrorStream(true).start();
@@ -1272,8 +1274,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyRespawnMode(boolean qrEnabled) throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 qrEnabled ? "--qr-respawn" : "--timer-respawn",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
@@ -1334,8 +1336,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBossMode() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--boss",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--boss",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
                 .redirectErrorStream(true).start();
@@ -1376,8 +1378,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyCaptureTheFlagMode() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--ctf",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--ctf",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
                 .redirectErrorStream(true).start();
@@ -1399,8 +1401,8 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyInfectionMode() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "--add-modules", "jdk.httpserver", "-cp",
-                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+                classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--infection", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
                 String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
                 "--start-delay", "1")

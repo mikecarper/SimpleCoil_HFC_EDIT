@@ -29,6 +29,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="true"
@@ -40,6 +43,15 @@
         android:screenOrientation="portrait"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
+        <receiver android:name=".EventDeviceAdminReceiver" android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:label="@string/event_admin_label">
+            <meta-data android:name="android.app.device_admin" android:resource="@xml/event_device_admin" />
+            <intent-filter><action android:name="android.app.action.DEVICE_ADMIN_ENABLED" /></intent-filter>
+        </receiver>
+        <receiver android:name=".EventBootReceiver" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /></intent-filter>
+        </receiver>
         <activity
             android:name=".FullscreenActivity"
             android:configChanges="orientation|keyboardHidden|screenSize"
@@ -54,11 +66,15 @@
             </intent-filter>
         </activity>
 
+        <service android:name=".GameRelayService" android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
         <service
             android:name=".BluetoothLeService"
+            android:foregroundServiceType="connectedDevice"
             android:enabled="true" />
         <service
             android:name=".BossSecondaryBluetoothLeService"
+            android:foregroundServiceType="connectedDevice"
             android:enabled="true" />
         <service
             android:name=".UDPListenerService"

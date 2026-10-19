@@ -513,4 +513,24 @@
     <string name="ctf_your_flag_stolen_voice">Eure Flagge wurde gestohlen</string>
     <string name="ctf_captures_label">FLAGGEN</string>
     <string name="ctf_capture_limit_label">FLAGGEN (%1$d)</string>
+    <string name="gun_connection_channel">Blaster-Verbindung</string>
+    <string name="gun_connection_title">LAZER GUN RUN · Blaster-Verbindung</string>
+    <string name="gun_connection_background">Dein Blaster bleibt verbunden. Tippe hier, um zum Spiel zurückzukehren.</string>
+    <string name="match_reconnecting">Das Spiel läuft. Die Verbindung zum ursprünglichen Host wird wiederhergestellt. Hosting und neue Spiele bleiben gesperrt.</string>
+    <string name="event_admin_label">SimpleCoil-Veranstaltungskiosk</string>
+    <string name="event_organizer_unlock">Veranstaltungsmodus · Freigabe durch den Veranstalter</string>
+    <string name="event_organizer_pin">Veranstalter-PIN</string>
+    <string name="event_unlock">Entsperren</string>
+    <string name="event_unlock_help">Der Laptop steuert diese Veranstaltung. Bitte den Veranstalter, dieses Telefon freizugeben, oder gib die Veranstalter-PIN von der Spielerseite auf dem Laptop ein.</string>
+    <string name="event_pin_failed">Android konnte das Spiel nicht anheften. Bitte den Veranstalter, dieses Telefon zu prüfen.</string>
+    <string name="event_pin_incorrect">Falsche Veranstalter-PIN</string>
+    <string name="event_pin_wait">Zu viele Versuche. Versuche es in einer Minute erneut.</string>
+    <string name="event_controlled">Im Veranstaltungsmodus vom Laptop gesteuert</string>
+    <string name="event_transferred">Dieser Spieler wurde auf ein anderes Telefon übertragen. Dieses Telefon ist jetzt keinem Spieler zugeordnet.</string>
+    <string name="event_assigned_teams">Teams vom Laptop zugewiesen</string>
+    <string name="relay_notification_title">Spielverbindung über nahe Telefone</string>
+    <string name="relay_notification_body">Die Verbindung zum selben Spiel bleibt über nahe Telefone erhalten.</string>
+    <string name="relay_ready">Verbindung über nahe Telefone bereit</string>
+    <string name="relay_connected">Über ein nahes Telefon verbunden</string>
+    <string name="relay_preparing">Verbindung zu nahen Telefonen wird vorbereitet · Bestätige die Android-Verbindungsanfrage</string>
 </resources>

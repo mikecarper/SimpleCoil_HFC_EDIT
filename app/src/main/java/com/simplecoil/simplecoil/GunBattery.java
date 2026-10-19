@@ -48,6 +48,8 @@ final class GunBattery {
         blasterType = type;
     }
 
+    int blasterType() { return blasterType; }
+
     void addSample(byte low, byte high) {
         long now = clock.nowMillis();
         expireSamples(now);

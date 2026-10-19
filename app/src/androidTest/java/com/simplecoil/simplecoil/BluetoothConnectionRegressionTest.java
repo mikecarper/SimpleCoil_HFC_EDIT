@@ -97,6 +97,18 @@ public class BluetoothConnectionRegressionTest {
         assertTrue("Bluetooth worker failed: " + failures, failures.isEmpty());
     }
 
+    @Test
+    public void repeatedConnectDoesNotRestartConnectedOrConnectingGatt() throws Exception {
+        assertTrue(service.connect("00:11:22:33:44:55"));
+        assertTrue(original.operations.isEmpty());
+        assertSame(original.gatt, serviceField("mBluetoothGatt").get(service));
+        assertEquals(BluetoothProfile.STATE_CONNECTED, connectionState());
+        publish(original, BluetoothProfile.STATE_CONNECTING);
+        assertTrue(service.connect("00:11:22:33:44:55"));
+        assertTrue(original.operations.isEmpty());
+        assertEquals(BluetoothProfile.STATE_CONNECTING, connectionState());
+    }
+
     private void installFakeAdapter() throws Exception {
         // LG's Android 5.1 GATT implementation checks the process-default adapter
         // before close/disconnect. Satisfy that guard without turning on the radio

@@ -14,6 +14,11 @@ final class LiveJoin {
     static final String INTENT = "qr_live_join";
 
     static synchronized String identity(Context context) {
+        String hosted = Globals.getInstance().mHostPlayerIdentity;
+        return RoundRoster.validIdentity(hosted) ? hosted : deviceIdentity(context);
+    }
+
+    static synchronized String deviceIdentity(Context context) {
         if (context == null || context instanceof android.content.ContextWrapper
                 && ((android.content.ContextWrapper) context).getBaseContext() == null)
             return "00000000-0000-0000-0000-000000000001";

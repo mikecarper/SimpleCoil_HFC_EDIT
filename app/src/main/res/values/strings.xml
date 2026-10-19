@@ -1,4 +1,8 @@
 <resources>
+    <string name="gun_connection_channel">Gun connection</string>
+    <string name="gun_connection_title">LAZER GUN RUN · Gun connection</string>
+    <string name="gun_connection_background">Keeping your gun connected. Tap to return to the game.</string>
+    <string name="match_reconnecting">Match in progress. Reconnecting to the original host. Hosting and new games stay locked.</string>
     <string name="gun_battery">Gun battery: %1$s</string>
     <string name="gun_one_battery">Gun 1 battery: %1$s</string>
     <string name="gun_two_battery">Gun 2 battery: %1$s</string>
@@ -536,4 +540,20 @@
     <string name="reload_voice_prompt">Reload</string>
 
 
+    <string name="event_admin_label">SimpleCoil event kiosk</string>
+    <string name="event_organizer_unlock">Event Mode · Organizer unlock</string>
+    <string name="event_organizer_pin">Organizer PIN</string>
+    <string name="event_unlock">Unlock</string>
+    <string name="event_unlock_help">The laptop controls this event. Ask the organizer to release this phone, or enter the organizer PIN shown on the laptop’s Players page.</string>
+    <string name="event_pin_failed">Android could not pin the game. Ask the organizer to check this phone.</string>
+    <string name="event_pin_incorrect">Incorrect organizer PIN</string>
+    <string name="event_pin_wait">Too many attempts. Try again in one minute.</string>
+    <string name="event_controlled">Controlled by the laptop in Event Mode</string>
+    <string name="event_transferred">This player moved to another phone. This phone is now unassigned.</string>
+    <string name="event_assigned_teams">Teams assigned by the laptop</string>
+    <string name="relay_notification_title">Nearby game connection</string>
+    <string name="relay_notification_body">Keeping the same game connected through nearby phones.</string>
+    <string name="relay_ready">Nearby connection ready</string>
+    <string name="relay_connected">Connected through a nearby phone</string>
+    <string name="relay_preparing">Preparing nearby connection · Accept Android’s connection request when shown</string>
 </resources>

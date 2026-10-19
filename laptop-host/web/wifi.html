@@ -32,34 +32,39 @@
         <div class="wide"><label for="security">Wi-Fi access</label><select id="security"><option value="open">Open — no password</option><option value="wpa2">WPA2 — password protected</option></select></div>
         <div id="password-row" class="wide" hidden><label for="password">Wi-Fi password</label><div class="row"><input id="password" type="password" minlength="8" maxlength="63" autocomplete="new-password"><button id="show-password" class="secondary" type="button">Show</button><button id="copy-password" class="secondary" type="button">Copy</button></div></div>
       </div>
-      <div class="row"><button id="start-hotspot" type="submit" disabled>Start hotspot</button><button id="stop-hotspot" class="danger" type="button" disabled>Stop hotspot</button><button id="save-settings" class="secondary" type="button" disabled>Save settings</button></div>
+      <div class="row"><button id="start-hotspot" type="submit" disabled>Start hotspot</button><button id="apply-settings" type="button" hidden disabled>Apply changes</button><button id="stop-hotspot" class="danger" type="button" disabled>Stop hotspot</button><button id="save-settings" class="secondary" type="button" disabled>Save settings</button></div>
+      <p id="apply-note" class="muted" hidden>Apply changes restarts the hotspot. Phones must rejoin if you change the network name or password.</p>
     </form>
     <p id="join-note" class="muted">Game phones can join this open Recoil network without a password.</p>
-    <p id="round-note" class="muted" hidden>Finish the current round before changing Wi-Fi.</p>
+    <p id="round-note" class="muted" hidden>A round is active. Applying changes disconnects phones until they rejoin.</p>
     <p id="message" role="status" aria-live="polite"></p>
   </section>
   <p class="muted">Hotspot controls are available on this laptop. Turning the hotspot off disconnects phones from its Wi-Fi.</p>
 </main>
 <script>
   const byId=id=>document.getElementById(id),adapter=byId('adapter'),ssid=byId('ssid'),password=byId('password'),channel=byId('channel'),security=byId('security');
-  const start=byId('start-hotspot'),stop=byId('stop-hotspot'),save=byId('save-settings'),badge=byId('wifi-status'),message=byId('message');
-  let wifi=null,roundActive=false,changing=false,initialized=false,deviceSignature='';
+  const start=byId('start-hotspot'),apply=byId('apply-settings'),stop=byId('stop-hotspot'),save=byId('save-settings'),badge=byId('wifi-status'),message=byId('message');
+  let wifi=null,roundActive=false,changing=false,initialized=false,dirty=false,deviceSignature='';
+  function formValues(){return {ssid:ssid.value,password:password.value,security:security.value,interface:adapter.value,channel:channel.value}}
+  function hasChanges(){const values=formValues();return ['ssid','security','interface','channel'].some(key=>values[key]!==String(wifi?.[key]??''))||(values.security==='wpa2'&&values.password!==wifi?.password)}
   function notice(text,error=false){message.textContent=text;message.classList.toggle('error',error)}
   function render(){
     if(!wifi)return;
     const devices=wifi.devices||[],signature=JSON.stringify(devices.map(d=>[d.interface,d.label,d.apSupported]));
     if(signature!==deviceSignature){const selected=initialized?adapter.value:wifi.interface;adapter.replaceChildren();for(const device of devices){const option=document.createElement('option');option.value=device.interface;option.textContent=device.label+' ('+device.interface+')'+(device.apSupported?'':' — hotspot unavailable');adapter.append(option)}adapter.value=selected||wifi.interface||'';deviceSignature=signature}
-    if(wifi.available&&(!initialized||wifi.active)){adapter.value=wifi.interface||'';ssid.value=wifi.ssid||'';password.value=wifi.password||'';channel.value=wifi.channel||'6';security.value=wifi.security||'open';initialized=true}
-    const busy=changing||wifi.busy,active=Boolean(wifi.active),device=devices.find(d=>d.interface===adapter.value),locked=busy||active||roundActive;
+    if(wifi.available&&(!initialized||(!dirty&&!changing))){adapter.value=wifi.interface||'';ssid.value=wifi.ssid||'';password.value=wifi.password||'';channel.value=wifi.channel||'6';security.value=wifi.security||'open';initialized=true}
+    const busy=changing||wifi.busy,active=Boolean(wifi.active),device=devices.find(d=>d.interface===adapter.value);
     badge.textContent=busy?'Changing Wi-Fi…':active?'Hotspot on':wifi.available?'Hotspot off':'Wi-Fi controls unavailable';badge.classList.toggle('on',active);
     const protectedWifi=security.value==='wpa2';
-    byId('network-summary').textContent=active?wifi.ssid+(protectedWifi?' · WPA2':' · Open Wi-Fi'):'';
+    byId('network-summary').textContent=active?wifi.ssid+(wifi.security==='wpa2'?' · WPA2':' · Open Wi-Fi'):'';
     byId('join-details').hidden=!active;byId('host-address').textContent=(wifi.addresses||[]).join(' · ');
-    for(const field of [adapter,ssid,channel,security])field.disabled=locked||!wifi.available;
-    byId('password-row').hidden=!protectedWifi;password.required=protectedWifi;password.disabled=locked||!wifi.available||!protectedWifi;
-    byId('join-note').textContent=protectedWifi?'Join this network in each phone’s Wi-Fi settings and save its password once. Then open the game.':'Game phones can join this open Recoil network without a password.';
+    for(const field of [adapter,ssid,channel,security])field.disabled=busy||!wifi.available;
+    byId('password-row').hidden=!protectedWifi;password.required=protectedWifi;password.disabled=busy||!wifi.available||!protectedWifi;
+    byId('join-note').textContent=(active?wifi.security==='wpa2':protectedWifi)?'Join this network in each phone’s Wi-Fi settings and save its password once. Then open the game.':'Game phones can join this open Recoil network without a password.';
     start.disabled=busy||active||roundActive||!wifi.available||!device?.apSupported;
-    stop.disabled=busy||!active||roundActive;save.disabled=locked||!wifi.available||!device;
+    start.hidden=active;apply.hidden=!active;apply.disabled=busy||!active||!wifi.available||!device?.apSupported||!hasChanges();
+    stop.disabled=busy||!active||roundActive;save.hidden=active;save.disabled=busy||roundActive||!wifi.available||!device;
+    byId('apply-note').hidden=!active;
     byId('round-note').hidden=!roundActive;
     byId('adapter-note').textContent=!wifi.available?(wifi.message||'NetworkManager is required for hotspot controls.'):
       !device?'Choose a Wi-Fi adapter.':!device.apSupported?'This adapter needs an AP-capable driver before it can host Wi-Fi.':
@@ -73,12 +78,13 @@
   }
   async function control(action){
     if(changing)return;if(action!=='stop'&&!byId('wifi-form').reportValidity())return;
-    changing=true;render();notice(action==='start'?'Starting the hotspot…':action==='stop'?'Stopping the hotspot…':'Saving Wi-Fi settings…');
-    try{const result=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json','X-SimpleCoil-Control':'1'},body:JSON.stringify({action,ssid:ssid.value,password:password.value,security:security.value,interface:adapter.value,channel:channel.value})});
-      const data=await result.json();if(data.status)wifi=data.status;if(!result.ok||!data.ok)throw Error(data.message||'Wi-Fi change failed.');notice(data.message);
+    const values=formValues();changing=true;render();notice(action==='start'?'Starting the hotspot…':action==='apply'?'Restarting the hotspot with your changes…':action==='stop'?'Stopping the hotspot…':'Saving Wi-Fi settings…');
+    try{const result=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json','X-SimpleCoil-Control':'1'},body:JSON.stringify({action,...values})});
+      const data=await result.json();if(data.status)wifi=data.status;if(!result.ok||!data.ok)throw Error(data.message||'Wi-Fi change failed.');if(action!=='stop')dirty=false;notice(data.message);
     }catch(error){notice(error.message,true)}finally{changing=false;await refresh();render()}
   }
-  byId('wifi-form').onsubmit=event=>{event.preventDefault();control('start')};stop.onclick=()=>control('stop');save.onclick=()=>control('save');adapter.onchange=render;security.onchange=render;
+  byId('wifi-form').onsubmit=event=>{event.preventDefault();control(wifi?.active?'apply':'start')};apply.onclick=()=>control('apply');stop.onclick=()=>control('stop');save.onclick=()=>control('save');
+  for(const field of [adapter,ssid,channel,security,password])field.addEventListener('input',()=>{dirty=hasChanges();render()});
   byId('show-password').onclick=()=>{const hidden=password.type==='password';password.type=hidden?'text':'password';byId('show-password').textContent=hidden?'Hide':'Show'};
   byId('copy-password').onclick=async()=>{try{await navigator.clipboard.writeText(password.value);notice('Wi-Fi password copied.')}catch{notice('Use Show to read the Wi-Fi password.',true)}};
   refresh();setInterval(refresh,3000);

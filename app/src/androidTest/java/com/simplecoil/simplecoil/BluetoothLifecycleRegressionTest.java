@@ -1,6 +1,7 @@
 package com.simplecoil.simplecoil;
 
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.content.BroadcastReceiver;
@@ -8,10 +9,12 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.os.SystemClock;
+import android.os.Handler;
 import android.widget.PopupMenu;
 import android.widget.TextView;
 
 import androidx.test.core.app.ActivityScenario;
+import androidx.lifecycle.Lifecycle;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
@@ -81,6 +84,54 @@ public class BluetoothLifecycleRegressionTest {
             else editor.remove(FullscreenActivity.PREF_DEVICE_ADDRESS);
             editor.commit();
         }
+    }
+
+    @Test
+    public void coveredActivityKeepsTelemetryAndDoesNotReconnectHealthyGunOnReturn() {
+        scenario.moveToState(Lifecycle.State.CREATED);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            assertFalse((boolean) get("mActivityResumed"));
+            assertTrue((boolean) get("mGattReceiverRegistered"));
+            assertTrue((boolean) get("mBluetoothReceiverRegistered"));
+            assertTrue((boolean) get("mNetworkReceiverRegistered"));
+            set("mTelemetryCharacteristic", new BluetoothGattCharacteristic(
+                    BluetoothLeService.UUID_RECOIL_TELEMETRY, BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0));
+            invoke("startConnectionTest");
+            set("mCommunicating", true);
+            byte[] telemetry = new byte[20];
+            telemetry[1] = Globals.getInstance().mPlayerID;
+            ((BroadcastReceiver) get("mGattUpdateReceiver")).onReceive(activity,
+                    new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                            .putExtra(BluetoothLeService.EXTRA_DATA, telemetry));
+            Runnable watchdog = (Runnable) get("mConnectionTestRunnable");
+            ((Handler) get("connectionTestHandler")).removeCallbacksAndMessages(null);
+            watchdog.run();
+            ((Handler) get("connectionTestHandler")).removeCallbacksAndMessages(null);
+            assertSame(bluetooth, get("mBluetoothLeService"));
+            assertTrue((boolean) get("mConnected"));
+            assertEquals(0, bluetooth.closes);
+        });
+        scenario.moveToState(Lifecycle.State.RESUMED);
+        scenario.onActivity(current -> {
+            assertSame(bluetooth, get("mBluetoothLeService"));
+            assertEquals(0, bluetooth.connections);
+            assertEquals(0, bluetooth.closes);
+        });
+    }
+
+    @Test
+    public void missingTelemetryStillTriggersRecoveryWhileCovered() {
+        scenario.moveToState(Lifecycle.State.CREATED);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            invoke("startConnectionTest");
+            ((Handler) get("connectionTestHandler")).removeCallbacksAndMessages(null);
+            ((Runnable) get("mConnectionTestRunnable")).run();
+            assertNull(get("mBluetoothLeService"));
+            assertEquals(1, bluetooth.closes);
+            assertTrue((boolean) get("mPrimaryReconnectActive"));
+            assertNull(get("mBlasterDisconnectDialog"));
+        });
+        scenario.moveToState(Lifecycle.State.RESUMED);
     }
 
     @Test

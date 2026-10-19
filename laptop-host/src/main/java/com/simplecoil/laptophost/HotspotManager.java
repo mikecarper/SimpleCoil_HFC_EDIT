@@ -84,12 +84,16 @@ final class HotspotManager {
                 stop();
                 return;
             }
-            if (!"save".equals(action) && !"start".equals(action))
-                throw new IllegalArgumentException("Choose start, stop, or save.");
+            if (!List.of("save", "start", "apply").contains(action))
+                throw new IllegalArgumentException("Choose start, stop, save, or apply.");
             List<Map<String, Object>> devices = devices();
-            if (devices.stream().anyMatch(device -> settings.getProperty("uuid").equals(device.get("uuid")))) {
+            Map<String, Object> active = devices.stream()
+                    .filter(device -> settings.getProperty("uuid").equals(device.get("uuid")))
+                    .findFirst().orElse(null);
+            if (active != null) {
                 if ("start".equals(action)) return;
-                throw new IllegalArgumentException("Stop the hotspot before changing its settings.");
+                if ("save".equals(action))
+                    throw new IllegalArgumentException("Use Apply changes to restart the running hotspot with new settings.");
             }
             String ssid = text(values, "ssid", settings.getProperty("ssid"));
             String password = text(values, "password", settings.getProperty("password"));
@@ -99,43 +103,86 @@ final class HotspotManager {
             validate(ssid, password, channel, security);
             Map<String, Object> device = devices.stream().filter(d -> deviceName.equals(d.get("interface")))
                     .findFirst().orElseThrow(() -> new IllegalArgumentException("Choose a Wi-Fi adapter."));
-            if ("start".equals(action) && !Boolean.TRUE.equals(device.get("apSupported")))
+            if (!"save".equals(action) && !Boolean.TRUE.equals(device.get("apSupported")))
                 throw new IllegalArgumentException("This adapter's current driver does not support hotspot mode.");
-            settings.setProperty("ssid", ssid);
-            settings.setProperty("password", password);
-            settings.setProperty("security", security);
-            settings.setProperty("interface", deviceName);
-            settings.setProperty("channel", channel);
-            save();
-            if ("save".equals(action)) return;
 
-            String previous = String.valueOf(device.get("uuid"));
-            settings.setProperty("previousUuid", previous);
-            settings.setProperty("previousInterface", deviceName);
-            save();
+            Properties previousSettings = new Properties();
+            previousSettings.putAll(settings);
+            boolean sameAdapter = active != null && deviceName.equals(active.get("interface"));
+            if (active != null) checked("connection", "down", "uuid", settings.getProperty("uuid"));
             try {
-                configureProfile();
-                checked("radio", "wifi", "on");
-                if ("open".equals(security)) {
-                    checked("connection", "up", "uuid", settings.getProperty("uuid"), "ifname", deviceName);
-                } else {
-                    Path passwordFile = Files.createTempFile(settingsFile.getParent(), "wifi-password-", ".txt",
-                            PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
-                    try {
-                        Files.writeString(passwordFile, "802-11-wireless-security.psk:" + password + "\n");
-                        checked("connection", "up", "uuid", settings.getProperty("uuid"), "ifname", deviceName,
-                                "passwd-file", passwordFile.toString());
-                    } finally {
-                        Files.deleteIfExists(passwordFile);
-                    }
+                if (active != null && !sameAdapter) restorePrevious();
+                settings.setProperty("ssid", ssid);
+                settings.setProperty("password", password);
+                settings.setProperty("security", security);
+                settings.setProperty("interface", deviceName);
+                settings.setProperty("channel", channel);
+                if (!"save".equals(action) && !sameAdapter) {
+                    settings.setProperty("previousUuid", String.valueOf(device.get("uuid")));
+                    settings.setProperty("previousInterface", deviceName);
                 }
+                save();
+                if ("save".equals(action)) return;
+                configureProfile();
+                activate();
             } catch (IOException failure) {
+                if ("save".equals(action)) {
+                    settings.clear();
+                    settings.putAll(previousSettings);
+                    throw failure;
+                }
                 try { runner.run(List.of("connection", "down", "uuid", settings.getProperty("uuid"))); }
                 catch (IOException ignored) { /* Preserve the original activation error. */ }
-                try { restorePrevious(); }
-                catch (IOException restoreFailure) { failure.addSuppressed(restoreFailure); }
-                throw failure;
+                if (active == null) {
+                    try { restorePrevious(); }
+                    catch (IOException restoreFailure) { failure.addSuppressed(restoreFailure); }
+                    throw failure;
+                }
+                IOException restoreConnectionFailure = null;
+                if (!sameAdapter) {
+                    try { restoreConnection(String.valueOf(device.get("uuid")), deviceName); }
+                    catch (IOException restoreFailure) { restoreConnectionFailure = restoreFailure; }
+                }
+                settings.clear();
+                settings.putAll(previousSettings);
+                try {
+                    save();
+                    configureProfile();
+                    activate();
+                } catch (IOException restoreFailure) {
+                    failure.addSuppressed(restoreFailure);
+                    try { runner.run(List.of("connection", "down", "uuid", settings.getProperty("uuid"))); }
+                    catch (IOException cancellationFailure) { failure.addSuppressed(cancellationFailure); }
+                    try { restorePrevious(); }
+                    catch (IOException connectionFailure) { failure.addSuppressed(connectionFailure); }
+                    throw new IOException("Could not apply hotspot settings or restart the previous hotspot: "
+                            + failure.getMessage() + " Recovery: " + restoreFailure.getMessage(), failure);
+                }
+                String message = "Could not apply hotspot settings. The previous hotspot was restored: "
+                        + failure.getMessage();
+                if (restoreConnectionFailure != null) {
+                    failure.addSuppressed(restoreConnectionFailure);
+                    message += " The other adapter could not reconnect: " + restoreConnectionFailure.getMessage();
+                }
+                throw new IOException(message, failure);
             }
+        }
+    }
+
+    private void activate() throws IOException {
+        checked("radio", "wifi", "on");
+        String uuid = settings.getProperty("uuid"), device = settings.getProperty("interface");
+        if ("open".equals(settings.getProperty("security"))) {
+            checked("connection", "up", "uuid", uuid, "ifname", device);
+            return;
+        }
+        Path passwordFile = Files.createTempFile(settingsFile.getParent(), "wifi-password-", ".txt",
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+        try {
+            Files.writeString(passwordFile, "802-11-wireless-security.psk:" + settings.getProperty("password") + "\n");
+            checked("connection", "up", "uuid", uuid, "ifname", device, "passwd-file", passwordFile.toString());
+        } finally {
+            Files.deleteIfExists(passwordFile);
         }
     }
 
@@ -143,17 +190,15 @@ final class HotspotManager {
         String uuid = settings.getProperty("uuid");
         boolean exists = Arrays.asList(checked("-g", "UUID", "connection", "show").split("\\R"))
                 .contains(uuid);
-        List<String> command = new ArrayList<>();
         if (exists) {
             if (!PROFILE_NAME.equals(checked("-g", "connection.id", "connection", "show", "uuid", uuid).trim()))
                 throw new IOException("The saved hotspot profile belongs to another connection.");
-            if ("open".equals(settings.getProperty("security")))
-                checked("connection", "modify", "uuid", uuid, "remove", "802-11-wireless-security");
-            command.addAll(List.of("connection", "modify", "uuid", uuid));
-        } else {
-            command.addAll(List.of("connection", "add", "type", "wifi", "con-name", PROFILE_NAME,
-                    "connection.uuid", uuid));
+            checked("connection", "delete", "uuid", uuid);
         }
+        // Settings are persisted in our private file. Recreate only our stopped profile
+        // in memory so Ubuntu's Netplan backend cannot race on saved SSID changes.
+        List<String> command = new ArrayList<>(List.of("connection", "add", "save", "no",
+                "type", "wifi", "con-name", PROFILE_NAME, "connection.uuid", uuid));
         command.addAll(List.of("connection.interface-name", settings.getProperty("interface"),
                 "connection.autoconnect", "no", "connection.permissions", "user:" + System.getProperty("user.name"),
                 "802-11-wireless.ssid", settings.getProperty("ssid"), "802-11-wireless.mode", "ap",
@@ -181,11 +226,15 @@ final class HotspotManager {
     private void restorePrevious() throws IOException {
         String previous = settings.getProperty("previousUuid", "");
         String device = settings.getProperty("previousInterface", "");
-        if (!previous.isBlank() && !previous.equals(settings.getProperty("uuid")))
-            checked("connection", "up", "uuid", previous, "ifname", device);
+        restoreConnection(previous, device);
         settings.remove("previousUuid");
         settings.remove("previousInterface");
         save();
+    }
+
+    private void restoreConnection(String uuid, String device) throws IOException {
+        if (!uuid.isBlank() && !uuid.equals(settings.getProperty("uuid")))
+            checked("connection", "up", "uuid", uuid, "ifname", device);
     }
 
     private void refresh() {

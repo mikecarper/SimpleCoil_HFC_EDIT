@@ -20,6 +20,7 @@ import com.simplecoil.protocol.RoundRoster;
 import com.simplecoil.protocol.GpsOffset;
 import com.simplecoil.protocol.GameStartCountdown;
 import com.simplecoil.protocol.Powerups;
+import com.simplecoil.protocol.EventMode;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -140,6 +141,19 @@ public final class LaptopHost {
     private final long clockOriginNanos = System.nanoTime();
     private final Object stateLock = new Object();
     private final Map<Integer, Player> players = new LinkedHashMap<>();
+    // Operator edits belong to a person, never to a reusable blaster/player ID.
+    private final Map<String, String> hostPlayerNames = new HashMap<>();
+    private final Map<String, Boolean> hostPlayerParticipation = new HashMap<>();
+    private volatile Map<String, Integer> hostPlayerTeams = Collections.emptyMap();
+    private final Map<String, Settings> hostPlayerSettings = new HashMap<>();
+    private final Set<String> releasedPhones = new HashSet<>();
+    private final EventSettings eventSettings = new EventSettings();
+    private boolean eventMode = true;
+    private boolean eventPinning = true;
+    private String eventRevision = UUID.randomUUID().toString();
+    private final Map<String, String> playerEventRevisions = new HashMap<>();
+    private boolean hostCustomRules;
+    private final PlayerDirectory playerDirectory;
     private RoundRoster roundRoster;
     private final Powerups.Authority powerupAuthority = new Powerups.Authority();
     private volatile Map<Integer, Integer> balancedTeams = Collections.emptyMap();
@@ -173,6 +187,71 @@ public final class LaptopHost {
     private final Set<Integer> gpsVisibilityRefreshPlayers = new HashSet<>();
     private final HotspotManager hotspot = new HotspotManager();
     private final AtomicInteger nextClientID = new AtomicInteger();
+    private final UUID relayKey = UUID.randomUUID(), relayNode = UUID.randomUUID();
+    private volatile com.simplecoil.protocol.RelayMesh relayMesh;
+    private volatile com.simplecoil.protocol.RelayConfig relayConfig;
+    private UUID relayOwner;
+    private InetAddress relayAddress;
+
+    private void acceptGameSocket(Socket socket) throws IOException {
+        socket.setTcpNoDelay(true);socket.setKeepAlive(true);
+        clientExecutor.execute(new ClientConnection(socket, nextClientID.incrementAndGet()));
+    }
+    private void relayCapabilities(Player player, Map<String, Object> json) {
+        if (!(json.get("relaynode") instanceof String)) return;
+        try {
+            player.relayNode = com.simplecoil.protocol.RelayConfig.uuid((String) json.get("relaynode"));
+            player.relayP2p = json.get("relayp2p") instanceof String ? (String) json.get("relayp2p") : "";
+            player.relayBluetooth = json.get("relaybt") instanceof String ? (String) json.get("relaybt") : "";
+        } catch (IllegalArgumentException ignored) { }
+    }
+    private String relayConfigurationLocked() {
+        if (relayAddress == null) return null;
+        Map<UUID, com.simplecoil.protocol.RelayConfig.Member> members = new LinkedHashMap<>();
+        members.put(relayNode, new com.simplecoil.protocol.RelayConfig.Member(relayNode, relayAddress, ""));
+        Set<InetAddress> addresses = new HashSet<>();addresses.add(relayAddress);
+        List<Player> candidates = new ArrayList<>(players.values());
+        candidates.sort(java.util.Comparator.comparing((Player player) -> !player.connected));
+        for (Player player : candidates) if (player.relayNode != null && player.address != null
+                && addresses.add(player.address))
+            members.put(player.relayNode, new com.simplecoil.protocol.RelayConfig.Member(player.relayNode, player.address, player.relayP2p, player.relayBluetooth));
+        if (members.size() < 2) return null;
+        if (relayOwner == null || !members.containsKey(relayOwner))
+            for (UUID node : members.keySet()) if (!node.equals(relayNode)) { relayOwner = node;break; }
+        try {
+            com.simplecoil.protocol.RelayConfig next = new com.simplecoil.protocol.RelayConfig(relayKey, relayNode, relayOwner, members);
+            if (relayMesh == null) {
+                relayMesh = new com.simplecoil.protocol.RelayMesh(relayNode, next,
+                        new InetSocketAddress(config.tcpPort + 4), new com.simplecoil.protocol.RelayMesh.Listener() {
+                    @Override public void datagram(InetAddress source, InetAddress target, int port, byte[] payload) {
+                        if (port == config.udpPort) dispatchGameDatagram(source, payload, 0, payload.length);
+                    }
+                    @Override public boolean accept(Socket socket, int port) {
+                        if (stopping || port != config.tcpPort) return false;
+                        try { acceptGameSocket(socket);return true; }
+                        catch (IOException | RuntimeException failure) { return false; }
+                    }
+                });
+            } else relayMesh.update(next);
+            relayConfig = next;return next.encode();
+        } catch (IOException | IllegalArgumentException failure) {
+            System.err.println("Game relay unavailable: " + failure.getMessage());return null;
+        }
+    }
+    private void dispatchGameDatagram(InetAddress source, byte[] payload, int offset, int length) {
+        if (CombatPacket.looksLike(payload, offset, length)) handleCombatEvent(source, payload, offset, length);
+        else if (StatePacket.looksLike(payload, offset, length)) handleStateGossip(source, payload, offset, length);
+        else handleUdpDiscovery(source, new String(payload, offset, length, StandardCharsets.UTF_8));
+    }
+    private void sendGameDatagram(DatagramSocket socket, DatagramPacket packet) throws IOException {
+        com.simplecoil.protocol.RelayMesh mesh = relayMesh;
+        InetAddress target = packet.getAddress();byte[] ip = target.getAddress();
+        if (ip.length == 4 && (ip[3] & 255) == 255) target = com.simplecoil.protocol.RelayConfig.ipv4("255.255.255.255");
+        boolean relayed = mesh != null && mesh.datagram(target, packet.getPort(),
+                java.util.Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength()));
+        try { socket.send(packet); } catch (IOException failure) { if (!relayed) throw failure; }
+    }
+
     private final ExecutorService clientExecutor = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "SimpleCoil laptop client");
         thread.setDaemon(true);
@@ -217,6 +296,24 @@ public final class LaptopHost {
 
     private LaptopHost(HostConfig config) {
         this.config = config;
+        eventMode = config.eventMode && eventSettings.enabled();
+        eventPinning = eventSettings.kiosk();
+        try {
+            playerDirectory = new PlayerDirectory(config.playerStore);
+            Map<String, Integer> teams = new HashMap<>();
+            for (PlayerDirectory.Profile profile : playerDirectory.profiles.values()) {
+                if (profile.hostNamed) hostPlayerNames.put(profile.id, profile.name);
+                if (profile.benched != null) hostPlayerParticipation.put(profile.id, profile.benched);
+                if (profile.team > 0) teams.put(profile.id, profile.team);
+                if (profile.settings != null) {
+                    Settings settings = Settings.fromHostJson(profile.settings);
+                    if (settings == null) throw new IOException("Invalid settings for saved player " + profile.name);
+                    hostPlayerSettings.put(profile.id, settings);
+                }
+            }
+            hostPlayerTeams = Collections.unmodifiableMap(teams);
+            hostCustomRules = !hostPlayerSettings.isEmpty() && !fixedModeRules();
+        } catch (IOException exception) { throw new IllegalStateException(exception.getMessage(), exception); }
     }
 
     public static void main(String[] args) throws Exception {
@@ -254,7 +351,14 @@ public final class LaptopHost {
         dashboard.createContext("/map", exchange -> sendHtml(exchange, MAP_PAGE));
         dashboard.createContext("/leaderboard", exchange -> sendHtml(exchange, LEADERBOARD_PAGE));
         dashboard.createContext("/wifi", this::handleWifiPage);
+        dashboard.createContext("/players", this::handlePlayersPage);
+        dashboard.createContext("/event-setup", exchange -> sendFile(exchange,
+                config.webDirectory.resolve("event-setup.html"), "text/html; charset=utf-8", "no-store"));
+        dashboard.createContext("/assets/players.js", exchange -> sendFile(exchange,
+                config.webDirectory.resolve("players.js"), "text/javascript; charset=utf-8", "no-store"));
         dashboard.createContext("/api/wifi", this::handleWifiApi);
+        dashboard.createContext("/api/players", this::handlePlayersApi);
+        dashboard.createContext("/api/event", this::handleEventApi);
         dashboard.createContext("/assets/leaflet/", this::handleLeafletAsset);
         dashboard.createContext("/tiles/", this::handleMapTile);
         dashboard.createContext("/api/map-config", this::handleMapConfigApi);
@@ -293,6 +397,8 @@ public final class LaptopHost {
     private void stop() {
         if (stopping)
             return;
+        synchronized (stateLock) { savePlayerDirectoryLocked(); }
+        if (relayMesh != null) relayMesh.close();
         stopping = true;
         closeQuietly(tcpServer);
         if (udpServer != null)
@@ -345,10 +451,7 @@ public final class LaptopHost {
         while (!stopping) {
             try {
                 Socket socket = tcpServer.accept();
-                socket.setTcpNoDelay(true);
-                socket.setKeepAlive(true);
-                ClientConnection client = new ClientConnection(socket, nextClientID.incrementAndGet());
-                clientExecutor.execute(client);
+                acceptGameSocket(socket);
             } catch (SocketException e) {
                 if (!stopping)
                     System.err.println("TCP listener stopped: " + e.getMessage());
@@ -369,18 +472,7 @@ public final class LaptopHost {
             try {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 udpServer.receive(packet);
-                if (CombatPacket.looksLike(packet.getData(), packet.getOffset(),
-                        packet.getLength())) {
-                    handleCombatEvent(packet.getAddress(), packet.getData(), packet.getOffset(),
-                            packet.getLength());
-                } else if (StatePacket.looksLike(packet.getData(), packet.getOffset(), packet.getLength())) {
-                    handleStateGossip(packet.getAddress(), packet.getData(), packet.getOffset(),
-                            packet.getLength());
-                } else {
-                    String message = new String(packet.getData(), packet.getOffset(), packet.getLength(),
-                            StandardCharsets.UTF_8);
-                    handleUdpDiscovery(packet.getAddress(), message);
-                }
+                dispatchGameDatagram(packet.getAddress(), packet.getData(), packet.getOffset(), packet.getLength());
             } catch (SocketException e) {
                 if (!stopping)
                     System.err.println("UDP discovery stopped: " + e.getMessage());
@@ -440,7 +532,7 @@ public final class LaptopHost {
                     if (player.connected && source.equals(player.address))
                         return player.id;
                 int preferredTeam = 0;
-                if (!config.boss && !config.infection && !config.balanced
+                if (!config.boss && !config.infection && !assignedTeamsEnabledLocked()
                         && config.gameMode != GameMode.FFA) {
                     int[] teamSizes = new int[5];
                     for (Player player : players.values())
@@ -479,12 +571,12 @@ public final class LaptopHost {
             Player requestedPlayer = players.get(requestedID);
             if (requestedPlayer != null && source.equals(requestedPlayer.address))
                 return requestedID;
-            if (isRoundActiveLocked() && (config.balanced || !config.allowLateJoin))
+            if (isRoundActiveLocked() && (assignedTeamsEnabledLocked() || !config.allowLateJoin))
                 return -1;
 
             int requestedTeam = teamFor(requestedID);
             for (int candidate = 1; candidate <= MAX_PLAYERS; candidate++) {
-                if (config.gameMode != GameMode.FFA && !config.balanced
+                if (config.gameMode != GameMode.FFA && !assignedTeamsEnabledLocked()
                         && teamFor(candidate) != requestedTeam)
                     continue;
                 Player player = players.get(candidate);
@@ -651,7 +743,7 @@ public final class LaptopHost {
         }
         for (InetAddress address : recipients) {
             try {
-                socket.send(new DatagramPacket(payload, payload.length, address, config.udpPort));
+                sendGameDatagram(socket, new DatagramPacket(payload, payload.length, address, config.udpPort));
             } catch (IOException ignored) {
                 // The next one-second authority tick repairs a dropped send.
             }
@@ -669,7 +761,7 @@ public final class LaptopHost {
                 for (InetAddress address : broadcastAddresses()) {
                     DatagramPacket packet = new DatagramPacket(payload, payload.length, address, config.udpPort);
                     for (int attempt = 0; attempt < 3; attempt++)
-                        socket.send(packet);
+                        sendGameDatagram(socket, packet);
                 }
             } catch (IOException ignored) {
                 // Invites are an optional convenience. Manual Join Game remains
@@ -707,7 +799,7 @@ public final class LaptopHost {
             socket.setBroadcast(true);
             for (InetAddress address : broadcastAddresses()) {
                 DatagramPacket packet = new DatagramPacket(payload, payload.length, address, config.udpPort);
-                socket.send(packet);
+                sendGameDatagram(socket, packet);
             }
         } catch (IOException ignored) {
             // A host can still be joined manually if this Wi-Fi blocks broadcast.
@@ -737,6 +829,18 @@ public final class LaptopHost {
     }
 
     private void handleJson(ClientConnection client, Map<String, Object> json) {
+        if (json.containsKey(EventMode.BATTERY)) {
+            handleBatteryStatus(client, json.get(EventMode.BATTERY));
+            return;
+        }
+        if (json.containsKey(EventMode.LOCK_STATUS)) {
+            synchronized (stateLock) {
+                if (players.get(client.playerID) != null && players.get(client.playerID).connection == client && Set.of("locked", "pinned", "none", "error")
+                        .contains(json.get(EventMode.LOCK_STATUS)))
+                    client.eventLockStatus = (String) json.get(EventMode.LOCK_STATUS);
+            }
+            return;
+        }
         if (json.containsKey("powerupscan")) {
             handlePowerupScan(client, json);
             return;
@@ -748,10 +852,11 @@ public final class LaptopHost {
         }
         if (json.containsKey("lobbyready") && !json.containsKey("playername")) {
             synchronized (stateLock) {
-                if (roundState != RoundState.LOBBY || playerForClientLocked(client) == null
+                if (playerForClientLocked(client) == null
                         || !(json.get("lobbyready") instanceof Boolean))
                     return;
-                client.lobbyReady = (Boolean) json.get("lobbyready");
+                if (roundState == RoundState.LOBBY) client.lobbyReady = (Boolean) json.get("lobbyready");
+                relayCapabilities(players.get(client.playerID), json);
             }
             broadcastRoster();
             return;
@@ -814,6 +919,38 @@ public final class LaptopHost {
             boolean changed = !client.clockReady;
             client.clockReady = true;
             if (changed) broadcastRoster();
+        }
+    }
+
+    private void handleBatteryStatus(ClientConnection client, Object value) {
+        if (!(value instanceof Map)) return;
+        Map<String, Object> report = castObject(value);
+        int phone = intValue(report.get("phone"), -2);
+        if (phone < -1 || phone > 100 || !(report.get("charging") instanceof Boolean)
+                || !(report.get("guns") instanceof List) || ((List<?>) report.get("guns")).size() > 2) return;
+        List<Object> guns = new ArrayList<>();
+        for (Object item : (List<?>) report.get("guns")) {
+            if (!(item instanceof Map)) return;
+            Map<String, Object> gun = castObject(item);
+            int volts = intValue(gun.get("voltageTenths"), -2), type = intValue(gun.get("type"), -1);
+            if (!(gun.get("connected") instanceof Boolean) || !(gun.get("lowPower") instanceof Boolean)
+                    || type < 0 || type > 2 || volts != -1 && (volts < 19 || volts > 61)
+                    || !Set.of("unknown", "high", "good", "low", "critical", "empty").contains(gun.get("level"))) return;
+            guns.add(mapOf("connected", gun.get("connected"), "lowPower", gun.get("lowPower"),
+                    "type", type, "level", gun.get("level"), "voltageTenths", volts,
+                    "id", gun.get("id") instanceof String && com.simplecoil.protocol.GunBatteryHistory.validGun((String) gun.get("id"))
+                            ? ((String) gun.get("id")).toUpperCase(Locale.ROOT) : null));
+        }
+        synchronized (stateLock) {
+            Player player = players.get(client.playerID);
+            if (player == null || player.connection != client || !player.connected) return;
+            PlayerDirectory.Profile profile = playerDirectory.profiles.get(player.identity);
+            if (profile != null && report.containsKey("rounds")) {
+                if (profile.gunBatteryRounds.merge(report.get("rounds"), player.identity))
+                    savePlayerDirectoryLocked();
+            }
+            player.battery = mapOf("phone", phone, "charging", report.get("charging"), "guns", guns);
+            player.batteryAt = elapsedMillis();
         }
     }
 
@@ -1076,7 +1213,7 @@ public final class LaptopHost {
             Player player = playerForClientLocked(client);
             if (player == null || roundState != RoundState.LOBBY)
                 return;
-            player.name = name;
+            if (!eventMode) player.name = hostPlayerNames.getOrDefault(player.identity, name);
         }
         broadcastRoster();
         broadcastPlayerData();
@@ -1085,7 +1222,7 @@ public final class LaptopHost {
     private void handleBalancedCheckIn(ClientConnection client, Map<String, Object> json) {
         boolean readyToStart;
         synchronized (stateLock) {
-            if (!config.balancedQr || !Boolean.TRUE.equals(json.get("balancedcheckin"))
+            if (!balancedQrEnabledLocked() || !Boolean.TRUE.equals(json.get("balancedcheckin"))
                     || roundState != RoundState.LOBBY || !balancedTeams.containsKey(client.playerID)
                     || playerForClientLocked(client) == null)
                 return;
@@ -1118,11 +1255,12 @@ public final class LaptopHost {
         int requestedID = intValue(json.get("playerID"), 0);
         String name = validPlayerName(json.get("playername"));
         boolean rejoin = Boolean.TRUE.equals(json.get("rejoin"));
-        String identity = json.get("playeridentity") instanceof String ? (String) json.get("playeridentity")
+        String deviceIdentity = json.get(EventMode.DEVICE_IDENTITY) instanceof String ? (String) json.get(EventMode.DEVICE_IDENTITY)
+                : json.get("playeridentity") instanceof String ? (String) json.get("playeridentity")
                 : UUID.nameUUIDFromBytes((client.address().getHostAddress() + ":" + requestedID)
                         .getBytes(StandardCharsets.UTF_8)).toString();
         int requestedTeam = intValue(json.get("jointeam"), 0);
-        if (!RoundRoster.validIdentity(identity)) return;
+        if (!RoundRoster.validIdentity(deviceIdentity)) return;
         int priorKills = intValue(json.get("priorkills"), 0);
         int priorDeaths = intValue(json.get("priordeaths"), 0);
         if (!validPlayerID(requestedID) || name == null)
@@ -1133,6 +1271,10 @@ public final class LaptopHost {
         ClientConnection replaced = null;
         boolean accepted = false;
         synchronized (stateLock) {
+            PlayerDirectory.Profile profile = playerDirectory.forDevice(deviceIdentity, name);
+            String identity = profile.id;
+            if (profile.hostNamed || eventMode) name = profile.name;
+            else profile.name = name;
             if (client.playerID != 0 && client.playerID != requestedID)
                 return;
             if (roundState == RoundState.FINISHED && activeClients.isEmpty())
@@ -1144,7 +1286,7 @@ public final class LaptopHost {
             if (isRoundActiveLocked() && requestedTeam > 0 && roundRoster != null) {
                 joined = roundRoster.join(identity, requestedTeam, config.gameMode == GameMode.FFA
                         ? 0 : config.gameMode.wireValue, config.boss, config.infection, config.livesLimit,
-                        config.balanced, true);
+                        assignedTeamsEnabledLocked(), true);
                 if (joined == null) {
                     client.send(jsonFrame(mapOf("joinrejected", true)));
                     return;
@@ -1162,7 +1304,7 @@ public final class LaptopHost {
                 lastGossipPacketSequence[requestedID] = observedCombatSequence[requestedID] = 0;
                 clearEnemyGpsRevealsForPlayerLocked(requestedID);
                 endVotes &= ~(1L << (requestedID - 1));
-                if (config.balanced) {
+                if (assignedTeamsEnabledLocked()) {
                     Map<Integer, Integer> teams = new HashMap<>(balancedTeams);
                     teams.put(requestedID, joined.team);
                     balancedTeams = teams;
@@ -1198,7 +1340,7 @@ public final class LaptopHost {
             // path too, while retaining reconnects for players already in the
             // current round.
             if (joined == null && isRoundActiveLocked() && (existing == null && !config.allowLateJoin
-                    || config.balanced && !balancedTeams.containsKey(requestedID))) {
+                    || assignedTeamsEnabledLocked() && !balancedTeams.containsKey(requestedID))) {
                 client.close();
                 return;
             }
@@ -1225,6 +1367,9 @@ public final class LaptopHost {
                 players.put(requestedID, existing);
             }
             existing.identity = identity;
+            existing.deviceIdentity = deviceIdentity;
+            Settings editedSettings = hostPlayerSettings.get(identity);
+            if (editedSettings != null && !fixedModeRules()) existing.settings = editedSettings;
             if (joined != null) { existing.kills = joined.kills; existing.deaths = joined.deaths; }
             if (isRoundActiveLocked() && roundRoster != null && roundRoster.person(identity) == null) {
                 // Retain the explicit operator-controlled legacy invite path too.
@@ -1232,23 +1377,24 @@ public final class LaptopHost {
                         config.gameMode == GameMode.FFA ? 0 : teamFor(requestedID), 0);
                 roundRoster.restore(member);
             }
-            existing.name = name;
+            existing.name = hostPlayerNames.getOrDefault(identity, name);
             client.lobbyReady = !Boolean.FALSE.equals(json.get("lobbyready"));
-            client.lobbyBenched = joined != null ? false : existing.connection != null ? existing.benched()
-                    : Boolean.TRUE.equals(json.get("lobbybenched"));
-            existing.priorKills = priorKills;
-            existing.priorDeaths = priorDeaths;
+            client.lobbyBenched = joined != null ? false : hostPlayerParticipation.getOrDefault(identity,
+                    existing.connection != null ? existing.benched()
+                            : Boolean.TRUE.equals(json.get("lobbybenched")));
+            existing.priorKills = Math.max(priorKills, Math.min(100_000, profile.totalKills));
+            existing.priorDeaths = Math.max(priorDeaths, Math.min(100_000, profile.totalDeaths));
             existing.address = client.address();
             existing.connected = true;
             existing.connection = client;
+            relayCapabilities(existing, json);
+            if (existing.relayNode != null && relayAddress == null) relayAddress = client.socket.getLocalAddress();
             client.playerID = requestedID;
+            client.eventControlVersion = intValue(json.get(EventMode.CAPABILITY), 0);
             activeClients.put(requestedID, client);
-            if (config.balanced && roundState == RoundState.LOBBY && replaced == null) {
-                balancedTeams = Collections.emptyMap();
-                balancedCheckedIn.clear();
-                balancedCheckInDeadline = 0;
-            }
+            if (roundState == RoundState.LOBBY && replaced == null) invalidateTeamAssignmentsLocked();
             accepted = true;
+            savePlayerDirectoryLocked();
         }
         if (replaced != null && replaced != client)
             replaced.close();
@@ -1295,7 +1441,7 @@ public final class LaptopHost {
             return;
         }
         if (MSG_START_GAME.equals(message)) {
-            if (config.balanced)
+            if (eventMode || assignedTeamsEnabledLocked())
                 return; // The laptop operator fixes the roster being balanced.
             StartResult result = startRound();
             if (!result.ok && result.clockWaiting)
@@ -1389,10 +1535,10 @@ public final class LaptopHost {
                 if (!client.clockReady)
                     return StartResult.error("Waiting for phone clock synchronization.", true);
             }
-            if (config.balanced && balancedTeams.isEmpty()) {
+            if (assignedTeamsEnabledLocked() && balancedTeams.isEmpty()) {
                 balancedTeams = computeBalancedTeamsLocked();
                 balancedCheckedIn.clear();
-                balancedCheckInDeadline = config.balancedQr
+                balancedCheckInDeadline = balancedQrEnabledLocked()
                         ? elapsedMillis() + BALANCED_QR_CHECK_IN_TIMEOUT_MS : 0;
                 publishedAssignment = true;
             }
@@ -1422,9 +1568,9 @@ public final class LaptopHost {
                 if (!client.clockReady)
                     return StartResult.error("Waiting for phone clock synchronization.", true);
             }
-            if (config.balanced && balancedTeams.size() != recipients.size())
+            if (assignedTeamsEnabledLocked() && balancedTeams.size() != recipients.size())
                 return StartResult.error("The lobby roster changed. Press Start again.", false);
-            if (config.balancedQr && !balancedCheckedIn.containsAll(balancedTeams.keySet())
+            if (balancedQrEnabledLocked() && !balancedCheckedIn.containsAll(balancedTeams.keySet())
                     && (balancedCheckInDeadline == 0 || elapsedMillis() < balancedCheckInDeadline))
                 return StartResult.waitingForQr();
             roundID++;
@@ -1493,6 +1639,13 @@ public final class LaptopHost {
 
     /** Caller holds stateLock. Dynamic programming keeps a 32-player lobby practical. */
     private Map<Integer, Integer> computeBalancedTeamsLocked() {
+        if (!hostPlayerTeams.isEmpty()) {
+            Map<Integer, Integer> manual = new HashMap<>();
+            for (Player player : players.values())
+                if (player.connected && !player.benched()) manual.put(player.id,
+                        hostPlayerTeams.getOrDefault(player.identity, baseTeamFor(player.id)));
+            return Collections.unmodifiableMap(manual);
+        }
         List<Player> candidates = new ArrayList<>();
         for (Player player : players.values()) {
             if (player.connected && !player.benched())
@@ -1562,6 +1715,7 @@ public final class LaptopHost {
     private boolean requestEndVote(ClientConnection voter, String token, boolean approve) {
         final boolean agreed;
         synchronized (stateLock) {
+            if (eventMode && voter != null) return false;
             updateRoundStateLocked();
             if (!isRoundActiveLocked() || roundToken == null) return false;
             if (voter != null && (!roundToken.equals(token) || playerForClientLocked(voter) == null))
@@ -1602,6 +1756,7 @@ public final class LaptopHost {
             nextRoundStartAllowedAt = Math.max(nextRoundStartAllowedAt,
                     com.simplecoil.protocol.RoundRestart.allowedAt(elapsedMillis(), roundStartAt));
             recipients = connectedClientsLocked();
+            savePlayerDirectoryLocked();
         }
         System.out.println("Game finished: " + reason);
         for (ClientConnection client : recipients) {
@@ -1619,6 +1774,8 @@ public final class LaptopHost {
             Player player = players.get(playerID);
             if (player == null || player.benched() || !player.connected || !player.awaitingRespawn || player.connection == null)
                 return false;
+            int lives = player.settings.overrideLives ? player.settings.lives : config.livesLimit;
+            if (lives > 0 && player.deaths >= lives) return false;
             player.awaitingRespawn = false;
             player.eliminated = false;
             recipient = player.connection;
@@ -1641,7 +1798,7 @@ public final class LaptopHost {
                     && ctfCaptureLimitReachedLocked();
             infectionFinished = roundState == RoundState.RUNNING && config.infection
                     && infectionRoundFinishedLocked();
-            qrCheckInTimedOut = config.balancedQr && roundState == RoundState.LOBBY
+            qrCheckInTimedOut = balancedQrEnabledLocked() && roundState == RoundState.LOBBY
                     && !balancedTeams.isEmpty() && balancedCheckInDeadline > 0
                     && elapsedMillis() >= balancedCheckInDeadline;
         }
@@ -1923,14 +2080,27 @@ public final class LaptopHost {
 
             Map<String, Object> game = new LinkedHashMap<>();
             game.put("players", roster);
+            String relay = relayConfigurationLocked();
+            if (relay != null) game.put(com.simplecoil.protocol.RelayConfig.WIRE, relay);
             game.put("gpsoffset", gpsOriginMap(gpsOffset));
             game.put("lobbyplaying", isRoundActiveLocked());
             game.put("hostkind", "L");
             game.put("hostage", Math.min(365L * 24 * 60 * 60 * 1000, elapsedMillis()));
             game.put("limits", limits);
             game.put("gamemode", config.gameMode.wireValue);
-            game.put("balancedrandom", config.balanced);
-            game.put("balancedqr", config.balancedQr);
+            game.put("balancedrandom", assignedTeamsEnabledLocked());
+            game.put("balancedqr", balancedQrEnabledLocked());
+            game.put(EventMode.ASSIGNED_TEAMS, !hostPlayerTeams.isEmpty() && !fixedModeRules());
+            game.put(EventMode.CUSTOM_RULES, hostCustomRules);
+            game.put(EventMode.ENABLED, eventMode);
+            game.put(EventMode.TITLE, eventSettings.title());
+            game.put(EventMode.PINNING, eventMode && eventPinning && !releasedPhones.contains(
+                    players.containsKey(targetPlayerID) ? players.get(targetPlayerID).identity : ""));
+            game.put(EventMode.REVISION, playerEventRevisions.getOrDefault(
+                    players.containsKey(targetPlayerID) ? players.get(targetPlayerID).identity : "", eventRevision));
+            if (players.containsKey(targetPlayerID)) game.put(EventMode.PLAYER_IDENTITY, players.get(targetPlayerID).identity);
+            if (players.containsKey(targetPlayerID)) game.put(EventMode.PIN_HASH,
+                    EventMode.pinHash(players.get(targetPlayerID).identity, eventSettings.pin()));
             game.put("powerupqrrequired", config.powerupQrRequired);
             game.put("respawnqrenabled", config.respawnQrEnabled);
             game.put("bossmode", config.boss);
@@ -1944,7 +2114,7 @@ public final class LaptopHost {
             game.put("allowplayersettings", !config.onlyServerSettings && !config.tournament);
             game.put("playersettings", settingsArrayLocked());
             game.put("onlyserversettings", config.onlyServerSettings || config.tournament);
-            game.put("tournamentmode", config.tournament);
+            game.put("tournamentmode", config.tournament && !hostCustomRules);
             if (isRoundActiveLocked()) {
                 putPowerupSnapshotLocked(game, elapsedMillis());
                 if (roundRoster != null) game.put("roundroster", roundRoster.encode());
@@ -1994,7 +2164,8 @@ public final class LaptopHost {
             payload.put("allowplayersettings", !config.onlyServerSettings && !config.tournament);
             payload.put("playersettings", settingsArrayLocked());
             payload.put("onlyserversettings", config.onlyServerSettings || config.tournament);
-            payload.put("tournamentmode", config.tournament);
+            payload.put("tournamentmode", config.tournament && !hostCustomRules);
+            payload.put(EventMode.CUSTOM_RULES, hostCustomRules);
             payload.put("bossmode", config.boss);
             payload.put("capturetheflag", config.captureTheFlag);
             payload.put("infectionmode", config.infection);
@@ -2079,6 +2250,33 @@ public final class LaptopHost {
             roundRoster.update(player.id, member.generation, player.kills, player.deaths,
                     row == null ? member.captures : row.ctfCaptures,
                     row != null && (row.flags & StatePacket.FLAG_INFECTED) != 0);
+        }
+    }
+
+    private void recordPlayerProfileLocked(Player player) {
+        PlayerDirectory.Profile profile = playerDirectory.profiles.get(player.identity);
+        if (profile == null) return;
+        profile.name = player.name;
+        profile.lastTeam = teamFor(player.id);
+        if (roundRoster != null && roundRoster.person(player.identity) != null)
+            profile.record(roundToken, player.kills, player.deaths, player.shots, player.hits);
+    }
+
+    private boolean savePlayerDirectoryLocked() {
+        for (Player player : players.values()) recordPlayerProfileLocked(player);
+        for (PlayerDirectory.Profile profile : playerDirectory.profiles.values()) {
+            profile.hostNamed = hostPlayerNames.containsKey(profile.id);
+            if (profile.hostNamed) profile.name = hostPlayerNames.get(profile.id);
+            profile.benched = hostPlayerParticipation.get(profile.id);
+            profile.team = hostPlayerTeams.getOrDefault(profile.id, 0);
+            Settings settings = hostPlayerSettings.get(profile.id);
+            profile.settings = settings == null ? null : settings.toJson(0);
+            if (profile.settings != null) profile.settings.remove("playerID");
+        }
+        try { playerDirectory.save();return true; }
+        catch (IOException exception) {
+            System.err.println("Unable to save player profiles: " + exception.getMessage());
+            return false;
         }
     }
 
@@ -2189,6 +2387,7 @@ public final class LaptopHost {
     }
 
     private void resetForNewLobbyLocked() {
+        savePlayerDirectoryLocked();
         powerupAuthority.resetRound();
         gpsOffset = null;
         players.clear();
@@ -2227,6 +2426,8 @@ public final class LaptopHost {
         synchronized (stateLock) {
             Player player = players.get(client.playerID);
             if (player != null && player.connection == client) {
+                recordPlayerProfileLocked(player);
+                savePlayerDirectoryLocked();
                 activeClients.remove(player.id);
                 endVotes &= ~(1L << (player.id - 1));
                 player.connection = null;
@@ -2235,9 +2436,7 @@ public final class LaptopHost {
                 if (!isRoundActiveLocked() && roundState != RoundState.FINISHED) {
                     players.remove(player.id);
                     grenadeOwners.entrySet().removeIf(entry -> entry.getValue() == player.id);
-                    balancedTeams = Collections.emptyMap();
-                    balancedCheckedIn.clear();
-                    balancedCheckInDeadline = 0;
+                    invalidateTeamAssignmentsLocked();
                 }
                 changed = true;
             }
@@ -2289,16 +2488,42 @@ public final class LaptopHost {
             return playerID == 1 || row != null
                     && (row.flags & StatePacket.FLAG_INFECTED) != 0 ? 1 : 2;
         }
-        if (config.balanced) {
+        if (assignedTeamsEnabledLocked()) {
             Integer assigned = balancedTeams.get(playerID);
             if (assigned != null)
                 return assigned;
+            Player player = players.get(playerID);
+            if (player != null && hostPlayerTeams.containsKey(player.identity))
+                return hostPlayerTeams.get(player.identity);
         }
+        return baseTeamFor(playerID);
+    }
+
+    private int baseTeamFor(int playerID) {
         if (config.gameMode == GameMode.FFA)
             return playerID;
         if (config.gameMode == GameMode.FOUR_TEAMS)
             return ((playerID - 1) / (MAX_PLAYERS / 4)) + 1;
         return playerID <= MAX_PLAYERS / 2 ? 1 : 2;
+    }
+
+    private boolean assignedTeamsEnabledLocked() {
+        return config.balanced || !hostPlayerTeams.isEmpty() && !fixedModeRules();
+    }
+
+    private boolean fixedModeRules() {
+        return config.boss || config.captureTheFlag || config.infection;
+    }
+
+    private boolean balancedQrEnabledLocked() {
+        return config.balancedQr && hostPlayerTeams.isEmpty();
+    }
+
+    private void invalidateTeamAssignmentsLocked() {
+        balancedTeams = hostPlayerTeams.isEmpty() || fixedModeRules()
+                ? Collections.emptyMap() : computeBalancedTeamsLocked();
+        balancedCheckedIn.clear();
+        balancedCheckInDeadline = 0;
     }
 
     private boolean areOpponents(int firstID, int secondID) {
@@ -2407,6 +2632,8 @@ public final class LaptopHost {
         private volatile boolean lobbyReady = true;
         private volatile boolean lobbyBenched;
         private volatile int clockSamples;
+        private volatile int eventControlVersion;
+        private volatile String eventLockStatus = "unknown";
         private volatile long lastReceivedAt;
 
         ClientConnection(Socket socket, int clientID) throws IOException {
@@ -2582,6 +2809,7 @@ public final class LaptopHost {
         final int id;
         String name;
         String identity = UUID.randomUUID().toString();
+        String deviceIdentity;
         InetAddress address;
         ClientConnection connection;
         boolean connected;
@@ -2601,6 +2829,10 @@ public final class LaptopHost {
         int hits;
         boolean awaitingRespawn;
         boolean eliminated;
+        UUID relayNode;
+        String relayP2p = "", relayBluetooth = "";
+        Map<String, Object> battery;
+        long batteryAt = Long.MIN_VALUE;
         final Deque<GeoPoint> trail = new ArrayDeque<>();
 
         Player(int id, String name, InetAddress address, Settings settings) {
@@ -2930,6 +3162,9 @@ public final class LaptopHost {
 
         static Settings tournament() {
             Settings settings = new Settings();
+            // The phone's default team timer is three minutes. Keep the
+            // displayed profile consistent when custom host rules are enabled.
+            settings.spawnTime = 180;
             settings.allowBurst = false;
             settings.allowAuto = false;
             return settings;
@@ -2977,6 +3212,15 @@ public final class LaptopHost {
                     || settings.firingMode < 0 || settings.firingMode > 2)
                 return null;
             return settings;
+        }
+
+        static Settings fromHostJson(Map<String, Object> json) {
+            Set<String> fields = Set.of("health", "reloadshots", "reloadtime", "reloadonempty", "spawntime",
+                    "damage", "liveslimit", "shotmodesingle", "shotmodeburst3", "shotmodeauto", "firingmode");
+            if (!fields.containsAll(json.keySet())) return null;
+            for (String field : List.of("reloadonempty", "shotmodesingle", "shotmodeburst3", "shotmodeauto"))
+                if (!(json.get(field) instanceof Boolean)) return null;
+            return fromClientJson(json);
         }
 
         Map<String, Object> toJson(int playerID) {
@@ -3059,6 +3303,309 @@ public final class LaptopHost {
         sendFile(exchange, config.webDirectory.resolve("wifi.html"), "text/html; charset=utf-8", "no-store");
     }
 
+    private void handlePlayersPage(HttpExchange exchange) throws IOException {
+        if (!localWifiRequest(exchange)) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Open player controls on this laptop."));
+            return;
+        }
+        sendFile(exchange, config.webDirectory.resolve("players.html"), "text/html; charset=utf-8", "no-store");
+    }
+
+    private Map<String, Object> playerControlsState() {
+        synchronized (stateLock) {
+            Map<String, Object> state = dashboardState();
+            state.put("eventMode", eventMode);
+            state.put("kioskMode", eventPinning);
+            state.put("organizerPin", eventSettings.pin());
+            state.put("customRules", hostCustomRules);
+            state.put("manualTeams", !hostPlayerTeams.isEmpty());
+            boolean specialMode = config.boss || config.captureTheFlag || config.infection;
+            state.put("canEditTeams", !specialMode && config.gameMode == GameMode.TWO_TEAMS);
+            state.put("canEditSettings", !specialMode);
+            state.put("rulesNote", specialMode ? "This game mode fixes teams and weapon rules. Names and participation are editable."
+                    : "Saving gameplay settings enables custom host rules. Phones cannot change those settings.");
+            List<Object> saved = new ArrayList<>();
+            for (PlayerDirectory.Profile profile : playerDirectory.profiles.values()) {
+                Map<String, Object> details = profile.toJson();
+                details.put("eventLocked", !releasedPhones.contains(profile.id));
+                if (details.get("settings") == null) details.put("settings", defaultSettings(1).toJson(0));
+                saved.add(details);
+            }
+            state.put("savedPlayers", saved);
+            for (Object item : (List<?>) state.get("players")) {
+                Map<String, Object> details = castObject(item);
+                Player player = players.get(intValue(details.get("id"), 0));
+                details.put("identity", player.identity);
+                details.put("hostNamed", hostPlayerNames.containsKey(player.identity));
+                details.put("settings", player.settings.toJson(player.id));
+                details.put("customSettings", hostPlayerSettings.containsKey(player.identity));
+                details.put("eventLocked", !releasedPhones.contains(player.identity));
+                details.put("eventCapable", player.connection != null && player.connection.eventControlVersion >= 1);
+                details.put("lockStatus", player.connection == null ? "offline" : player.connection.eventLockStatus);
+                details.put("viaRelay", player.connection != null && player.connection.socket instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket);
+                details.put("battery", player.battery);
+                PlayerDirectory.Profile profile = playerDirectory.profiles.get(player.identity);
+                details.put("gunBatteryRounds", profile == null ? List.of() : profile.gunBatteryRounds.snapshot());
+                details.put("batteryAgeMs", player.batteryAt == Long.MIN_VALUE ? null : Math.max(0, elapsedMillis() - player.batteryAt));
+            }
+            return state;
+        }
+    }
+
+    private void handlePlayersApi(HttpExchange exchange) throws IOException {
+        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        if (!localWifiRequest(exchange)) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Player editing is available only on this laptop."));
+            return;
+        }
+        if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 200, playerControlsState());
+            return;
+        }
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("ok", false, "message", "Use GET or POST."));
+            return;
+        }
+        String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+        if (contentType == null || !contentType.split(";", 2)[0].trim().equalsIgnoreCase("application/json")
+                || !"1".equals(exchange.getRequestHeaders().getFirst("X-SimpleCoil-Control"))) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Use the laptop's player controls."));
+            return;
+        }
+        byte[] body = exchange.getRequestBody().readNBytes(4097);
+        if (body.length > 4096) {
+            sendJson(exchange, 413, mapOf("ok", false, "message", "Player settings are too large."));
+            return;
+        }
+        Map<String, Object> request;
+        try {
+            Object parsed = Json.parse(new String(body, StandardCharsets.UTF_8));
+            if (!(parsed instanceof Map)) throw new IllegalArgumentException();
+            request = castObject(parsed);
+        } catch (IllegalArgumentException exception) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Invalid player settings."));
+            return;
+        }
+        if ("transfer".equals(request.get("action"))) {
+            handlePlayerTransfer(exchange, request);
+            return;
+        }
+        if ("battery".equals(request.get("action"))) {
+            ClientConnection target;
+            synchronized (stateLock) {
+                Player player = players.get(intValue(request.get("id"), 0));
+                if (player == null || !player.identity.equals(request.get("identity")) || !player.connected
+                        || player.connection == null || player.connection.eventControlVersion < 2) {
+                    sendJson(exchange, 409, mapOf("ok", false, "message", "Connect a phone with the updated app to check its batteries."));
+                    return;
+                }
+                target = player.connection;
+            }
+            target.send(jsonFrame(mapOf(EventMode.BATTERY_REQUEST, true)));
+            sendJson(exchange, 200, mapOf("ok", true, "message", "Battery refresh requested. Readings update when the phone responds.", "status", playerControlsState()));
+            return;
+        }
+        int playerID = intValue(request.get("id"), 0);
+        String name = validPlayerName(request.get("name"));
+        if (request.containsKey("id") && !validPlayerID(playerID) || !(request.get("identity") instanceof String)
+                || !RoundRoster.validIdentity((String) request.get("identity"))) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Choose a player from the current roster."));
+            return;
+        }
+        if (request.containsKey("name") && name == null) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Names must contain 1–20 characters and no control characters."));
+            return;
+        }
+        if (request.containsKey("benched") && !(request.get("benched") instanceof Boolean)
+                || request.containsKey("eventLocked") && !(request.get("eventLocked") instanceof Boolean)
+                || request.containsKey("resetSettings") && !Boolean.TRUE.equals(request.get("resetSettings"))
+                || request.containsKey("settings") && request.containsKey("resetSettings")
+                || !Set.of("id", "identity", "name", "benched", "team", "settings", "resetSettings", "eventLocked").containsAll(request.keySet())
+                || request.keySet().stream().allMatch(key -> "id".equals(key) || "identity".equals(key))) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Invalid player edit."));
+            return;
+        }
+        int team = intValue(request.get("team"), 0);
+        Settings settings = request.get("settings") instanceof Map
+                ? Settings.fromHostJson(castObject(request.get("settings"))) : null;
+        if (request.containsKey("team") && (team < 1 || team > 2)
+                || request.containsKey("settings") && settings == null) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Invalid team or gameplay settings. Check the field limits and allow at least one firing mode."));
+            return;
+        }
+        synchronized (stateLock) {
+            updateRoundStateLocked();
+            String identity = (String) request.get("identity");
+            PlayerDirectory.Profile profile = playerDirectory.profiles.get(identity);
+            Player player = request.containsKey("id") ? players.get(playerID) : players.values().stream()
+                    .filter(member -> member.identity.equals(identity)).findFirst().orElse(null);
+            if (profile == null || request.containsKey("id") && (player == null || !player.identity.equals(identity))) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "This player has left or changed ID. Select them again."));
+                return;
+            }
+            boolean lobbyEdit = request.containsKey("benched") || request.containsKey("team")
+                    || request.containsKey("settings") || request.containsKey("resetSettings");
+            if (lobbyEdit && roundState != RoundState.LOBBY) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "Teams, participation, and gameplay settings can only change in the lobby."));
+                return;
+            }
+            if ((request.containsKey("team") || request.containsKey("settings") || request.containsKey("resetSettings"))
+                    && (config.boss || config.captureTheFlag || config.infection)) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "This game mode fixes teams and weapon rules."));
+                return;
+            }
+            // Validate the entire request before committing any field.
+            if (request.containsKey("name")) {
+                hostPlayerNames.put(identity, name);
+                profile.name = name;
+                if (player != null) player.name = name;
+            }
+            if (request.containsKey("benched")) {
+                boolean benched = Boolean.TRUE.equals(request.get("benched"));
+                hostPlayerParticipation.put(identity, benched);
+                if (player != null && player.connection != null) player.connection.lobbyBenched = benched;
+            }
+            if (request.containsKey("team")) {
+                Map<String, Integer> teams = new HashMap<>(hostPlayerTeams);
+                if (teams.isEmpty()) for (Player member : players.values())
+                    teams.put(member.identity, teamFor(member.id));
+                teams.put(identity, team);
+                hostPlayerTeams = Collections.unmodifiableMap(teams);
+            }
+            if (settings != null) {
+                hostPlayerSettings.put(identity, settings);
+                if (player != null) player.settings = settings;
+                hostCustomRules = true;
+            } else if (request.containsKey("resetSettings")) {
+                hostPlayerSettings.remove(identity);
+                if (player != null) player.settings = defaultSettings(player.id);
+                hostCustomRules = !hostPlayerSettings.isEmpty();
+            }
+            if (request.containsKey("eventLocked")) {
+                if (Boolean.TRUE.equals(request.get("eventLocked"))) releasedPhones.remove(identity);
+                else releasedPhones.add(identity);
+                playerEventRevisions.put(identity, UUID.randomUUID().toString());
+            }
+            if (request.containsKey("team") || request.containsKey("benched")) invalidateTeamAssignmentsLocked();
+            if (!savePlayerDirectoryLocked()) {
+                sendJson(exchange, 503, mapOf("ok", false, "message", "Player changed in memory, but the laptop could not save the profile. Check available disk space and retry."));
+                return;
+            }
+        }
+        broadcastRoster();
+        broadcastPlayerData();
+        sendJson(exchange, 200, mapOf("ok", true, "message", "Player updated.", "status", playerControlsState()));
+    }
+
+    private void handlePlayerTransfer(HttpExchange exchange, Map<String, Object> request) throws IOException {
+        int targetID = intValue(request.get("targetId"), 0);
+        if (!(request.get("identity") instanceof String) || !(request.get("targetIdentity") instanceof String)
+                || !validPlayerID(targetID) || !Set.of("action", "identity", "targetId", "targetIdentity").containsAll(request.keySet())) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Choose a saved player and a replacement phone."));
+            return;
+        }
+        ClientConnection previous = null;
+        synchronized (stateLock) {
+            updateRoundStateLocked();
+            Player target = players.get(targetID);
+            PlayerDirectory.Profile profile = playerDirectory.profiles.get(request.get("identity"));
+            if (roundState != RoundState.LOBBY || profile == null || target == null || !target.connected
+                    || !target.identity.equals(request.get("targetIdentity")) || target.identity.equals(profile.id)) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "Transfers require a different connected phone in the lobby. Refresh the roster and try again."));
+                return;
+            }
+            Player source = players.values().stream().filter(player -> player.identity.equals(profile.id)).findFirst().orElse(null);
+            int desiredTeam = source != null ? teamFor(source.id) : profile.team > 0 ? profile.team
+                    : profile.lastTeam > 0 ? profile.lastTeam : teamFor(target.id);
+            if ((config.boss || config.captureTheFlag || config.infection) && desiredTeam != teamFor(target.id)) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "In this game mode, connect the replacement phone using the same team or Boss role first."));
+                return;
+            }
+            if (source != null) {
+                previous = source.connection;
+                players.remove(source.id);activeClients.remove(source.id);
+                grenadeOwners.entrySet().removeIf(entry -> entry.getValue() == source.id);
+            }
+            playerDirectory.bind(profile.id, target.deviceIdentity);
+            releasedPhones.remove(profile.id);
+            target.identity = profile.id;target.name = profile.name;
+            target.settings = hostPlayerSettings.getOrDefault(profile.id, defaultSettings(target.id));
+            target.priorKills = Math.min(100_000, profile.totalKills);
+            target.priorDeaths = Math.min(100_000, profile.totalDeaths);
+            target.connection.lobbyBenched = Boolean.TRUE.equals(profile.benched);
+            if (!config.boss && !config.captureTheFlag && !config.infection) {
+                Map<String, Integer> teams = new HashMap<>(hostPlayerTeams);
+                if (teams.isEmpty()) for (Player member : players.values()) teams.put(member.identity, baseTeamFor(member.id));
+                teams.put(profile.id, desiredTeam);hostPlayerTeams = Collections.unmodifiableMap(teams);
+            }
+            invalidateTeamAssignmentsLocked();
+            if (!savePlayerDirectoryLocked()) {
+                sendJson(exchange, 503, mapOf("ok", false, "message", "The phone changed, but its profile could not be saved. Check disk space and retry."));
+                return;
+            }
+        }
+        if (previous != null) {
+            previous.send(jsonFrame(mapOf(EventMode.TRANSFERRED_OUT, true)));
+            previous.close();
+        }
+        broadcastRoster();broadcastPlayerData();
+        sendJson(exchange, 200, mapOf("ok", true, "message", "Player moved to the replacement phone. The original phone is unassigned.",
+                "status", playerControlsState()));
+    }
+
+    private void handleEventApi(HttpExchange exchange) throws IOException {
+        if (!localWifiRequest(exchange)) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Event controls are available only on this laptop."));
+            return;
+        }
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("ok", false, "message", "Use POST."));
+            return;
+        }
+        if (!"application/json".equalsIgnoreCase(String.valueOf(exchange.getRequestHeaders()
+                .getFirst("Content-Type")).split(";", 2)[0].trim())
+                || !"1".equals(exchange.getRequestHeaders().getFirst("X-SimpleCoil-Control"))) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Use the laptop's event controls."));
+            return;
+        }
+        byte[] body = exchange.getRequestBody().readNBytes(4097);
+        if (body.length > 4096) {
+            sendJson(exchange, 413, mapOf("ok", false, "message", "Event settings are too large."));
+            return;
+        }
+        Map<String, Object> request;
+        try {
+            Object parsed = Json.parse(new String(body, StandardCharsets.UTF_8));
+            if (!(parsed instanceof Map)) throw new IllegalArgumentException();
+            request = castObject(parsed);
+            if (!(request.get("enabled") instanceof Boolean) || !(request.get("kiosk") instanceof Boolean)
+                    || !(request.get("pin") instanceof String) || !EventMode.validPin((String) request.get("pin"))
+                    || request.containsKey("title") && !EventMode.validTitle(request.get("title") instanceof String ? (String) request.get("title") : null)
+                    || !Set.of("enabled", "kiosk", "pin", "title").containsAll(request.keySet()))
+                throw new IllegalArgumentException();
+        } catch (IllegalArgumentException exception) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Choose Event Mode, Kiosk Mode, and an organizer PIN with 6–8 digits."));
+            return;
+        }
+        try {
+            synchronized (stateLock) {
+                eventSettings.save((String) request.get("pin"), request.containsKey("title") ? (String) request.get("title") : eventSettings.title(),
+                        Boolean.TRUE.equals(request.get("enabled")), Boolean.TRUE.equals(request.get("kiosk")));
+                eventMode = Boolean.TRUE.equals(request.get("enabled"));
+                eventPinning = Boolean.TRUE.equals(request.get("kiosk"));
+                releasedPhones.clear();
+                eventRevision = UUID.randomUUID().toString();
+                playerEventRevisions.clear();
+            }
+        } catch (IOException exception) {
+            sendJson(exchange, 503, mapOf("ok", false, "message", "Unable to save the organizer PIN."));
+            return;
+        }
+        broadcastRoster();
+        sendJson(exchange, 200, mapOf("ok", true, "message", eventMode ? "Event controls applied." : "Event Mode released on all connected phones.",
+                "status", playerControlsState()));
+    }
+
     private void handleWifiApi(HttpExchange exchange) throws IOException {
         exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
         if (!localWifiRequest(exchange)) {
@@ -3094,7 +3641,7 @@ public final class LaptopHost {
             return;
         }
         synchronized (stateLock) {
-            if (isRoundActiveLocked()) {
+            if (isRoundActiveLocked() && !"apply".equals(request.get("action"))) {
                 sendJson(exchange, 409, mapOf("ok", false, "message", "Finish the round before changing Wi-Fi."));
                 return;
             }
@@ -3110,6 +3657,7 @@ public final class LaptopHost {
             hotspot.control(action, request);
             message = switch (action) {
                 case "start" -> "Hotspot started. Connect the phones to this network.";
+                case "apply" -> "Hotspot restarted with the new settings. Phones can rejoin now.";
                 case "stop" -> "Hotspot stopped.";
                 default -> "Wi-Fi settings saved.";
             };
@@ -3265,6 +3813,14 @@ public final class LaptopHost {
             sendJson(exchange, 405, mapOf("error", "Use POST."));
             return;
         }
+        synchronized (stateLock) {
+            if (eventMode) {
+                boolean active = isRoundActiveLocked();
+                if (active) endRound("event host ended the round");
+                sendJson(exchange, active ? 200 : 409, mapOf("ok", active, "message", active ? "Round ended by the event host." : "No active round to end."));
+                return;
+            }
+        }
         boolean requested = requestEndVote(null, null, false);
         sendJson(exchange, requested ? 200 : 409, mapOf("ok", requested, "message",
                 requested ? "Waiting for two players to approve on their phones."
@@ -3293,9 +3849,10 @@ public final class LaptopHost {
             ClientConnection client = activeClients.get(playerID);
             if (roundState == RoundState.LOBBY && client != null && !client.closed) {
                 client.lobbyBenched = Boolean.parseBoolean(value);
-                balancedTeams = Collections.emptyMap();
-                balancedCheckedIn.clear();
-                balancedCheckInDeadline = 0;
+                Player player = players.get(playerID);
+                if (player != null) hostPlayerParticipation.put(player.identity, client.lobbyBenched);
+                invalidateTeamAssignmentsLocked();
+                savePlayerDirectoryLocked();
                 changed = true;
             }
         }
@@ -3331,6 +3888,8 @@ public final class LaptopHost {
 
             Map<String, Object> state = new LinkedHashMap<>();
             state.put("state", roundState.name().toLowerCase(Locale.ROOT));
+            state.put("eventMode", eventMode);
+            state.put("eventTitle", eventSettings.title());
             state.put("gameMode", config.gameMode.wireValue);
             state.put("bossMode", config.boss);
             state.put("infectionMode", config.infection);
@@ -3339,10 +3898,10 @@ public final class LaptopHost {
             state.put("playerCount", playing.size());
             state.put("benchedCount", activeClients.size() - playing.size());
             state.put("clockReady", clockReadyCountLocked());
-            state.put("balancedQr", config.balancedQr);
+            state.put("balancedQr", balancedQrEnabledLocked());
             state.put("assignedCount", balancedTeams.size());
             state.put("checkedInCount", balancedCheckedIn.size());
-            state.put("checkInRemainingMs", config.balancedQr && roundState == RoundState.LOBBY
+            state.put("checkInRemainingMs", balancedQrEnabledLocked() && roundState == RoundState.LOBBY
                     && balancedCheckInDeadline > 0
                     ? Math.max(0, balancedCheckInDeadline - now) : 0);
             state.put("startInMs", roundState == RoundState.COUNTDOWN ? Math.max(0, roundStartAt - now) : 0);
@@ -3355,7 +3914,7 @@ public final class LaptopHost {
                     && (!config.infection || hasPlayingLeaderLocked())
                     && clockReadyCountLocked() == playing.size()
                     && playing.stream().allMatch(client -> client.lobbyReady)
-                    && (!config.balancedQr || balancedTeams.isEmpty()));
+                    && (!balancedQrEnabledLocked() || balancedTeams.isEmpty()));
             state.put("gunsReady", playing.stream()
                     .filter(client -> client.lobbyReady).count());
             state.put("endVoteRequested", endVoteRequested);
@@ -3373,6 +3932,8 @@ public final class LaptopHost {
                 item.put("clockReady", player.connection != null && player.connection.clockReady);
                 item.put("benched", player.benched());
                 item.put("awaitingRespawn", player.awaitingRespawn);
+                int lives = player.settings.overrideLives ? player.settings.lives : config.livesLimit;
+                item.put("canRespawn", player.awaitingRespawn && (lives == 0 || player.deaths < lives));
                 item.put("kills", player.kills);
                 item.put("deaths", player.deaths);
                 item.put("shots", player.shots);
@@ -3611,7 +4172,10 @@ public final class LaptopHost {
         int livesLimit;
         Path tileDirectory = HOST_DIRECTORY.resolve("maps");
         Path webDirectory = HOST_DIRECTORY.resolve("web");
+        Path playerStore = Path.of(System.getProperty("simplecoil.players.file",
+                Path.of(System.getProperty("user.home"), ".local", "share", "simplecoil", "players.json").toString()));
         boolean noBrowser;
+        boolean eventMode = true;
         boolean showHelp;
 
         static HostConfig parse(String[] args) {
@@ -3660,6 +4224,10 @@ public final class LaptopHost {
                 }
                 if ("--no-browser".equals(argument)) {
                     config.noBrowser = true;
+                    continue;
+                }
+                if ("--no-event-mode".equals(argument)) {
+                    config.eventMode = false;
                     continue;
                 }
                 if ("--no-late-join".equals(argument)) {
@@ -3771,7 +4339,7 @@ public final class LaptopHost {
         static String usage() {
             return "Usage: java --add-modules jdk.httpserver -cp out com.simplecoil.laptophost.LaptopHost [options]\n"
                     + "  --teams 2                   Tournament team layout is locked to two teams\n"
-                    + "  --tournament                Accepted for compatibility; always enabled\n"
+                    + "  --tournament                Default rules; host can edit player profiles\n"
                     + "  --boss                      Player 1 vs everyone; fixed Boss rules\n"
                     + "  --ctf                       Two-team QR capture-the-flag rules\n"
                     + "  --infection                 Player 1 starts an Infection match\n"
@@ -3796,12 +4364,13 @@ public final class LaptopHost {
                     + "  --tiles DIRECTORY           Offline XYZ tiles (default: laptop-host/maps)\n"
                     + "  --no-late-join              Reject joins after the start\n"
                     + "  --takeover                  Replace an idle phone-hosted lobby on this Wi-Fi\n"
+                    + "  --no-event-mode             Allow ordinary phone controls in the lobby\n"
                     + "  --no-browser                Do not open the dashboard automatically";
         }
     }
 
     /** Tiny dependency-free JSON implementation for the protocol and dashboard. */
-    private static final class Json {
+    static final class Json {
         private Json() {
         }
 
@@ -4068,12 +4637,12 @@ public final class LaptopHost {
     }
 
     private static final String INDEX_PAGE = """
-            <!doctype html><html><head><meta charset="utf-8"><title>SimpleCoil Laptop Host</title>
+            <!doctype html><html><head><meta charset="utf-8"><title>LAZER GUN RUN · Laptop Host</title>
             <style>body{margin:0;background:#10141b;color:#eef3f8;font:18px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}main{max-width:660px;padding:32px}h1{margin-top:0}.buttons{display:flex;gap:14px;flex-wrap:wrap}a,button{border:0;border-radius:8px;background:#2585d8;color:white;padding:14px 18px;font:inherit;text-decoration:none;cursor:pointer}p{line-height:1.5;color:#c6d1dc}.note{font-size:.9em;color:#9dadbc}</style></head>
-            <body><main><h1>SimpleCoil Laptop Host</h1><p>Open the live map and leaderboard as two independent display windows. Keep this page local to the laptop; game controls are available on the map display.</p>
-            <div class="buttons"><a href="/map" target="simplecoil-map">Open map display</a><a href="/leaderboard" target="simplecoil-leaderboard">Open leaderboard</a><button onclick="openDisplays()">Open both displays</button><a href="/wifi" target="simplecoil-wifi">Wi-Fi hotspot</a></div>
+            <body><main><h1 id="event-title">LAZER GUN RUN</h1><p>Open the live map and leaderboard as two independent display windows. Keep this page local to the laptop; game controls are available on the map display.</p>
+            <div class="buttons"><a href="/map" target="simplecoil-map">Open map display</a><a href="/leaderboard" target="simplecoil-leaderboard">Open leaderboard</a><button onclick="openDisplays()">Open both displays</button><a href="/wifi" target="simplecoil-wifi">Wi-Fi hotspot</a><a href="/players" target="simplecoil-players">Players &amp; Event Mode</a></div>
             <p class="note">Phones join the laptop's printed LAN IP from <em>Join Game</em>. The dashboard uses the local browser only unless the host was started with <code>--dashboard-bind 0.0.0.0</code>.</p>
-            <script>function openDisplays(){window.open('/map','simplecoil-map','popup=yes');window.open('/leaderboard','simplecoil-leaderboard','popup=yes')}</script></main></body></html>
+            <script>fetch('/api/state',{cache:'no-store'}).then(r=>r.json()).then(s=>{document.querySelector('#event-title').textContent=s.eventTitle||'LAZER GUN RUN'}).catch(()=>{});function openDisplays(){window.open('/map','simplecoil-map','popup=yes');window.open('/leaderboard','simplecoil-leaderboard','popup=yes')}</script></main></body></html>
             """;
 
     private static final String MAP_PAGE = """
@@ -4081,7 +4650,7 @@ public final class LaptopHost {
             <link rel="stylesheet" href="/assets/leaflet/leaflet.css">
             <style>
             :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:15px system-ui,sans-serif;overflow:hidden}header{height:60px;display:flex;align-items:center;gap:12px;padding:9px 14px;background:#111c27;border-bottom:1px solid #274257}h1{font-size:20px;margin:0;white-space:nowrap}#status{color:#b8c8d8;flex:1}button{border:0;border-radius:7px;padding:9px 12px;background:#267ec8;color:#fff;font:inherit;cursor:pointer}button.danger{background:#b83d46}button:disabled{opacity:.45;cursor:not-allowed}#map{width:100vw;height:calc(100vh - 60px);background-color:#0d1720;background-image:linear-gradient(#203445 1px,transparent 1px),linear-gradient(90deg,#203445 1px,transparent 1px);background-size:50px 50px}.legend{position:fixed;z-index:1000;right:16px;bottom:16px;max-width:340px;background:#101a25e8;border:1px solid #34516a;border-radius:8px;padding:10px;line-height:1.7}.swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.team1{background:#49a5ff}.team2{background:#ff5d67}#tile-status{color:#ffd98a;font-size:12px}#respawns:empty{display:none}#respawns{border-top:1px solid #34516a;margin-top:7px;padding-top:7px}.respawn{font-size:12px;padding:5px 7px;margin:3px 3px 0 0;background:#466c32}.player-label{background:#101a25e8;border:1px solid #7890a5;color:#fff;font-weight:700;box-shadow:none}.player-label:before{border-top-color:#7890a5}.leaflet-control-zoom a{background:#152332;color:#fff;border-color:#35516a}.leaflet-control-zoom a:hover{background:#22384b;color:#fff}@media(max-width:760px){header{gap:6px;padding:7px}h1{font-size:15px}#status{font-size:11px}button{padding:7px 8px;font-size:12px}}
-            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button onclick="window.open('/wifi','simplecoil-wifi')">Wi-Fi</button><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
+            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button onclick="window.open('/players','simplecoil-players')">Players</button><button onclick="window.open('/wifi','simplecoil-wifi')">Wi-Fi</button><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
             <script src="/assets/leaflet/leaflet.js"></script><script>
             const status=document.querySelector('#status'),start=document.querySelector('#start'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status'),lobbyPlayers=document.querySelector('#lobby-players');let lobbySignature='';
             const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:true}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],grenadeLayers=[],fitted=false,mapConfig={maxZoom:19};
@@ -4089,15 +4658,15 @@ public final class LaptopHost {
             function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)&&(p.longitude!==0||p.latitude!==0)&&p.longitude>=-180&&p.longitude<=180&&p.latitude>=-90&&p.latitude<=90}function ll(p){return[p.latitude,p.longitude]}
             async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tileUrl='/tiles/{z}/{x}/{y}.png'+(mapConfig.version?'?v='+encodeURIComponent(mapConfig.version):'');const tiles=L.tileLayer(tileUrl,{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom+3,maxNativeZoom:mapConfig.maxZoom,bounds:mapConfig.bounds,attribution:mapConfig.attribution||'',noWrap:true,keepBuffer:4,updateWhenIdle:false});let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent='Offline map loaded.'}});tiles.addTo(map);tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.';if(!(state?.players||[]).some(valid)){if(mapConfig.center)map.setView(mapConfig.center,mapConfig.zoom);else if(mapConfig.bounds)map.fitBounds(mapConfig.bounds,{padding:[30,30],maxZoom:18})}}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
             async function control(path){try{const r=await fetch(path,{method:'POST'}),j=await r.json();status.textContent=j.message||(j.ok?'Done.':'Unable to complete action.')}catch(e){status.textContent='Host control error.'}}
-            start.onclick=()=>control('/api/start');end.onclick=()=>{if(confirm('Ask two participating players to approve ending the round?'))control('/api/end')};fitButton.onclick=()=>fitPlayers(true);
-            function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.awaitingRespawn||p.benched||!p.connected)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}
-            function drawLobby(s){const visible=s.state==='lobby';lobbyPlayers.hidden=!visible;if(!visible){lobbySignature='';return}const list=[...(s.players||[])].sort((a,b)=>Number(a.benched)-Number(b.benched)||a.team-b.team||a.id-b.id);const sig=JSON.stringify(list.map(p=>[p.id,p.name,p.team,p.connected,p.gunReady,p.clockReady,p.benched]));if(sig===lobbySignature)return;lobbySignature=sig;lobbyPlayers.replaceChildren();for(const p of list){const row=document.createElement('div'),name=document.createElement('span'),b=document.createElement('button');row.style.cssText='display:flex;gap:8px;align-items:center;margin-top:6px';name.style.flex='1';const status=p.benched?'Sitting out':!p.connected?'Reconnecting':!p.gunReady?'Needs gun':!p.clockReady?'Syncing clock':'Ready';name.textContent=`Team ${p.team} / ${p.name} #${p.id} - ${status}`;b.textContent=p.benched?'Play':'Sit out';b.disabled=!p.connected;b.onclick=()=>{b.disabled=true;control('/api/bench?id='+encodeURIComponent(p.id)+'&benched='+(!p.benched)).finally(()=>{lobbySignature=''})};row.append(name,b);lobbyPlayers.append(row)}}
+            start.onclick=()=>control('/api/start');end.onclick=()=>{if(confirm(state?.eventMode?'End the round for all players?':'Ask two participating players to approve ending the round?'))control('/api/end')};fitButton.onclick=()=>fitPlayers(true);
+            function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.canRespawn||p.benched||!p.connected)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}
+            function drawLobby(s){const visible=s.state==='lobby';lobbyPlayers.hidden=!visible;if(!visible){lobbySignature='';return}const list=[...(s.players||[])].sort((a,b)=>Number(a.benched)-Number(b.benched)||a.team-b.team||a.id-b.id);const sig=JSON.stringify(list.map(p=>[p.id,p.name,p.team,p.connected,p.gunReady,p.clockReady,p.benched]));if(sig===lobbySignature)return;lobbySignature=sig;lobbyPlayers.replaceChildren();for(const p of list){const row=document.createElement('div'),name=document.createElement('span'),b=document.createElement('button');row.style.cssText='display:flex;gap:8px;align-items:center;margin-top:6px';name.style.flex='1';const status=p.benched?'Sitting out':!p.connected?'Reconnecting':!p.gunReady?'Needs gun':!p.clockReady?'Syncing clock':'Ready';name.textContent=`Team ${p.team} / ${p.name} #${p.id} - ${status}`;b.textContent=p.benched?'Play':'Sit out';b.disabled=!p.connected;b.onclick=()=>{b.disabled=true;control('/api/bench?id='+encodeURIComponent(p.id)+'&benched='+(!p.benched)).finally(()=>{lobbySignature=''})};const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>window.open('/players?id='+encodeURIComponent(p.id),'simplecoil-players');row.append(name,edit,b);lobbyPlayers.append(row)}}
             function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores visible';if(s.balancedQr&&s.assignedCount)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount}`;const missing=(s.players||[]).filter(x=>x.connected&&!x.benched&&!x.gunReady).map(x=>x.name+' #'+x.id);return `${p} players - guns ${s.gunsReady||0}/${p} - clocks ${ready}/${p}`+(missing.length?' - Needs gun: '+missing.join(', '):'')}
             function fitPlayers(force){const points=(state?.players||[]).filter(valid).map(ll),maxZoom=Number.isFinite(mapConfig.maxZoom)?mapConfig.maxZoom:18;if(!points.length)return;if(points.length===1)map.setView(points[0],Math.min(18,maxZoom));else map.fitBounds(points,{padding:[70,70],maxZoom:Math.min(18,maxZoom)});if(force||!fitted)fitted=true}
             function drawPlayers(s){const visible=new Set();for(const p of s.players.filter(p=>!p.benched)){const points=(p.trail||[]).filter(valid).map(ll);if(!valid(p)&&!points.length)continue;visible.add(p.id);let item=players.get(p.id);if(!item){const trail=L.polyline([],{color:color(p.team),weight:3,opacity:.48,interactive:false}).addTo(map);item={marker:null,trail};players.set(p.id,item)}const opacity=p.connected?1:.4;if(valid(p)){if(!item.marker)item.marker=L.circleMarker(ll(p),{radius:11,color:'#fff',weight:2,fillColor:color(p.team),fillOpacity:1}).addTo(map).bindTooltip('',{permanent:true,direction:'top',className:'player-label',offset:[0,-9]});item.marker.setLatLng(ll(p)).setRadius(p.awaitingRespawn?8:11).setStyle({fillColor:color(p.team),opacity,fillOpacity:opacity});const label=document.createElement('span');label.textContent=`${p.name} #${p.id}${p.awaitingRespawn?' - RESPAWN':''}`;item.marker.setTooltipContent(label)}else if(item.marker){map.removeLayer(item.marker);item.marker=null}item.trail.setStyle({color:color(p.team),opacity:.48*opacity});item.trail.setLatLngs(points)}for(const [id,item] of players){if(visible.has(id))continue;if(item.marker)map.removeLayer(item.marker);map.removeLayer(item.trail);players.delete(id)}}
             function drawLasers(s){for(const layer of laserLayers)map.removeLayer(layer);laserLayers=[];const byId=Object.fromEntries(s.players.filter(valid).map(p=>[p.id,p]));function point(event,prefix,fallback){const p={longitude:event[prefix+'Longitude'],latitude:event[prefix+'Latitude']};return valid(p)?p:fallback}for(const event of s.lasers||[]){const a=point(event,'shooter',byId[event.shooter]),b=point(event,'target',byId[event.target]);if(!valid(a)||!valid(b))continue;const kill=event.kind==='kill',opacity=Math.max(0,1-event.ageMs/1500);laserLayers.push(L.polyline([ll(a),ll(b)],{color:kill?'#ff3047':'#fff36b',weight:kill?7:5,opacity,interactive:false}).addTo(map))}}
             function drawGrenades(s){for(const layer of grenadeLayers)map.removeLayer(layer);grenadeLayers=[];for(const burst of s.grenadeBursts||[]){const opacity=Math.max(0,1-burst.ageMs/8000);for(const hit of burst.hits||[]){if(!valid(hit))continue;grenadeLayers.push(L.circleMarker(ll(hit),{radius:17,color:'#ff3047',weight:3,opacity,fillColor:'#ff3047',fillOpacity:.24*opacity,interactive:true}).addTo(map).bindTooltip(`Grenade #${burst.grenadeID} hit player #${hit.playerID}`))}const center={latitude:burst.centerLatitude,longitude:burst.centerLongitude};if(!valid(center))continue;grenadeLayers.push(L.circleMarker(ll(center),{radius:8,color:'#fff',weight:2,opacity,fillColor:'#ff3047',fillOpacity:opacity,interactive:true}).addTo(map).bindTooltip(`Estimated grenade #${burst.grenadeID} center (${burst.hits.length} mapped hits)`))}}
-            function draw(s){status.textContent=label(s);start.disabled=!s.canStart;end.disabled=!['countdown','running'].includes(s.state);end.textContent=!end.disabled&&s.endVoteRequested?`End game (${s.endVoteCount}/2)`:'End game';drawRespawns(s);drawLobby(s);drawPlayers(s);drawLasers(s);drawGrenades(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}
+            function draw(s){document.title=(s.eventTitle||'LAZER GUN RUN')+' · Tactical Map';status.textContent=(s.eventTitle||'LAZER GUN RUN')+' · '+label(s);start.disabled=!s.canStart;end.disabled=!['countdown','running'].includes(s.state);end.textContent=!end.disabled&&!s.eventMode&&s.endVoteRequested?`End game (${s.endVoteCount}/2)`:'End game';drawRespawns(s);drawLobby(s);drawPlayers(s);drawLasers(s);drawGrenades(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}
             async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();draw(state)}catch(e){status.textContent='Disconnected from laptop host.'}setTimeout(refresh,150)}setupTiles();refresh();
             </script></body></html>
             """;
@@ -4105,6 +4674,6 @@ public final class LaptopHost {
     private static final String LEADERBOARD_PAGE = """
             <!doctype html><html><head><meta charset="utf-8"><title>SimpleCoil Leaderboard</title>
             <style>:root{color-scheme:dark}body{margin:0;background:#0b121b;color:#eef4f9;font:18px system-ui,sans-serif;padding:26px}h1{margin:0 0 4px}#subtitle{color:#aebdca;margin:0 0 22px}table{width:100%;border-collapse:collapse;background:#111c27;border-radius:10px;overflow:hidden}th,td{padding:13px 14px;text-align:left;border-bottom:1px solid #263c50}th{color:#aabdd0;font-size:.78em;letter-spacing:.06em;text-transform:uppercase}tr:last-child td{border:0}.team1 td:first-child{border-left:6px solid #49a5ff}.team2 td:first-child{border-left:6px solid #ff5d67}.offline{opacity:.48}.dead{color:#ffb0b7}#empty{color:#aebdca;padding:24px 0}@media(max-width:600px){body{padding:14px;font-size:15px}th,td{padding:9px 7px}}</style></head><body><h1>Leaderboard</h1><p id="subtitle">Connecting...</p><table><thead><tr><th>Player</th><th>Team</th><th>Kills</th><th>Hits</th><th>Shots</th><th>Accuracy</th></tr></thead><tbody id="rows"></tbody></table><p id="empty"></p>
-            <script>const rows=document.querySelector('#rows'),subtitle=document.querySelector('#subtitle'),empty=document.querySelector('#empty');function pct(p){return p.accuracy==null?'-':Math.round(p.accuracy)+'%'}function title(s){if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)} seconds`;if(s.state==='running')return s.remainingMs?`Game running - ${Math.ceil(s.remainingMs/1000)} seconds remaining`:'Game running';if(s.state==='finished')return 'Final scores';return `Lobby - ${s.clockReady||0}/${s.playerCount||0} clocks synchronized`};function draw(s){subtitle.textContent=title(s);const players=[...(s.players||[])].filter(p=>!p.benched).sort((a,b)=>b.kills-a.kills||b.accuracy-a.accuracy||b.hits-a.hits||a.id-b.id);rows.replaceChildren();empty.textContent=players.length?'':'Waiting for players to join...';for(const p of players){const tr=document.createElement('tr');tr.className=`team${p.team}${p.connected?'':' offline'}`;const name=document.createElement('td');name.textContent=p.name+(p.awaitingRespawn?' - RESPAWN':'');if(p.awaitingRespawn)name.className='dead';const vals=[p.team,p.kills,p.hits,p.shots,pct(p)];tr.append(name,...vals.map(v=>{const td=document.createElement('td');td.textContent=v;return td}));rows.append(tr)}}async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();draw(await r.json())}catch(e){subtitle.textContent='Disconnected from laptop host.'}setTimeout(refresh,200)}refresh();</script></body></html>
+            <script>const rows=document.querySelector('#rows'),subtitle=document.querySelector('#subtitle'),empty=document.querySelector('#empty');function pct(p){return p.accuracy==null?'-':Math.round(p.accuracy)+'%'}function title(s){if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)} seconds`;if(s.state==='running')return s.remainingMs?`Game running - ${Math.ceil(s.remainingMs/1000)} seconds remaining`:'Game running';if(s.state==='finished')return 'Final scores';return `Lobby - ${s.clockReady||0}/${s.playerCount||0} clocks synchronized`};function draw(s){document.title=(s.eventTitle||'LAZER GUN RUN')+' · Leaderboard';subtitle.textContent=(s.eventTitle||'LAZER GUN RUN')+' · '+title(s);const players=[...(s.players||[])].filter(p=>!p.benched).sort((a,b)=>b.kills-a.kills||b.accuracy-a.accuracy||b.hits-a.hits||a.id-b.id);rows.replaceChildren();empty.textContent=players.length?'':'Waiting for players to join...';for(const p of players){const tr=document.createElement('tr');tr.className=`team${p.team}${p.connected?'':' offline'}`;const name=document.createElement('td');name.textContent=p.name+(p.awaitingRespawn?' - RESPAWN':'');if(p.awaitingRespawn)name.className='dead';const vals=[p.team,p.kills,p.hits,p.shots,pct(p)];tr.append(name,...vals.map(v=>{const td=document.createElement('td');td.textContent=v;return td}));rows.append(tr)}}async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();draw(await r.json())}catch(e){subtitle.textContent='Disconnected from laptop host.'}setTimeout(refresh,200)}refresh();</script></body></html>
             """;
 }

@@ -18,6 +18,9 @@ package com.simplecoil.simplecoil;
 
 import android.annotation.SuppressLint;
 import android.app.Service;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -30,9 +33,12 @@ import android.bluetooth.BluetoothProfile;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Binder;
+import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
+import androidx.core.app.NotificationCompat;
 
 import java.util.LinkedList;
 import java.util.Arrays;
@@ -75,6 +81,53 @@ public class BluetoothLeService extends Service {
     private String mBluetoothDeviceAddress;
     private volatile BluetoothGatt mBluetoothGatt;
     private int mConnectionState = STATE_DISCONNECTED;
+    private boolean mConnectionForeground;
+    private PowerManager.WakeLock mConnectionWakeLock;
+
+    /** A connected blaster continues delivering telemetry when another app has focus. */
+    @SuppressLint("WakelockTimeout") // Released by close()/onUnbind()/onDestroy().
+    private void keepConnectionActive() {
+        if (getBaseContext() == null) return;
+        try {
+            String channel = "gun_connection";
+            NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager != null)
+                manager.createNotificationChannel(new NotificationChannel(channel,
+                        getString(R.string.gun_connection_channel), NotificationManager.IMPORTANCE_LOW));
+            Intent open = new Intent(this, FullscreenActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+            PendingIntent returnToGame = PendingIntent.getActivity(this, weaponSlot(), open, flags);
+            startForeground(17520 + weaponSlot(), new NotificationCompat.Builder(this, channel)
+                    .setSmallIcon(R.drawable.ic_gun_connection)
+                    .setContentTitle(getString(R.string.gun_connection_title))
+                    .setContentText(getString(R.string.gun_connection_background))
+                    .setContentIntent(returnToGame).setOngoing(true).setOnlyAlertOnce(true)
+                    .setPriority(NotificationCompat.PRIORITY_LOW).build());
+            mConnectionForeground = true;
+            if (mConnectionWakeLock == null) {
+                PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+                if (power != null) {
+                    mConnectionWakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                            "SimpleCoil:GunConnection:" + weaponSlot());
+                    mConnectionWakeLock.setReferenceCounted(false);
+                }
+            }
+            if (mConnectionWakeLock != null && !mConnectionWakeLock.isHeld()) mConnectionWakeLock.acquire();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to prioritize the gun connection", e);
+        }
+    }
+
+    private void releaseConnectionPriority() {
+        if (mConnectionWakeLock != null && mConnectionWakeLock.isHeld()) mConnectionWakeLock.release();
+        mConnectionWakeLock = null;
+        if (mConnectionForeground) {
+            stopForeground(true);
+            mConnectionForeground = false;
+        }
+    }
 
     private static final int STATE_DISCONNECTED = 0;
     private static final int STATE_CONNECTING = 1;
@@ -496,10 +549,14 @@ public class BluetoothLeService extends Service {
         // Previously connected device.  Try to reconnect.
         if (address.equals(mBluetoothDeviceAddress)
                 && mBluetoothGatt != null) {
+            // Resuming an activity must not reconnect an already healthy GATT
+            // session or restart a connection/discovery still in flight.
+            if (mConnectionState == STATE_CONNECTED || mConnectionState == STATE_CONNECTING) return true;
             Log.d(TAG, "Trying to use an existing mBluetoothGatt for connection.");
             try {
                 if (mBluetoothGatt.connect()) {
                     mConnectionState = STATE_CONNECTING;
+                    keepConnectionActive();
                     return true;
                 }
                 return false;
@@ -541,6 +598,7 @@ public class BluetoothLeService extends Service {
         Log.d(TAG, "Trying to create a new connection.");
         mBluetoothDeviceAddress = address;
         mConnectionState = STATE_CONNECTING;
+        keepConnectionActive();
         return true;
     }
 
@@ -572,6 +630,7 @@ public class BluetoothLeService extends Service {
         mBluetoothGatt = null;
         mBluetoothDeviceAddress = null;
         mConnectionState = STATE_DISCONNECTED;
+        releaseConnectionPriority();
         clearPendingGattOperations();
         if (gatt != null) {
             try {

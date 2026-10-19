@@ -12,7 +12,9 @@ import java.util.Properties;
 /** Exercises Wi-Fi control without changing the computer's real connections. */
 public final class HotspotManagerTest {
     private static final String USB = "wlx-test";
+    private static final String INTERNET = "wlp-internet";
     private static final String PREVIOUS = "7051d67c-c66c-44c7-b652-fc4e83bff6d1";
+    private static final String INTERNET_UUID = "1fedc2b5-9adc-49b1-9f2a-101589c7656f";
     private static final Map<String, Object> VALUES = Map.of("ssid", "Game: Field", "password", "Test: password 123",
             "interface", USB, "channel", "6", "security", "wpa2");
 
@@ -21,6 +23,11 @@ public final class HotspotManagerTest {
         try {
             verifyLifecycle(temporary.resolve("lifecycle/hotspot.properties"));
             verifyOpenMode(temporary.resolve("open/hotspot.properties"));
+            verifyApply(temporary.resolve("apply/hotspot.properties"));
+            verifyApplyRecovery(temporary.resolve("apply-recovery/hotspot.properties"));
+            verifyApplyRecoveryFailure(temporary.resolve("apply-recovery-failure/hotspot.properties"));
+            verifyAdapterChange(temporary.resolve("adapter-change/hotspot.properties"), false);
+            verifyAdapterChange(temporary.resolve("adapter-recovery/hotspot.properties"), true);
             verifyFailureRecovery(temporary.resolve("recovery/hotspot.properties"));
             verifyUnsupportedAndValidation(temporary.resolve("validation/hotspot.properties"));
             verifyUnavailable(temporary.resolve("unavailable/hotspot.properties"));
@@ -32,6 +39,90 @@ public final class HotspotManagerTest {
                 for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(path);
             }
         }
+    }
+
+    private static void verifyApply(Path file) throws Exception {
+        FakeNetwork network = new FakeNetwork();
+        HotspotManager manager = new HotspotManager(file, network);
+        change(manager, "start", Map.of("interface", USB));
+        int before = network.commands.size();
+        change(manager, "apply", Map.of("ssid", "Recoil-Updated", "channel", "11", "security", "wpa2",
+                "password", VALUES.get("password")));
+        require(network.active && network.protectedProfile && "Recoil-Updated".equals(network.activeSsid)
+                        && "11".equals(network.activeChannel), "apply did not restart with the new settings");
+        require(!network.restored, "apply reconnected the previous client network during an AP restart");
+        List<List<String>> applied = network.commands.subList(before, network.commands.size());
+        require(applied.get(1).equals(List.of("connection", "down", "uuid", network.uuid)),
+                "apply did not stop the active hotspot before changing its profile");
+        Properties saved = readSettings(file);
+        require(PREVIOUS.equals(saved.getProperty("previousUuid")), "apply lost the original connection to restore");
+        require("Recoil-Updated".equals(saved.getProperty("ssid")), "new hotspot settings were not saved");
+        before = network.commands.size();
+        expectFailure(manager, "apply", Map.of("password", "short"), "Password");
+        network.supported = false;
+        expectFailure(manager, "apply", Map.of(), "does not support");
+        network.supported = true;
+        require(network.active && network.commands.subList(before, network.commands.size()).stream()
+                        .noneMatch(command -> command.contains("down")), "invalid settings stopped the working hotspot");
+        change(manager, "apply", Map.of("security", "open", "password", ""));
+        require(network.active && !network.protectedProfile, "apply did not remove WPA2 when selecting open Wi-Fi");
+        change(manager, "stop", Map.of());
+        require(network.restored, "stop after apply did not restore the original connection");
+    }
+
+    private static void verifyApplyRecovery(Path file) throws Exception {
+        FakeNetwork network = new FakeNetwork();
+        HotspotManager manager = new HotspotManager(file, network);
+        change(manager, "start", VALUES);
+        network.failuresRemaining = 1;
+        expectFailure(manager, "apply", Map.of("ssid", "Recoil-Failed", "security", "open", "channel", "1"),
+                "previous hotspot was restored");
+        require(!manager.isBusy() && network.active && network.protectedProfile,
+                "failed apply did not restore the working WPA2 hotspot");
+        require(VALUES.get("ssid").equals(network.activeSsid) && "6".equals(network.activeChannel),
+                "recovery activated the failed settings instead of the previous settings");
+        require(VALUES.get("ssid").equals(readSettings(file).getProperty("ssid")),
+                "failed apply overwrote the saved working settings");
+        require(!Files.exists(network.passwordFile), "apply recovery retained a password file");
+        require(!network.restored, "recovery replaced the original client connection metadata");
+        change(manager, "stop", Map.of());
+        require(network.restored, "stop after recovery lost the original connection");
+    }
+
+    private static void verifyApplyRecoveryFailure(Path file) throws Exception {
+        FakeNetwork network = new FakeNetwork();
+        HotspotManager manager = new HotspotManager(file, network);
+        change(manager, "start", VALUES);
+        network.failActivation = true;
+        expectFailure(manager, "apply", Map.of("ssid", "Recoil-Failed"),
+                "or restart the previous hotspot");
+        require(!network.active && network.restored && !manager.isBusy(),
+                "unrecoverable apply left a partial activation or failed to restore the client connection");
+    }
+
+    private static void verifyAdapterChange(Path file, boolean fail) throws Exception {
+        FakeNetwork network = new FakeNetwork();
+        HotspotManager manager = new HotspotManager(file, network);
+        change(manager, "start", Map.of("interface", USB));
+        if (fail) {
+            network.failuresRemaining = 1;
+            expectFailure(manager, "apply", Map.of("interface", INTERNET), "previous hotspot was restored");
+            require(network.active && USB.equals(network.activeInterface), "failed adapter change lost the old AP");
+            require(network.restoredInterfaces.contains(INTERNET), "failed adapter change lost the target's internet connection");
+        } else {
+            change(manager, "apply", Map.of("interface", INTERNET));
+            require(network.active && INTERNET.equals(network.activeInterface), "apply did not move the hotspot to the selected adapter");
+            require(network.restoredInterfaces.equals(List.of(USB)), "changing adapters did not restore the old adapter's connection");
+            require(INTERNET_UUID.equals(readSettings(file).getProperty("previousUuid")), "new adapter's previous connection was lost");
+            change(manager, "stop", Map.of());
+            require(network.restoredInterfaces.contains(INTERNET), "stop did not restore the new adapter's previous connection");
+        }
+    }
+
+    private static Properties readSettings(Path file) throws IOException {
+        Properties saved = new Properties();
+        try (var reader = Files.newBufferedReader(file)) { saved.load(reader); }
+        return saved;
     }
 
     private static void verifyOpenMode(Path file) throws Exception {
@@ -50,9 +141,11 @@ public final class HotspotManagerTest {
         change(manager, "stop", Map.of());
         change(manager, "start", Map.of("security", "open", "password", ""));
         require(network.active && !network.protectedProfile, "switching to open left WPA2 protection behind");
-        require(network.commands.stream().anyMatch(command -> command.contains("remove")
-                        && command.contains("802-11-wireless-security")),
-                "switching to open did not remove the previous security setting");
+        require(network.commands.stream().anyMatch(command -> command.contains("delete")),
+                "switching to open did not replace the previous protected profile");
+        require(network.commands.stream().filter(command -> command.contains("add"))
+                        .allMatch(command -> command.contains("save") && "no".equals(command.get(command.indexOf("save") + 1))),
+                "hotspot profiles were persisted through Netplan instead of the app's private settings");
         change(manager, "stop", Map.of());
         HotspotManager reopened = new HotspotManager(file, network);
         require("open".equals(reopened.status().get("security")), "open selection was not saved");
@@ -89,7 +182,7 @@ public final class HotspotManagerTest {
         change(manager, "start", VALUES);
         require(network.commands.subList(count, network.commands.size()).stream()
                         .noneMatch(command -> command.contains("up")), "starting an active AP restarted it");
-        expectFailure(manager, "save", VALUES, "Stop the hotspot");
+        expectFailure(manager, "save", VALUES, "Use Apply changes");
         HotspotManager reopened = new HotspotManager(file, network);
         require(Boolean.TRUE.equals(reopened.status().get("active")), "restart lost ownership of the AP");
         change(reopened, "stop", Map.of());
@@ -162,32 +255,40 @@ public final class HotspotManagerTest {
 
     private static final class FakeNetwork implements HotspotManager.CommandRunner {
         final List<List<String>> commands = new ArrayList<>();
+        final List<String> restoredInterfaces = new ArrayList<>();
         boolean supported = true, active, exists, restored, cancelled, failActivation, protectedProfile;
         boolean passwordWasPrivate, passwordWasCorrect;
+        int failuresRemaining;
+        String activeInterface = USB, profileSsid, activeSsid, profileChannel, activeChannel;
         String uuid;
         Path passwordFile;
 
         @Override public HotspotManager.Result run(List<String> arguments) throws IOException {
             commands.add(List.copyOf(arguments));
             if (arguments.contains("device")) {
-                return ok("GENERAL.DEVICE:wlp-internet\nGENERAL.TYPE:wifi\nGENERAL.PRODUCT:Intel\n"
-                        + "GENERAL.CONNECTION:Internet\nGENERAL.CON-UUID:other-connection\nWIFI-PROPERTIES.AP:yes\n"
-                        + "GENERAL.DEVICE:" + USB + "\nGENERAL.TYPE:wifi\nGENERAL.PRODUCT:TP-Link\\: USB\n"
-                        + "GENERAL.CONNECTION:" + (active ? "SimpleCoil Hotspot" : "Previous") + "\n"
-                        + "GENERAL.CON-UUID:" + (active ? uuid : PREVIOUS) + "\nWIFI-PROPERTIES.AP:"
-                        + (supported ? "yes" : "no") + "\nIP4.ADDRESS[1]:" + (active ? "10.42.0.1" : "192.168.1.20") + "/24\n");
+                return ok(device(INTERNET, "Intel", INTERNET_UUID, true)
+                        + device(USB, "TP-Link\\: USB", PREVIOUS, supported));
             }
             if (arguments.contains("UUID")) return ok(exists ? uuid + "\n" : "");
             if (arguments.contains("connection.id")) return ok("SimpleCoil Hotspot\n");
             if (arguments.contains("add")) {
                 uuid = arguments.get(arguments.indexOf("connection.uuid") + 1);
                 exists = true;
+                protectedProfile = false;
             }
+            if (arguments.contains("delete")) { exists = false; protectedProfile = false; }
             if (arguments.contains("802-11-wireless-security.key-mgmt")) protectedProfile = true;
             if (arguments.contains("remove") && arguments.contains("802-11-wireless-security")) protectedProfile = false;
+            if (arguments.contains("802-11-wireless.ssid")) profileSsid = arguments.get(arguments.indexOf("802-11-wireless.ssid") + 1);
+            if (arguments.contains("802-11-wireless.channel")) profileChannel = arguments.get(arguments.indexOf("802-11-wireless.channel") + 1);
             if (arguments.contains("up")) {
                 String target = arguments.get(arguments.indexOf("uuid") + 1);
-                if (PREVIOUS.equals(target)) { restored = true; active = false; }
+                String device = arguments.get(arguments.indexOf("ifname") + 1);
+                if (PREVIOUS.equals(target) || INTERNET_UUID.equals(target)) {
+                    if (PREVIOUS.equals(target)) restored = true;
+                    restoredInterfaces.add(device);
+                    if (device.equals(activeInterface)) active = false;
+                }
                 else {
                     if (arguments.contains("passwd-file")) {
                         passwordFile = Path.of(arguments.get(arguments.indexOf("passwd-file") + 1));
@@ -197,11 +298,22 @@ public final class HotspotManagerTest {
                                 .equals("802-11-wireless-security.psk:" + VALUES.get("password") + "\n");
                     } else require(!protectedProfile, "protected profile was activated without credentials");
                     active = true;
-                    if (failActivation) return new HotspotManager.Result(4, "activation failed");
+                    activeInterface = device;
+                    activeSsid = profileSsid;
+                    activeChannel = profileChannel;
+                    if (failActivation || failuresRemaining-- > 0) return new HotspotManager.Result(4, "activation failed");
                 }
             }
             if (arguments.contains("down")) { active = false; cancelled = true; }
             return ok("");
+        }
+
+        private String device(String name, String label, String previous, boolean apSupported) {
+            boolean hosting = active && name.equals(activeInterface);
+            return "GENERAL.DEVICE:" + name + "\nGENERAL.TYPE:wifi\nGENERAL.PRODUCT:" + label + "\n"
+                    + "GENERAL.CONNECTION:" + (hosting ? "SimpleCoil Hotspot" : "Previous") + "\n"
+                    + "GENERAL.CON-UUID:" + (hosting ? uuid : previous) + "\nWIFI-PROPERTIES.AP:"
+                    + (apSupported ? "yes" : "no") + "\nIP4.ADDRESS[1]:" + (hosting ? "10.42.0.1" : "192.168.1.20") + "/24\n";
         }
 
         private HotspotManager.Result ok(String output) { return new HotspotManager.Result(0, output); }

@@ -225,6 +225,36 @@ public class TcpServer extends Service {
     private long mEndVotes;
     private volatile long mClockSamplingUntil;
     private ServerSocket mListenSocket;
+    private final java.util.concurrent.ArrayBlockingQueue<Socket> mRelaySockets = new java.util.concurrent.ArrayBlockingQueue<>(32);
+    private final java.util.Map<java.util.UUID, com.simplecoil.protocol.RelayConfig.Member> mRelayMembers = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.UUID mRelayKey = java.util.UUID.randomUUID();
+    public boolean acceptRelaySocket(Socket socket, int port) {
+        return port == TCP_SERVER_PORT && keepListening && mTcpServerReady && !mDestroyed && mRelaySockets.offer(socket);
+    }
+    private void relayCapabilities(ClientData client, JSONObject data) {
+        if (client == null || client.clientSocket == null || client.mPlayerID <= 0) return;
+        try {
+            java.util.UUID node = com.simplecoil.protocol.RelayConfig.uuid(data.optString("relaynode", ""));
+            InetAddress address = client.clientSocket.getInetAddress();
+            for (java.util.Map.Entry<java.util.UUID, com.simplecoil.protocol.RelayConfig.Member> entry : mRelayMembers.entrySet())
+                if (!entry.getKey().equals(node) && entry.getValue().address.equals(address))
+                    mRelayMembers.remove(entry.getKey(), entry.getValue());
+            mRelayMembers.put(node, new com.simplecoil.protocol.RelayConfig.Member(node,
+                    address, data.optString("relayp2p", ""), data.optString("relaybt", "")));
+        } catch (IllegalArgumentException ignored) { }
+    }
+    private String relayConfiguration() {
+        if (getBaseContext() == null) return null;
+        try {
+            java.util.UUID self = com.simplecoil.protocol.RelayConfig.uuid(GameRelayService.node(this));
+            com.simplecoil.protocol.RelayConfig.Member previous = mRelayMembers.get(self);
+            InetAddress local = previous == null ? Globals.getIPAddress(this) : previous.address;
+            if (local == null) return null;
+            mRelayMembers.put(self, new com.simplecoil.protocol.RelayConfig.Member(self, local, GameRelayService.p2p(), GameRelayService.bluetoothAddress()));
+            com.simplecoil.protocol.RelayConfig config = new com.simplecoil.protocol.RelayConfig(mRelayKey, self, self, mRelayMembers);
+            GameRelayService.configure(this, config);return config.encode();
+        } catch (IllegalArgumentException ignored) { return null; }
+    }
     private volatile Thread mServerThread = null;
     private volatile Thread mClientThread = null;
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
@@ -276,6 +306,7 @@ public class TcpServer extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        GameRelayService.register(this);
         ContextCompat.registerReceiver(this, mGpsOriginReceiver,
                 new IntentFilter(NetMsg.NETMSG_GPSLOCUPDATE), ContextCompat.RECEIVER_NOT_EXPORTED);
         mGpsOriginReceiverRegistered = true;
@@ -346,6 +377,8 @@ public class TcpServer extends Service {
 
     @Override
     public void onDestroy() {
+        GameRelayService.unregister(this);
+        Socket relayPending;while ((relayPending = mRelaySockets.poll()) != null) closeSocket(relayPending);
         synchronized (mServerStateLock) {
             mDestroyed = true;
             stopGPSDataLocked();
@@ -1741,6 +1774,8 @@ public class TcpServer extends Service {
             if (liveRoster != null && liveRoster.token.equals(mRoundToken))
                 game.put(LiveJoin.ROSTER, liveRoster.encode());
             game.put(JSON_PLAYERS, players);
+            String relayConfig = relayConfiguration();
+            if (relayConfig != null) game.put(com.simplecoil.protocol.RelayConfig.WIRE, relayConfig);
             GpsWire.putOrigin(game, Globals.getInstance().mGpsOffset);
             game.put(JSON_LOBBY_PLAYING, mStartAnnounced
                     || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE);
@@ -2588,12 +2623,14 @@ public class TcpServer extends Service {
                 mTcpServerReady = true;
                 startupReady = true;
             }
+            relayConfiguration();
             sendBroadcast(new Intent(NetMsg.NETMSG_TCPSERVERREADY));
             Log.d(TAG, "TCP Server listening");
             while (keepListening) {
                 try {
                     // Wait for new clients
-                    pendingSocket = ss.accept();
+                    pendingSocket = mRelaySockets.poll();
+                    if (pendingSocket == null) pendingSocket = ss.accept();
                     if (!keepListening)
                         break;
                     ClientData client = new ClientData();
@@ -3192,6 +3229,8 @@ public class TcpServer extends Service {
                 return;
             }
             if (player.has(JSON_LOBBY_READY) && !player.has(JSON_PLAYERNAME)) {
+                relayCapabilities(client, player);
+                if (player.has(com.simplecoil.protocol.RelayConfig.NODE)) sendAllGameInfo(SEND_ALL);
                 if (client.mPlayerID > 0 && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                         && !mStartingGame && !mStartAnnounced) {
                     Object value = player.opt(JSON_LOBBY_READY);
@@ -3623,6 +3662,7 @@ public class TcpServer extends Service {
             if (rejoin && newRegistration)
                 Log.d(TAG, "rejoined client " + client.clientID + " not present so adding as a new player");
             client.mPlayerID = id;
+            relayCapabilities(client, player);
             client.lobbyReady = player.optBoolean(JSON_LOBBY_READY, true);
             if (newRegistration && requestedTeam == 0)
                 client.lobbyBenched = player.optBoolean(JSON_LOBBY_BENCHED, false);

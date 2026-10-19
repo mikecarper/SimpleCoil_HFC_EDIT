@@ -19,6 +19,8 @@ package com.simplecoil.simplecoil;
 // Network message globals
 
 public class NetMsg {
+    public static final String NETMSG_PLAYERTRANSFERRED = "com.simplecoil.simplecoil.PLAYERTRANSFERRED";
+    public static final String NETMSG_BATTERYREQUEST = "com.simplecoil.simplecoil.BATTERYREQUEST";
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
     // Protocol 30 adds host-authorized, life-scoped power-up grants over TCP.
     public static final int NETWORK_VERSION_NUMBER = 30;

@@ -64,6 +64,24 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class UDPListenerService extends Service {
     private static final String TAG = "UDPSvc";
+    private final Object relayReceiveLock = new Object();
+    public void receiveRelayedDatagram(InetAddress source, byte[] payload) {
+        if (keepListening && !mDestroyed) dispatchDatagram(source, payload, 0, payload.length);
+    }
+    private void dispatchDatagram(InetAddress source, byte[] payload, int offset, int length) {
+        synchronized (relayReceiveLock) {
+            if (CombatPacket.looksLikeCombat(payload, offset, length)) processCombatPacket(source, payload, offset, length);
+            else if (PeerStatePacket.looksLikePeerState(payload, offset, length)) processPeerStatePacket(source, payload, offset, length);
+            else processMessage(source, new String(payload, offset, length, StandardCharsets.UTF_8));
+        }
+    }
+    private void sendGamePacket(DatagramSocket socket, DatagramPacket packet) throws IOException {
+        boolean relayed = GameRelayService.mirror(packet.getAddress(), packet.getPort(),
+                Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength()));
+        try { socket.send(packet); }
+        catch (IOException failure) { if (!relayed) throw failure; }
+    }
+
 
     private static final Integer LISTEN_PORT = 17500;
     private static final Integer LISTEN_TIMEOUT_MS = 1000;
@@ -404,19 +422,7 @@ public class UDPListenerService extends Service {
                 try {
                     packet.setLength(recvBuf.length);
                     socket.receive(packet);
-                    if (CombatPacket.looksLikeCombat(packet.getData(), packet.getOffset(),
-                            packet.getLength())) {
-                        processCombatPacket(packet.getAddress(), packet.getData(),
-                                packet.getOffset(), packet.getLength());
-                    } else if (PeerStatePacket.looksLikePeerState(packet.getData(), packet.getOffset(),
-                            packet.getLength())) {
-                        processPeerStatePacket(packet.getAddress(), packet.getData(),
-                                packet.getOffset(), packet.getLength());
-                    } else {
-                        String message = new String(packet.getData(), packet.getOffset(),
-                                packet.getLength(), StandardCharsets.UTF_8);
-                        processMessage(packet.getAddress(), message);
-                    }
+                    dispatchDatagram(packet.getAddress(), packet.getData(), packet.getOffset(), packet.getLength());
                 } catch (SocketTimeoutException e) {
                     // do nothing
                 } catch (RuntimeException e) {
@@ -759,7 +765,7 @@ public class UDPListenerService extends Service {
         if (socket == null || socket.isClosed() || acknowledgement == null || destination == null)
             return;
         try {
-            socket.send(new DatagramPacket(acknowledgement, acknowledgement.length,
+            sendGamePacket(socket, new DatagramPacket(acknowledgement, acknowledgement.length,
                     destination, LISTEN_PORT));
         } catch (IOException e) {
             // The sender's 20/60 ms retry schedule is the recovery path. Avoid
@@ -1285,7 +1291,7 @@ public class UDPListenerService extends Service {
                 try (DatagramSocket socket = new DatagramSocket()) {
                     if (mDestroyed) return;
                     byte[] payload = (NetMsg.MESSAGE_PREFIX + message).getBytes(StandardCharsets.UTF_8);
-                    socket.send(new DatagramPacket(payload, payload.length, destination, LISTEN_PORT));
+                    sendGamePacket(socket, new DatagramPacket(payload, payload.length, destination, LISTEN_PORT));
                 } catch (IOException e) {
                     Log.d(TAG, "Round-end receipt will retry", e);
                 } finally { mQueuedCombatSends.decrementAndGet(); }
@@ -2249,7 +2255,7 @@ public class UDPListenerService extends Service {
                     try {
                         packet.setAddress(recipient);
                         packet.setPort(LISTEN_PORT);
-                        socket.send(packet);
+                        sendGamePacket(socket, packet);
                     } catch (IOException e) {
                         // Targeted events have 20/60 ms retries. Logging at debug
                         // avoids a UI/error allocation in the combat path.
@@ -3609,7 +3615,7 @@ public class UDPListenerService extends Service {
                 Log.d(TAG, "sending UDP packet to " + ip + ":" + port);
             packet.setAddress(ip);
             packet.setPort(port);
-            getSendSocketLocked().send(packet);
+            sendGamePacket(getSendSocketLocked(), packet);
         } catch (SocketException e) {
             closeSendSocketLocked();
             Log.e(TAG, "Socket Error:", e);
@@ -3658,6 +3664,7 @@ public class UDPListenerService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        GameRelayService.register(this);
         // Avoid paying thread-start latency on the first hit of a round.
         mCombatExecutor.prestartCoreThread();
         IntentFilter serviceEvents = new IntentFilter(NetMsg.NETMSG_STARTGAME);
@@ -3669,6 +3676,7 @@ public class UDPListenerService extends Service {
 
     @Override
     public void onDestroy() {
+        GameRelayService.unregister(this);
         mMainHandler.removeCallbacks(mRoundEndRetry);
         synchronized (mListenerStateLock) {
             mDestroyed = true;

@@ -50,6 +50,12 @@ public class GlobalsTest {
                 Globals.respawnWaitSeconds(false, false, Globals.GAME_MODE_FFA, Long.MAX_VALUE));
     }
 
+    @Test public void laptopCustomRulesUseTheEditedRespawnTimeForTeamGames() {
+        assertEquals(42L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_2TEAMS, 42, true));
+        assertEquals(24L, Globals.respawnWaitSeconds(true, true, Globals.GAME_MODE_2TEAMS, 42, true));
+        assertEquals(180L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_2TEAMS, 42, false));
+    }
+
     @Test public void defaultGameLengthIsFiveMinutes() {
         assertEquals(5, FullscreenActivity.DEFAULT_TIME_LIMIT_MINUTES);
     }
