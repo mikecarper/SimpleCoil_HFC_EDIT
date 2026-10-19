@@ -56,6 +56,7 @@ import java.util.Deque;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -64,9 +65,12 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -187,13 +191,16 @@ public final class LaptopHost {
     private final Set<Integer> gpsVisibilityRefreshPlayers = new HashSet<>();
     private final HotspotManager hotspot = new HotspotManager();
     private final AtomicInteger nextClientID = new AtomicInteger();
+    private final Set<ClientConnection> allClients = ConcurrentHashMap.newKeySet();
     private final UUID relayKey = UUID.randomUUID(), relayNode = UUID.randomUUID();
     private volatile com.simplecoil.protocol.RelayMesh relayMesh;
     private volatile com.simplecoil.protocol.RelayConfig relayConfig;
     private InetAddress relayAddress;
 
     private void acceptGameSocket(Socket socket) throws IOException {
-        socket.setTcpNoDelay(true);socket.setKeepAlive(true);
+        // Native sockets and relay streams use the same heartbeat policy. A
+        // transport read timeout must not silently override the 35-second grace.
+        socket.setSoTimeout(0);socket.setTcpNoDelay(true);socket.setKeepAlive(true);
         clientExecutor.execute(new ClientConnection(socket, nextClientID.incrementAndGet()));
     }
     private void relayCapabilities(Player player, Map<String, Object> json) {
@@ -210,7 +217,7 @@ public final class LaptopHost {
         Set<InetAddress> addresses = new HashSet<>();addresses.add(relayAddress);
         List<Player> candidates = new ArrayList<>(players.values());
         candidates.sort(java.util.Comparator.comparing((Player player) -> !player.connected));
-        for (Player player : candidates) if (player.relayNode != null && player.address != null
+        for (Player player : candidates) if (player.relayNode != null && !members.containsKey(player.relayNode) && player.address != null
                 && addresses.add(player.address))
             members.put(player.relayNode, new com.simplecoil.protocol.RelayConfig.Member(player.relayNode, player.address, "", player.relayBluetooth));
         // Retain admitted relay membership across lobby disconnects and seat
@@ -414,12 +421,10 @@ public final class LaptopHost {
         if (tileServer != null)
             tileServer.stop(0);
 
-        List<ClientConnection> clients;
         synchronized (stateLock) {
-            clients = new ArrayList<>(activeClients.values());
             activeClients.clear();
         }
-        for (ClientConnection client : clients)
+        for (ClientConnection client : new ArrayList<>(allClients))
             client.close();
         scheduler.shutdownNow();
         clientExecutor.shutdownNow();
@@ -830,8 +835,7 @@ public final class LaptopHost {
         } else if (frame.startsWith(TCP_MESSAGE_PREFIX)) {
             handleMessage(client, frame.substring(TCP_MESSAGE_PREFIX.length()));
         } else if (frame.startsWith(MESSAGE_PREFIX)) {
-            client.send(MSG_VERSION_ERROR);
-            client.close();
+            client.sendAndClose(MSG_VERSION_ERROR);
         }
     }
 
@@ -920,7 +924,7 @@ public final class LaptopHost {
                     reply.put(JSON_GPS_CLOCK, gpsTime);
                 client.clockSamples = Math.min(CLOCK_SAMPLES_REQUIRED, client.clockSamples + 1);
             }
-            client.send(jsonFrame(reply));
+            client.sendClockReply(reply);
         } else if (Boolean.TRUE.equals(json.get("clockready"))
                 && client.clockSamples >= CLOCK_SAMPLES_REQUIRED) {
             boolean changed = !client.clockReady;
@@ -1274,7 +1278,7 @@ public final class LaptopHost {
         if (priorKills < 0 || priorKills > 100_000 || priorDeaths < 0 || priorDeaths > 100_000)
             return;
 
-        ClientConnection replaced = null;
+        List<ClientConnection> replaced = new ArrayList<>();
         boolean accepted = false;
         synchronized (stateLock) {
             PlayerDirectory.Profile profile = playerDirectory.forDevice(deviceIdentity, name);
@@ -1299,7 +1303,7 @@ public final class LaptopHost {
                 }
                 requestedID = joined.id;
                 Player old = players.get(requestedID);
-                if (old != null && old.connection != null) replaced = old.connection;
+                if (old != null && old.connection != null) replaced.add(old.connection);
                 if (old == null || !old.identity.equals(identity))
                     powerupAuthority.resetPlayer(requestedID);
                 players.remove(requestedID);
@@ -1359,10 +1363,11 @@ public final class LaptopHost {
                     client.close();
                     return;
                 }
-                replaced = existing.connection;
+                replaced.add(existing.connection);
             }
             for (Player player : players.values()) {
-                if (player.id != requestedID && player.connected && client.address().equals(player.address)) {
+                if (player.id != requestedID && player.connected && client.address().equals(player.address)
+                        && !player.identity.equals(identity)) {
                     client.close();
                     return;
                 }
@@ -1372,6 +1377,10 @@ public final class LaptopHost {
                 client.close();
                 return;
             }
+            // Discovery knows an endpoint before TCP proves its saved identity.
+            // A changed phone address can therefore receive a different seat.
+            // Once admitted, retire every older seat for that same person.
+            boolean movedSeat = retireOtherIdentitySeatsLocked(identity, requestedID, replaced);
             if (existing == null) {
                 existing = new Player(requestedID, name, client.address(), defaultSettings(requestedID));
                 players.put(requestedID, existing);
@@ -1402,16 +1411,41 @@ public final class LaptopHost {
             client.playerID = requestedID;
             client.eventControlVersion = intValue(json.get(EventMode.CAPABILITY), 0);
             activeClients.put(requestedID, client);
-            if (roundState == RoundState.LOBBY && replaced == null) invalidateTeamAssignmentsLocked();
+            if (roundState == RoundState.LOBBY && (replaced.isEmpty() || movedSeat)) invalidateTeamAssignmentsLocked();
             accepted = true;
             savePlayerDirectoryLocked();
         }
-        if (replaced != null && replaced != client)
-            replaced.close();
+        for (ClientConnection previous : replaced)
+            if (previous != client) previous.close();
         if (accepted) {
             broadcastRoster();
             broadcastGrenadePairings();
         }
+    }
+
+    /** Caller holds stateLock and has validated the new registration. */
+    private boolean retireOtherIdentitySeatsLocked(String identity, int keepID, List<ClientConnection> replaced) {
+        boolean removed = false;
+        Iterator<Player> iterator = players.values().iterator();
+        while (iterator.hasNext()) {
+            Player previous = iterator.next();
+            if (previous.id == keepID || !previous.identity.equals(identity)) continue;
+            recordPlayerProfileLocked(previous);
+            if (previous.connection != null) replaced.add(previous.connection);
+            iterator.remove();
+            activeClients.remove(previous.id);
+            grenadeOwners.entrySet().removeIf(entry -> entry.getValue() == previous.id);
+            pendingAssignments.entrySet().removeIf(entry -> entry.getValue().playerID == previous.id);
+            clearEnemyGpsRevealsForPlayerLocked(previous.id);
+            endVotes &= ~(1L << (previous.id - 1));
+            powerupAuthority.resetPlayer(previous.id);
+            gossipState[previous.id] = null;
+            gossipStateReceivedAt[previous.id] = 0;
+            lastGossipPacketSequence[previous.id] = observedCombatSequence[previous.id] = 0;
+            observedCombatType[previous.id] = observedCombatTarget[previous.id] = 0;
+            removed = true;
+        }
+        return removed;
     }
 
     private void handleMessage(ClientConnection client, String message) {
@@ -1771,10 +1805,8 @@ public final class LaptopHost {
             savePlayerDirectoryLocked();
         }
         System.out.println("Game finished: " + reason);
-        for (ClientConnection client : recipients) {
-            client.send(messageFrame(MSG_END_GAME));
-            client.close();
-        }
+        for (ClientConnection client : recipients)
+            client.sendAndClose(messageFrame(MSG_END_GAME));
     }
 
     private boolean grantRespawn(int playerID) {
@@ -1897,8 +1929,11 @@ public final class LaptopHost {
                     stale.add(client);
             }
         }
-        for (ClientConnection client : stale)
+        for (ClientConnection client : stale) {
+            if (client.socket instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket)
+                System.err.println("Game relay client " + client.clientID + " heartbeat timed out");
             client.close();
+        }
     }
 
     /** Caller holds stateLock. */
@@ -2630,7 +2665,14 @@ public final class LaptopHost {
         private final int clientID;
         private final DataInputStream input;
         private final DataOutputStream output;
-        private final Object outputLock = new Object();
+        private final Object outboundLock = new Object();
+        private final Deque<OutboundFrame> outbound = new ArrayDeque<>();
+        private static final int MAX_OUTBOUND_FRAMES = 128;
+        private static final int MAX_OUTBOUND_BYTES = 256 * 1024;
+        private static final long FINAL_WRITE_TIMEOUT_MS = 5_000;
+        private int outboundBytes, outboundFrames;
+        private boolean writerActive, outboundClosing;
+        private ScheduledFuture<?> finalWriteTimeout;
         private volatile boolean closed;
         private volatile boolean left;
         private volatile int playerID;
@@ -2648,6 +2690,8 @@ public final class LaptopHost {
             input = new DataInputStream(socket.getInputStream());
             output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             lastReceivedAt = elapsedMillis();
+            allClients.add(this);
+            if (stopping) close();
         }
 
         InetAddress address() {
@@ -2659,9 +2703,11 @@ public final class LaptopHost {
             try {
                 while (!closed && !stopping)
                     handleFrame(this, input.readUTF());
-            } catch (IOException ignored) {
+            } catch (IOException failure) {
                 // A phone leaving Wi-Fi or using Leave Game is an ordinary
                 // disconnect; the roster update below is the useful result.
+                if (!closed && !stopping && socket instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket)
+                    System.err.println("Game relay client " + clientID + " read ended: " + failure.getClass().getSimpleName());
             } finally {
                 close();
                 disconnect(this);
@@ -2669,31 +2715,112 @@ public final class LaptopHost {
         }
 
         boolean send(String message) {
-            if (message == null || closed)
-                return false;
-            synchronized (outputLock) {
-                if (closed)
-                    return false;
-                try {
-                    output.writeUTF(message);
-                    output.flush();
-                    return true;
-                } catch (IOException e) {
-                    close();
-                    return false;
+            return enqueue(message, null, false);
+        }
+
+        boolean sendClockReply(Map<String, Object> reply) {
+            Map<String, Object> snapshot = new LinkedHashMap<>(reply);
+            // Reserve the longest possible timestamp; assign the actual value
+            // only when this reply reaches the writer, after earlier frames.
+            snapshot.put("clocksend", Long.MAX_VALUE);
+            return enqueue(jsonFrame(snapshot), snapshot, false);
+        }
+
+        boolean sendAndClose(String message) {
+            return enqueue(message, null, true);
+        }
+
+        /** A slow phone must never hold up scheduler, dashboard, or state-lock work. */
+        private boolean enqueue(String message, Map<String, Object> clockReply, boolean closeAfter) {
+            if (message == null || closed) return false;
+            int bytes = utfFrameBytes(message);
+            boolean startWriter = false, failed = bytes < 0;
+            synchronized (outboundLock) {
+                if (closed || outboundClosing) return false;
+                if (failed || outboundFrames >= MAX_OUTBOUND_FRAMES
+                        || bytes > MAX_OUTBOUND_BYTES - outboundBytes) failed = true;
+                else {
+                    outbound.addLast(new OutboundFrame(message, clockReply, bytes, closeAfter));
+                    outboundBytes += bytes;outboundFrames++;
+                    if (closeAfter) {
+                        outboundClosing = true;
+                        try {
+                            finalWriteTimeout = scheduler.schedule(this::close,
+                                    FINAL_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                        } catch (RejectedExecutionException stopped) { failed = true; }
+                    }
+                    if (!writerActive) { writerActive = true;startWriter = true; }
                 }
+            }
+            if (failed) { close();return false; }
+            if (startWriter) {
+                try { clientExecutor.execute(this::drainOutbound); }
+                catch (RejectedExecutionException stopped) { close();return false; }
+            }
+            return true;
+        }
+
+        private void drainOutbound() {
+            while (true) {
+                OutboundFrame frame;
+                synchronized (outboundLock) {
+                    if (closed || (frame = outbound.pollFirst()) == null) {
+                        writerActive = false;return;
+                    }
+                }
+                try {
+                    String message = frame.message;
+                    if (frame.clockReply != null) {
+                        frame.clockReply.put("clocksend", elapsedMillis());
+                        message = jsonFrame(frame.clockReply);
+                    }
+                    output.writeUTF(message);output.flush();
+                } catch (IOException failure) {
+                    if (!closed && !stopping && socket instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket)
+                        System.err.println("Game relay client " + clientID + " write failed: " + failure.getClass().getSimpleName());
+                    close();return;
+                }
+                synchronized (outboundLock) {
+                    if (!closed) { outboundBytes -= frame.bytes;outboundFrames--; }
+                }
+                if (frame.closeAfter) { close();return; }
             }
         }
 
         void close() {
-            if (closed)
-                return;
-            closed = true;
+            synchronized (outboundLock) {
+                if (closed) return;
+                closed = true;
+                outbound.clear();outboundBytes = outboundFrames = 0;
+                if (finalWriteTimeout != null) finalWriteTimeout.cancel(false);
+            }
+            allClients.remove(this);
             try {
                 socket.close();
             } catch (IOException ignored) {
             }
         }
+    }
+
+    private static final class OutboundFrame {
+        final String message;
+        final Map<String, Object> clockReply;
+        final int bytes;
+        final boolean closeAfter;
+        OutboundFrame(String message, Map<String, Object> clockReply, int bytes, boolean closeAfter) {
+            this.message = message;this.clockReply = clockReply;this.bytes = bytes;this.closeAfter = closeAfter;
+        }
+    }
+
+    /** DataOutputStream.writeUTF uses modified UTF-8, including a two-byte length. */
+    private static int utfFrameBytes(String message) {
+        int bytes = 0;
+        for (int index = 0; index < message.length(); index++) {
+            int value = message.charAt(index);
+            bytes += value >= 1 && value <= 127 ? 1 : value <= 2047 ? 2 : 3;
+            if (bytes > 65535) return -1;
+        }
+        return bytes + 2;
     }
 
     private enum RoundState {
@@ -3550,8 +3677,7 @@ public final class LaptopHost {
             }
         }
         if (previous != null) {
-            previous.send(jsonFrame(mapOf(EventMode.TRANSFERRED_OUT, true)));
-            previous.close();
+            previous.sendAndClose(jsonFrame(mapOf(EventMode.TRANSFERRED_OUT, true)));
         }
         broadcastRoster();
         sendJson(exchange, 200, mapOf("ok", true, "message", "Player moved to the replacement phone. The original phone is unassigned.",

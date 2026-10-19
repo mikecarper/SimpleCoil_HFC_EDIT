@@ -80,6 +80,10 @@ public class TcpClient extends Service {
     private static final int MAX_REJOIN_TRIES = 3;
     private static final int CONNECTION_TIMEOUT_MS = 1000;
     private static final int RECONNECT_RETRY_DELAY_MS = 1000;
+    // A Bluetooth bridge can temporarily buffer traffic while its radio also
+    // services the gun. Preserve the virtual stream through that delay; native
+    // Wi-Fi keeps its existing faster failure detection.
+    private static final int RELAY_SERVER_IDLE_TIMEOUT_MS = 15000;
     private static final int SHUTDOWN_FLUSH_TIMEOUT_MS = 1000;
     // A disconnected player can retain elimination reports until it rejoins.
     // Keep that recovery buffer finite on memory-constrained game phones.
@@ -112,12 +116,16 @@ public class TcpClient extends Service {
     // session to the replacement host.
     private boolean mRestartAfterHostTakeover;
     private InetAddress mSessionServerAddress;
+    // Registration binds a player seat just as it binds a host. A delayed gun
+    // status packet must not change the actor used by this TCP relationship.
+    private byte mSessionPlayerID;
     private boolean mReceiverRegistered;
     private Socket mActiveSocket;
     private Thread mClientThread;
     private Intent mPendingTerminalEvent;
     private final GameClock mGameClock = new GameClock();
     private boolean mClockSynchronized;
+    private boolean mRelayClockConnection;
     private boolean mClockRequestQueued;
     private long mPendingClockRequest = -1;
     private long mLastClockSync;
@@ -126,9 +134,12 @@ public class TcpClient extends Service {
     private Intent mPendingStartIntent;
     private Intent mPendingGameStartEvent;
     private static final long CLOCK_REFRESH_MS = 30000;
-    // Samples delayed beyond 80 ms are unusable, so do not spend five seconds
+    // Native Wi-Fi samples above 80 ms are unusable; do not spend five seconds
     // waiting for a lost probe before trying again on a recovering Wi-Fi link.
     private static final long CLOCK_REQUEST_TIMEOUT_MS = 500;
+    // Let a valid 800 ms relay sample return before replacing its request.
+    // Native Wi-Fi keeps its existing quicker lost-probe recovery.
+    private static final long RELAY_CLOCK_REQUEST_TIMEOUT_MS = 2000;
     // Once a shared countdown has been announced, take one inexpensive probe
     // per second.  The probe only improves an already-good NTP estimate; it
     // never delays the countdown or floods the dedicated host with a new
@@ -378,6 +389,7 @@ public class TcpClient extends Service {
         mLastServerTrafficAt = 0;
         mGameClock.reset();
         mClockSynchronized = false;
+        mRelayClockConnection = false;
         mClockRequestQueued = false;
         mPendingClockRequest = -1;
         mLastClockSync = 0;
@@ -421,7 +433,8 @@ public class TcpClient extends Service {
         if (mDestroyed || !keepListening || out == null || sendExecutor.isShutdown() || mClockRequestQueued)
             return;
         long now = SystemClock.elapsedRealtime();
-        if (mPendingClockRequest >= 0 && now - mPendingClockRequest < CLOCK_REQUEST_TIMEOUT_MS)
+        long requestTimeout = mRelayClockConnection ? RELAY_CLOCK_REQUEST_TIMEOUT_MS : CLOCK_REQUEST_TIMEOUT_MS;
+        if (mPendingClockRequest >= 0 && now - mPendingClockRequest < requestTimeout)
             return;
         if (mGameClock.samples() >= GameClock.SAMPLES_PER_SYNC) {
             boolean countdownActive = hasActiveStartCountdownLocked(now);
@@ -481,7 +494,10 @@ public class TcpClient extends Service {
             if (!isCurrentSession(generation) || sentAt != mPendingClockRequest || sentAt < 0)
                 return;
             mPendingClockRequest = -1;
-            if (!mGameClock.record(sentAt, hostReceived, hostSent, receivedAt)) {
+            boolean accepted = mRelayClockConnection
+                    ? mGameClock.recordRelay(sentAt, hostReceived, hostSent, receivedAt)
+                    : mGameClock.record(sentAt, hostReceived, hostSent, receivedAt);
+            if (!accepted) {
                 // A follow-up probe can be rejected for excessive delay.  Keep
                 // the last good estimate, but do not immediately retry in a
                 // tight loop while a busy Wi-Fi link is recovering.
@@ -672,6 +688,7 @@ public class TcpClient extends Service {
                 return;
             }
             mSessionServerAddress = serverAddress;
+            mSessionPlayerID = Globals.getInstance().mPlayerID;
             // An explicit start joins a new session. Only automatic reconnects
             // inside runTcpClientSession may replay events from the previous link.
             messageQueue = new ConcurrentLinkedQueue<>();
@@ -755,17 +772,10 @@ public class TcpClient extends Service {
                 }
                 // Discovery may find another host while this session is reconnecting.
                 // Pending events belong only to the server selected at explicit start.
-                try {
-                    s.connect(new InetSocketAddress(serverAddress, TcpServer.TCP_SERVER_PORT), CONNECTION_TIMEOUT_MS);
-                } catch (IOException wifiUnavailable) {
-                    try { s.close(); } catch (IOException ignored) { }
-                    Socket fallback = GameRelayService.open(serverAddress, TcpServer.TCP_SERVER_PORT, CONNECTION_TIMEOUT_MS);
-                    if (fallback == null) throw wifiUnavailable;
-                    s = fallback;
-                    synchronized (this) {
-                        if (!keepListening || mDestroyed) { s.close();break; }
-                        mActiveSocket = s;
-                    }
+                s = connectGameSocket(s, serverAddress);
+                synchronized (this) {
+                    if (!keepListening || mDestroyed) { s.close();break; }
+                    mActiveSocket = s;
                 }
                 s.setTcpNoDelay(true);
                 is = s.getInputStream();
@@ -780,22 +790,21 @@ public class TcpClient extends Service {
                     // before gameplay threads can enqueue events for this connection.
                     out = connectionOut;
                     resetClockSyncLocked();
+                    mRelayClockConnection = s instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket;
                     sendPlayerInfo(rejoin);
                 }
                 wasConnected = true;
                 if (rejoin)
                     sendBroadcast(new Intent(NetMsg.NETMSG_NETWORKCONNECTED));
                 rejoin = true;
-                int noReadCount = 0;
-                long idleTick = SystemClock.elapsedRealtime();
+                long lastMessageAt = SystemClock.elapsedRealtime();
                 retryCount = MAX_REJOIN_TRIES;
                 while (keepListening && out == connectionOut) {
                     requestClockSync();
                     String message = messageReader.poll(in);
                     if (message != null) {
-                        noReadCount = 0;
-                        idleTick = SystemClock.elapsedRealtime();
-                        mLastServerTrafficAt = idleTick;
+                        lastMessageAt = SystemClock.elapsedRealtime();
+                        mLastServerTrafficAt = lastMessageAt;
                         if (message.equals(TcpServer.TCP_SERVER_PING))
                             sendPong();
                         else {
@@ -854,11 +863,9 @@ public class TcpClient extends Service {
                         }
                         sleep(sampling ? TcpServer.CLOCK_READ_WAIT_MS : readWait);
                         long now = SystemClock.elapsedRealtime();
-                        if (now - idleTick >= readWait) {
-                            noReadCount += (int) ((now - idleTick) / readWait);
-                            idleTick = now;
-                        }
-                        if (noReadCount >= 35) {
+                        long idleTimeout = s instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket
+                                ? RELAY_SERVER_IDLE_TIMEOUT_MS : 35L * readWait;
+                        if (now - lastMessageAt >= idleTimeout) {
                             Log.d(TAG, "no ping from server, disconnecting");
                             break;
                         }
@@ -893,6 +900,19 @@ public class TcpClient extends Service {
             finishServerSession(NetMsg.NETMSG_SERVERUNREACHABLE);
         }
         Log.d(TAG, "Client stopping");
+    }
+
+    /** Resolve the native or nearby transport while the worker owns cancellation. */
+    Socket connectGameSocket(Socket nativeSocket, InetAddress serverAddress) throws IOException {
+        try {
+            nativeSocket.connect(new InetSocketAddress(serverAddress, TcpServer.TCP_SERVER_PORT), CONNECTION_TIMEOUT_MS);
+            return nativeSocket;
+        } catch (IOException wifiUnavailable) {
+            try { nativeSocket.close(); } catch (IOException ignored) { }
+            Socket fallback = GameRelayService.open(serverAddress, TcpServer.TCP_SERVER_PORT, CONNECTION_TIMEOUT_MS);
+            if (fallback == null) throw wifiUnavailable;
+            return fallback;
+        }
     }
 
     private void finishServerSession(String action) {
@@ -964,7 +984,7 @@ public class TcpClient extends Service {
     public void sendPlayerNameChange() {
         try {
             JSONObject playerInfo = new JSONObject();
-            playerInfo.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
+            playerInfo.put(TcpServer.JSON_PLAYERID, sessionPlayerID());
             playerInfo.put(TcpServer.JSON_PLAYERNAMECHANGE, Globals.getInstance().mPlayerName);
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerInfo.toString();
             sendTCPMessage(message);
@@ -1128,7 +1148,7 @@ public class TcpClient extends Service {
     private void sendPlayerInfo(boolean rejoin) {
         try {
             JSONObject playerInfo = new JSONObject();
-            playerInfo.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
+            playerInfo.put(TcpServer.JSON_PLAYERID, sessionPlayerID());
             playerInfo.put(TcpServer.JSON_PLAYERNAME, Globals.getInstance().mPlayerName);
             // A laptop resolves this device to its saved person. Peer hosts
             // must keep the original device identity across reconnects too.
@@ -1214,6 +1234,11 @@ public class TcpClient extends Service {
         return !mDestroyed && keepListening && host != null && host.equals(mSessionServerAddress);
     }
 
+    private synchronized byte sessionPlayerID() {
+        return !mDestroyed && keepListening && mSessionServerAddress != null
+                ? mSessionPlayerID : Globals.getInstance().mPlayerID;
+    }
+
     public synchronized boolean hasLobbyConnection() {
         return !mDestroyed && keepListening && out != null && mLobbyRegistered;
     }
@@ -1233,7 +1258,7 @@ public class TcpClient extends Service {
         try {
             JSONObject playerSettings = new JSONObject();
             playerSettings.put(TcpServer.JSON_PLAYERSETTINGS, true);
-            playerSettings.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
+            playerSettings.put(TcpServer.JSON_PLAYERID, sessionPlayerID());
             playerSettings.put(TcpServer.JSON_HEALTH, Globals.getInstance().mFullHealth);
             playerSettings.put(TcpServer.JSON_RELOAD_SHOTS, Globals.getInstance().mFullReload & 0xff);
             playerSettings.put(TcpServer.JSON_RELOAD_TIME, Globals.getInstance().mReloadTime);
@@ -1320,7 +1345,7 @@ public class TcpClient extends Service {
     private void sendPlayerGrenade(boolean priority) {
         try {
             JSONObject playerGrenade = new JSONObject();
-            playerGrenade.put(TcpServer.JSON_PLAYERID, Globals.getInstance().mPlayerID);
+            playerGrenade.put(TcpServer.JSON_PLAYERID, sessionPlayerID());
             playerGrenade.put(TcpServer.JSON_PAIRED_GRENADE_ID, Globals.getInstance().mPairedGrenadeID);
             String message = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + playerGrenade.toString();
             if (priority)
@@ -1426,14 +1451,17 @@ public class TcpClient extends Service {
     private void parseGameInfo(String message) {
         final long receivedAt = SystemClock.elapsedRealtime();
         final long generation;
+        final byte localPlayerID;
         synchronized (this) {
             if (mDestroyed || (isListening && !keepListening))
                 return;
             generation = mSessionGeneration;
+            localPlayerID = sessionPlayerID();
         }
         try {
             JSONObject game = TcpJson.parseObject(message);
             if (Boolean.TRUE.equals(game.opt(EventMode.BATTERY_REQUEST))) {
+                Log.d(TAG, "Host requested a battery refresh");
                 broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_BATTERYREQUEST));
                 return;
             }
@@ -1467,6 +1495,7 @@ public class TcpClient extends Service {
                     if (!isCurrentSession(generation) || Globals.getInstance().mRequestedJoinTeam == 0
                             || !Globals.isValidPlayerID(id) || !TcpServer.isValidRoundToken(token)) return;
                     Globals.getInstance().mPlayerID = (byte) id;
+                    mSessionPlayerID = (byte) id;
                     Globals.getInstance().mRequestedJoinTeam = 0;
                     Globals.getInstance().mLocalLobbyBenched = false;
                     Globals.getInstance().mWaitingForLobbyRoundEnd = false;
@@ -1566,7 +1595,7 @@ public class TcpClient extends Service {
                         throw new JSONException("Conflicting GPS player snapshot");
                     seenPlayers[rawPlayerID] = true;
                     byte playerID = (byte) rawPlayerID;
-                    if (playerID != Globals.getInstance().mPlayerID) {
+                    if (playerID != localPlayerID) {
                         double[] position = GpsWire.readPosition(update, gpsOrigin);
                         double latitude = position[0];
                         double longitude = position[1];
@@ -1777,7 +1806,7 @@ public class TcpClient extends Service {
                         if (TcpJson.getBoolean(player, TcpServer.JSON_BALANCED_CHECKIN))
                             balancedCheckedIn.add(playerID);
                     }
-                    if (playerID != Globals.getInstance().mPlayerID) {
+                    if (playerID != localPlayerID) {
                         InetAddress playerIP;
                         String ip = player.getString(TcpServer.JSON_PLAYERIP);
                         if (ip.startsWith("/")) ip = ip.substring(1);
@@ -1972,6 +2001,11 @@ public class TcpClient extends Service {
                                     if (!isCurrentSession(generation))
                                         return;
                                     commitGpsOriginLocked(gpsOrigin);
+                                    // This validated roster acknowledges the registered
+                                    // seat. Restore it if stale local hardware telemetry
+                                    // raced with the host's earlier assignment.
+                                    if (keepListening && mSessionServerAddress != null)
+                                        globals.mPlayerID = mSessionPlayerID;
                                     globals.mTournamentMode = tournamentMode;
                                     globals.mHostCustomRules = hostCustomRules;
                                     globals.mHostAssignedTeams = hostAssignedTeams;
@@ -2014,7 +2048,7 @@ public class TcpClient extends Service {
                                     globals.mTeamPlayerNameMap.putAll(playerNames);
                                     globals.mLobbyPlayerReady = Collections.unmodifiableMap(lobbyReadiness);
                                     globals.mLobbyPlayers = Collections.unmodifiableMap(lobbyPlayers);
-                                    LobbyPlayer localPresence = lobbyPlayers.get(globals.mPlayerID);
+                                    LobbyPlayer localPresence = lobbyPlayers.get(localPlayerID);
                                     // A peer roster can arrive before this phone is admitted,
                                     // while another player still occupies its requested number.
                                     // Only the laptop's identity-bound editor owns local names.
@@ -2141,7 +2175,7 @@ public class TcpClient extends Service {
             return;
         }
         globals.mBossHunterCount = -1;
-        Globals.PlayerSettings local = settings.get(globals.mPlayerID);
+        Globals.PlayerSettings local = settings.get(sessionPlayerID());
         if (local != null) {
             globals.mFullHealth = local.health;
             globals.mFullReload = local.shots;

@@ -10,10 +10,16 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class RelayMesh implements Closeable {
     private static final int MAGIC = 0x4c475231, MAX_PAYLOAD = 8192, HOPS = 6;
     private static final int PING = 0, UDP = 1, OPEN = 2, OPEN_ACK = 3, DATA = 4, ACK = 5, CLOSE = 6;
+    private static final long ROUTE_LIFETIME_MS = 3500;
     private static final UUID ZERO = new UUID(0, 0);
     public interface Listener {
         void datagram(InetAddress source, InetAddress destination, int port, byte[] payload);
         boolean accept(Socket socket, int port);
+        default void linkOpened(UUID peer) { }
+        default void linkClosed(UUID peer, String reason) { }
+        default void linkCongested(UUID peer) { }
+        default void handshakeFailed(String reason) { }
+        default void streamAborted(String reason) { }
     }
     private final UUID self;
     private final Listener listener;
@@ -21,10 +27,15 @@ public final class RelayMesh implements Closeable {
     private volatile RelayConfig config;
     private volatile boolean closed;
     private volatile long hostSeenAt;
-    private final AtomicLong sequence = new AtomicLong();
+    // The origin UUID and cohort key survive app updates. Starting again at
+    // zero would collide with neighbors' retained duplicate history. Android's
+    // system monotonic clock advances across processes within one boot; its
+    // nanosecond seed also makes an accidental overlap after reboot negligible.
+    private final AtomicLong sequence = new AtomicLong(System.nanoTime() & Long.MAX_VALUE);
     private final Semaphore handshakes = new Semaphore(8);
     private final CopyOnWriteArrayList<Link> links = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<UUID, VirtualSocket> streams = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, LearnedRoute> routes = new ConcurrentHashMap<>();
     private final Set<String> connecting = Collections.synchronizedSet(new HashSet<>());
     private final LinkedHashMap<String, Boolean> seen = new LinkedHashMap<>();
     private final ScheduledExecutorService ticker = Executors.newSingleThreadScheduledExecutor(r -> daemon(r, "LGR relay clock"));
@@ -56,8 +67,12 @@ public final class RelayMesh implements Closeable {
         if (!config.key.equals(next.key) || !next.members.containsKey(self)
                 || !next.members.get(self).address.equals(localAddress()))
             throw new IllegalArgumentException("A changed relay session requires a new mesh");
-        config = next;
-        for (Link link : links) if (!next.accepts(link.peer, link.logical)) link.close();
+        synchronized (routes) {
+            config = next;
+            for (Map.Entry<UUID, LearnedRoute> entry : routes.entrySet())
+                if (!next.accepts(entry.getKey(), entry.getValue().source)) routes.remove(entry.getKey(), entry.getValue());
+        }
+        for (Link link : links) if (!next.accepts(link.peer, link.logical)) link.close("membership changed");
     }
 
     /** Nonblocking and idempotent for a physical endpoint. */
@@ -69,7 +84,11 @@ public final class RelayMesh implements Closeable {
         try { workers.execute(() -> {
             Socket socket = new Socket();
             try {
-                socket.connect(endpoint, 1500);handshake(socket, address);
+                socket.connect(endpoint, 1500);
+                try { handshake(socket, address); }
+                catch (IOException | RuntimeException failure) {
+                    listener.handshakeFailed(failure.getClass().getSimpleName());throw failure;
+                }
             } catch (IOException | RuntimeException failure) { closeQuietly(socket); }
             finally { connecting.remove(address); }
         }); } catch (RejectedExecutionException stopped) { connecting.remove(address); }
@@ -80,14 +99,19 @@ public final class RelayMesh implements Closeable {
         if (closed || !handshakes.tryAcquire()) { closeQuietly(socket);return; }
         try { workers.execute(() -> {
         try { handshake(socket, null); }
-        catch (IOException | RuntimeException failure) { closeQuietly(socket); }
+        catch (IOException | RuntimeException failure) {
+            listener.handshakeFailed(failure.getClass().getSimpleName());closeQuietly(socket);
+        }
         finally { handshakes.release(); }
         }); } catch (RejectedExecutionException stopped) { handshakes.release();closeQuietly(socket); }
     }
 
     private void handshake(Socket socket, String endpoint) throws IOException {
         socket.setSoTimeout(3000);socket.setTcpNoDelay(true);socket.setKeepAlive(true);
-        DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+        // Flush each complete frame together instead of sending its primitive
+        // header fields as separate writes on an RFCOMM radio link.
+        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(
+                socket.getOutputStream(), MAX_PAYLOAD + 128));
         DataInputStream in = new DataInputStream(socket.getInputStream());
         out.writeInt(MAGIC);writeUuid(out, config.key);writeUuid(out, self);out.write(localAddress().getAddress());out.flush();
         if (in.readInt() != MAGIC || !readUuid(in).equals(config.key)) throw new IOException("Wrong relay session");
@@ -96,6 +120,7 @@ public final class RelayMesh implements Closeable {
             throw new IOException("Unknown relay peer");
         socket.setSoTimeout(0);
         Link link = new Link(socket, in, out, peer, logical, endpoint);links.add(link);
+        listener.linkOpened(peer);
         workers.execute(link::read);workers.execute(link::write);
     }
 
@@ -126,7 +151,7 @@ public final class RelayMesh implements Closeable {
         if (time - lastPing >= 1000) { lastPing = time;publish(PING, RelayConfig.ipv4("255.255.255.255"), 0, ZERO, 0, new byte[0]); }
         for (VirtualSocket socket : streams.values()) {
             try { socket.retry(time); }
-            catch (IOException failure) { socket.abort(); }
+            catch (IOException failure) { socket.abort("retry: " + failure.getClass().getSimpleName()); }
         }
     }
 
@@ -149,13 +174,19 @@ public final class RelayMesh implements Closeable {
     private void receive(Frame frame, Link incoming) {
         RelayConfig current = config;
         if (closed || !current.accepts(frame.origin, frame.source) || frame.origin.equals(self)
-                || frame.hops < 1 || frame.hops > HOPS || !remember(frame)) return;
+                || frame.hops < 1 || frame.hops > HOPS) return;
+        long time = now();incoming.lastReadAt = time;
+        learnRoute(frame, incoming, time);
+        if (!remember(frame)) return;
         if (frame.origin.equals(current.host)) hostSeenAt = now();
         boolean broadcast = frame.destination.getHostAddress().equals("255.255.255.255");
         if (broadcast || frame.destination.equals(localAddress())) {
             if (frame.type == UDP) {
                 if (frame.payload.length <= 1472) listener.datagram(frame.source, frame.destination, frame.port, frame.payload);
             } else if (frame.type != PING) handleStream(frame);
+            // A delivered unicast has reached its endpoint. Sending it onward
+            // turns every host reply and ACK into needless Bluetooth traffic.
+            if (!broadcast) return;
         }
         if (frame.hops > 1) forward(frame.nextHop(), incoming);
     }
@@ -168,7 +199,7 @@ public final class RelayMesh implements Closeable {
                 socket = streams.putIfAbsent(frame.stream, created);
                 if (socket == null) {
                     socket = created;
-                    if (!listener.accept(socket, frame.port)) { socket.abort();return; }
+                    if (!listener.accept(socket, frame.port)) { socket.abort("port rejected");return; }
                 }
             }
             if (socket != null && socket.remote.equals(frame.source) && !socket.socketClosed)
@@ -188,18 +219,63 @@ public final class RelayMesh implements Closeable {
     }
 
     private void forward(Frame frame, Link incoming) {
+        if (!frame.destination.getHostAddress().equals("255.255.255.255")) {
+            long time = now();
+            // An old native TCP connection can remain established after its
+            // phone leaves Wi-Fi coverage. Require recent traffic before using
+            // it as the preferred direct route.
+            for (Link link : links)
+                if (link != incoming && link.logical.equals(frame.destination) && link.routable(time)) {
+                    if (enqueue(link, frame)) return;
+                }
+            for (RelayConfig.Member member : config.members.values()) {
+                if (!member.address.equals(frame.destination)) continue;
+                LearnedRoute route = routes.get(member.id);
+                if (route != null && route.via != incoming && time - route.seenAt < ROUTE_LIFETIME_MS
+                        && route.via.routable(time) && config.accepts(member.id, route.source)) {
+                    if (enqueue(route.via, frame)) return;
+                }
+                break;
+            }
+        }
         for (Link link : links) {
             if (link == incoming) continue;
-            // State packets are expendable; a congested control link is closed
-            // instead of silently dropping bytes from a virtual TCP stream.
-            if (!link.queue.offer(frame) && frame.type != UDP && frame.type != PING) link.close();
+            enqueue(link, frame);
+        }
+    }
+
+    private boolean enqueue(Link link, Frame frame) {
+        // End-to-end retries recover a copy deferred by a full physical queue.
+        boolean accepted = link.queue.offer(frame);
+        if (!accepted && frame.type != UDP && frame.type != PING) link.congested();
+        return accepted;
+    }
+
+    private void learnRoute(Frame frame, Link incoming, long time) {
+        synchronized (routes) {
+            if (!config.accepts(frame.origin, frame.source) || incoming.stopped) return;
+            LearnedRoute previous = routes.get(frame.origin);
+            if (previous != null && time - previous.seenAt < ROUTE_LIFETIME_MS && previous.via.fresh(time)) {
+                if (frame.sequence < previous.sequence
+                        || frame.sequence == previous.sequence && frame.hops <= previous.hops) return;
+            }
+            // Learning precedes duplicate suppression: a later copy of the
+            // same frame can reveal a shorter path without redelivering it.
+            routes.put(frame.origin, new LearnedRoute(incoming, frame.source, time, frame.sequence, frame.hops));
+        }
+    }
+
+    private final class LearnedRoute {
+        final Link via;final InetAddress source;final long seenAt, sequence;final int hops;
+        LearnedRoute(Link via, InetAddress source, long seenAt, long sequence, int hops) {
+            this.via = via;this.source = source;this.seenAt = seenAt;this.sequence = sequence;this.hops = hops;
         }
     }
 
     @Override public void close() {
-        closed = true;closeQuietly(server);ticker.shutdownNow();
-        for (VirtualSocket socket : streams.values()) socket.abort();
-        for (Link link : links) link.close();
+        closed = true;routes.clear();closeQuietly(server);ticker.shutdownNow();
+        for (VirtualSocket socket : streams.values()) socket.abort("mesh closed");
+        for (Link link : links) link.close("mesh closed");
         workers.shutdownNow();
     }
     private static void closeQuietly(Closeable closeable) { try { closeable.close(); } catch (IOException ignored) { } }
@@ -209,25 +285,98 @@ public final class RelayMesh implements Closeable {
     private final class Link {
         final Socket socket;final DataInputStream in;final DataOutputStream out;
         final UUID peer;final InetAddress logical;final String endpoint;
-        final ArrayBlockingQueue<Frame> queue = new ArrayBlockingQueue<>(128);
+        final FrameQueue queue = new FrameQueue();
         volatile boolean stopped;
+        volatile long lastReadAt = now();
+        private volatile long congestedUntil;
+        private long lastCongestionAt;
         Link(Socket socket, DataInputStream in, DataOutputStream out, UUID peer, InetAddress logical, String endpoint) {
             this.socket = socket;this.in = in;this.out = out;this.peer = peer;this.logical = logical;this.endpoint = endpoint;
         }
         void read() {
             try { while (!closed && !stopped) receive(Frame.read(in), this); }
-            catch (IOException | RuntimeException ignored) { }
-            finally { close(); }
+            catch (IOException | RuntimeException failure) { close("read: " + failure.getClass().getSimpleName()); }
+            finally { close("reader stopped"); }
         }
         void write() {
             try { while (!closed && !stopped) {
-                Frame frame = queue.poll(1, TimeUnit.SECONDS);
+                Frame frame = queue.poll(1000);
                 if (frame != null) { frame.write(out);out.flush(); }
             } }
-            catch (IOException | InterruptedException ignored) { }
-            finally { close(); }
+            catch (IOException | InterruptedException failure) { close("write: " + failure.getClass().getSimpleName()); }
+            finally { close("writer stopped"); }
         }
-        void close() { stopped = true;links.remove(this);closeQuietly(socket); }
+        void close(String reason) {
+            synchronized (this) { if (stopped) return;stopped = true; }
+            for (Map.Entry<UUID, LearnedRoute> entry : routes.entrySet())
+                if (entry.getValue().via == this) routes.remove(entry.getKey(), entry.getValue());
+            links.remove(this);closeQuietly(socket);listener.linkClosed(peer, reason);
+        }
+        boolean fresh(long time) { return !stopped && time - lastReadAt < ROUTE_LIFETIME_MS; }
+        boolean routable(long time) { return fresh(time) && time >= congestedUntil; }
+        void congested() {
+            long time = now();
+            // A queued retry is not evidence that the stalled writer made
+            // progress. Give pending byte gaps a chance to use another route.
+            congestedUntil = time + 1000;
+            synchronized (this) {
+                if (lastCongestionAt != 0 && time - lastCongestionAt < 5000) return;
+                lastCongestionAt = time;
+            }
+            listener.linkCongested(peer);
+        }
+    }
+
+    /** Bounded lanes with end-to-end retransmission instead of radio disconnection. */
+    private static final class FrameQueue {
+        private static final int CAPACITY = 128;
+        private final ArrayDeque<Frame> metadata = new ArrayDeque<>(), data = new ArrayDeque<>(), state = new ArrayDeque<>();
+        private int dataSinceState;
+        synchronized boolean offer(Frame frame) {
+            if (frame.type == DATA) {
+                // A retry gets a new flooding sequence number but retains its
+                // stream offset. Keep only one queued copy of those bytes.
+                for (Frame queued : data)
+                    if (sameFlow(queued, frame) && queued.offset == frame.offset) return true;
+            } else if (frame.type != UDP) {
+                Iterator<Frame> iterator = metadata.iterator();
+                while (iterator.hasNext()) {
+                    Frame queued = iterator.next();
+                    if (!sameFlow(queued, frame)) continue;
+                    // ACKs are cumulative: an older acknowledgement must not
+                    // replace newer progress while the writer is stalled.
+                    if (frame.type == ACK && queued.offset > frame.offset) return true;
+                    iterator.remove();break;
+                }
+            }
+            if (metadata.size() + data.size() + state.size() >= CAPACITY) {
+                if (frame.type == UDP) return false;
+                if (!state.isEmpty()) state.removeFirst();
+                else if (frame.type != DATA && !data.isEmpty()) data.removeLast();
+                else return false;
+            }
+            (frame.type == UDP ? state : frame.type == DATA ? data : metadata).addLast(frame);
+            notifyAll();return true;
+        }
+        synchronized Frame poll(long timeout) throws InterruptedException {
+            long deadline = now() + timeout;
+            while (metadata.isEmpty() && data.isEmpty() && state.isEmpty()) {
+                long remaining = deadline - now();
+                if (remaining <= 0) return null;
+                wait(remaining);
+            }
+            if (!metadata.isEmpty()) return metadata.removeFirst();
+            if (!data.isEmpty() && (state.isEmpty() || dataSinceState < 8)) {
+                if (dataSinceState < 8) dataSinceState++;
+                return data.removeFirst();
+            }
+            dataSinceState = 0;return state.removeFirst();
+        }
+        private static boolean sameFlow(Frame first, Frame second) {
+            return first.type == second.type && first.origin.equals(second.origin)
+                    && first.stream.equals(second.stream) && first.destination.equals(second.destination)
+                    && first.port == second.port;
+        }
     }
 
     private static final class Frame {
@@ -259,7 +408,7 @@ public final class RelayMesh implements Closeable {
     /** A reliable, ordered byte stream over the relay graph with its original logical endpoint. */
     public final class VirtualSocket extends Socket {
         final UUID id;final InetAddress remote;final int remotePort;
-        volatile boolean socketClosed;boolean opened;int timeout = 5000;
+        volatile boolean socketClosed;boolean opened;int timeout;
         long received, consumed, written, remoteEnd = -1, closedAt;
         final TreeMap<Long, byte[]> incoming = new TreeMap<>();
         final TreeMap<Long, Pending> outgoing = new TreeMap<>();
@@ -272,16 +421,18 @@ public final class RelayMesh implements Closeable {
         }
         void announceOpen() { publish(OPEN, remote, remotePort, id, 0, new byte[0]); }
         synchronized void receive(long offset, byte[] data) {
-            if (data.length == 0 || offset > consumed + 262144 || offset + data.length < offset) { abort();return; }
+            if (data.length == 0 || offset > consumed + 262144 || offset + data.length < offset) {
+                abort("invalid receive position");return;
+            }
             if (offset >= consumed && !incoming.containsKey(offset)) {
-                if (incomingBytes + data.length > 262144) { abort();return; }
+                if (incomingBytes + data.length > 262144) { abort("receive buffer full");return; }
                 incoming.put(offset, data);incomingBytes += data.length;
                 while (incoming.containsKey(received)) received += incoming.get(received).length;
             }
             publish(ACK, remote, remotePort, id, received, new byte[0]);notifyAll();
         }
         synchronized void acknowledge(long offset) {
-            if (offset > written) { abort();return; }
+            if (offset > written) { abort("invalid acknowledgement");return; }
             Iterator<Map.Entry<Long, Pending>> iterator = outgoing.entrySet().iterator();
             while (iterator.hasNext()) {
                 Map.Entry<Long, Pending> entry = iterator.next();
@@ -291,17 +442,26 @@ public final class RelayMesh implements Closeable {
             notifyAll();
         }
         synchronized void retry(long time) throws IOException {
-            if (socketClosed && time - closedAt > 5000) { streams.remove(id, this);return; }
+            // close() can publish its final offset before a slow radio has
+            // transmitted every byte. Retain unacknowledged data for its full
+            // retry window, even after the application's socket has closed.
+            if (socketClosed && outgoing.isEmpty() && time - closedAt > 5000) {
+                streams.remove(id, this);return;
+            }
             for (Map.Entry<Long, Pending> entry : outgoing.entrySet()) {
                 Pending pending = entry.getValue();
-                if (time - pending.created > 15_000) { abort();return; }
+                if (time - pending.created > 15_000) { abort("acknowledgement timed out");return; }
                 if (time - pending.lastSent >= 300) {
                     pending.lastSent = time;publish(DATA, remote, remotePort, id, entry.getKey(), pending.bytes);
                 }
             }
             if (socketClosed) publish(CLOSE, remote, remotePort, id, written, new byte[0]);
         }
-        synchronized void abort() { socketClosed = true;closedAt = now();streams.remove(id, this);notifyAll(); }
+        synchronized void abort(String reason) {
+            if (!socketClosed) { socketClosed = true;closedAt = now(); }
+            boolean removed = streams.remove(id, this);notifyAll();
+            if (removed) listener.streamAborted(reason);
+        }
         @Override public synchronized void close() {
             if (!socketClosed) { socketClosed = true;closedAt = now();publish(CLOSE, remote, remotePort, id, written, new byte[0]);notifyAll(); }
         }

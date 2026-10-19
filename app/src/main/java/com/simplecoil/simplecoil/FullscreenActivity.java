@@ -444,6 +444,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private boolean mSecondaryScanPendingPermission;
     private Runnable mSecondaryScanFinish;
     private long mSecondaryTeamCommandAt;
+    private long mPrimaryTeamCommandAt;
     private Runnable mSecondaryReconnectRunnable;
     // A first-time scan must not connect to whichever nearby blaster happens to
     // advertise first. Collect viable SRG1 devices briefly, then use a held
@@ -5258,6 +5259,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             command[4] = Globals.getInstance().mPlayerID;
             mCommandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             mBluetoothLeService.writeCharacteristic(mCommandCharacteristic, command);
+            mPrimaryTeamCommandAt = SystemClock.elapsedRealtime();
         } else if (!TEST_NETWORK) {
             // Keep the selected/network-assigned ID in the UI and preferences
             // until a disconnected blaster is available to receive it.
@@ -5283,6 +5285,38 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         setTeam();
         Toast.makeText(getApplicationContext(), getString(R.string.player_id_reassigned,
                 assignedPlayerID), Toast.LENGTH_SHORT).show();
+    }
+
+    private boolean networkOwnsPlayerID() {
+        return mUseNetwork && (mReady || mIsServer || mLobbyJoined || mLobbyTakeoverPending
+                || mMatchSession.active() || hasCommittedRound()
+                || mTcpClient != null && mTcpClient.hasClientSession());
+    }
+
+    private void handleReportedGunPlayerID(byte playerID, boolean secondary) {
+        if (secondary) {
+            if (playerID != Globals.getInstance().mPlayerID
+                    && SystemClock.elapsedRealtime() - mSecondaryTeamCommandAt > 2000)
+                setSecondWeaponTeam();
+            return;
+        }
+        if (playerID <= 0 || !Globals.isValidPlayerID(playerID)) return;
+        boolean changed = mLastTeam != playerID;
+        mLastTeam = playerID;
+        if (networkOwnsPlayerID()) {
+            // The gun can still report its old ID while a host assignment is
+            // being programmed. Telemetry must never move the admitted player
+            // into another person's seat or change the reconnect identity.
+            if (playerID != Globals.getInstance().mPlayerID
+                    && SystemClock.elapsedRealtime() - mPrimaryTeamCommandAt > 2000)
+                setTeam();
+            return;
+        }
+        if (changed || Globals.getInstance().mPlayerID != playerID) {
+            Log.d(TAG, "Player ID changed to " + playerID);
+            Globals.getInstance().mPlayerID = playerID;
+            displayCurrentTeam();
+        }
     }
 
     private void displayCurrentTeam() {
@@ -9756,20 +9790,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 mLastHitData1.playerID = Globals.INVALID_PLAYER_ID;
                 mLastHitData2.playerID = Globals.INVALID_PLAYER_ID;
             }
-            /* Since setting player ID is somewhat unreliable, we use this to make sure that we are
-               displaying the actual ID that the tagger is currently using. */
+            // Before joining, the gun can supply a local player selection.
+            // Once joined, its telemetry only confirms the host's assigned ID.
             // Zero is an unconfigured/reset blaster, not a new player selection.
             // Invalid status bytes must not become reload or network identities.
-            if (secondary && player_id != Globals.getInstance().mPlayerID
-                    && SystemClock.elapsedRealtime() - mSecondaryTeamCommandAt > 2000) {
-                setSecondWeaponTeam();
-            } else if (!secondary && player_id > 0 && Globals.isValidPlayerID(player_id)
-                    && mLastTeam != player_id) {
-                Log.d(TAG, "Player ID changed to " + player_id);
-                mLastTeam = player_id;
-                Globals.getInstance().mPlayerID = player_id;
-                displayCurrentTeam();
-            }
+            handleReportedGunPlayerID(player_id, secondary);
             /* We monitor the last shot count rather than trigger pulls here so we know when to
                update the displayed shots remaining and play shooting sounds. pew! pew! */
             if ((secondary ? mSecondaryLastShotCount : mLastShotCount) != shotsRemaining) {

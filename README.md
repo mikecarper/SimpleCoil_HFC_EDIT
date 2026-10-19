@@ -149,7 +149,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.43 on every phone for this build.
+messages cannot end a new round. Install 1.50 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
 remains the primary connection. If it fails, Bluetooth Classic links can forward
@@ -169,6 +169,23 @@ stops the app's repeated Recoil network scans while that Wi-Fi stays associated.
 An attention chime plays once when Android opens a screen-pinning confirmation;
 ordinary reconnects do not replay it. The chime uses the phone's media volume.
 
+Version 1.50 hardens nearby relays against idle timeouts and congestion.
+Control acknowledgements and heartbeats take priority; queued retries coalesce,
+and a full bounded queue recovers without closing the Bluetooth link. Pending
+terminal bytes keep their 15-second retry window after a stream closes.
+Unicast packets prefer one fresh direct or learned path and stop at their
+destination. Stale or congested paths can use another neighbor, broadcasts
+still propagate, and app restarts receive a fresh packet-sequence range.
+Bluetooth setup cancels Classic discovery and allows 15 seconds to connect.
+The host's player assignment stays authoritative when a blaster reports its old
+ID; the app reprograms the gun instead of adopting another player's slot.
+
+Clock probes still reach the original host. Actual relay sockets allow up to
+800 ms of network round-trip delay and wait up to two seconds for a probe;
+native Wi-Fi keeps its 80 ms delay limit. Both require twelve fresh samples and
+choose the least-delayed estimate. The relay bound allows up to 400 ms of
+network timing uncertainty per phone; it does not bound UI or gun latency.
+
 The phone player list opens only after tapping its button. Host player updates,
 reconnections and round completion do not open it automatically. It lists actual
 players and team totals without empty player slots.
@@ -179,10 +196,11 @@ A completely isolated phone must move back into reach. The relay carries game
 traffic only, and does not extend Internet access. Radio range depends on the
 phones, obstacles and interference; there is no guaranteed distance increase.
 
-The latest live bench test on version 1.43 rejoined the laptop with a phone's
-Wi-Fi disabled and returned two fresh phone/gun battery reports, then disconnected.
-Bluetooth fallback still has intermittent dropouts; sustained connectivity and
-physical range extension have not been validated.
+The version 1.50 live bench kept one phone's Wi-Fi radio disabled for 197.6
+seconds. Bluetooth through a nearby Wi-Fi-connected phone returned all 20 host
+battery requests and 20 fresh gun reports. The 182-second stability window had
+no game reconnects, and clock readiness stayed true. Wi-Fi was restored afterward.
+This was a stationary bench check; physical range extension remains untested.
 
 Once a network match starts, each participant stays bound to that match's host.
 Joining a host also disables automatic hosting on that participant, including
@@ -256,16 +274,17 @@ does not turn an old fix into a new one. Expired fixes are removed from the map.
 
 - Lobby join immediately begins a 12-exchange clock-calibration burst before a
   start is accepted.
-- Exchanges with a round-trip delay above 80 ms are discarded; the lowest-delay
-  valid sample is used to estimate clock offset. That bounds the network-path
-  uncertainty of an accepted estimate to 40 ms relative to the host.
+- Native Wi-Fi discards exchanges above 80 ms round-trip delay; relay sockets
+  allow up to 800 ms. Both use the lowest-delay valid sample, bounding network
+  timing uncertainty to 40 ms per native phone or 400 ms per relayed phone.
 - The host sends one shared start deadline and every phone shows a countdown to
   it, normally 24 seconds away. The voice counts "10 Mississippi" through
   "0 Mississippi" every two seconds, then says "All out of Mississippi's."
   The count takes 20 seconds, leaving four seconds for the closing line before
   play starts. Solo starts use the same timing. Timed games also use a shared
   end deadline.
-- The network-offset target is below 50 ms on a healthy local network. Wi-Fi
+- The network-offset target is below 50 ms on a healthy native Wi-Fi connection.
+  Bluetooth fallback uses the larger bound above. Wi-Fi
   congestion, device suspension, and normal UI scheduling can still affect the
   moment a device visibly reacts.
 - All participants must use network protocol 30 (this build). Older protocol

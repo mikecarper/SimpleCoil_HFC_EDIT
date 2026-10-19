@@ -32,6 +32,11 @@ public final class GameRelayService extends Service {
     private PowerManager.WakeLock wake;
     private WifiManager.WifiLock wifiLock;
     private static final UUID BLUETOOTH_SERVICE = UUID.fromString("7493b200-9f40-48f2-ae5a-b9410bf17f31");
+    // Mesh heartbeats arrive every second. Retire a silent physical socket
+    // separately from SO_TIMEOUT, allowing the stream's 15-second retry window.
+    private static final long BLUETOOTH_STALE_MS = 30_000;
+    // Android's normal RFCOMM setup can take about 12 seconds, including SDP.
+    private static final long BLUETOOTH_CONNECT_MS = 15_000;
     private final ExecutorService bluetoothWorkers = Executors.newCachedThreadPool();
     private final ConcurrentHashMap<String, BluetoothLink> bluetoothLinks = new ConcurrentHashMap<>();
     private volatile BluetoothServerSocket bluetoothServer;
@@ -142,6 +147,21 @@ public final class GameRelayService extends Service {
                     @Override public boolean accept(Socket socket, int port) {
                         TcpServer server = tcp;return server != null && server.acceptRelaySocket(socket, port);
                     }
+                    @Override public void linkOpened(UUID peer) {
+                        Log.i("GameRelay", "Game relay link ready with " + peer);
+                    }
+                    @Override public void linkClosed(UUID peer, String reason) {
+                        Log.i("GameRelay", "Game relay link closed with " + peer + ": " + reason);
+                    }
+                    @Override public void linkCongested(UUID peer) {
+                        Log.i("GameRelay", "Game relay copy deferred for retry with " + peer);
+                    }
+                    @Override public void handshakeFailed(String reason) {
+                        Log.d("GameRelay", "Game relay handshake failed: " + reason);
+                    }
+                    @Override public void streamAborted(String reason) {
+                        Log.w("GameRelay", "Game relay stream stopped: " + reason);
+                    }
                 });
             }
             config = next;
@@ -159,6 +179,12 @@ public final class GameRelayService extends Service {
                 if (!self.equals(config.host)) mesh.connect(new InetSocketAddress(config.members.get(config.host).address, 17514));
                 startBluetoothRelay();
                 long now = SystemClock.elapsedRealtime();
+                for (BluetoothLink link : bluetoothLinks.values()) {
+                    if (now - link.lastReadAt >= BLUETOOTH_STALE_MS) {
+                        Log.i("GameRelay", "Retiring silent Bluetooth relay socket");
+                        try { link.close(); } catch (IOException ignored) { }
+                    }
+                }
                 if (mesh.hostReachable()) hostMissingSince = now;
                 else if (now - hostMissingSince >= 5000) connectBluetoothBuddy();
             }
@@ -218,6 +244,7 @@ public final class GameRelayService extends Service {
             try {
                 server = adapter.listenUsingInsecureRfcommWithServiceRecord("LAZER GUN RUN nearby", BLUETOOTH_SERVICE);
                 bluetoothServer = server;bluetoothStarting = false;
+                Log.i("GameRelay", "Bluetooth relay listening; scan mode " + adapter.getScanMode());
                 while (!destroyed) admitBluetooth(server.accept(), false);
             } catch (IOException | SecurityException failure) {
                 if (!destroyed) Log.d("GameRelay", "Bluetooth relay listener unavailable", failure);
@@ -242,14 +269,27 @@ public final class GameRelayService extends Service {
             bluetoothWorkers.execute(() -> {
                 BluetoothSocket socket = null;
                 Runnable cancel = null;
+                long started = SystemClock.elapsedRealtime();
+                java.util.concurrent.atomic.AtomicBoolean deadline = new java.util.concurrent.atomic.AtomicBoolean();
+                String phase = "create";
+                boolean discovering = false;
                 try {
+                    discovering = adapter.isDiscovering();
+                    // Classic discovery competes with SDP and RFCOMM connection setup,
+                    // including discovery started by another app on the same adapter.
+                    adapter.cancelDiscovery();
                     socket = adapter.getRemoteDevice(peer.bluetooth).createInsecureRfcommSocketToServiceRecord(BLUETOOTH_SERVICE);
                     BluetoothSocket pending = socket;
-                    cancel = () -> { try { pending.close(); } catch (IOException ignored) { } };
-                    main.postDelayed(cancel, 8000);socket.connect();main.removeCallbacks(cancel);
+                    cancel = () -> { deadline.set(true);try { pending.close(); } catch (IOException ignored) { } };
+                    phase = "connect";
+                    main.postDelayed(cancel, BLUETOOTH_CONNECT_MS);socket.connect();main.removeCallbacks(cancel);
+                    phase = "admit";
                     admitBluetooth(socket, true);socket = null;
                 } catch (IOException | SecurityException failure) {
-                    Log.d("GameRelay", "Nearby Bluetooth peer not reachable: " + peer.id);
+                    Log.d("GameRelay", "Nearby Bluetooth peer not reachable: " + peer.id
+                            + "; phase=" + phase + "; error=" + failure.getClass().getSimpleName()
+                            + "; elapsed=" + (SystemClock.elapsedRealtime() - started)
+                            + "; deadline=" + deadline.get() + "; discovery=" + discovering);
                 } finally {
                     if (cancel != null) main.removeCallbacks(cancel);
                     if (socket != null) try { socket.close(); } catch (IOException ignored) { }
@@ -276,7 +316,7 @@ public final class GameRelayService extends Service {
         }
         if (previous != null) previous.close();
         currentMesh.attach(link);
-        Log.i("GameRelay", "Nearby Bluetooth link established with " + member.id);
+        Log.i("GameRelay", "Nearby Bluetooth socket connected with " + member.id);
     }
     private final class BluetoothLink extends Socket {
         private final BluetoothSocket socket;
@@ -285,6 +325,7 @@ public final class GameRelayService extends Service {
         final boolean outgoing;
         private volatile boolean closed;
         private volatile int timeout = 3000;
+        private volatile long lastReadAt = SystemClock.elapsedRealtime();
         BluetoothLink(BluetoothSocket socket, boolean outgoing, RelayConfig.Member member) throws IOException {
             this.socket = socket;this.outgoing = outgoing;mac = member.bluetooth;input = socket.getInputStream();
         }
@@ -298,10 +339,14 @@ public final class GameRelayService extends Service {
             @Override public int read() throws IOException { byte[] one = new byte[1];return read(one, 0, 1) < 0 ? -1 : one[0] & 255; }
             @Override public int read(byte[] bytes, int offset, int length) throws IOException {
                 if (length == 0) return 0;
-                long end = SystemClock.elapsedRealtime() + (timeout == 0 ? 8000 : timeout);
+                long end = timeout == 0 ? Long.MAX_VALUE : SystemClock.elapsedRealtime() + timeout;
                 while (!closed) {
                     int available = input.available();
-                    if (available > 0) return input.read(bytes, offset, Math.min(available, length));
+                    if (available > 0) {
+                        int count = input.read(bytes, offset, Math.min(available, length));
+                        if (count > 0) lastReadAt = SystemClock.elapsedRealtime();
+                        return count;
+                    }
                     if (SystemClock.elapsedRealtime() >= end) throw new SocketTimeoutException("Bluetooth relay timed out");
                     try { Thread.sleep(10); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt();throw new java.io.InterruptedIOException(); }
                 }

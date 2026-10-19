@@ -8,10 +8,15 @@ final class GameClock {
     static final int SAMPLES_PER_SYNC = 12;
     static final long MAX_ROUND_TRIP_MS = 5000;
     // With an NTP-style midpoint, an otherwise unknowable asymmetric path can
-    // move the result by at most half the measured network round trip. Reject
-    // anything above 80 ms so a completed sync has at most 40 ms of network
-    // uncertainty relative to the host (before normal local scheduling jitter).
+    // move the result by at most half the measured network round trip.
+    // Native Wi-Fi rejects anything above 80 ms, bounding network uncertainty
+    // to 40 ms per phone before local scheduling jitter.
     static final long MAX_SAMPLE_DELAY_MS = 80;
+    // The nearby relay uses real samples with at most 400 ms uncertainty per
+    // phone. Two relay phones can differ by at most 800 ms from network delay,
+    // leaving 200 ms toward the game's one-second goal for local scheduling.
+    // This bounds the network contribution, not total UI or hardware latency.
+    static final long MAX_RELAY_SAMPLE_DELAY_MS = 800;
     static final long MAX_TIMESTAMP = Long.MAX_VALUE / 4;
     private long offset;
     private long bestRoundTrip = Long.MAX_VALUE;
@@ -40,12 +45,21 @@ final class GameClock {
     }
 
     boolean record(long clientSend, long hostReceive, long hostSend, long clientReceive) {
+        return record(clientSend, hostReceive, hostSend, clientReceive, MAX_SAMPLE_DELAY_MS);
+    }
+
+    boolean recordRelay(long clientSend, long hostReceive, long hostSend, long clientReceive) {
+        return record(clientSend, hostReceive, hostSend, clientReceive, MAX_RELAY_SAMPLE_DELAY_MS);
+    }
+
+    private boolean record(long clientSend, long hostReceive, long hostSend, long clientReceive,
+                           long maximumDelay) {
         if (!validTimestamp(clientSend) || !validTimestamp(hostReceive)
                 || !validTimestamp(hostSend) || !validTimestamp(clientReceive)
                 || clientReceive < clientSend || hostSend < hostReceive)
             return false;
         long roundTrip = (clientReceive - clientSend) - (hostSend - hostReceive);
-        if (roundTrip < 0 || roundTrip > MAX_SAMPLE_DELAY_MS)
+        if (roundTrip < 0 || roundTrip > maximumDelay)
             return false;
         long measuredOffset = ((hostReceive - clientSend) + (hostSend - clientReceive)) / 2;
         if (sampling) {

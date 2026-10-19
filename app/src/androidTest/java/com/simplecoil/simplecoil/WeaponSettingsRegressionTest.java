@@ -33,11 +33,13 @@ import static org.junit.Assert.assertTrue;
 public class WeaponSettingsRegressionTest {
     private static final String TEST_GUN_ONE = "02:00:00:00:00:01";
     private static final String TEST_GUN_TWO = "02:00:00:00:00:02";
+    private static final String PLAYER_ID_PREFERENCE = "PlayerID";
     private ActivityScenario<FullscreenActivity> scenario;
     private FullscreenActivity activity;
     private RecordingBluetoothService bluetooth;
     private BluetoothLeService originalBluetooth;
     private BluetoothLeService originalSecondaryBluetooth;
+    private Object originalTcpClient, originalMatchSession;
     private SharedPreferences preferences;
     private boolean hadShotPreference;
     private int originalShotPreference;
@@ -45,6 +47,8 @@ public class WeaponSettingsRegressionTest {
     private boolean originalRecoilPreference;
     private boolean hadFiringPreference;
     private int originalFiringPreference;
+    private boolean hadPlayerIdPreference, hadGameModePreference;
+    private int originalPlayerIdPreference, originalGameModePreference;
     private byte originalBlasterType;
     private byte originalLastTeam;
     private final Map<Field, Object> originalGlobals = new HashMap<>();
@@ -69,6 +73,10 @@ public class WeaponSettingsRegressionTest {
         originalRecoilPreference = preferences.getBoolean("RecoilEnabled", true);
         hadFiringPreference = preferences.contains(FullscreenActivity.PREF_FIRING_MODE);
         originalFiringPreference = preferences.getInt(FullscreenActivity.PREF_FIRING_MODE, 0);
+        hadPlayerIdPreference = preferences.contains(PLAYER_ID_PREFERENCE);
+        originalPlayerIdPreference = preferences.getInt(PLAYER_ID_PREFERENCE, 0);
+        hadGameModePreference = preferences.contains(FullscreenActivity.PREF_GAME_MODE);
+        originalGameModePreference = preferences.getInt(FullscreenActivity.PREF_GAME_MODE, 0);
         for (String address : new String[]{TEST_GUN_ONE, TEST_GUN_TWO}) {
             String key = FullscreenActivity.PREF_GUN_LOW_POWER_PREFIX + address;
             if (preferences.contains(key)) originalPowerPreferences.put(key, preferences.getBoolean(key, false));
@@ -92,6 +100,8 @@ public class WeaponSettingsRegressionTest {
             set("mSecondaryDeviceAddress", "");
             originalBluetooth = (BluetoothLeService) get("mBluetoothLeService");
             originalSecondaryBluetooth = (BluetoothLeService) get("mSecondaryBluetoothLeService");
+            originalTcpClient = get("mTcpClient");
+            originalMatchSession = get("mMatchSession");
             originalBlasterType = (byte) get("mBlasterType");
             originalLastTeam = (byte) get("mLastTeam");
             bluetooth = new RecordingBluetoothService();
@@ -118,6 +128,8 @@ public class WeaponSettingsRegressionTest {
             scenario.onActivity(current -> {
                 set("mBluetoothLeService", originalBluetooth);
                 set("mSecondaryBluetoothLeService", originalSecondaryBluetooth);
+                set("mTcpClient", originalTcpClient);
+                set("mMatchSession", originalMatchSession);
                 set("mBlasterType", originalBlasterType);
                 set("mLastTeam", originalLastTeam);
             });
@@ -130,6 +142,10 @@ public class WeaponSettingsRegressionTest {
         else editor.remove("RecoilEnabled");
         if (hadFiringPreference) editor.putInt(FullscreenActivity.PREF_FIRING_MODE, originalFiringPreference);
         else editor.remove(FullscreenActivity.PREF_FIRING_MODE);
+        if (hadPlayerIdPreference) editor.putInt(PLAYER_ID_PREFERENCE, originalPlayerIdPreference);
+        else editor.remove(PLAYER_ID_PREFERENCE);
+        if (hadGameModePreference) editor.putInt(FullscreenActivity.PREF_GAME_MODE, originalGameModePreference);
+        else editor.remove(FullscreenActivity.PREF_GAME_MODE);
         for (String address : new String[]{TEST_GUN_ONE, TEST_GUN_TWO}) {
             String key = FullscreenActivity.PREF_GUN_LOW_POWER_PREFIX + address;
             if (originalPowerPreferences.containsKey(key)) editor.putBoolean(key, originalPowerPreferences.get(key));
@@ -193,6 +209,132 @@ public class WeaponSettingsRegressionTest {
             assertEquals(0xff, lastShotConfig()[5] & 0xff);
             assertEquals(0xc8, lastShotConfig()[6] & 0xff);
         });
+    }
+
+    @Test public void staleGunSeatCannotReplaceHostAssignmentOrPlayerName() {
+        scenario.onActivity(current -> {
+            prepareHostAssignedGun();
+            set("mReady", true);
+            reportedGunSeat(17);
+            assertHostAssignmentRetained();
+            assertEquals(1, bluetooth.commands.size());
+            // Repeated stale status packets should not flood the gun's command queue.
+            reportedGunSeat(17);
+            assertHostAssignmentRetained();
+            assertEquals(1, bluetooth.commands.size());
+        });
+    }
+
+    @Test public void staleGunSeatCannotReplaceAssignmentDuringTcpReconnect() {
+        scenario.onActivity(current -> {
+            Object previous = get("mTcpClient");
+            try {
+                prepareHostAssignedGun();
+                set("mReady", false);
+                set("mLobbyJoined", false);
+                set("mTcpClient", new RetainedSessionTcpClient());
+                reportedGunSeat(17);
+                assertHostAssignmentRetained();
+            } finally { set("mTcpClient", previous); }
+        });
+    }
+
+    @Test public void staleGunSeatCannotReplaceAssignmentWhileMatchIsOutOfRange() {
+        scenario.onActivity(current -> {
+            Object previousClient = get("mTcpClient"), previousMatch = get("mMatchSession");
+            try {
+                prepareHostAssignedGun();
+                set("mReady", false);
+                set("mLobbyJoined", false);
+                set("mTcpClient", null);
+                set("mMatchSession", new MatchSessionLock("192.0.2.5", "existing-round"));
+                reportedGunSeat(17);
+                assertHostAssignmentRetained();
+            } finally {
+                set("mTcpClient", previousClient);set("mMatchSession", previousMatch);
+            }
+        });
+    }
+
+    @Test public void standaloneAndUnjoinedPhonesStillAdoptValidGunSeat() {
+        scenario.onActivity(current -> {
+            Object previousClient = get("mTcpClient"), previousMatch = get("mMatchSession");
+            try {
+                for (boolean networking : new boolean[]{false, true}) {
+                    prepareHostAssignedGun();
+                    set("mUseNetwork", networking);
+                    set("mReady", false);
+                    set("mLobbyJoined", false);
+                    set("mTcpClient", null);
+                    set("mMatchSession", new MatchSessionLock(null, null));
+                    reportedGunSeat(17);
+                    assertEquals("An unjoined phone must still reflect the physical gun ID",
+                            17, Globals.getInstance().mPlayerID);
+                }
+            } finally {
+                set("mTcpClient", previousClient);set("mMatchSession", previousMatch);
+            }
+        });
+    }
+
+    @Test public void leavingHostedModeAdoptsTheSamePreviouslyRejectedGunSeat() {
+        scenario.onActivity(current -> {
+            Object previousClient = get("mTcpClient"), previousMatch = get("mMatchSession");
+            try {
+                for (boolean networking : new boolean[]{false, true}) {
+                    prepareHostAssignedGun();
+                    set("mReady", true);
+                    reportedGunSeat(17);
+                    assertHostAssignmentRetained();
+                    // Leave for practice or unjoined network discovery before
+                    // the blaster has acknowledged its host-assigned seat.
+                    set("mReady", false);
+                    set("mLobbyJoined", false);
+                    set("mUseNetwork", networking);
+                    reportedGunSeat(17);
+                    assertEquals("Leaving the host must release the local gun selection",
+                            17, Globals.getInstance().mPlayerID);
+                }
+            } finally {
+                set("mTcpClient", previousClient);set("mMatchSession", previousMatch);
+            }
+        });
+    }
+
+    private void prepareHostAssignedGun() {
+        prepareTelemetry(false, 0);
+        set("mUseNetwork", true);
+        set("mIsServer", false);
+        set("mLobbyJoined", false);
+        set("mLobbyTakeoverPending", false);
+        set("mTcpClient", null);
+        set("mMatchSession", new MatchSessionLock(null, null));
+        set("mLastTeam", (byte) 0); // First status can precede acknowledgement of the new seat.
+        set("mPrimaryTeamCommandAt", android.os.SystemClock.elapsedRealtime() - 2500L);
+        set("mCommandCharacteristic", characteristic(GattAttributes.RECOIL_COMMAND_UUID));
+        Globals.getInstance().mBossMode = false;
+        Globals.getInstance().mTournamentMode = false;
+        Globals.getInstance().mPlayerID = 1; // Laptop-assigned replacement for the gun's old seat.
+        Globals.getInstance().mPlayerName = "Steph";
+        bluetooth.commands.clear();
+    }
+
+    private void reportedGunSeat(int seat) {
+        byte[] packet = new byte[20];
+        packet[FullscreenActivity.RECOIL_OFFSET_TEAM] = (byte) seat;
+        packet[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = 30;
+        deliverGattEvent(new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+    }
+
+    private void assertHostAssignmentRetained() {
+        assertEquals("Old gun status must not become a new network identity", 1,
+                Globals.getInstance().mPlayerID);
+        assertEquals("Steph", Globals.getInstance().mPlayerName);
+        assertFalse("The stale gun must receive the assigned seat", bluetooth.commands.isEmpty());
+        byte[] command = bluetooth.commands.get(bluetooth.commands.size() - 1);
+        assertEquals(0x80, command[2] & 255);
+        assertEquals(1, command[4] & 255);
     }
 
     @Test public void switchingFromBossToHunterRemovesTheWideCone() {
@@ -752,9 +894,16 @@ public class WeaponSettingsRegressionTest {
 
     private static final class RecordingBluetoothService extends BluetoothLeService {
         final List<byte[]> configs = new ArrayList<>();
+        final List<byte[]> commands = new ArrayList<>();
         @Override public synchronized void writeCharacteristic(BluetoothGattCharacteristic characteristic, byte[] value) {
             if (GattAttributes.RECOIL_CONFIG_UUID.equals(characteristic.getUuid().toString()))
                 configs.add(value.clone());
+            else if (GattAttributes.RECOIL_COMMAND_UUID.equals(characteristic.getUuid().toString()))
+                commands.add(value.clone());
         }
+    }
+
+    private static final class RetainedSessionTcpClient extends TcpClient {
+        @Override synchronized boolean hasClientSession() { return true; }
     }
 }

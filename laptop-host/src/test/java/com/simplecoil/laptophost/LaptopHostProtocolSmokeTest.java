@@ -1856,6 +1856,9 @@ public final class LaptopHostProtocolSmokeTest {
                 require(reply != null, "clock sample was not answered");
             }
             send(JSON_PREFIX + "{\"clockready\":true}");
+            // Wait for the host to process readiness before an HTTP start can
+            // race it. A following clock reply is a FIFO processing barrier.
+            require(probeClock("") != null, "clock readiness was not processed");
         }
 
         void send(String frame) throws IOException {

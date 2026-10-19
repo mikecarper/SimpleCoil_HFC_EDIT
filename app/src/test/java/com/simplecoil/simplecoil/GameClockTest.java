@@ -62,6 +62,45 @@ public class GameClockTest {
         }
     }
 
+    @Test public void relaySamplingHasAnExplicitBoundWithoutRelaxingNativeSampling() {
+        GameClock nativeClock = new GameClock(), relayClock = new GameClock();
+        assertFalse(nativeClock.record(1000, 2000, 2000, 1081));
+        assertFalse(relayClock.recordRelay(1000, 2000, 2000, 1801));
+        assertEquals(0, relayClock.samples());
+        assertTrue(relayClock.recordRelay(1000, 2000, 2000, 1800));
+        assertEquals(1, relayClock.samples());
+        assertFalse("Relay samples must not change the default Wi-Fi threshold",
+                relayClock.record(2000, 3000, 3000, 2081));
+    }
+
+    @Test public void fullRelayCalibrationBoundsAsymmetricNetworkErrorToFourHundredMilliseconds() {
+        for (int outbound = 0; outbound <= 800; outbound += 40) {
+            long actualOffset = 100000, inbound = 800 - outbound;
+            GameClock clock = new GameClock();
+            for (int sample = 0; sample < GameClock.SAMPLES_PER_SYNC; sample++) {
+                long sent = 1000 + sample * 1000;
+                assertTrue(clock.recordRelay(sent, sent + actualOffset + outbound,
+                        sent + actualOffset + outbound, sent + outbound + inbound));
+            }
+            assertEquals(GameClock.SAMPLES_PER_SYNC, clock.samples());
+            long error = clock.toLocalTime(5000000) + actualOffset - 5000000;
+            assertTrue(Math.abs(error) <= GameClock.MAX_RELAY_SAMPLE_DELAY_MS / 2);
+        }
+    }
+
+    @Test public void relayCalibrationStillSelectsTheLeastDelayedActualSample() {
+        GameClock clock = new GameClock();
+        for (int sample = 0; sample < GameClock.SAMPLES_PER_SYNC - 1; sample++)
+            assertTrue(clock.recordRelay(1000, 6700, 6700, 1800));
+        assertTrue(clock.recordRelay(2000, 7050, 7050, 2100));
+        assertEquals(GameClock.SAMPLES_PER_SYNC, clock.samples());
+        assertEquals(4000, clock.toLocalTime(9000));
+        clock.reset();
+        assertEquals(0, clock.samples());
+        try { clock.toLocalTime(9000);fail("A new host inherited relay calibration"); }
+        catch (IllegalArgumentException expected) { }
+    }
+
     @Test public void refreshKeepsPreviousEstimateUntilAFullNewBatchArrives() {
         GameClock clock = new GameClock();
         clock.record(1000, 6010, 6010, 1020);

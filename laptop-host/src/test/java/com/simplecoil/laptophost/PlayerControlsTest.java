@@ -20,6 +20,7 @@ public final class PlayerControlsTest {
     public static void main(String[] args) throws Exception {
         root = Files.createTempDirectory("simplecoil-player-controls");
         verifyDirectory();
+        verifyReturningIdentityHasOnlyOneSeat();
         verifyRelay();
         String firstDevice = UUID.randomUUID().toString(), secondDevice = UUID.randomUUID().toString(), replacementDevice = UUID.randomUUID().toString();
         Process host = start();
@@ -126,6 +127,60 @@ public final class PlayerControlsTest {
         } finally { stop(host); }
         System.out.println("Player controls, battery rounds, event policies, phone transfers, and persistence passed");
     }
+    private static void verifyReturningIdentityHasOnlyOneSeat() throws Exception {
+        Path previousRoot = root;root = Files.createTempDirectory("simplecoil-returning-player");
+        Process host = start();String device = UUID.randomUUID().toString();
+        try (Phone original = new Phone("127.0.0.2",1,"Steph",device)) {
+            String person = (String) active(1).get("identity");
+            Map<String,Object> settings = new LinkedHashMap<>(object(active(1).get("settings")));
+            settings.remove("playerID");settings.put("health",12);
+            check(post("/api/players",Map.of("id",1,"identity",person,"name","Saved Steph","settings",settings)).statusCode()==200,
+                    "Could not prepare the returning player's saved profile");
+            original.close();
+            await(() -> Boolean.FALSE.equals(active(1).get("connected")), "Old admitted seat did not disconnect");
+            // A DHCP change or fresh discovery can assign a new slot before
+            // the host learns which saved player is registering over TCP.
+            try (Phone returned = new Phone("127.0.0.3",3,"Phone name",device)) {
+                await(() -> uniqueIdentitySeat(person,3), "Returning phone left a duplicate admitted player row");
+                check(active(3).get("name").equals("Saved Steph"), "New seat lost the saved player name");
+                check(number(object(active(3).get("settings")).get("health"))==12, "New seat lost host gameplay edits");
+                checkRelayAddress(returned,device,"127.0.0.3");
+                // The older socket can still look connected when the new
+                // registration arrives. It must retire without deleting the
+                // replacement row when its delayed disconnect callback runs.
+                try (Phone replacedAgain = new Phone("127.0.0.4",5,"Phone name",device)) {
+                    await(() -> uniqueIdentitySeat(person,5), "A still-connected previous seat was duplicated");
+                    checkRelayAddress(replacedAgain,device,"127.0.0.4");
+                    replacedAgain.send(JSON+"{\"batterystatus\":{\"phone\":42,\"charging\":true,\"guns\":[]}}");
+                    await(() -> active(5).get("battery")!=null, "Retiring the old connection removed its replacement");
+                    try (Phone newcomer = new Phone("127.0.0.5",1,"New player",UUID.randomUUID().toString())) {
+                        check(Boolean.TRUE.equals(active(1).get("connected")), "Retired identity kept its old seat reserved");
+                        check(uniqueIdentitySeat(person,5), "Reusing a retired seat duplicated the returning player");
+                    }
+                }
+            }
+        } finally {stop(host);root=previousRoot;}
+    }
+    private static boolean uniqueIdentitySeat(String identity,int id) throws Exception {
+        int count=0;boolean expected=false;
+        for(Object value:(List<?>)object(LaptopHost.Json.parse(get("/api/players"))).get("players")) {
+            Map<String,Object> player=object(value);
+            if(identity.equals(player.get("identity"))) {
+                count++;
+                expected=number(player.get("id"))==id && Boolean.TRUE.equals(player.get("connected"));
+            }
+        }
+        return count==1&&expected;
+    }
+    private static void checkRelayAddress(Phone phone,String device,String address) throws Exception {
+        Map<String,Object> roster=phone.lastRoster;
+        if(!roster.containsKey(com.simplecoil.protocol.RelayConfig.WIRE))
+            roster=phone.until(game->game.containsKey(com.simplecoil.protocol.RelayConfig.WIRE));
+        com.simplecoil.protocol.RelayConfig config=com.simplecoil.protocol.RelayConfig.decode(
+                (String)roster.get(com.simplecoil.protocol.RelayConfig.WIRE));
+        check(config.members.get(UUID.fromString(device)).address.getHostAddress().equals(address),
+                "An old admitted seat overwrote the returning phone's relay endpoint");
+    }
     private static void verifyRelay() throws Exception {
         Path previousRoot=root;root=Files.createTempDirectory("simplecoil-relay-controls");
         Process host=start();String bridgeId=UUID.randomUUID().toString(), runnerId=UUID.randomUUID().toString();
@@ -166,6 +221,21 @@ public final class PlayerControlsTest {
                 await(outOfRange::hostReachable,"Host was not reachable through the nearby phone");
                 try(Phone relayed=new Phone(outOfRange.open(config.members.get(config.host).address,TCP,3000),17,"Runner",runnerId,true)) {
                     await(()->Boolean.TRUE.equals(active(17).get("viaRelay")),"Host did not accept the relayed phone");
+                    // A quiet application must not inherit a transport's old
+                    // five-second read timeout. Leave the same virtual socket
+                    // idle, then complete a host command and a fresh report.
+                    long quietUntil = System.nanoTime() + 6_500_000_000L;
+                    while (System.nanoTime() < quietUntil) {
+                        check(Boolean.TRUE.equals(active(17).get("connected")), "Host dropped an idle relay before its heartbeat deadline");
+                        Thread.sleep(100);
+                    }
+                    String relayPerson = (String) active(17).get("identity");
+                    check(post("/api/players",Map.of("action","battery","id",17,"identity",relayPerson)).statusCode()==200,
+                            "Host could not request a battery report after relay idle");
+                    relayed.until(game -> Boolean.TRUE.equals(game.get(EventMode.BATTERY_REQUEST)));
+                    relayed.send(JSON + "{\"batterystatus\":{\"phone\":17,\"charging\":true,\"guns\":[{\"type\":2,\"connected\":true,\"lowPower\":false,\"level\":\"good\",\"voltageTenths\":48}]}}");
+                    await(() -> active(17).get("battery") != null, "Fresh battery report was lost after relay idle");
+                    check(Boolean.TRUE.equals(active(17).get("viaRelay")), "Relay idle recovery replaced the virtual connection");
                     bridge.syncClock();relayed.syncClock();
                     check(post("/api/start",Map.of()).statusCode()==200,"Relayed phone could not start with the shared game");
                     await(()->state().get("state").equals("running"),"Relayed round did not start");

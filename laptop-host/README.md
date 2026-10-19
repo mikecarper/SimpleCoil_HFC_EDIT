@@ -127,7 +127,7 @@ The laptop starts in **Event Mode**: the operator starts and ends rounds, edits
 players, and controls the event. **End game** ends the round directly. Phone
 start commands and name/rule edits cannot override the operator. Use
 `--no-event-mode` for the ordinary phone controls and two-player end-approval
-workflow. Use protocol-30 phones; update every phone to version 1.43 for the
+workflow. Use protocol-30 phones; update every phone to version 1.50 for the
 new Event Mode, kiosk, battery, and player-transfer controls.
 
 The laptop sends the phone scoreboard only after a player-list request. Host edits,
@@ -151,9 +151,26 @@ A continuous chain back to the laptop is required; an isolated group cannot
 reach a host outside every available radio path.
 An admitted phone keeps its fallback membership after losing its lobby TCP
 connection, so it can return through a neighbor before the round starts.
-The live version 1.43 bench reached the host with phone Wi-Fi disabled and returned
-two fresh battery reports before disconnecting. Bluetooth fallback still has
-intermittent dropouts; sustained connectivity and physical range remain unvalidated.
+The live version 1.50 bench kept one phone's Wi-Fi radio off for 197.6 seconds,
+with all 20 host refresh controls received and 20 fresh gun reports returned.
+Clock readiness stayed true and the 182-second stability window had no game
+reconnects. Wi-Fi was restored afterward. Physical range remains untested.
+Version 1.50 removes the five-second virtual read timeout and uses bounded
+relay queues that coalesce retries instead of disconnecting under congestion.
+Unicast traffic prefers a fresh single path and stops at its destination. Stale
+or full preferred paths can fail over through another neighbor. Broadcasts
+continue to propagate, and restarted apps use fresh packet sequence ranges.
+Returning phones retire older roster seats for the same saved player, keeping
+the current relay address authoritative. Phones retain the host-assigned slot
+when a gun reports its previous ID. Bluetooth setup allows 15 seconds and
+cancels Classic discovery before dialing.
+The host queues writes independently for each phone, so a slow relay cannot
+delay other phones' heartbeats or dashboard actions. Terminal messages flush
+before closing, and clock replies are timestamped by their writer.
+Clock probes reach the original host. Relay clients accept network round trips
+up to 800 ms, require twelve samples and use the least-delayed estimate; native
+Wi-Fi retains its 80 ms limit. Relay network timing uncertainty is bounded to
+400 ms per phone, independently of UI scheduling or gun latency.
 
 A round stopped before 60 seconds of actual play can be restarted without
 the usual 30-second between-game wait. A canceled countdown can also be
@@ -474,8 +491,10 @@ When a phone has a fresh GPS fix, SimpleCoil also uses its UTC timestamp as an
 optional refinement for the shared countdown. It does not change the phone's
 system clock; the existing monotonic round-trip clock sync remains the fallback
 and final guardrail when GPS time is missing or disagrees. Joining the lobby
-immediately starts a 12-probe calibration burst; only samples at or below 80 ms
-round trip are accepted, keeping network-path uncertainty below 50 ms.
+immediately starts a 12-probe calibration burst. Native Wi-Fi accepts samples up
+to 80 ms round trip; relay sockets allow up to 800 ms. Choosing the least-delayed
+valid sample bounds network timing uncertainty to 40 ms per native phone or
+400 ms per relayed phone, before UI scheduling and hardware latency.
 
 Phones see only their own team by default; the laptop's local game-master map
 still sees every player. A valid IR hit temporarily reveals the involved enemy
