@@ -742,7 +742,10 @@ public class TcpClient extends Service {
                     wasConnected = false;
                     sendBroadcast(new Intent(NetMsg.NETMSG_NETWORKDISCONNECTED));
                 }
-                if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
+                // Once connected, retain this host while a nearby relay forms.
+                // Its Bluetooth setup can outlast the initial three join attempts,
+                // including in the lobby before the operator starts a round.
+                if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE && !rejoin)
                     retryCount--;
                 s = new Socket();
                 synchronized (this) {
@@ -1204,6 +1207,11 @@ public class TcpClient extends Service {
     /** A lobby snapshot may arrive while its activity is paused for gun pairing. */
     synchronized boolean hasClientSession() {
         return !mDestroyed && (keepListening || isListening);
+    }
+
+    /** Includes automatic reconnects, but excludes stopped or replaced sessions. */
+    synchronized boolean hasClientSession(InetAddress host) {
+        return !mDestroyed && keepListening && host != null && host.equals(mSessionServerAddress);
     }
 
     public synchronized boolean hasLobbyConnection() {

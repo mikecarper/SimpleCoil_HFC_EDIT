@@ -7,7 +7,11 @@ import android.app.KeyguardManager;
 import android.app.admin.DevicePolicyManager;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.widget.EditText;
 import android.widget.Toast;
@@ -71,9 +75,23 @@ final class EventKioskController {
             }
             // Without device-owner allowlisting Android asks the user to confirm screen pinning.
             activity.startLockTask();
+            if (policy == null || !policy.isLockTaskPermitted(activity.getPackageName()))
+                soundPinPrompt();
         } catch (RuntimeException failure) {
             error = true;
             Toast.makeText(activity, R.string.event_pin_failed, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void soundPinPrompt() {
+        ToneGenerator chime = null;
+        try {
+            chime = new ToneGenerator(AudioManager.STREAM_MUSIC, 85);
+            chime.startTone(ToneGenerator.TONE_PROP_ACK, 350);
+            ToneGenerator playing = chime;
+            new Handler(Looper.getMainLooper()).postDelayed(playing::release, 600);
+        } catch (RuntimeException unavailable) {
+            if (chime != null) chime.release();
         }
     }
 

@@ -127,19 +127,33 @@ The laptop starts in **Event Mode**: the operator starts and ends rounds, edits
 players, and controls the event. **End game** ends the round directly. Phone
 start commands and name/rule edits cannot override the operator. Use
 `--no-event-mode` for the ordinary phone controls and two-player end-approval
-workflow. Use protocol-30 phones; update every phone to version 1.39 for the
+workflow. Use protocol-30 phones; update every phone to version 1.43 for the
 new Event Mode, kiosk, battery, and player-transfer controls.
 
-Version 1.39 also prepares nearby phone relays automatically after admission.
+The laptop sends the phone scoreboard only after a player-list request. Host edits,
+reconnections and round changes do not open that dialog, including on older phones.
+Updated phones show actual players without empty player slots.
+
+Nearby phone relays prepare automatically after admission.
 Keep one or more phones within reach of the laptop's Wi-Fi. Phones beyond that
 coverage can forward the same game's UDP traffic and TCP host controls through
-nearby phones over Wi-Fi Direct or Bluetooth Classic. Accept the Android direct
-connection invitation during setup, and enable Bluetooth on the phones.
+nearby phones over Bluetooth Classic. A nearby phone forwards Bluetooth traffic
+over its working Wi-Fi connection to the laptop, and relays replies back. Enable
+Bluetooth on all phones. Version 1.40 removes automatic Wi-Fi Direct invitations;
+the tested LG Android 5.1.1 phones need no pairing confirmation for this fallback.
+The laptop also disables Wi-Fi Direct preparation on admitted 1.39 phones.
 The laptop listens for game relays on TCP 17514 (the configured game TCP port + 4).
 Phones retain their admitted logical addresses and identities across radio loss.
+The host reserves a disconnected relay player's seat while it reconnects; an
+explicit Leave releases that seat. Disconnected phones are marked offline.
 The private player-control API reports `viaRelay` for a relayed control connection.
 A continuous chain back to the laptop is required; an isolated group cannot
 reach a host outside every available radio path.
+An admitted phone keeps its fallback membership after losing its lobby TCP
+connection, so it can return through a neighbor before the round starts.
+The live version 1.43 bench reached the host with phone Wi-Fi disabled and returned
+two fresh battery reports before disconnecting. Bluetooth fallback still has
+intermittent dropouts; sustained connectivity and physical range remain unvalidated.
 
 A round stopped before 60 seconds of actual play can be restarted without
 the usual 30-second between-game wait. A canceled countdown can also be

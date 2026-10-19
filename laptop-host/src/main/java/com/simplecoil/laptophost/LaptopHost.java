@@ -115,8 +115,8 @@ public final class LaptopHost {
     private static final long GRENADE_MARKER_LIFETIME_MS = 8_000;
     private static final long JOIN_ASSIGNMENT_TIMEOUT_MS = 10_000;
     private static final long BALANCED_QR_CHECK_IN_TIMEOUT_MS = 90_000;
-    // Match the dedicated phone host's practical heartbeat window. A Wi-Fi
-    // disappearance must not leave a ghost player occupying an ID or marker.
+    // Match the dedicated phone host's practical heartbeat window. Stop showing
+    // a disconnected phone as online while retaining admitted relay seats.
     private static final long CLIENT_IDLE_TIMEOUT_MS = 35_000;
 
     private static final String MSG_PING = "ping";
@@ -190,7 +190,6 @@ public final class LaptopHost {
     private final UUID relayKey = UUID.randomUUID(), relayNode = UUID.randomUUID();
     private volatile com.simplecoil.protocol.RelayMesh relayMesh;
     private volatile com.simplecoil.protocol.RelayConfig relayConfig;
-    private UUID relayOwner;
     private InetAddress relayAddress;
 
     private void acceptGameSocket(Socket socket) throws IOException {
@@ -201,7 +200,6 @@ public final class LaptopHost {
         if (!(json.get("relaynode") instanceof String)) return;
         try {
             player.relayNode = com.simplecoil.protocol.RelayConfig.uuid((String) json.get("relaynode"));
-            player.relayP2p = json.get("relayp2p") instanceof String ? (String) json.get("relayp2p") : "";
             player.relayBluetooth = json.get("relaybt") instanceof String ? (String) json.get("relaybt") : "";
         } catch (IllegalArgumentException ignored) { }
     }
@@ -214,12 +212,20 @@ public final class LaptopHost {
         candidates.sort(java.util.Comparator.comparing((Player player) -> !player.connected));
         for (Player player : candidates) if (player.relayNode != null && player.address != null
                 && addresses.add(player.address))
-            members.put(player.relayNode, new com.simplecoil.protocol.RelayConfig.Member(player.relayNode, player.address, player.relayP2p, player.relayBluetooth));
+            members.put(player.relayNode, new com.simplecoil.protocol.RelayConfig.Member(player.relayNode, player.address, "", player.relayBluetooth));
+        // Retain admitted relay membership across lobby disconnects and seat
+        // changes while Bluetooth reconnects. Prefer
+        // current addresses and keep the remaining cohort within the 32-phone cap.
+        com.simplecoil.protocol.RelayConfig previous = relayConfig;
+        if (previous != null) for (com.simplecoil.protocol.RelayConfig.Member member : previous.members.values()) {
+            if (members.size() >= 33) break;
+            if (!members.containsKey(member.id) && addresses.add(member.address)) members.put(member.id, member);
+        }
         if (members.size() < 2) return null;
-        if (relayOwner == null || !members.containsKey(relayOwner))
-            for (UUID node : members.keySet()) if (!node.equals(relayNode)) { relayOwner = node;break; }
         try {
-            com.simplecoil.protocol.RelayConfig next = new com.simplecoil.protocol.RelayConfig(relayKey, relayNode, relayOwner, members);
+            // Advertising the laptop as owner with no P2P address also prevents
+            // 1.39 phones from creating groups or sending Android invitations.
+            com.simplecoil.protocol.RelayConfig next = new com.simplecoil.protocol.RelayConfig(relayKey, relayNode, relayNode, members);
             if (relayMesh == null) {
                 relayMesh = new com.simplecoil.protocol.RelayMesh(relayNode, next,
                         new InetSocketAddress(config.tcpPort + 4), new com.simplecoil.protocol.RelayMesh.Listener() {
@@ -529,7 +535,7 @@ public final class LaptopHost {
                 return existing.playerID;
             if (requestedID == 0) {
                 for (Player player : players.values())
-                    if (player.connected && source.equals(player.address))
+                    if ((player.connected || player.relayNode != null) && source.equals(player.address))
                         return player.id;
                 int preferredTeam = 0;
                 if (!config.boss && !config.infection && !assignedTeamsEnabledLocked()
@@ -549,7 +555,7 @@ public final class LaptopHost {
                     if (preferredTeam != 0 && teamFor(candidate) != preferredTeam)
                         continue;
                     Player player = players.get(candidate);
-                    if (player != null && player.connected)
+                    if (player != null && (player.connected || player.relayNode != null))
                         continue;
                     boolean reserved = false;
                     for (PendingAssignment pending : pendingAssignments.values())
@@ -581,7 +587,8 @@ public final class LaptopHost {
                     continue;
                 Player player = players.get(candidate);
                 boolean sameKnownEndpoint = player != null && source.equals(player.address);
-                if (player != null && (player.connected || (isRoundActiveLocked() && !sameKnownEndpoint)))
+                if (player != null && (player.connected
+                        || (isRoundActiveLocked() || player.relayNode != null) && !sameKnownEndpoint))
                     continue;
                 if (reservedByAnotherEndpointLocked(candidate, source))
                     continue;
@@ -1216,7 +1223,6 @@ public final class LaptopHost {
             if (!eventMode) player.name = hostPlayerNames.getOrDefault(player.identity, name);
         }
         broadcastRoster();
-        broadcastPlayerData();
     }
 
     private void handleBalancedCheckIn(ClientConnection client, Map<String, Object> json) {
@@ -1326,6 +1332,10 @@ public final class LaptopHost {
                 pendingAssignments.remove(client.address());
 
             Player existing = players.get(requestedID);
+            if (existing != null && existing.relayNode != null && !existing.identity.equals(identity)) {
+                client.close();
+                return;
+            }
             if (joined == null && isRoundActiveLocked() && roundRoster != null) {
                 RoundRoster.Member member = roundRoster.person(identity);
                 RoundRoster.Member occupant = roundRoster.seat(requestedID);
@@ -1409,6 +1419,7 @@ public final class LaptopHost {
             return;
         if (MSG_LEAVE.equals(message) || MSG_QUIT.equals(message)) {
             synchronized (stateLock) {
+                client.left = true;
                 rememberRoundStatsLocked();
                 if (roundRoster != null) roundRoster.leave(client.playerID);
             }
@@ -1437,6 +1448,8 @@ public final class LaptopHost {
             return;
         }
         if (MSG_PLAYER_DATA_REQUEST.equals(message)) {
+            // Legacy phones open a modal for every playerdata frame. Keep this
+            // response opt-in; automatic roster, edit and round updates stay silent.
             client.send(playerDataFrame());
             return;
         }
@@ -1502,7 +1515,6 @@ public final class LaptopHost {
             if (teammate != scorerConnection)
                 teammate.send(messageFrame(MSG_TEAM_ELIMINATED));
         }
-        broadcastPlayerData();
         if (reachedScoreLimit)
             endRound("score limit reached");
     }
@@ -1781,7 +1793,6 @@ public final class LaptopHost {
             recipient = player.connection;
         }
         recipient.send(messageFrame(MSG_RESPAWN_GRANTED));
-        broadcastPlayerData();
         return true;
     }
 
@@ -2037,12 +2048,6 @@ public final class LaptopHost {
 
     private void broadcastGrenadePairings() {
         String frame = grenadePairingsFrame();
-        for (ClientConnection client : connectedClients())
-            client.send(frame);
-    }
-
-    private void broadcastPlayerData() {
-        String frame = playerDataFrame();
         for (ClientConnection client : connectedClients())
             client.send(frame);
     }
@@ -2433,7 +2438,8 @@ public final class LaptopHost {
                 player.connection = null;
                 player.connected = false;
                 clearEnemyGpsRevealsForPlayerLocked(player.id);
-                if (!isRoundActiveLocked() && roundState != RoundState.FINISHED) {
+                if (!isRoundActiveLocked() && roundState != RoundState.FINISHED
+                        && (client.left || player.relayNode == null)) {
                     players.remove(player.id);
                     grenadeOwners.entrySet().removeIf(entry -> entry.getValue() == player.id);
                     invalidateTeamAssignmentsLocked();
@@ -2444,7 +2450,6 @@ public final class LaptopHost {
         if (changed && !stopping) {
             broadcastEndVotes();
             broadcastRoster();
-            broadcastPlayerData();
         }
     }
 
@@ -2627,6 +2632,7 @@ public final class LaptopHost {
         private final DataOutputStream output;
         private final Object outputLock = new Object();
         private volatile boolean closed;
+        private volatile boolean left;
         private volatile int playerID;
         private volatile boolean clockReady;
         private volatile boolean lobbyReady = true;
@@ -2830,7 +2836,7 @@ public final class LaptopHost {
         boolean awaitingRespawn;
         boolean eliminated;
         UUID relayNode;
-        String relayP2p = "", relayBluetooth = "";
+        String relayBluetooth = "";
         Map<String, Object> battery;
         long batteryAt = Long.MIN_VALUE;
         final Deque<GeoPoint> trail = new ArrayDeque<>();
@@ -3493,7 +3499,6 @@ public final class LaptopHost {
             }
         }
         broadcastRoster();
-        broadcastPlayerData();
         sendJson(exchange, 200, mapOf("ok", true, "message", "Player updated.", "status", playerControlsState()));
     }
 
@@ -3548,7 +3553,7 @@ public final class LaptopHost {
             previous.send(jsonFrame(mapOf(EventMode.TRANSFERRED_OUT, true)));
             previous.close();
         }
-        broadcastRoster();broadcastPlayerData();
+        broadcastRoster();
         sendJson(exchange, 200, mapOf("ok", true, "message", "Player moved to the replacement phone. The original phone is unassigned.",
                 "status", playerControlsState()));
     }

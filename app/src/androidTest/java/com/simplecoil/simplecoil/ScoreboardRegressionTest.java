@@ -81,8 +81,8 @@ public class ScoreboardRegressionTest {
             adapter.registerDataSetObserver(new DataSetObserver() {
                 @Override public void onChanged() {
                     changes[0]++;
-                    assertEquals(3, adapter.getCount());
-                    assertSame(replacement, adapter.getItem(2));
+                assertEquals(2, adapter.getCount());
+                assertSame(replacement, adapter.getItem(1));
                 }
             });
             adapter.setData(new PlayerDisplayData[]{null, null, replacement});
@@ -167,22 +167,30 @@ public class ScoreboardRegressionTest {
     }
 
     @Test
-    public void refreshKeepsHeadersMissingPlayersAndTeamTotalsIntact() {
+    public void refreshShowsOnlyActualPlayersAndKeepsTheirOriginalTeamIds() {
         onMain(() -> {
+            Globals.getInstance().mGameMode = Globals.GAME_MODE_2TEAMS;
             for (boolean isClient : new boolean[]{false, true}) {
                 PlayerDisplayDataListAdapter adapter = adapter(player("Original", 1), isClient);
                 PlayerDisplayData[] replacement = new PlayerDisplayData[Globals.MAX_PLAYER_ID + 2];
+                replacement[3] = player("Chris", 5);
+                replacement[3].playerID = 3;
+                replacement[17] = player("Mike", 8);
+                replacement[17].playerID = 17;
                 replacement[Globals.MAX_PLAYER_ID + 1] = player("Team 1: 10, Team 2: 20", 0);
                 adapter.setData(replacement);
-                assertEquals(replacement.length, adapter.getCount());
+                assertEquals(4, adapter.getCount());
                 View header = adapter.getView(0, null, parent);
                 assertEquals(activity.getString(R.string.player_list_id_label), text(header, R.id.player_id_tv));
                 assertEquals(activity.getString(R.string.game_limit_lives), text(header, R.id.player_eliminated_tv));
-                View empty = adapter.getView(1, null, parent);
-                assertEquals(activity.getString(R.string.player_name_not_connected), text(empty, R.id.player_name_tv));
-                assertEquals("", text(empty, R.id.player_points_tv));
-                assertEquals("", text(empty, R.id.player_eliminated_tv));
-                View footer = adapter.getView(Globals.MAX_PLAYER_ID + 1, null, parent);
+                View first = adapter.getView(1, null, parent);
+                assertEquals("Chris", text(first, R.id.player_name_tv));
+                assertEquals("1-3", text(first, R.id.player_id_tv));
+                assertSame(replacement[17], adapter.getItem(2));
+                assertEquals("2-1", text(adapter.getView(2, null, parent), R.id.player_id_tv));
+                assertTrue(adapter.isEnabled(1));
+                assertTrue(!adapter.isEnabled(0) && !adapter.isEnabled(3));
+                View footer = adapter.getView(3, null, parent);
                 assertEquals("Team 1: 10, Team 2: 20", text(footer, R.id.player_id_tv));
             }
         });
@@ -204,7 +212,7 @@ public class ScoreboardRegressionTest {
             assertEquals(View.GONE, networkStatus(header).getVisibility());
 
             View anotherPlayerRow = adapter.getView(1, null, parent);
-            View footer = adapter.getView(Globals.MAX_PLAYER_ID + 1, anotherPlayerRow, parent);
+            View footer = adapter.getView(2, anotherPlayerRow, parent);
             assertEquals("Team 1: 3, Team 2: 0", text(footer, R.id.player_id_tv));
             assertEquals("", text(footer, R.id.player_name_tv));
             assertEquals("", text(footer, R.id.player_points_tv));

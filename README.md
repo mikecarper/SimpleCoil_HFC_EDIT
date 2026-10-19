@@ -149,21 +149,40 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.39 on every phone for this build.
+messages cannot end a new round. Install 1.43 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
-remains the primary connection. If it fails, Wi-Fi Direct and, when necessary,
-Bluetooth Classic links can forward game traffic through other admitted phones.
+remains the primary connection. If it fails, Bluetooth Classic links can forward
+game traffic through other admitted phones. A phone with hub Wi-Fi forwards that
+traffic to the original host, and sends replies back over Bluetooth.
 The original host, player identities, round and operator controls stay in use;
-losing the hub does not create a separate game. Accept Android's Wi-Fi Direct
-invitation when setting up the phones. Bluetooth and Wi-Fi must be enabled for
-both fallback options. The app keeps these connections alive in the background.
+losing the hub does not create a separate game. Version 1.40 removes automatic
+Wi-Fi Direct connections and their Android invitations. Leave Bluetooth enabled
+on all phones and Wi-Fi enabled on the phones within hub range. No phone-to-phone
+pairing or confirmation is required on the tested LG Android 5.1.1 phones. The
+app keeps these connections alive in the background.
+
+Version 1.43 keeps an admitted lobby connected to its original host while a
+Bluetooth fallback forms, including past the initial lobby timeout and changes
+between Wi-Fi and Bluetooth. A selected game on SlowFi or another Wi-Fi name also
+stops the app's repeated Recoil network scans while that Wi-Fi stays associated.
+An attention chime plays once when Android opens a screen-pinning confirmation;
+ordinary reconnects do not replay it. The chime uses the phone's media volume.
+
+The phone player list opens only after tapping its button. Host player updates,
+reconnections and round completion do not open it automatically. It lists actual
+players and team totals without empty player slots.
 
 This requires a continuous path of nearby phones back to the original host.
-Wi-Fi Direct uses one group owner; Bluetooth provides additional neighbor links.
+Bluetooth provides the neighbor links; at least one phone must still reach the host.
 A completely isolated phone must move back into reach. The relay carries game
 traffic only, and does not extend Internet access. Radio range depends on the
 phones, obstacles and interference; there is no guaranteed distance increase.
+
+The latest live bench test on version 1.43 rejoined the laptop with a phone's
+Wi-Fi disabled and returned two fresh phone/gun battery reports, then disconnected.
+Bluetooth fallback still has intermittent dropouts; sustained connectivity and
+physical range extension have not been validated.
 
 Once a network match starts, each participant stays bound to that match's host.
 Joining a host also disables automatic hosting on that participant, including

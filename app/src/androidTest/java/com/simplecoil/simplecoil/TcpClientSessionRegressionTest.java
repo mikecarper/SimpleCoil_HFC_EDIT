@@ -163,15 +163,45 @@ public class TcpClientSessionRegressionTest {
     }
 
     @Test
-    public void losingHubConnectivityDoesNotClaimTheHostCancelled() throws Exception {
+    public void admittedLobbyKeepsRetryingUntilTheHostOrRelayReturns() throws Exception {
         connect();
+        InetAddress host = Globals.getInstance().mServerIP;
+        assertTrue(client.hasClientSession(host));
+        assertFalse(client.hasClientSession(InetAddress.getByName("127.0.0.2")));
         listener.close();
         peer.close();
-        // Allow the seven-second missing-heartbeat window plus three retries.
-        assertTrue("Unreachable lobby did not return to discovery", awaitStopped(12000));
-        assertTrue(client.actions.contains(NetMsg.NETMSG_SERVERUNREACHABLE));
+        // Exceed the old seven-second heartbeat window plus three join attempts.
+        SystemClock.sleep(12000);
+        assertTrue("Admitted client stopped before the fallback could become ready", flag("keepListening"));
+        assertTrue("Lobby lost its selected host while reconnecting", client.hasClientSession(host));
+        assertFalse(client.actions.contains(NetMsg.NETMSG_SERVERUNREACHABLE));
         assertFalse(client.actions.contains(NetMsg.NETMSG_SERVERCANCEL));
         assertFalse(client.actions.contains(NetMsg.NETMSG_ENDGAME));
+        assertNull(client.consumePendingTerminalEvent());
+        listener = new ServerSocket();
+        listener.setReuseAddress(true);
+        listener.bind(new InetSocketAddress("127.0.0.1", TcpServer.TCP_SERVER_PORT));
+        listener.setSoTimeout(5000);
+        peer = listener.accept();peer.setSoTimeout(3000);
+        received = new DataInputStream(peer.getInputStream());
+        String registration = received.readUTF();
+        assertTrue("Client did not rejoin its original session", registration.contains("\"rejoin\":true"));
+        assertTrue(received.readUTF().contains(TcpServer.JSON_PLAYERSETTINGS));
+        assertTrue(received.readUTF().contains(TcpServer.JSON_PAIRED_GRENADE_ID));
+        synchronizeClock();
+        send(TcpServer.TCP_SERVER_PING);
+        expectPong();
+        client.stopTcpClient();
+        assertFalse("A stopped session retained the lobby host", client.hasClientSession(host));
+    }
+
+    @Test public void initialUnreachableHostStillReturnsToDiscovery() throws Exception {
+        listener = new ServerSocket();listener.setReuseAddress(true);
+        listener.bind(new InetSocketAddress("127.0.0.1", TcpServer.TCP_SERVER_PORT));listener.close();
+        Globals.getInstance().mServerIP = InetAddress.getByName("127.0.0.1");
+        client.startTcpClient();
+        assertTrue("Initial join never returned to discovery", awaitStopped(6000));
+        assertTrue(client.actions.contains(NetMsg.NETMSG_SERVERUNREACHABLE));
         Intent pending = client.consumePendingTerminalEvent();
         assertNotNull(pending);
         assertEquals(NetMsg.NETMSG_SERVERUNREACHABLE, pending.getAction());

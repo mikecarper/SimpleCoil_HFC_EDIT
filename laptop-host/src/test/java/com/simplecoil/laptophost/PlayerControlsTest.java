@@ -26,6 +26,9 @@ public final class PlayerControlsTest {
         try (Phone first = new Phone("127.0.0.2", 1, "Blue", firstDevice);
              Phone second = new Phone("127.0.0.3", 17, "Red", secondDevice);
              Phone replacement = new Phone("127.0.0.4", 2, "Replacement", replacementDevice)) {
+            first.send(MESSAGE + "PLAYERDATAREQUEST");
+            Map<String,Object> requestedScores = first.until(game -> game.containsKey("playerdata"));
+            check(((List<?>)requestedScores.get("playerdata")).size() == 3, "Manual player list did not contain the actual roster");
             check(get("/players").contains("Move to another phone"), "Player editor unavailable");
             check(get("/assets/players.js").contains("settingsValues"), "Player editor script unavailable");
             check(control("/api/players", "{}", "https://example.com", true).statusCode() == 403, "Cross-origin edit accepted");
@@ -133,6 +136,25 @@ public final class PlayerControlsTest {
             // The first snapshot can precede the second registration.
             if(!config.members.containsKey(UUID.fromString(runnerId)))
                 config=com.simplecoil.protocol.RelayConfig.decode((String)nativeRunner.until(game->game.containsKey(com.simplecoil.protocol.RelayConfig.WIRE)).get(com.simplecoil.protocol.RelayConfig.WIRE));
+            check(config.owner.equals(config.host) && config.members.values().stream().allMatch(member -> member.p2p.isEmpty()),
+                    "Legacy phones were instructed to prepare Wi-Fi Direct invitations");
+            nativeRunner.close();
+            Map<String,Object> disconnected = bridge.until(game -> game.containsKey("players")
+                    && rosterName(game,17).isEmpty() && game.containsKey(com.simplecoil.protocol.RelayConfig.WIRE));
+            config = com.simplecoil.protocol.RelayConfig.decode((String)disconnected.get(com.simplecoil.protocol.RelayConfig.WIRE));
+            check(config.members.containsKey(UUID.fromString(runnerId)), "Lobby dropout revoked the phone's fallback membership");
+            check(Boolean.FALSE.equals(active(17).get("connected")), "Disconnected relay phone still appeared online");
+            try (DatagramSocket newcomer = new DatagramSocket(null)) {
+                newcomer.setReuseAddress(true);
+                newcomer.bind(new InetSocketAddress("127.0.0.4",19700));
+                newcomer.setSoTimeout(1000);
+                byte[] request = "SimpleCoil:JOIN3017".getBytes(StandardCharsets.UTF_8);
+                newcomer.send(new DatagramPacket(request,request.length,InetAddress.getByName("127.0.0.1"),19700));
+                DatagramPacket reply = new DatagramPacket(new byte[128],128);
+                newcomer.receive(reply);
+                check(new String(reply.getData(),reply.getOffset(),reply.getLength(),StandardCharsets.UTF_8)
+                        .equals("SimpleCoil:SERVERREPLY:18"), "A new phone took the reconnecting relay player's seat");
+            }
             com.simplecoil.protocol.RelayMesh.Listener unused=new com.simplecoil.protocol.RelayMesh.Listener(){
                 public void datagram(InetAddress from,InetAddress to,int port,byte[] bytes){}
                 public boolean accept(Socket socket,int port){return false;}
@@ -199,12 +221,12 @@ public final class PlayerControlsTest {
     private interface Condition{boolean get()throws Exception;}
     private static void await(Condition condition,String message)throws Exception{long until=System.nanoTime()+5_000_000_000L;while(System.nanoTime()<until){if(condition.get())return;Thread.sleep(25);}throw new AssertionError(message);}
     private static final class Phone implements AutoCloseable{
-        private final Socket socket;private final DataInputStream input;private final DataOutputStream output;private Map<String,Object> lastRoster;
+        private final Socket socket;private final DataInputStream input;private final DataOutputStream output;private Map<String,Object> lastRoster;private boolean scoreboardRequested;
         Phone(String address,int id,String name,String identity)throws Exception{this(connectSocket(address),id,name,identity,false);}
         private static Socket connectSocket(String address)throws Exception{Socket socket=new Socket();socket.bind(new InetSocketAddress(address,0));socket.connect(new InetSocketAddress("127.0.0.1",TCP));return socket;}
-        Phone(Socket socket,int id,String name,String identity,boolean rejoin)throws Exception{this.socket=socket;socket.setSoTimeout(4000);input=new DataInputStream(socket.getInputStream());output=new DataOutputStream(socket.getOutputStream());Map<String,Object> registration=new LinkedHashMap<>(Map.of("playerID",id,"playername",name,"playeridentity",identity,"deviceidentity",identity,"eventcontrol",2,"lobbyready",true,"relaynode",identity,"relayp2p",""));registration.put("rejoin",rejoin);send(JSON+LaptopHost.Json.stringify(registration));lastRoster=until(game->game.containsKey("players"));}
-        void send(String frame)throws IOException{output.writeUTF(frame);output.flush();}
-        Map<String,Object> until(Predicate<Map<String,Object>> predicate)throws Exception{long until=System.nanoTime()+5_000_000_000L;while(System.nanoTime()<until){String frame=input.readUTF();if(frame.equals(MESSAGE+"ping")){send(MESSAGE+"pong");continue;}if(frame.startsWith(JSON)){Map<String,Object> game=object(LaptopHost.Json.parse(frame.substring(JSON.length())));if(predicate.test(game))return game;}}throw new AssertionError("Expected phone frame was not received");}
+        Phone(Socket socket,int id,String name,String identity,boolean rejoin)throws Exception{this.socket=socket;socket.setSoTimeout(4000);input=new DataInputStream(socket.getInputStream());output=new DataOutputStream(socket.getOutputStream());Map<String,Object> registration=new LinkedHashMap<>(Map.of("playerID",id,"playername",name,"playeridentity",identity,"deviceidentity",identity,"eventcontrol",2,"lobbyready",true,"relaynode",identity,"relayp2p","02:11:22:33:44:55"));registration.put("rejoin",rejoin);send(JSON+LaptopHost.Json.stringify(registration));lastRoster=until(game->game.containsKey("players"));}
+        void send(String frame)throws IOException{if(frame.equals(MESSAGE+"PLAYERDATAREQUEST"))scoreboardRequested=true;output.writeUTF(frame);output.flush();}
+        Map<String,Object> until(Predicate<Map<String,Object>> predicate)throws Exception{long until=System.nanoTime()+5_000_000_000L;while(System.nanoTime()<until){String frame=input.readUTF();if(frame.equals(MESSAGE+"ping")){send(MESSAGE+"pong");continue;}if(frame.startsWith(JSON)){Map<String,Object> game=object(LaptopHost.Json.parse(frame.substring(JSON.length())));if(game.containsKey("playerdata")){check(scoreboardRequested,"Host pushed an unsolicited modal scoreboard");scoreboardRequested=false;}if(predicate.test(game))return game;}}throw new AssertionError("Expected phone frame was not received");}
         void syncClock()throws Exception{for(int i=1;i<=12;i++){send(JSON+"{\"clocksync\":"+i+"}");final int sequence=i;until(game->game.get("clocksync") instanceof Number&&number(game.get("clocksync"))==sequence);}send(JSON+"{\"clockready\":true}");until(game->game.containsKey("players"));}
         public void close()throws IOException{socket.close();}
     }

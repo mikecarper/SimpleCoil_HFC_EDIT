@@ -553,7 +553,7 @@
     <string name="event_assigned_teams">Teams assigned by the laptop</string>
     <string name="relay_notification_title">Nearby game connection</string>
     <string name="relay_notification_body">Keeping the same game connected through nearby phones.</string>
-    <string name="relay_ready">Nearby connection ready</string>
+    <string name="relay_ready">Connected to host · Nearby fallback is automatic</string>
     <string name="relay_connected">Connected through a nearby phone</string>
-    <string name="relay_preparing">Preparing nearby connection · Accept Android’s connection request when shown</string>
+    <string name="relay_preparing">Reconnecting to host through nearby phones…</string>
 </resources>

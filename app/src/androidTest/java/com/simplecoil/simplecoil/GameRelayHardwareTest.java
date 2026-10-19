@@ -8,9 +8,9 @@ import android.content.ServiceConnection;
 import android.content.ComponentName;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothAdapter;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiManager;
-import android.net.wifi.p2p.WifiP2pManager;
 import android.os.Bundle;
 import android.os.Looper;
 import android.os.IBinder;
@@ -48,7 +48,7 @@ public class GameRelayHardwareTest {
         assertTrue("Unexpected test phone", owner || self.equals(client));
         Map<UUID, RelayConfig.Member> members = new LinkedHashMap<>();
         members.put(host, new RelayConfig.Member(host, RelayConfig.ipv4(args.getString("relay_host_ip")),
-                args.getString("relay_host_p2p"), args.getString("relay_host_bt")));
+                "", args.getString("relay_host_bt")));
         members.put(client, new RelayConfig.Member(client, RelayConfig.ipv4(args.getString("relay_client_ip")),
                 "", args.getString("relay_client_bt")));
         RelayConfig config = new RelayConfig(RelayConfig.uuid(args.getString("relay_key")), host, host, members);
@@ -82,6 +82,7 @@ public class GameRelayHardwareTest {
         };
         List<Integer> enabled = new ArrayList<>();
         boolean gunProbe = "true".equals(args.getString("relay_gun"));
+        Set<android.bluetooth.BluetoothDevice> bonded = new HashSet<>(BluetoothAdapter.getDefaultAdapter().getBondedDevices());
         boolean gunBound = false, gunReceiverRegistered = false;
         BroadcastReceiver gunReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context ignored, Intent intent) {
@@ -125,15 +126,9 @@ public class GameRelayHardwareTest {
             } else {
                 await(() -> GameRelayService.reachable(hostIP), 60_000, "Initial game link did not connect");
                 try (Socket initial = GameRelayService.open(hostIP, 17510, 5000)) { exchange(initial, "initial"); }
-                report("WAITING_FOR_DIRECT_INVITATION");
-                WifiP2pManager p2p = (WifiP2pManager) context.getSystemService(Context.WIFI_P2P_SERVICE);
-                WifiP2pManager.Channel channel = p2p.initialize(context, Looper.getMainLooper(), null);
-                await(() -> {
-                    AtomicBoolean connected = new AtomicBoolean();CountDownLatch ready = new CountDownLatch(1);
-                    p2p.requestGroupInfo(channel, group -> { connected.set(group != null && !group.isGroupOwner());ready.countDown(); });
-                    ready.await(3, TimeUnit.SECONDS);return connected.get();
-                }, 75_000, "Wi-Fi Direct invitation was not accepted");
-                // Leave Wi-Fi on, disconnect only the hub: Wi-Fi Direct must carry the traffic.
+                int gunBeforeFallback = telemetry.get();
+                // Leave the Wi-Fi radio on but disconnect the hub. No direct group
+                // or invitation is needed: Bluetooth must carry the game traffic.
                 for (WifiConfiguration network : wifi.getConfiguredNetworks()) {
                     if (network.status != WifiConfiguration.Status.DISABLED) {
                         enabled.add(network.networkId);assertTrue(wifi.disableNetwork(network.networkId));
@@ -142,13 +137,12 @@ public class GameRelayHardwareTest {
                 wifi.disconnect();
                 await(() -> wifi.getConnectionInfo().getNetworkId() < 0, 15_000, "Hub did not disconnect");
                 SystemClock.sleep(5000);
-                await(() -> GameRelayService.reachable(hostIP), 60_000, "Direct game link did not connect; accept the Android invitation");
-                try (Socket direct = GameRelayService.open(hostIP, 17510, 5000)) {
-                    for (int i = 0; i < 20; i++) { exchange(direct, "direct:" + i);datagram(hostIP);SystemClock.sleep(300); }
+                await(() -> GameRelayService.reachable(hostIP), 60_000, "Bluetooth did not reach the same host after hub loss");
+                try (Socket nearby = GameRelayService.open(hostIP, 17510, 8000)) {
+                    for (int i = 0; i < 20; i++) { exchange(nearby, "nearby:" + i);datagram(hostIP);SystemClock.sleep(300); }
                 }
-                report("DIRECT_PASS hubDisconnected=true");
-                int gunBeforeFallback = telemetry.get();
-                // Complete Wi-Fi radio loss removes the direct group too. Bluetooth must take over.
+                report("HUB_LOSS_PASS hubDisconnected=true");
+                // The fallback must also survive complete Wi-Fi radio loss.
                 assertTrue(wifi.setWifiEnabled(false));
                 await(() -> !wifi.isWifiEnabled(), 15_000, "Wi-Fi did not turn off");
                 SystemClock.sleep(5000);
@@ -161,6 +155,7 @@ public class GameRelayHardwareTest {
                     exchange(bluetooth, "DONE");
                 }
                 report("BLUETOOTH_PASS wifiEnabled=false streamMessages=30 datagrams=" + datagrams.get());
+                assertEquals("Fallback should not pair the phones", bonded, BluetoothAdapter.getDefaultAdapter().getBondedDevices());
                 if (gunProbe) {
                     assertTrue("Gun telemetry stopped while Bluetooth relayed the game", telemetry.get() >= gunBeforeFallback + 3);
                     assertEquals("Relay disconnected the BLE gun", 0, gunDisconnects.get());

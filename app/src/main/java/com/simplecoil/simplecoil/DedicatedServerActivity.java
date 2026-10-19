@@ -451,15 +451,16 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
         mPlayerDisplayList = findViewById(R.id.player_list);
         mPlayerDisplayList.setAdapter(mPlayerDisplayListAdapter);
         mPlayerDisplayList.setOnItemClickListener((parent, view, position, id) -> {
-            if (position == 0 || position > Globals.MAX_PLAYER_ID)
+            if (!mPlayerDisplayListAdapter.isEnabled(position))
                 return;
+            PlayerDisplayData selectedPlayer = mPlayerDisplayListAdapter.getItem(position);
             if (Globals.getInstance().mTournamentMode) {
                 Toast.makeText(getApplicationContext(), R.string.tournament_rules_locked,
                         Toast.LENGTH_SHORT).show();
                 return;
             }
             PlayerSettingsAlertDialog dialog = new PlayerSettingsAlertDialog(DedicatedServerActivity.this);
-            dialog.setServer((byte)position, mTcpServer);
+            dialog.setServer(selectedPlayer.playerID, mTcpServer);
             dialog.show();
         });
         // The server and round timers remain active while this screen is hidden.

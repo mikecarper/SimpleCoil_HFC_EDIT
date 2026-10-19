@@ -716,9 +716,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return value == maximum ? maximum : value + 1;
     }
 
-    // A dedicated host can send a scoreboard only in response to a request or
-    // when a round ends. Do not let repeated network frames create unbounded UI
-    // parser threads or stack dialogs on top of the game.
+    // Hosts also broadcast scoreboard snapshots after edits and round changes.
+    // Only a recent explicit tap may open the modal player list.
+    private long mPlayerDataRequestedUntil;
     private final AtomicBoolean mPlayerDataDialogActive = new AtomicBoolean();
     private volatile boolean mReady = false;
     private int mNetworkTeam = 0;
@@ -1380,7 +1380,28 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         Globals.getInstance().mLobbyRoundActive = false;
     }
 
+    private boolean retainingRelayLobby() {
+        InetAddress host = Globals.getInstance().mServerIP;
+        return !mIsServer && mTcpClient != null && mTcpClient.hasClientSession(host)
+                && GameRelayService.configuredFor(host);
+    }
+
     private boolean updateLobbyNetwork(String address, long now) {
+        if (retainingRelayLobby() && mLobbyNetworkAddress != null) {
+            // The admitted address stays stable across Wi-Fi and Bluetooth.
+            // Losing the Wi-Fi network ID must not stop the reconnect worker.
+            if (address == null) {
+                mLobbyNetworkLostAt = now;
+                mLobbyNotice = getString(R.string.lobby_reconnecting);
+                return false;
+            }
+            if (address.split("/", 2)[0].equals(mLobbyNetworkAddress.split("/", 2)[0])) {
+                if (mLobbyNetworkLostAt >= 0) mLobbyNotice = null;
+                mLobbyNetworkLostAt = -1;
+                mLobbyNetworkAddress = address;
+                return true;
+            }
+        }
         // A short Wi-Fi drop is not a host cancellation or a new network.
         // Preserve the listener/session while the same hub comes back in range.
         if (address == null && mLobbyNetworkAddress != null) {
@@ -1565,6 +1586,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         }
         if (mIsServer && mTcpServer.isTcpServerReady() && mUDPListenerService.isHostingLobby())
             mLobbyConnectionDeadline = now + SharedLobby.CONNECTION_TIMEOUT_MS;
+        // An admitted relay can take longer than discovery's initial join
+        // deadline. Its TCP worker remains bound to this host until an explicit
+        // leave, cancellation, or host takeover retires the session.
+        if (retainingRelayLobby()) return;
         if (mReady || mPeerHostCreationPending || mLobbyTakeoverPending) {
             if (mLobbyConnectionDeadline == 0)
                 mLobbyConnectionDeadline = now + SharedLobby.CONNECTION_TIMEOUT_MS;
@@ -3061,6 +3086,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (mPlayerDataButton != null) {
             mPlayerDataButton.setOnClickListener((v -> {
                 if (mUseNetwork && mTcpClient != null && mTcpClient.isDedicatedServer()) {
+                    mPlayerDataRequestedUntil = SystemClock.elapsedRealtime() + 15_000;
                     mTcpClient.sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_PLAYERDATAREQUEST);
                     // Disable the button for 1 second to prevent spamming the server
                     mPlayerDataButton.setEnabled(false);
@@ -7133,6 +7159,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     @Override
     protected void onPause() {
         mActivityResumed = false;
+        mPlayerDataRequestedUntil = 0;
         if (mPowerupRevealCurrent != 0) {
             speakRoundVoicePrompt(PowerupPresentation.voice(mPowerupRevealCurrent));
             mPowerupRevealCurrent = 0;
@@ -10305,8 +10332,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 }
             } else if (NetMsg.NETMSG_PLAYERDATAUPDATE.equals(action)) {
                 String playerData = intent.getStringExtra(NetMsg.INTENT_PLAYERDATA);
-                if (playerData != null)
+                if (playerData != null && mActivityResumed && mPlayerDataRequestedUntil > 0
+                        && SystemClock.elapsedRealtime() <= mPlayerDataRequestedUntil) {
+                    mPlayerDataRequestedUntil = 0;
                     displayPlayerData(playerData);
+                }
             } else if (NetMsg.NETMSG_STARTGAME.equals(action)) {
                 if (mIsServer && intent.hasExtra(NetMsg.INTENT_ROUND_ID) && mTcpServer != null) {
                     Intent scheduled = mTcpServer.getScheduledGameStart();
@@ -10698,7 +10728,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 final PlayerDisplayDataListAdapter playerDisplayListAdapter = new PlayerDisplayDataListAdapter(FullscreenActivity.this, playerDisplayData, true);
                 runOnUiThread(() -> {
                     try {
-                        if (isFinishing() || isDestroyed()) {
+                        if (!mActivityResumed || isFinishing() || isDestroyed()) {
                             mPlayerDataDialogActive.set(false);
                             return;
                         }

@@ -8,7 +8,6 @@ import android.net.wifi.p2p.*;
 import android.os.*;
 import android.util.Log;
 import androidx.core.app.NotificationCompat;
-import androidx.core.content.ContextCompat;
 import com.simplecoil.protocol.RelayConfig;
 import com.simplecoil.protocol.RelayMesh;
 import java.io.IOException;
@@ -23,19 +22,13 @@ public final class GameRelayService extends Service {
     public static final String CAPABILITIES_CHANGED = "com.simplecoil.simplecoil.RELAY_CAPABILITIES";
     private static volatile GameRelayService instance;
     private static volatile RelayConfig requested;
-    private static volatile String p2pAddress = "";
     private static volatile UDPListenerService udp;
     private static volatile TcpServer tcp;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private WifiP2pManager manager;
-    private WifiP2pManager.Channel channel;
     private WifiManager wifi;
-    private WifiP2pGroup group;
-    private InetAddress ownerAddress;
     private volatile RelayConfig config;
     private volatile RelayMesh mesh;
-    private long nextAction, nextDiscovery;
-    private boolean managedGroup, receiverRegistered, foreground;
+    private boolean foreground;
     private PowerManager.WakeLock wake;
     private WifiManager.WifiLock wifiLock;
     private static final UUID BLUETOOTH_SERVICE = UUID.fromString("7493b200-9f40-48f2-ae5a-b9410bf17f31");
@@ -50,7 +43,9 @@ public final class GameRelayService extends Service {
         return context != null && (!(context instanceof ContextWrapper) || ((ContextWrapper) context).getBaseContext() != null);
     }
     public static String node(Context context) { return LiveJoin.deviceIdentity(context); }
-    public static String p2p() { return p2pAddress; }
+    // Keep the legacy capability field compatible with 1.39 hosts, without
+    // advertising a transport that requires an Android connection invitation.
+    public static String p2p() { return ""; }
     @SuppressWarnings("deprecation")
     public static String bluetoothAddress() {
         try {
@@ -76,6 +71,12 @@ public final class GameRelayService extends Service {
     public static void unregister(UDPListenerService service) { if (udp == service) udp = null; }
     public static void register(TcpServer service) { tcp = service; }
     public static void unregister(TcpServer service) { if (tcp == service) tcp = null; }
+    public static boolean configuredFor(InetAddress host) {
+        GameRelayService service = instance;
+        RelayConfig config = service == null ? null : service.config;
+        return service != null && service.mesh != null && config != null && host != null
+                && host.equals(config.members.get(config.host).address);
+    }
     public static boolean reachable(InetAddress host) {
         GameRelayService service = instance;RelayMesh mesh = service == null ? null : service.mesh;
         RelayConfig config = service == null ? null : service.config;
@@ -108,16 +109,7 @@ public final class GameRelayService extends Service {
     @Override public void onCreate() {
         super.onCreate();instance = this;
         wifi = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
-        manager = (WifiP2pManager) getSystemService(WIFI_P2P_SERVICE);
-        if (manager != null) {
-            channel = manager.initialize(this, Looper.getMainLooper(), () -> { channel = null; });
-            IntentFilter filter = new IntentFilter();
-            filter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
-            filter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
-            filter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION);
-            ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
-            receiverRegistered = true;queryGroup();
-        }
+        retireDirectRelay();
         if (requested == null) {
             String saved = getSharedPreferences("GameRelay", MODE_PRIVATE).getString("config", null);
             String matchHost = getSharedPreferences("MatchSession", MODE_PRIVATE).getString("host", null);
@@ -165,9 +157,7 @@ public final class GameRelayService extends Service {
             if (mesh != null && config != null) {
                 UUID self = RelayConfig.uuid(node(GameRelayService.this));
                 if (!self.equals(config.host)) mesh.connect(new InetSocketAddress(config.members.get(config.host).address, 17514));
-                queryGroup();ensureDirectGroup(self);startBluetoothRelay();
-                if (group != null && !group.isGroupOwner() && ownerAddress != null)
-                    mesh.connect(new InetSocketAddress(ownerAddress, 17514));
+                startBluetoothRelay();
                 long now = SystemClock.elapsedRealtime();
                 if (mesh.hostReachable()) hostMissingSince = now;
                 else if (now - hostMissingSince >= 5000) connectBluetoothBuddy();
@@ -175,64 +165,46 @@ public final class GameRelayService extends Service {
             main.postDelayed(this, 1000);
         }
     };
-    private void setP2pAddress(String address) {
-        if (!RelayConfig.validMac(address) || address.equalsIgnoreCase(p2pAddress)) return;
-        p2pAddress = address;
-        sendBroadcast(new Intent(CAPABILITIES_CHANGED).setPackage(getPackageName()));
-    }
-    private final BroadcastReceiver receiver = new BroadcastReceiver() {
-        @Override public void onReceive(Context context, Intent intent) {
-            if (WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION.equals(intent.getAction())) {
-                WifiP2pDevice device = intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE);
-                if (device != null) setP2pAddress(device.deviceAddress);
-            }
-            queryGroup();
+    /** Remove a previous build's game-owned direct group; never initiate a new one. */
+    private void retireDirectRelay() {
+        SharedPreferences preferences = getSharedPreferences("GameRelay", MODE_PRIVATE);
+        if (preferences.getBoolean("directRelayRetiredV2", false)) return;
+        String saved = preferences.getString("config", null);
+        RelayConfig previous;
+        try { previous = saved == null ? null : RelayConfig.decode(saved); }
+        catch (IllegalArgumentException ignored) { previous = null; }
+        if (previous == null || previous.members.get(previous.owner).p2p.isEmpty()) {
+            preferences.edit().putBoolean("directRelayRetiredV2", true).apply();return;
         }
-    };
-    private void queryGroup() {
-        if (manager == null || channel == null) return;
-        manager.requestGroupInfo(channel, value -> {
-            group = value;
-            if (value != null && value.isGroupOwner()) setP2pAddress(value.getOwner().deviceAddress);
-            if (value == null) ownerAddress = null;
-        });
-        manager.requestConnectionInfo(channel, info -> { ownerAddress = info == null ? null : info.groupOwnerAddress; });
-    }
-    private void ensureDirectGroup(UUID self) {
-        if (manager == null || channel == null || wifi == null || !wifi.isWifiEnabled() || config == null) return;
-        RelayConfig.Member owner = config.members.get(config.owner);
-        if (group != null) {
-            if (self.equals(config.owner) && group.isGroupOwner()
-                    || !group.isGroupOwner() && owner.p2p.equalsIgnoreCase(group.getOwner().deviceAddress)) managedGroup = true;
-            return;
-        }
-        long now = SystemClock.elapsedRealtime();
-        if (now < nextAction) return;
-        if (self.equals(config.owner)) {
-            nextAction = now + 10_000;
-            manager.createGroup(channel, action("create group"));
-            return;
-        }
-        if (owner.p2p.isEmpty()) return;
-        if (now >= nextDiscovery) {
-            nextDiscovery = now + 8000;manager.discoverPeers(channel, action("discover peers"));
-        }
-        manager.requestPeers(channel, peers -> {
-            if (config == null || group != null || SystemClock.elapsedRealtime() < nextAction) return;
-            for (WifiP2pDevice peer : peers.getDeviceList()) {
-                if (!owner.p2p.equalsIgnoreCase(peer.deviceAddress)) continue;
-                WifiP2pConfig join = new WifiP2pConfig();join.deviceAddress = peer.deviceAddress;
-                join.groupOwnerIntent = 0;join.wps.setup = WpsInfo.PBC;
-                nextAction = SystemClock.elapsedRealtime() + 30_000;
-                manager.connect(channel, join, action("join nearby game"));break;
-            }
-        });
-    }
-    private WifiP2pManager.ActionListener action(String operation) {
-        return new WifiP2pManager.ActionListener() {
-            @Override public void onSuccess() { queryGroup(); }
-            @Override public void onFailure(int reason) { Log.d("GameRelay", operation + " deferred: " + reason); }
+        WifiP2pManager direct = (WifiP2pManager) getSystemService(WIFI_P2P_SERVICE);
+        if (direct == null) return;
+        WifiP2pManager.Channel legacy = direct.initialize(this, Looper.getMainLooper(), null);
+        if (legacy == null) return;
+        RelayConfig retired = previous;
+        Runnable finished = () -> {
+            preferences.edit().putBoolean("directRelayRetiredV2", true).apply();
+            if (Build.VERSION.SDK_INT >= 27) legacy.close();
         };
+        Runnable cleanup = () -> direct.requestGroupInfo(legacy, group -> {
+            boolean gameGroup = group != null && (group.isGroupOwner() && retired.owner.equals(RelayConfig.uuid(node(this)))
+                    || group.getOwner() != null && retired.members.get(retired.owner).p2p.equalsIgnoreCase(group.getOwner().deviceAddress));
+            // The designated owner may have changed while phones rejoined the laptop.
+            if (group != null && group.getOwner() != null)
+                for (RelayConfig.Member member : retired.members.values())
+                    if (member.p2p.equalsIgnoreCase(group.getOwner().deviceAddress)) gameGroup = true;
+            if (!gameGroup) { finished.run();return; }
+            direct.removeGroup(legacy, new WifiP2pManager.ActionListener() {
+                @Override public void onSuccess() { finished.run(); }
+                @Override public void onFailure(int reason) {
+                    Log.d("GameRelay", "Previous direct group cleanup deferred: " + reason);
+                    if (Build.VERSION.SDK_INT >= 27) legacy.close();
+                }
+            });
+        });
+        direct.cancelConnect(legacy, new WifiP2pManager.ActionListener() {
+            @Override public void onSuccess() { cleanup.run(); }
+            @Override public void onFailure(int reason) { cleanup.run(); }
+        });
     }
 
     @SuppressWarnings("deprecation")
@@ -368,8 +340,6 @@ public final class GameRelayService extends Service {
     @Override public void onDestroy() {
         destroyed = true;
         main.removeCallbacksAndMessages(null);
-        if (receiverRegistered) unregisterReceiver(receiver);
-        if (managedGroup && manager != null && channel != null) manager.removeGroup(channel, null);
         if (mesh != null) mesh.close();
         if (bluetoothServer != null) try { bluetoothServer.close(); } catch (IOException ignored) { }
         for (BluetoothLink link : bluetoothLinks.values()) try { link.close(); } catch (IOException ignored) { }

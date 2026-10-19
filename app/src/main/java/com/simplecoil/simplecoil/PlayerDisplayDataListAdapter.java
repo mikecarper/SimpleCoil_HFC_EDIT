@@ -26,11 +26,12 @@ import android.widget.ImageView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.List;
 
 public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData> {
     private final Activity context;
     private final boolean isClient;
+    private PlayerDisplayData totals;
 
     private static final class ViewHolder {
         final TextView playerID;
@@ -50,9 +51,21 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
 
     public PlayerDisplayDataListAdapter(Activity context,
                                         PlayerDisplayData[] data, boolean isClient) {
-        super(context, R.layout.player_display_data, new ArrayList<>(Arrays.asList(data)));
+        super(context, R.layout.player_display_data, populatedRows(data));
         this.context = context;
         this.isClient = isClient;
+        totals = data.length > Globals.MAX_PLAYER_ID + 1 ? data[Globals.MAX_PLAYER_ID + 1] : null;
+    }
+
+    private static List<PlayerDisplayData> populatedRows(PlayerDisplayData[] data) {
+        List<PlayerDisplayData> rows = new ArrayList<>();
+        if (data.length == 0) return rows;
+        rows.add(null); // Column headings.
+        for (int id = 1; id < data.length && id <= Globals.MAX_PLAYER_ID; id++)
+            if (data[id] != null) rows.add(data[id]);
+        if (data.length > Globals.MAX_PLAYER_ID + 1 && data[Globals.MAX_PLAYER_ID + 1] != null)
+            rows.add(data[Globals.MAX_PLAYER_ID + 1]);
+        return rows;
     }
 
     public void setData(PlayerDisplayData[] data) {
@@ -60,8 +73,13 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
         // and notify ListView only after the complete replacement is installed.
         setNotifyOnChange(false);
         clear();
-        addAll(Arrays.asList(data));
+        totals = data.length > Globals.MAX_PLAYER_ID + 1 ? data[Globals.MAX_PLAYER_ID + 1] : null;
+        addAll(populatedRows(data));
         notifyDataSetChanged();
+    }
+    @Override public boolean areAllItemsEnabled() { return false; }
+    @Override public boolean isEnabled(int position) {
+        return position > 0 && getItem(position) != totals;
     }
     //TODO add player and weapon presetto display
     @Override
@@ -95,7 +113,7 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
             return rowView;
         }
         PlayerDisplayData player = getItem(position);
-        if (position > Globals.MAX_PLAYER_ID) {
+        if (player == totals) {
             if (player != null && player.playerName != null)
                 playerIDTV.setText(player.playerName);
             else
@@ -107,35 +125,28 @@ public class PlayerDisplayDataListAdapter extends ArrayAdapter<PlayerDisplayData
                 holder.networkStatus.setVisibility(View.GONE);
             return rowView;
         }
+        int playerID = player.playerID;
         switch (Globals.getInstance().mGameMode) {
             case Globals.GAME_MODE_FFA:
-                playerIDTV.setText(res.getString(R.string.player_list_position,position));
+                playerIDTV.setText(res.getString(R.string.player_list_position,playerID));
                 break;
             case Globals.GAME_MODE_2TEAMS:
-                if (position > Globals.MAX_PLAYER_ID / 2)
-                    playerIDTV.setText("2-" + (position - (Globals.MAX_PLAYER_ID / 2)));
+                if (playerID > Globals.MAX_PLAYER_ID / 2)
+                    playerIDTV.setText("2-" + (playerID - (Globals.MAX_PLAYER_ID / 2)));
                 else
-                    playerIDTV.setText("1-" + position);
+                    playerIDTV.setText("1-" + playerID);
                 break;
             case Globals.GAME_MODE_4TEAMS:
                 int playersPerTeam = Globals.MAX_PLAYER_ID / 4;
-                if (position > playersPerTeam * 3)
-                    playerIDTV.setText("4-" + (position - (playersPerTeam * 3)));
-                else if (position > playersPerTeam * 2)
-                    playerIDTV.setText("3-" + (position - (playersPerTeam * 2)));
-                else if (position > playersPerTeam)
-                    playerIDTV.setText("2-" + (position - playersPerTeam));
+                if (playerID > playersPerTeam * 3)
+                    playerIDTV.setText("4-" + (playerID - (playersPerTeam * 3)));
+                else if (playerID > playersPerTeam * 2)
+                    playerIDTV.setText("3-" + (playerID - (playersPerTeam * 2)));
+                else if (playerID > playersPerTeam)
+                    playerIDTV.setText("2-" + (playerID - playersPerTeam));
                 else
-                    playerIDTV.setText("1-" + position);
+                    playerIDTV.setText("1-" + playerID);
                 break;
-        }
-        if (player == null) {
-            playerNameTV.setText(R.string.player_name_not_connected);
-            playerPointsTV.setText("");
-            playerEliminatedTV.setText("");
-            if (holder.networkStatus != null)
-                holder.networkStatus.setVisibility(View.GONE);
-            return rowView;
         }
         playerNameTV.setText(player.playerName);
         playerPointsTV.setText("" + player.points);

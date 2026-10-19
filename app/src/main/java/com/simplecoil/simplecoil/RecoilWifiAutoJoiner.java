@@ -16,6 +16,7 @@ import android.net.wifi.ScanResult;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.net.wifi.SupplicantState;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -154,6 +155,14 @@ final class RecoilWifiAutoJoiner {
             }
             if (isRecoilSsid(currentSsid())) {
                 Log.d(TAG, "Already connected to a Recoil hub");
+                return;
+            }
+            WifiInfo connected = mWifiManager.getConnectionInfo();
+            if (!userInitiated && Globals.getInstance().mServerIP != null && connected != null
+                    && connected.getNetworkId() >= 0 && connected.getSupplicantState() == SupplicantState.COMPLETED) {
+                // A selected game can use SlowFi or any other Wi-Fi name. Do not
+                // keep taking its radio off-channel to search for a Recoil SSID.
+                scheduleRetry(CONNECT_RETRY_MS);
                 return;
             }
 

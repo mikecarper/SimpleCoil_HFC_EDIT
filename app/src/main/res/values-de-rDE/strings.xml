@@ -530,7 +530,7 @@
     <string name="event_assigned_teams">Teams vom Laptop zugewiesen</string>
     <string name="relay_notification_title">Spielverbindung über nahe Telefone</string>
     <string name="relay_notification_body">Die Verbindung zum selben Spiel bleibt über nahe Telefone erhalten.</string>
-    <string name="relay_ready">Verbindung über nahe Telefone bereit</string>
+    <string name="relay_ready">Mit dem Host verbunden · Ausweichverbindung automatisch</string>
     <string name="relay_connected">Über ein nahes Telefon verbunden</string>
-    <string name="relay_preparing">Verbindung zu nahen Telefonen wird vorbereitet · Bestätige die Android-Verbindungsanfrage</string>
+    <string name="relay_preparing">Verbindung zum Host über nahe Telefone wird wiederhergestellt…</string>
 </resources>

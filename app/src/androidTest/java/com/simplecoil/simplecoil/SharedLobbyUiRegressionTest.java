@@ -26,6 +26,30 @@ import static androidx.test.espresso.matcher.ViewMatchers.withText;
 
 @RunWith(AndroidJUnit4.class)
 public class SharedLobbyUiRegressionTest {
+    @Test public void automaticAndLateScoreboardUpdatesNeverOpenAPlayerList() throws Exception {
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                android.content.BroadcastReceiver receiver = (android.content.BroadcastReceiver) get(activity, "mUDPUpdateReceiver");
+                android.content.Intent update = new android.content.Intent(NetMsg.NETMSG_PLAYERDATAUPDATE)
+                        .putExtra(NetMsg.INTENT_PLAYERDATA, "{\"playerdata\":[{\"playerID\":3,\"playername\":\"Chris\",\"points\":0,\"eliminated\":0}]}");
+                java.util.concurrent.atomic.AtomicBoolean active = (java.util.concurrent.atomic.AtomicBoolean) get(activity, "mPlayerDataDialogActive");
+                set(activity, "mPlayerDataRequestedUntil", 0L);
+                receiver.onReceive(activity, update);
+                assertFalse("An unsolicited host update opened the scoreboard", active.get());
+                set(activity, "mPlayerDataRequestedUntil", android.os.SystemClock.elapsedRealtime() - 1);
+                receiver.onReceive(activity, update);
+                assertFalse("An expired request opened the scoreboard", active.get());
+                set(activity, "mPlayerDataRequestedUntil", android.os.SystemClock.elapsedRealtime() + 15_000);
+                set(activity, "mActivityResumed", false);
+                receiver.onReceive(activity, update);
+                assertFalse("A background response opened the scoreboard", active.get());
+                set(activity, "mPlayerDataRequestedUntil", 0L);
+                set(activity, "mActivityResumed", true);
+            });
+        }
+    }
+
     @Test public void joiningLobbyDisablesAutomaticHostingEvenIfStartIsMissed() throws Exception {
         SharedPreferences prefs = InstrumentationRegistry.getInstrumentation().getTargetContext()
                 .getSharedPreferences(FullscreenActivity.PREF_NAME, 0);
