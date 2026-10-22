@@ -310,6 +310,80 @@ public class PowerupNetworkRegressionTest {
     }
 
     @Test
+    public void airstrikeKindTenRoundTripsCompactAndLegacyRecipientsAsAnInstantGrant() throws Exception {
+        long now = SystemClock.elapsedRealtime();
+        Powerups.Grant airstrike = new Powerups.Grant(1, 1, 0, Powerups.AIRSTRIKE,
+                new int[]{2, 3}, new int[]{0, 0}, now + Powerups.INSTANT_DELIVERY_MS, 2);
+        JSONObject compact = TcpServer.powerupGrantJson(airstrike);
+        assertEquals(10, compact.getInt("kind"));
+        Powerups.Grant decoded = TcpServer.readPowerupGrant(compact, now);
+        assertEquals(Powerups.AIRSTRIKE, decoded.kind);
+        assertEquals(now + Powerups.INSTANT_DELIVERY_MS, decoded.expiresAt);
+        assertTrue(Powerups.isInstant(decoded.kind));
+        assertArrayEquals(airstrike.targets, decoded.targets);
+        assertArrayEquals(airstrike.targetLives, decoded.targetLives);
+        JSONObject legacy = new JSONObject(compact.toString());
+        legacy.remove("recipients");
+        legacy.put("targets", new JSONArray().put(2).put(3));
+        legacy.put("lives", new JSONArray().put(0).put(0));
+        decoded = TcpServer.readPowerupGrant(legacy, now);
+        assertEquals(Powerups.AIRSTRIKE, decoded.kind);
+        assertArrayEquals(airstrike.targets, decoded.targets);
+        assertArrayEquals(airstrike.targetLives, decoded.targetLives);
+        try {
+            TcpServer.readPowerupGrant(new JSONObject(compact.toString())
+                    .put("kind", Powerups.AIRSTRIKE + 1), now);
+            fail("An unknown reward after Airstrike was accepted");
+        } catch (org.json.JSONException expected) { }
+    }
+
+    @Test
+    public void liveAirstrikeConvertsItsClockAndRetriesOnlyUntilAcknowledged() throws Exception {
+        long localNow = SystemClock.elapsedRealtime(), hostNow = localNow + 5000L;
+        Powerups.Grant airstrike = new Powerups.Grant(1, 1, 0, Powerups.AIRSTRIKE,
+                new int[]{2, 3}, new int[]{0, 0}, hostNow + Powerups.INSTANT_DELIVERY_MS, 2);
+        JSONObject frame = snapshot(hostNow, airstrike)
+                .put(TcpServer.JSON_POWERUP_GRANT, TcpServer.powerupGrantJson(airstrike));
+        receive(frame);
+        assertEquals(1, client.events.size());
+        Intent first = client.events.get(0);
+        assertEquals(Powerups.AIRSTRIKE, first.getIntExtra(NetMsg.INTENT_POWERUP_KIND, 0));
+        assertEquals(localNow + Powerups.INSTANT_DELIVERY_MS,
+                first.getLongExtra(NetMsg.INTENT_POWERUP_EXPIRES, 0));
+        assertFalse(first.getBooleanExtra(NetMsg.INTENT_POWERUP_SNAPSHOT, true));
+        assertArrayEquals(new int[]{2, 3}, first.getIntArrayExtra(NetMsg.INTENT_POWERUP_TARGETS));
+        assertEquals(roster.seat(1).identity, first.getStringExtra(NetMsg.INTENT_POWERUP_SOURCE_IDENTITY));
+        client.events.clear();
+        client.replayPowerups();
+        assertEquals(1, client.events.size());
+        assertFalse(client.events.get(0).getBooleanExtra(NetMsg.INTENT_POWERUP_SNAPSHOT, true));
+        client.acknowledgePowerup(1);
+        client.replayPowerups();
+        receive(frame);
+        assertEquals("An acknowledged Airstrike was replayed", 1, client.events.size());
+    }
+
+    @Test
+    public void reconnectAndHostHandoffSnapshotsNeverReplayAirstrikeKills() throws Exception {
+        long localNow = SystemClock.elapsedRealtime(), hostNow = localNow + 5000L;
+        Powerups.Grant airstrike = new Powerups.Grant(1, 1, 0, Powerups.AIRSTRIKE,
+                new int[]{2, 3}, new int[]{0, 0}, hostNow + Powerups.INSTANT_DELIVERY_MS, 2);
+        receive(snapshot(hostNow, airstrike));
+        assertTrue(client.events.isEmpty());
+        client.replayPowerups();
+        assertTrue(client.events.isEmpty());
+        JSONObject recovered = client.powerupAuthoritySnapshot();
+        assertNotNull(recovered);
+        Powerups.Grant decoded = TcpServer.readPowerupSnapshot(recovered).grants.get(0);
+        assertEquals(Powerups.AIRSTRIKE, decoded.kind);
+        assertEquals(localNow + Powerups.INSTANT_DELIVERY_MS, decoded.expiresAt);
+        server.setDedicated(false);
+        assertTrue(server.restorePowerupAuthority(recovered));
+        server.replayPowerups();
+        assertTrue("A recovered host replayed the instantaneous Airstrike", server.events.isEmpty());
+    }
+
+    @Test
     public void missedLiveInstantBroadcastIsRetryableUntilTheActivityAcknowledgesIt() throws Exception {
         long hostNow = SystemClock.elapsedRealtime() + 5000;
         Powerups.Grant heal = new Powerups.Grant(1, 1, 0, Powerups.HEAL_TEAM,

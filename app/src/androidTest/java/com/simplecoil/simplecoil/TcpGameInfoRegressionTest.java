@@ -1358,7 +1358,7 @@ public class TcpGameInfoRegressionTest {
         java.lang.reflect.Field dedicated = TcpClient.class.getDeclaredField("mIsDedicatedServer");
         dedicated.setAccessible(true);
         dedicated.set(client, true);
-        java.lang.reflect.Field activeToken = TcpClient.class.getDeclaredField("mActiveStartToken");
+        java.lang.reflect.Field activeToken = TcpClient.class.getDeclaredField("mStatisticsRoundToken");
         activeToken.setAccessible(true);
         activeToken.set(client, token);
         JSONObject votes = new JSONObject().put(TcpServer.JSON_END_VOTES, 1L)

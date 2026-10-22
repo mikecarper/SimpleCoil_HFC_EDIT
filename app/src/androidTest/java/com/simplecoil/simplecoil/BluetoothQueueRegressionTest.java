@@ -32,6 +32,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 /** Uses the Android 5.x GATT implementation with an isolated, non-radio transport. */
@@ -48,6 +50,7 @@ public class BluetoothQueueRegressionTest {
     private final List<byte[]> descriptorValues = new ArrayList<>();
     private boolean denyNotifications;
     private boolean completeWritesSynchronously;
+    private int closedTransports;
 
     @Before
     public void setUp() throws Exception {
@@ -72,7 +75,9 @@ public class BluetoothQueueRegressionTest {
                             field(BluetoothGatt.class, "mDeviceBusy").set(gatt, Boolean.FALSE);
                             callback.onCharacteristicWrite(gatt, command, BluetoothGatt.GATT_SUCCESS);
                         }
-                    } else if (!name.equals("unregisterClient")) {
+                    } else if (name.equals("unregisterClient")) {
+                        closedTransports++;
+                    } else {
                         throw new AssertionError("Unexpected Bluetooth transport call: " + name);
                     }
                     return null;
@@ -215,6 +220,7 @@ public class BluetoothQueueRegressionTest {
         assertWriteResult(0, new byte[]{16, 0, 2}, BluetoothGatt.GATT_SUCCESS);
         assertWriteResult(1, new byte[]{32, 0, 4}, BluetoothGatt.GATT_SUCCESS);
         assertTrue(isAvailable());
+        assertNull(serviceField("mGattOperationTimeout").get(service));
     }
 
     @Test
@@ -351,6 +357,173 @@ public class BluetoothQueueRegressionTest {
         assertEquals(0, ((java.util.Queue<?>) serviceField("mCharacteristicReadQueue").get(service)).size());
         assertEquals(1, service.broadcasts.size());
         assertWriteResult(0, new byte[]{48, 0, 6}, BluetoothGatt.GATT_FAILURE);
+    }
+
+    @Test
+    public void missingWriteCallbackRetiresTheHandleFailsQueuedCommandsAndIgnoresLateAck() throws Exception {
+        queueTwoCommands();
+        service.writeDescriptor(descriptor);
+        service.readCharacteristic(telemetry);
+        Runnable timeout = timeout();
+        assertEquals(5000L, BluetoothLeService.GATT_OPERATION_TIMEOUT_MS);
+        timeout.run();
+        assertEquals(1, closedTransports);
+        assertNull(serviceField("mBluetoothGatt").get(service));
+        assertTrue(isAvailable());
+        assertNull(serviceField("mGattOperationTimeout").get(service));
+        for (String field : Arrays.asList("mCharacteristicWriteQueue", "mDescriptorWriteQueue", "mCharacteristicReadQueue"))
+            assertTrue(((java.util.Queue<?>) serviceField(field).get(service)).isEmpty());
+        assertEquals(Arrays.asList("writeCharacteristic"), operations);
+        assertEquals(3, service.broadcasts.size());
+        assertWriteResult(0, new byte[]{16, 0, 2}, BluetoothGatt.GATT_FAILURE);
+        assertWriteResult(1, new byte[]{32, 0, 4}, BluetoothGatt.GATT_FAILURE);
+        assertEquals(BluetoothLeService.ACTION_GATT_DISCONNECTED, service.broadcasts.get(2).getAction());
+        completeWrite();
+        timeout.run();
+        assertEquals(3, service.broadcasts.size());
+        assertEquals(1, closedTransports);
+    }
+
+    @Test
+    public void missingReadCallbackRetiresRatherThanAdvancesTheStalledHandle() throws Exception {
+        assertMissingSetupCallback(true);
+    }
+
+    @Test
+    public void missingDescriptorCallbackRetiresRatherThanAdvancesTheStalledHandle() throws Exception {
+        assertMissingSetupCallback(false);
+    }
+
+    private void assertMissingSetupCallback(boolean read) throws Exception {
+        if (read) service.readCharacteristic(telemetry);
+        else service.writeDescriptor(descriptor);
+        service.writeCharacteristic(command, new byte[]{16, 0, 2});
+        int broadcasts = service.broadcasts.size(), starts = operations.size();
+        timeout().run();
+        assertNull(serviceField("mBluetoothGatt").get(service));
+        assertEquals(starts, operations.size());
+        assertWriteResult(broadcasts, new byte[]{16, 0, 2}, BluetoothGatt.GATT_FAILURE);
+        assertEquals(BluetoothLeService.ACTION_GATT_DISCONNECTED,
+                service.broadcasts.get(broadcasts + 1).getAction());
+        if (read) completeRead(telemetry, BluetoothGatt.GATT_SUCCESS);
+        else completeDescriptor(descriptor, BluetoothGatt.GATT_SUCCESS);
+        assertEquals(broadcasts + 2, service.broadcasts.size());
+        assertEquals(1, closedTransports);
+    }
+
+    @Test
+    public void completedOperationAndCloseCancelOnlyTheirOwnWatchdog() throws Exception {
+        queueTwoCommands();
+        Runnable firstTimeout = timeout();
+        completeWrite();
+        Runnable secondTimeout = timeout();
+        assertNotSame(firstTimeout, secondTimeout);
+        firstTimeout.run();
+        assertSame(gatt, serviceField("mBluetoothGatt").get(service));
+        assertSame(secondTimeout, serviceField("mGattOperationTimeout").get(service));
+        assertEquals(0, closedTransports);
+        completeWrite();
+        assertNull(serviceField("mGattOperationTimeout").get(service));
+        secondTimeout.run();
+        assertEquals(2, service.broadcasts.size());
+        service.writeCharacteristic(command, new byte[]{48, 0, 6});
+        Runnable closedTimeout = timeout();
+        service.close();
+        closedTimeout.run();
+        assertEquals(2, service.broadcasts.size());
+        assertEquals(1, closedTransports);
+    }
+
+    @Test
+    public void healthyTelemetryCannotHideAMissingWriteCallback() throws Exception {
+        service.writeCharacteristic(command, new byte[]{16, 0, 2});
+        Runnable timeout = timeout();
+        callback.onCharacteristicChanged(gatt, telemetry);
+        assertSame(timeout, serviceField("mGattOperationTimeout").get(service));
+        assertEquals(BluetoothLeService.TELEMETRY_DATA_AVAILABLE, service.broadcasts.get(0).getAction());
+        timeout.run();
+        assertEquals(1, closedTransports);
+        assertWriteResult(1, new byte[]{16, 0, 2}, BluetoothGatt.GATT_FAILURE);
+        assertEquals(BluetoothLeService.ACTION_GATT_DISCONNECTED, service.broadcasts.get(2).getAction());
+    }
+
+    @Test
+    public void rejectedFrameworkOperationsDoNotLeaveAnArmedWatchdog() throws Exception {
+        service.writeCharacteristic(new BluetoothGattCharacteristic(command.getUuid(), 0, 0), new byte[]{16, 0, 2});
+        service.readCharacteristic(new BluetoothGattCharacteristic(telemetry.getUuid(), 0, 0));
+        BluetoothGattDescriptor orphan = new BluetoothGattDescriptor(descriptor.getUuid(), 0);
+        orphan.setValue(new byte[]{1, 0});
+        service.writeDescriptor(orphan);
+        assertTrue(isAvailable());
+        assertNull(serviceField("mGattOperationTimeout").get(service));
+        assertEquals(0, closedTransports);
+    }
+
+    @Test
+    public void completedWriteLookupReturnsExactIndependentResultAndOriginalTimestamp() throws Exception {
+        byte[] payload = new byte[]{16, 0, 2};
+        service.writeCharacteristic(command, payload);
+        assertNull(service.getCompletedWriteResult(command, payload));
+        completeWrite();
+        Intent first = service.getCompletedWriteResult(command, payload);
+        assertNotNull(first);
+        assertEquals(BluetoothGatt.GATT_SUCCESS, first.getIntExtra(BluetoothLeService.EXTRA_STATUS, -1));
+        assertEquals(service.broadcasts.get(0).getLongExtra(BluetoothLeService.EXTRA_COMPLETED_AT, -1),
+                first.getLongExtra(BluetoothLeService.EXTRA_COMPLETED_AT, -2));
+        assertTrue(first.getLongExtra(BluetoothLeService.EXTRA_COMPLETED_AT, -1) >= 0);
+        first.getByteArrayExtra(BluetoothLeService.EXTRA_DATA)[2] = 99;
+        first.putExtra(BluetoothLeService.EXTRA_STATUS, BluetoothGatt.GATT_FAILURE);
+        Intent second = service.getCompletedWriteResult(command, payload);
+        assertNotSame(first, second);
+        assertArrayEquals(payload, second.getByteArrayExtra(BluetoothLeService.EXTRA_DATA));
+        assertEquals(BluetoothGatt.GATT_SUCCESS, second.getIntExtra(BluetoothLeService.EXTRA_STATUS, -1));
+        assertNull(service.getCompletedWriteResult(command, new byte[]{16, 0, 4}));
+        assertNull(service.getCompletedWriteResult(characteristic(command.getUuid().toString()), payload));
+        service.close();
+        assertNull(service.getCompletedWriteResult(command, payload));
+    }
+
+    @Test
+    public void identicalQueuedWriteCannotReuseAnEarlierCompletionWithTheSameWrappedCommandId() throws Exception {
+        byte[] wrapped = new byte[]{16, 0, 2};
+        service.writeCharacteristic(command, wrapped);
+        service.writeCharacteristic(command, new byte[]{32, 0, 4});
+        service.writeCharacteristic(command, wrapped);
+        completeWrite();
+        assertNull("An identical queued command reused the first ACK", service.getCompletedWriteResult(command, wrapped));
+        completeWrite();
+        assertNull("An identical active command reused the first ACK", service.getCompletedWriteResult(command, wrapped));
+        releaseTransport();
+        callback.onCharacteristicWrite(gatt, command, BluetoothGatt.GATT_FAILURE);
+        Intent finalResult = service.getCompletedWriteResult(command, wrapped);
+        assertNotNull(finalResult);
+        assertEquals(BluetoothGatt.GATT_FAILURE, finalResult.getIntExtra(BluetoothLeService.EXTRA_STATUS, -1));
+        service.writeCharacteristic(command, wrapped);
+        assertNull("A new identical submission retained an old result", service.getCompletedWriteResult(command, wrapped));
+    }
+
+    @Test
+    public void completedWriteHistoryIsBoundedAndDisconnectClearsIt() throws Exception {
+        byte[] first = new byte[]{0, 0, 2, 0};
+        for (int index = 0; index <= BluetoothLeService.MAX_COMPLETED_WRITE_RESULTS; index++) {
+            byte[] value = new byte[]{0, 0, 2, (byte) index};
+            service.writeCharacteristic(command, value);
+            completeWrite();
+        }
+        assertEquals(BluetoothLeService.MAX_COMPLETED_WRITE_RESULTS,
+                ((java.util.Queue<?>) serviceField("mCompletedWriteResults").get(service)).size());
+        assertNull(service.getCompletedWriteResult(command, first));
+        byte[] latest = new byte[]{0, 0, 2, (byte) BluetoothLeService.MAX_COMPLETED_WRITE_RESULTS};
+        assertNotNull(service.getCompletedWriteResult(command, latest));
+        callback.onConnectionStateChange(gatt, BluetoothGatt.GATT_SUCCESS, android.bluetooth.BluetoothProfile.STATE_DISCONNECTED);
+        assertNull(service.getCompletedWriteResult(command, latest));
+        assertTrue(((java.util.Queue<?>) serviceField("mCompletedWriteResults").get(service)).isEmpty());
+    }
+
+    private Runnable timeout() throws Exception {
+        Runnable timeout = (Runnable) serviceField("mGattOperationTimeout").get(service);
+        assertNotNull(timeout);
+        return timeout;
     }
 
     private void queueTwoCommands() {

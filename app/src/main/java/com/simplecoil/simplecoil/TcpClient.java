@@ -154,6 +154,15 @@ public class TcpClient extends Service {
     private long mActiveLocalStartAt = -1;
     private long mActiveStartRound;
     private String mActiveStartToken;
+    private RoundReport mCompletedRoundReport;
+    // Countdown clock refinement clears mActiveStartToken at GO. Statistics
+    // retain a separate accepted token through the entire round/reconnect.
+    private String mStatisticsRoundToken;
+    private long mStatisticsStartAt = -1;
+    private String mTelemetryToken;
+    private long mTelemetrySequence;
+    private int mTelemetryShots;
+    private JSONObject mPendingTelemetryResume;
     // Local-clock snapshots survive a transport reconnect, but never a new
     // round. They carry scan credits as well as buffs for peer-host takeover.
     private final Powerups.Authority mPowerupCache = new Powerups.Authority();
@@ -614,6 +623,9 @@ public class TcpClient extends Service {
             Globals.getInstance().mEndGameVoteRequested = false;
         }
         mActiveStartToken = roundToken;
+        mStatisticsRoundToken = roundToken;
+        mStatisticsStartAt = startAt;
+        applyTelemetryResumeLocked();
         intent.putExtra(NetMsg.INTENT_START_AT, startAt)
                 .putExtra(NetMsg.INTENT_END_AT, duration == 0 ? 0 : startAt + duration)
                 .putExtra(NetMsg.INTENT_ROUND_ID, roundID)
@@ -1162,8 +1174,22 @@ public class TcpClient extends Service {
                 playerInfo.put(LiveJoin.TEAM, Globals.getInstance().mRequestedJoinTeam);
             playerInfo.put(TcpServer.JSON_LOBBY_READY, Globals.getInstance().mLocalLobbyReady);
             playerInfo.put(TcpServer.JSON_LOBBY_BENCHED, Globals.getInstance().mLocalLobbyBenched);
-            playerInfo.put(TcpServer.JSON_PRIOR_KILLS, PlayerHistory.kills(this));
-            playerInfo.put(TcpServer.JSON_PRIOR_DEATHS, PlayerHistory.deaths(this));
+            RoundRoster activeRoster = Globals.getInstance().mRoundRoster;
+            String historyToken = Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                    && activeRoster != null ? activeRoster.token : null;
+            playerInfo.put(TcpServer.JSON_PRIOR_KILLS, historyToken == null ? PlayerHistory.kills(this)
+                    : PlayerHistory.baselineKills(this, historyToken));
+            playerInfo.put(TcpServer.JSON_PRIOR_DEATHS, historyToken == null ? PlayerHistory.deaths(this)
+                    : PlayerHistory.baselineDeaths(this, historyToken));
+            String savedBaselineToken = PlayerHistory.baselineRoundToken(this);
+            if (TcpServer.isValidRoundToken(savedBaselineToken)) {
+                playerInfo.put(TcpServer.JSON_HISTORY_ROUND_TOKEN, savedBaselineToken);
+                playerInfo.put(TcpServer.JSON_HISTORY_BASELINE_KILLS,
+                        PlayerHistory.baselineKills(this, savedBaselineToken));
+                playerInfo.put(TcpServer.JSON_HISTORY_BASELINE_DEATHS,
+                        PlayerHistory.baselineDeaths(this, savedBaselineToken));
+            }
+            playerInfo.put(TcpServer.JSON_ROUND_ANALYTICS, true);
             if (rejoin) {
                 Log.d(TAG, "Attempting to rejoin server");
                 playerInfo.put(TcpServer.JSON_REJOIN, true);
@@ -1214,7 +1240,7 @@ public class TcpClient extends Service {
     public boolean voteToEndGame(String roundToken, boolean approve) {
         synchronized (this) {
             if (!isDedicatedServer() || !TcpServer.isValidRoundToken(roundToken)
-                    || !roundToken.equals(mActiveStartToken) || !keepListening) return false;
+                    || !roundToken.equals(mStatisticsRoundToken) || !keepListening) return false;
         }
         try {
             sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
@@ -1288,19 +1314,19 @@ public class TcpClient extends Service {
         sendPlayerGrenade(false);
     }
 
-    /**
-     * Report a confirmed blaster shot to the host's optional live dashboard.
-     * This is intentionally non-persistent: a delayed shot from a prior life
-     * or round must never inflate the next round's accuracy.
-     */
-    public void reportHostedShots(int count) {
-        if (!mIsDedicatedServer || count < 1 || count > Globals.MAX_RELOAD_COUNT)
+    /** Cumulative, scoped totals survive a reconnect without counting twice. */
+    public synchronized void reportHostedShots(int count) {
+        if (count < 1 || count > Globals.MAX_RELOAD_COUNT)
             return;
         try {
-            JSONObject telemetry = new JSONObject();
+            JSONObject telemetry = createRoundTelemetry();
+            if (telemetry == null) return;
+            mTelemetryShots = (int) Math.min(Globals.MAX_SCOREBOARD_VALUE,
+                    (long) mTelemetryShots + count);
             telemetry.put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_SHOT);
             telemetry.put(TcpServer.JSON_TELEMETRY_COUNT, count);
-            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry.toString());
+            telemetry.put(TcpServer.JSON_TELEMETRY_TOTAL, mTelemetryShots);
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry, true);
         } catch (JSONException e) {
             Log.w(TAG, "Unable to encode hosted shot telemetry", e);
         }
@@ -1312,34 +1338,130 @@ public class TcpClient extends Service {
      * the two involved opponents a short-lived GPS reveal without trusting a
      * self-reported miss or kill.
      */
-    public void reportHostedHit(int attackerID) {
+    public synchronized void reportHostedHit(int attackerID) {
         // The receiving blaster is the authoritative source of a hit in both
         // phone-hosted and dedicated games.  A normal phone host uses this
         // report for the short enemy-GPS reveal as well as the dashboard.
         if (attackerID <= 0 || !Globals.isValidPlayerID(attackerID))
             return;
         try {
-            JSONObject telemetry = new JSONObject();
+            JSONObject telemetry = createRoundTelemetry();
+            if (telemetry == null) return;
             telemetry.put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_HIT);
-            telemetry.put(TcpServer.JSON_TELEMETRY_ATTACKER, attackerID);
-            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry.toString());
+            if (!putRoundAttacker(telemetry, attackerID)) return;
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry, true);
         } catch (JSONException e) {
             Log.w(TAG, "Unable to encode hosted hit telemetry", e);
         }
     }
 
     /** Report a verified grenade hit without inventing a shooter position. */
-    public void reportHostedGrenadeHit(int grenadeID) {
+    public synchronized void reportHostedGrenadeHit(int grenadeID) {
         if (grenadeID <= 0 || !Globals.isValidGrenadeID(grenadeID))
             return;
         try {
-            JSONObject telemetry = new JSONObject();
+            JSONObject telemetry = createRoundTelemetry();
+            if (telemetry == null) return;
             telemetry.put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_GRENADE_HIT);
             telemetry.put(TcpServer.JSON_TELEMETRY_GRENADE_ID, grenadeID);
-            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry.toString());
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry, true);
         } catch (JSONException e) {
             Log.w(TAG, "Unable to encode hosted grenade hit telemetry", e);
         }
+    }
+
+    /** Call before the local roster advances its death/life counter. */
+    public synchronized void reportRoundElimination(int attackerID) {
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        RoundRoster.Member member = roster == null ? null : roster.seat(Globals.getInstance().mPlayerID);
+        reportRoundElimination(attackerID, member == null ? -1 : member.deaths);
+    }
+
+    public synchronized void reportRoundElimination(int attackerID, int lifeBefore) {
+        if (attackerID < 0 || !Globals.isValidPlayerID(attackerID)) return;
+        Globals globals = Globals.getInstance();
+        // Friendly and self grenade damage can still kill the victim. Record
+        // that death so a dedicated checkpoint may revive them, without giving
+        // a teammate (or the victim) a kill or increasing their streak.
+        if (attackerID == globals.mPlayerID || attackerID > 0
+                && globals.mGameMode != Globals.GAME_MODE_FFA
+                && globals.calcNetworkTeam((byte) attackerID) == globals.calcNetworkTeam(globals.mPlayerID))
+            attackerID = 0;
+        try {
+            JSONObject telemetry = createRoundTelemetry();
+            if (telemetry == null || lifeBefore < 0 || lifeBefore > Globals.MAX_SCOREBOARD_VALUE) return;
+            telemetry.put(TcpServer.JSON_TELEMETRY_LIFE, lifeBefore);
+            telemetry.put(TcpServer.JSON_TELEMETRY, TcpServer.JSON_TELEMETRY_ELIMINATION);
+            if (!putRoundAttacker(telemetry, attackerID))
+                telemetry.put(TcpServer.JSON_TELEMETRY_ATTACKER, 0);
+            sendTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + telemetry, true);
+        } catch (JSONException e) { Log.w(TAG, "Unable to encode round elimination", e); }
+    }
+
+    private JSONObject createRoundTelemetry() throws JSONException {
+        Globals globals = Globals.getInstance();
+        RoundRoster roster = globals.mRoundRoster;
+        RoundRoster.Member member = roster == null ? null : roster.seat(globals.mPlayerID);
+        if (mDestroyed || globals.mGameState != Globals.GAME_STATE_RUNNING
+                || member == null || !member.active || !roster.token.equals(mStatisticsRoundToken)
+                || mStatisticsStartAt >= 0 && SystemClock.elapsedRealtime() < mStatisticsStartAt)
+            return null;
+        if (!roster.token.equals(mTelemetryToken)) {
+            mTelemetryToken = roster.token;
+            mTelemetrySequence = 0;
+            mTelemetryShots = 0;
+        }
+        return new JSONObject().put(TcpServer.JSON_ROUND_TOKEN, roster.token)
+                .put(TcpServer.JSON_TELEMETRY_GENERATION, member.generation)
+                .put(TcpServer.JSON_TELEMETRY_LIFE, member.deaths)
+                .put(TcpServer.JSON_TELEMETRY_SEQUENCE, ++mTelemetrySequence);
+    }
+
+    private boolean putRoundAttacker(JSONObject telemetry, int attackerID) throws JSONException {
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        RoundRoster.Member attacker = roster == null ? null : roster.seat(attackerID);
+        if (attackerID > 0) {
+            if (attacker == null || !roster.token.equals(telemetry.get(TcpServer.JSON_ROUND_TOKEN))) return false;
+            telemetry.put(TcpServer.JSON_TELEMETRY_ATTACKER_GENERATION, attacker.generation);
+        }
+        telemetry.put(TcpServer.JSON_TELEMETRY_ATTACKER, attackerID);
+        return true;
+    }
+
+    public synchronized RoundReport getCompletedRoundReport(String token) {
+        return mCompletedRoundReport != null && mCompletedRoundReport.roundToken.equals(token)
+                ? mCompletedRoundReport : null;
+    }
+
+    private void receiveTelemetryResumeLocked(JSONObject resume) throws JSONException {
+        Object token = resume.get(TcpServer.JSON_ROUND_TOKEN);
+        int generation = TcpJson.getInt(resume, TcpServer.JSON_TELEMETRY_GENERATION);
+        int life = TcpJson.getInt(resume, TcpServer.JSON_TELEMETRY_LIFE);
+        long sequence = TcpJson.getLong(resume, TcpServer.JSON_TELEMETRY_SEQUENCE);
+        int total = TcpJson.getInt(resume, TcpServer.JSON_TELEMETRY_TOTAL);
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        RoundRoster.Member member = roster == null ? null : roster.seat(Globals.getInstance().mPlayerID);
+        if (!(token instanceof String) || !TcpServer.isValidRoundToken((String) token)
+                || generation < 0 || generation > 255 || life < 0 || life > Globals.MAX_SCOREBOARD_VALUE
+                || sequence < 0 || total < 0 || total > Globals.MAX_SCOREBOARD_VALUE
+                || member == null || !member.active || !roster.token.equals(token)
+                || member.generation != generation || life > member.deaths) return;
+        mPendingTelemetryResume = resume;
+        applyTelemetryResumeLocked();
+    }
+
+    private void applyTelemetryResumeLocked() throws JSONException {
+        if (mPendingTelemetryResume == null || !mPendingTelemetryResume.get(TcpServer.JSON_ROUND_TOKEN)
+                .equals(mStatisticsRoundToken)) return;
+        if (!mStatisticsRoundToken.equals(mTelemetryToken)) {
+            mTelemetryToken = mStatisticsRoundToken;
+            mTelemetryShots = 0;
+            mTelemetrySequence = 0;
+        }
+        mTelemetryShots = Math.max(mTelemetryShots, TcpJson.getInt(mPendingTelemetryResume, TcpServer.JSON_TELEMETRY_TOTAL));
+        mTelemetrySequence = Math.max(mTelemetrySequence,
+                TcpJson.getLong(mPendingTelemetryResume, TcpServer.JSON_TELEMETRY_SEQUENCE));
+        mPendingTelemetryResume = null;
     }
 
     private void sendPlayerGrenade(boolean priority) {
@@ -1475,6 +1597,24 @@ public class TcpClient extends Service {
                 finishServerSession(NetMsg.NETMSG_PLAYERTRANSFERRED);
                 return;
             }
+            if (game.has(TcpServer.JSON_TELEMETRY_RESUME)) {
+                synchronized (this) {
+                    if (!isCurrentSession(generation)) return;
+                    receiveTelemetryResumeLocked(game.getJSONObject(TcpServer.JSON_TELEMETRY_RESUME));
+                }
+                return;
+            }
+            if (game.has(RoundReport.KEY)) {
+                RoundReport report = RoundReport.fromJson(game.getJSONObject(RoundReport.KEY));
+                synchronized (this) {
+                    if (!isCurrentSession(generation) || !report.roundToken.equals(mStatisticsRoundToken)
+                            || report.playerID != Globals.getInstance().mPlayerID
+                            || mCompletedRoundReport != null
+                            && report.roundToken.equals(mCompletedRoundReport.roundToken)) return;
+                    mCompletedRoundReport = report;
+                }
+                return;
+            }
             // Parse the origin now, but commit only with the validated message.
             // A malformed snapshot must not leave a new decoding frame behind.
             final GpsOffset gpsOrigin = game.has(GpsWire.ORIGIN)
@@ -1510,7 +1650,7 @@ public class TcpClient extends Service {
                 String token = game.getString(TcpServer.JSON_ROUND_TOKEN);
                 synchronized (this) {
                     if (!isCurrentSession(generation) || !mIsDedicatedServer
-                            || !token.equals(mActiveStartToken) || votes < 0
+                            || !token.equals(mStatisticsRoundToken) || votes < 0
                             || (votes & ~EndGameVotes.VALID_MASK) != 0) return;
                     Globals.getInstance().mEndGameVotes = votes;
                     Globals.getInstance().mEndGameVoteRequested = true;
@@ -1763,6 +1903,8 @@ public class TcpClient extends Service {
                         && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_MODE);
                 boolean balancedQr = game.has(TcpServer.JSON_BALANCED_QR)
                         && TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_QR);
+                boolean balancedPrepared = game.has(TcpServer.JSON_BALANCED_PREPARED)
+                        ? TcpJson.getBoolean(game, TcpServer.JSON_BALANCED_PREPARED) : balancedMode;
                 int powerupQrRequired = game.has(TcpServer.JSON_POWERUP_QR_REQUIRED)
                         ? TcpJson.getInt(game, TcpServer.JSON_POWERUP_QR_REQUIRED) : 0;
                 int grenadeDamage = game.has(TcpServer.JSON_GRENADE_DAMAGE)
@@ -2079,6 +2221,7 @@ public class TcpClient extends Service {
                                     globals.mGameMode = gameMode;
                                     globals.mBalancedRandom = balancedMode;
                                     globals.mBalancedRequireQr = balancedQr;
+                                    globals.mBalancedGamePrepared = balancedMode && balancedPrepared;
                                     globals.mPowerupQrRequired = powerupQrRequired;
                                     globals.mRespawnQrEnabled = respawnQrEnabled;
                                     globals.setBalancedAssignments(balancedTeams, balancedCheckedIn);

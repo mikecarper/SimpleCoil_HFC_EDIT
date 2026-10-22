@@ -34,7 +34,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Binder;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
@@ -42,6 +44,8 @@ import androidx.core.app.NotificationCompat;
 
 import java.util.LinkedList;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Queue;
 import java.util.UUID;
@@ -155,6 +159,8 @@ public class BluetoothLeService extends Service {
             "com.example.bluetooth.le.EXTRA_STATUS";
     public final static String EXTRA_WEAPON_SLOT =
             "com.example.bluetooth.le.EXTRA_WEAPON_SLOT";
+    public final static String EXTRA_COMPLETED_AT =
+            "com.example.bluetooth.le.EXTRA_COMPLETED_AT";
 
     /** A separate service component supplies its own GATT handle and operation queue. */
     protected int weaponSlot() {
@@ -168,6 +174,8 @@ public class BluetoothLeService extends Service {
 
     // A stalled GATT callback must not let callers retain an unbounded number of payloads.
     static final int MAX_QUEUED_GATT_OPERATIONS = 64;
+    static final int MAX_COMPLETED_WRITE_RESULTS = 64;
+    static final long GATT_OPERATION_TIMEOUT_MS = 5_000L;
 
     private boolean mActionAvailable = true;
     private final Queue<CharacteristicWrite> mCharacteristicWriteQueue = new LinkedList<>();
@@ -176,6 +184,9 @@ public class BluetoothLeService extends Service {
     private CharacteristicWrite mActiveCharacteristicWrite;
     private DescriptorWrite mActiveDescriptorWrite;
     private BluetoothGattCharacteristic mActiveCharacteristicRead;
+    private final Handler mGattOperationHandler = new Handler(Looper.getMainLooper());
+    private Runnable mGattOperationTimeout;
+    private final Queue<CompletedWriteResult> mCompletedWriteResults = new LinkedList<>();
 
     // Android 5.1 uses mutable characteristic objects. Keep each operation's payload
     // separate from that object until it actually reaches the front of the queue.
@@ -183,16 +194,34 @@ public class BluetoothLeService extends Service {
         final BluetoothGattCharacteristic characteristic;
         final byte[] value;
         final int writeType;
+        final BluetoothGatt gatt;
 
         CharacteristicWrite(BluetoothGattCharacteristic characteristic, byte[] value) {
+            this(characteristic, value, null);
+        }
+
+        CharacteristicWrite(BluetoothGattCharacteristic characteristic, byte[] value, BluetoothGatt gatt) {
             this.characteristic = characteristic;
             this.value = value.clone();
             writeType = characteristic.getWriteType();
+            this.gatt = gatt;
         }
 
         void prepare() {
             characteristic.setWriteType(writeType);
             characteristic.setValue(value.clone());
+        }
+    }
+
+    private static final class CompletedWriteResult {
+        final CharacteristicWrite write;
+        final int status;
+        final long completedAt;
+
+        CompletedWriteResult(CharacteristicWrite write, int status) {
+            this.write = write;
+            this.status = status;
+            completedAt = SystemClock.elapsedRealtime();
         }
     }
 
@@ -221,6 +250,7 @@ public class BluetoothLeService extends Service {
     }
 
     private synchronized void clearPendingGattOperations() {
+        cancelGattOperationTimeout();
         mActionAvailable = true;
         mActiveCharacteristicWrite = null;
         mActiveDescriptorWrite = null;
@@ -230,22 +260,92 @@ public class BluetoothLeService extends Service {
         mCharacteristicReadQueue.clear();
     }
 
-    private void broadcastWriteFinished(CharacteristicWrite write, int status) {
-        logFireTiming("write_finished", write.characteristic.getUuid(), write.value, status);
+    private Intent writeResultIntent(CompletedWriteResult result) {
+        CharacteristicWrite write = result.write;
         Intent intent = new Intent(CHARACTERISTIC_WRITE_FINISHED);
         intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
         intent.putExtra(EXTRA_UUID, write.characteristic.getUuid().toString());
         intent.putExtra(EXTRA_DATA, write.value.clone());
-        intent.putExtra(EXTRA_STATUS, status);
-        sendBroadcast(intent);
+        intent.putExtra(EXTRA_STATUS, result.status);
+        intent.putExtra(EXTRA_COMPLETED_AT, result.completedAt);
+        return intent;
+    }
+
+    private void forgetCompletedWriteResult(BluetoothGattCharacteristic characteristic, byte[] value) {
+        Iterator<CompletedWriteResult> results = mCompletedWriteResults.iterator();
+        while (results.hasNext()) {
+            CharacteristicWrite write = results.next().write;
+            if (write.characteristic == characteristic && Arrays.equals(write.value, value)) results.remove();
+        }
+    }
+
+    /** Recover an exact ACK missed while the activity receiver was paused, never an old connection's result. */
+    public synchronized Intent getCompletedWriteResult(BluetoothGattCharacteristic characteristic, byte[] value) {
+        if (mBluetoothGatt == null || characteristic == null || value == null) return null;
+        // An earlier identical command can complete after a wrapped-ID copy
+        // was queued. Its ACK cannot stand in for that unfinished submission.
+        if (mActiveCharacteristicWrite != null && mActiveCharacteristicWrite.characteristic == characteristic
+                && Arrays.equals(mActiveCharacteristicWrite.value, value)) return null;
+        for (CharacteristicWrite write : mCharacteristicWriteQueue)
+            if (write.characteristic == characteristic && Arrays.equals(write.value, value)) return null;
+        for (CompletedWriteResult result : mCompletedWriteResults) {
+            CharacteristicWrite write = result.write;
+            if (write.gatt == mBluetoothGatt && write.characteristic == characteristic
+                    && write.characteristic.getUuid().equals(characteristic.getUuid())
+                    && Arrays.equals(write.value, value)) return writeResultIntent(result);
+        }
+        return null;
+    }
+
+    private void broadcastWriteFinished(CharacteristicWrite write, int status) {
+        CompletedWriteResult result = new CompletedWriteResult(write, status);
+        logFireTiming("write_finished", write.characteristic.getUuid(), write.value, status);
+        if (write.gatt != null && write.gatt == mBluetoothGatt) {
+            forgetCompletedWriteResult(write.characteristic, write.value);
+            while (mCompletedWriteResults.size() >= MAX_COMPLETED_WRITE_RESULTS) mCompletedWriteResults.remove();
+            mCompletedWriteResults.add(result);
+        }
+        sendBroadcast(writeResultIntent(result));
+    }
+
+    private List<CharacteristicWrite> pendingCharacteristicWrites() {
+        List<CharacteristicWrite> failed = new ArrayList<>();
+        if (mActiveCharacteristicWrite != null) failed.add(mActiveCharacteristicWrite);
+        failed.addAll(mCharacteristicWriteQueue);
+        return failed;
     }
 
     private void failPendingGattOperations() {
-        if (mActiveCharacteristicWrite != null)
-            broadcastWriteFinished(mActiveCharacteristicWrite, BluetoothGatt.GATT_FAILURE);
-        for (CharacteristicWrite write : mCharacteristicWriteQueue)
-            broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
+        List<CharacteristicWrite> failed = pendingCharacteristicWrites();
         clearPendingGattOperations();
+        for (CharacteristicWrite write : failed) broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
+    }
+
+    private void cancelGattOperationTimeout() {
+        if (mGattOperationTimeout != null) mGattOperationHandler.removeCallbacks(mGattOperationTimeout);
+        mGattOperationTimeout = null;
+    }
+
+    private void startGattOperationTimeout(final BluetoothGatt gatt, final Object operation) {
+        cancelGattOperationTimeout();
+        mGattOperationTimeout = new Runnable() {
+            @Override public void run() {
+                synchronized (BluetoothLeService.this) {
+                    if (mGattOperationTimeout != this || !isCurrentGatt(gatt)
+                            || operation != mActiveCharacteristicWrite && operation != mActiveDescriptorWrite
+                            && operation != mActiveCharacteristicRead) return;
+                    Log.w(TAG, "GATT operation timed out; reconnecting instead of advancing a stale handle");
+                    List<CharacteristicWrite> failed = pendingCharacteristicWrites();
+                    // A delayed ACK only identifies its handle/characteristic, not
+                    // its operation. Retire the handle before permitting any retry.
+                    close();
+                    for (CharacteristicWrite write : failed)
+                        broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
+                    broadcastUpdate(ACTION_GATT_DISCONNECTED);
+                }
+            }
+        };
+        mGattOperationHandler.postDelayed(mGattOperationTimeout, GATT_OPERATION_TIMEOUT_MS);
     }
 
     private boolean startCharacteristicWrite(BluetoothGatt gatt, CharacteristicWrite write) {
@@ -256,8 +356,11 @@ public class BluetoothLeService extends Service {
         // callback cannot be overwritten by a stale false assignment afterward.
         mActionAvailable = false;
         mActiveCharacteristicWrite = write;
+        startGattOperationTimeout(gatt, write);
         if (gatt.writeCharacteristic(write.characteristic))
             return true;
+        if (mActiveCharacteristicWrite != write) return true;
+        cancelGattOperationTimeout();
         mActiveCharacteristicWrite = null;
         mActionAvailable = true;
         broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
@@ -268,8 +371,11 @@ public class BluetoothLeService extends Service {
         write.prepare();
         mActionAvailable = false;
         mActiveDescriptorWrite = write;
+        startGattOperationTimeout(gatt, write);
         if (gatt.writeDescriptor(write.descriptor))
             return true;
+        if (mActiveDescriptorWrite != write) return true;
+        cancelGattOperationTimeout();
         mActiveDescriptorWrite = null;
         mActionAvailable = true;
         return false;
@@ -278,8 +384,11 @@ public class BluetoothLeService extends Service {
     private boolean startCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
         mActionAvailable = false;
         mActiveCharacteristicRead = characteristic;
+        startGattOperationTimeout(gatt, characteristic);
         if (gatt.readCharacteristic(characteristic))
             return true;
+        if (mActiveCharacteristicRead != characteristic) return true;
+        cancelGattOperationTimeout();
         mActiveCharacteristicRead = null;
         mActionAvailable = true;
         return false;
@@ -356,6 +465,7 @@ public class BluetoothLeService extends Service {
                     intentAction = ACTION_GATT_DISCONNECTED;
                     mConnectionState = STATE_DISCONNECTED;
                     clearPendingGattOperations();
+                    mCompletedWriteResults.clear();
                     Log.i(TAG, "Disconnected from GATT server: " + status);
                     broadcastUpdate(intentAction);
                 }
@@ -383,6 +493,7 @@ public class BluetoothLeService extends Service {
                 if (!isCurrentGatt(gatt) || mActiveCharacteristicRead == null
                         || mActiveCharacteristicRead != characteristic)
                     return;
+                cancelGattOperationTimeout();
                 mActiveCharacteristicRead = null;
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "read success!");
@@ -403,6 +514,7 @@ public class BluetoothLeService extends Service {
                         || mActiveCharacteristicWrite.characteristic != characteristic)
                     return;
                 CharacteristicWrite completed = mActiveCharacteristicWrite;
+                cancelGattOperationTimeout();
                 mActiveCharacteristicWrite = null;
                 // Report the completed snapshot, not a value changed by the next write.
                 broadcastWriteFinished(completed, status);
@@ -413,9 +525,13 @@ public class BluetoothLeService extends Service {
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt,
                                             BluetoothGattCharacteristic characteristic) {
+            // The framework can reuse this mutable object while another callback
+            // waits for the service monitor. Preserve this notification first.
+            byte[] value = characteristic.getValue();
+            byte[] snapshot = value == null ? null : value.clone();
             synchronized (BluetoothLeService.this) {
                 if (!isCurrentGatt(gatt)) return;
-                broadcastUpdate(characteristic);
+                broadcastUpdate(characteristic, snapshot);
             }
         }
 
@@ -427,6 +543,7 @@ public class BluetoothLeService extends Service {
                 if (!isCurrentGatt(gatt) || mActiveDescriptorWrite == null
                         || mActiveDescriptorWrite.descriptor != descriptor)
                     return;
+                cancelGattOperationTimeout();
                 mActiveDescriptorWrite = null;
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "descriptor write success!");
@@ -446,8 +563,12 @@ public class BluetoothLeService extends Service {
     }
 
     private void broadcastUpdate(final BluetoothGattCharacteristic characteristic) {
+        byte[] value = characteristic.getValue();
+        broadcastUpdate(characteristic, value == null ? null : value.clone());
+    }
+
+    private void broadcastUpdate(final BluetoothGattCharacteristic characteristic, byte[] data) {
         if (UUID_RECOIL_TELEMETRY.equals((characteristic.getUuid()))) {
-            byte[] data = characteristic.getValue();
             if (data == null)
                 return;
             logFireTiming("telemetry", characteristic.getUuid(), data, BluetoothGatt.GATT_SUCCESS);
@@ -456,7 +577,6 @@ public class BluetoothLeService extends Service {
             intent.putExtra(EXTRA_DATA, data.clone());
             sendBroadcast(intent);
         } else if (UUID_RECOIL_ID.equals((characteristic.getUuid()))) {
-            final byte[] data = characteristic.getValue();
             if (data == null || data.length <= 10) {
                 Log.w(TAG, "Ignoring short ID characteristic response");
                 return;
@@ -525,9 +645,15 @@ public class BluetoothLeService extends Service {
 
         synchronized (this) {
             clearPendingGattOperations();
+            mCompletedWriteResults.clear();
         }
 
         return true;
+    }
+
+    /** Readiness query for activity setup missed while its receiver was paused. */
+    public synchronized boolean isConnected() {
+        return mBluetoothGatt != null && mConnectionState == STATE_CONNECTED;
     }
 
     /**
@@ -555,6 +681,7 @@ public class BluetoothLeService extends Service {
             Log.d(TAG, "Trying to use an existing mBluetoothGatt for connection.");
             try {
                 if (mBluetoothGatt.connect()) {
+                    mCompletedWriteResults.clear();
                     mConnectionState = STATE_CONNECTING;
                     keepConnectionActive();
                     return true;
@@ -632,6 +759,7 @@ public class BluetoothLeService extends Service {
         mConnectionState = STATE_DISCONNECTED;
         releaseConnectionPriority();
         clearPendingGattOperations();
+        mCompletedWriteResults.clear();
         if (gatt != null) {
             try {
                 gatt.close();
@@ -682,7 +810,10 @@ public class BluetoothLeService extends Service {
     public synchronized void writeCharacteristic(BluetoothGattCharacteristic characteristic, byte[] value) {
         if (characteristic == null || value == null)
             return;
-        CharacteristicWrite write = new CharacteristicWrite(characteristic, value);
+        // Command IDs wrap. A new identical submission must not find an old ACK
+        // while it is queued or in flight on this same connection.
+        forgetCompletedWriteResult(characteristic, value);
+        CharacteristicWrite write = new CharacteristicWrite(characteristic, value, mBluetoothGatt);
         if (mBluetoothAdapter == null || mBluetoothGatt == null) {
             Log.w(TAG, "BluetoothAdapter not initialized");
             broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);

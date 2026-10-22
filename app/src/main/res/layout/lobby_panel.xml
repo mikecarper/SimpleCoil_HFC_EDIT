@@ -56,6 +56,17 @@
         </LinearLayout>
         <TextView android:id="@+id/lobby_last_game_team" style="@style/LobbyBody"
             android:layout_marginTop="6dp" android:gravity="center" />
+        <LinearLayout android:id="@+id/lobby_last_game_analytics"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:layout_marginTop="8dp" android:visibility="gone">
+            <TextView android:id="@+id/lobby_last_game_accuracy" style="@style/LobbyHeading"
+                android:textSize="16sp" />
+            <TextView android:id="@+id/lobby_last_game_shots" style="@style/LobbyBody" />
+            <TextView android:id="@+id/lobby_last_game_streaks" style="@style/LobbyBody" />
+            <TextView android:id="@+id/lobby_last_game_skill" style="@style/LobbyBody" />
+            <TextView android:id="@+id/lobby_last_game_analytics_note" style="@style/LobbyBody"
+                android:textSize="12sp" android:layout_marginTop="4dp" />
+        </LinearLayout>
     </LinearLayout>
 
     <LinearLayout android:id="@+id/lobby_gun_card" style="@style/LobbyCard" android:orientation="vertical">
@@ -133,6 +144,12 @@
     <LinearLayout style="@style/LobbyCard" android:orientation="vertical">
         <TextView android:id="@+id/lobby_roster_title" style="@style/LobbyEyebrow"
             android:text="@string/lobby_players_label" />
+        <Button android:id="@+id/lobby_rebalance_button" style="@style/LobbyTextButton"
+            android:layout_width="match_parent" android:text="@string/rebalance_teams_button"
+            android:visibility="gone" />
+        <TextView android:id="@+id/lobby_rebalance_hint" style="@style/LobbyBody"
+            android:text="@string/rebalance_teams_hint" android:textSize="13sp"
+            android:visibility="gone" />
         <TextView android:id="@+id/lobby_blockers" style="@style/LobbyBody"
             android:textColor="#FFBA6A" android:layout_marginTop="4dp"
             android:textSize="13sp" android:visibility="gone" />

@@ -38,14 +38,35 @@ public final class LaptopHostProtocolSmokeTest {
     private static final int UDP_PORT = 19_500;
     private static final int DASHBOARD_PORT = 19_511;
     private static final int TILE_PORT = 19_512;
-    private static final String JSON_PREFIX = "SimpleCoil:30JSON";
-    private static final String MESSAGE_PREFIX = "SimpleCoil:30MESG";
+    private static final int NETWORK_VERSION = 31;
+    private static final String JSON_PREFIX = "SimpleCoil:" + NETWORK_VERSION + "JSON";
+    private static final String MESSAGE_PREFIX = "SimpleCoil:" + NETWORK_VERSION + "MESG";
     private static final long GPS_UTC_BASE = 1_800_000_000_000L;
     private static final HttpClient WIFI_HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).build();
 
     public static void main(String[] args) throws Exception {
+        System.setProperty("simplecoil.reports", Files.createTempDirectory("simplecoil-smoke-reports").toString());
+        System.setProperty("simplecoil.players.file", Files.createTempDirectory("simplecoil-smoke-players")
+                .resolve("players.json").toString());
+        System.setProperty("simplecoil.event.file", Files.createTempDirectory("simplecoil-smoke-event")
+                .resolve("event.properties").toString());
+        if (args.length == 1 && "--reports-only".equals(args[0])) {
+            verifyRoundReports();
+            verifyRoundReportBounds();
+            verifyQueuedSourceSlotReuse();
+            System.out.println("Post-round statistics and timeline smoke tests passed");
+            return;
+        }
+        if (args.length == 1 && "--balanced-only".equals(args[0])) {
+            verifyBalancedQr();
+            verifyBalancedNoQr();
+            verifyBalancedTeamRetention();
+            System.out.println("Balanced-team retention and rebalance protocol smoke tests passed");
+            return;
+        }
         if (args.length == 1 && "--powerups-only".equals(args[0])) {
             verifyPowerupRecipientWire();
+            verifyAirstrikeHostWireSnapshot();
             verifyPowerupStandaloneFrameBound();
             verifyPowerupSnapshotFraming();
             verifyPowerupRequests(2);
@@ -60,6 +81,7 @@ public final class LaptopHostProtocolSmokeTest {
             verifyNormalStartCountdown(true);
             verifyBalancedQr();
             verifyBalancedNoQr();
+            verifyBalancedTeamRetention();
             System.out.println("Game-start countdown protocol smoke tests passed");
             return;
         }
@@ -91,7 +113,7 @@ public final class LaptopHostProtocolSmokeTest {
         byte[] testTileBytes = new byte[] {(byte) 0x89, 0x50, 0x4e, 0x47};
         Files.write(testTile, testTileBytes);
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1",
@@ -155,6 +177,7 @@ public final class LaptopHostProtocolSmokeTest {
                     "unknown Wi-Fi actions were accepted");
             verifyUdpDiscovery();
             verifySharedLobbyDiscovery();
+            verifyPreviousProtocolRejected();
             String completedToken;
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
                  FakePhone blueTeammate = new FakePhone("127.0.0.5", 2, "Blue Two");
@@ -273,8 +296,8 @@ public final class LaptopHostProtocolSmokeTest {
                         "grenade pairing was not shared");
                 second.send(JSON_PREFIX + "{\"telemetry\":\"grenadehit\",\"grenadeID\":4}");
                 require(waitForDashboard(value -> value.contains("\"grenadeID\":4")
-                        && value.contains("\"hits\":2")) != null,
-                        "paired grenade hit did not credit its owner");
+                        && value.contains("\"hits\":1")) != null,
+                        "paired grenade hit incorrectly changed gun IR accuracy");
                 require(post("/api/end").contains("\"ok\":true"), "host did not request approval");
                 require(first.readUntil(frame -> frame.contains("\"endvotes\":0")) != null,
                         "the operator incorrectly counted as a player approval");
@@ -366,7 +389,10 @@ public final class LaptopHostProtocolSmokeTest {
         System.out.println("LaptopHost balanced QR smoke test passed.");
         verifyBalancedNoQr();
         System.out.println("LaptopHost balanced no-QR smoke test passed.");
+        verifyBalancedTeamRetention();
+        System.out.println("LaptopHost retained-team and manual rebalance smoke test passed.");
         verifyPowerupRecipientWire();
+        verifyAirstrikeHostWireSnapshot();
         verifyPowerupStandaloneFrameBound();
         verifyPowerupSnapshotFraming();
         verifyPowerupRequests(2);
@@ -383,6 +409,10 @@ public final class LaptopHostProtocolSmokeTest {
         System.out.println("LaptopHost Capture the Flag smoke test passed.");
         verifyInfectionMode();
         System.out.println("LaptopHost Infection smoke test passed.");
+        verifyRoundReports();
+        verifyRoundReportBounds();
+        verifyQueuedSourceSlotReuse();
+        System.out.println("LaptopHost post-round statistics and timeline smoke tests passed.");
         if (args.length > 0 && "--verify-timeout".equals(args[0])) {
             verifyBalancedQrTimeout();
             System.out.println("LaptopHost 90-second QR timeout smoke test passed.");
@@ -392,7 +422,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyGpsOffsets() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--gps", "all", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
                 String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
@@ -513,11 +543,11 @@ public final class LaptopHostProtocolSmokeTest {
     }
 
     private static void verifyNormalStartCountdown(boolean explicitOverride) throws Exception {
-        require(GameStartCountdown.DURATION_SECONDS == 24 && GameStartCountdown.DURATION_MS == 24_000,
-                "the shared default start countdown must be twenty-four seconds");
+        require(GameStartCountdown.DURATION_SECONDS == 23 && GameStartCountdown.DURATION_MS == 23_000,
+                "the shared default start countdown must be twenty-three seconds");
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        List<String> command = new ArrayList<>(List.of(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver",
+        List<String> command = new ArrayList<>(List.of(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver",
                 "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT)));
@@ -548,7 +578,7 @@ public final class LaptopHostProtocolSmokeTest {
                     require(state.contains("\"state\":\"countdown\"")
                                     && jsonNumber(state, "startInMs") > 0
                                     && jsonNumber(state, "startInMs") <= GameStartCountdown.DURATION_MS,
-                            "normal default countdown was not twenty-four seconds");
+                            "normal default countdown was not twenty-three seconds");
                 }
             }
         } finally {
@@ -560,7 +590,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyPowerupRequests(int required) throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        List<String> command = new ArrayList<>(List.of(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver",
+        List<String> command = new ArrayList<>(List.of(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver",
                 "-cp", classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1"));
@@ -707,7 +737,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void assertPowerupGrant(String frame, String token, int source, int life) throws Exception {
         String grant = powerupGrantObject(frame);
         int kind = (int) jsonNumber(grant, "kind");
-        require(kind >= 1 && kind <= 9 && jsonNumber(grant, "id") > 0
+        require(kind >= Powerups.EMP && kind <= Powerups.AIRSTRIKE && jsonNumber(grant, "id") > 0
                         && jsonNumber(grant, "source") == source && jsonNumber(grant, "sourcelife") == life
                         && token.equals(jsonString(frame, "roundtoken")),
                 "the reward did not contain a valid source, life, kind, and round");
@@ -716,12 +746,14 @@ public final class LaptopHostProtocolSmokeTest {
         require(jsonNumber(grant, "expires") - jsonNumber(frame, "powerupclock") == Powerups.durationMillis(kind),
                 "the reward expiry did not use the authoritative duration");
         Powerups.Grant decoded = readPowerupGrant(grant);
-        int[] expectedTargets = kind == 1 || kind == 8 ? new int[]{17}
-                : kind == 3 || kind == 7 ? new int[]{1, 2} : new int[]{source};
+        boolean enemyWide = kind == Powerups.EMP || kind == Powerups.DAMAGE_TEAM || kind == Powerups.AIRSTRIKE;
+        boolean teammateWide = kind == Powerups.SHIELD_TEAM || kind == Powerups.HEAL_TEAM;
+        int[] expectedTargets = enemyWide ? new int[]{17}
+                : teammateWide ? new int[]{1, 2} : new int[]{source};
         require(java.util.Arrays.equals(decoded.targets, expectedTargets),
                 "the reward used the wrong team targets");
-        int[] expectedLives = kind == 1 || kind == 8 ? new int[]{0}
-                : kind == 3 || kind == 7 ? source == 1 ? new int[]{life, 0} : new int[]{0, life}
+        int[] expectedLives = enemyWide ? new int[]{0}
+                : teammateWide ? source == 1 ? new int[]{life, 0} : new int[]{0, life}
                 : new int[]{life};
         require(java.util.Arrays.equals(decoded.targetLives, expectedLives),
                 "the reward lost the targets' original lives");
@@ -815,12 +847,77 @@ public final class LaptopHostProtocolSmokeTest {
         }
     }
 
+    private static void verifyAirstrikeHostWireSnapshot() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--powerup-qr", "2"});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method stop = LaptopHost.class.getDeclaredMethod("stop");
+        stop.setAccessible(true);
+        try {
+            long clock = 1000;
+            Powerups.Grant original = new Powerups.Grant(1, 1, 0, Powerups.AIRSTRIKE,
+                    new int[]{17, 18}, new int[]{0, 2}, clock + Powerups.INSTANT_DELIVERY_MS, 2);
+            List<Powerups.ScanState> players = List.of(new Powerups.ScanState(1, 0, 3, 1, 2, 2),
+                    new Powerups.ScanState(17, 0, 0, 0, 0, 0), new Powerups.ScanState(18, 2, 0, 0, 0, 0));
+            java.lang.reflect.Field authorityField = LaptopHost.class.getDeclaredField("powerupAuthority");
+            authorityField.setAccessible(true);
+            Powerups.Authority authority = (Powerups.Authority) authorityField.get(host);
+            require(authority.restore(new Powerups.Snapshot(2, clock, List.of(original), players), clock),
+                    "the laptop could not restore a current-life Airstrike");
+            String liveWire = powerupWireObject(original);
+            Powerups.Grant live = readPowerupGrant(liveWire);
+            require(live.kind == Powerups.AIRSTRIKE && Powerups.isInstant(live.kind)
+                            && live.expiresAt - clock == 3000
+                            && java.util.Arrays.equals(live.targets, new int[]{17, 18})
+                            && java.util.Arrays.equals(live.targetLives, new int[]{0, 2}),
+                    "Airstrike live wire lost its instant delivery window or recipient lives");
+            java.util.Map<String, Object> snapshot = new java.util.LinkedHashMap<>();
+            java.lang.reflect.Method putSnapshot = LaptopHost.class.getDeclaredMethod(
+                    "putPowerupSnapshotLocked", java.util.Map.class, long.class);
+            putSnapshot.setAccessible(true);
+            putSnapshot.invoke(host, snapshot, 2000L);
+            String token = UUID.randomUUID().toString();
+            snapshot.put("roundtoken", token);
+            java.lang.reflect.Method jsonFrame = LaptopHost.class.getDeclaredMethod("jsonFrame", Object.class);
+            jsonFrame.setAccessible(true);
+            String frame = (String) jsonFrame.invoke(null, snapshot);
+            require(frame.startsWith(JSON_PREFIX) && token.equals(jsonString(frame, "roundtoken"))
+                            && frame.contains("\"kind\":" + Powerups.AIRSTRIKE)
+                            && jsonNumber(frame, "expires") == 4000
+                            && jsonNumber(frame, "powerupclock") == 2000,
+                    "Airstrike reconnect snapshot lost kind, original expiry, clock, or round scope");
+            java.util.Map<String, Object> decoded = parseHostObject(frame.substring(JSON_PREFIX.length()));
+            List<?> grants = (List<?>) decoded.get("powerupgrants");
+            require(grants.size() == 1, "the Airstrike snapshot changed its grant count");
+            String grantWire = ((String) jsonFrame.invoke(null, grants.get(0))).substring(JSON_PREFIX.length());
+            Powerups.Grant recoveredGrant = readPowerupGrant(grantWire);
+            Powerups.Snapshot recovery = new Powerups.Snapshot(2, 2000, List.of(recoveredGrant), players);
+            Powerups.Authority nextHost = new Powerups.Authority();
+            require(nextHost.restore(recovery, 50_000), "Airstrike wire recovery failed validation");
+            require(nextHost.activeGrants(50_000).get(0).expiresAt == 52_000,
+                    "Airstrike recovery restarted the full delivery window");
+            require(nextHost.restore(recovery, 51_000)
+                            && nextHost.activeGrants(51_000).get(0).expiresAt == 52_000,
+                    "Airstrike replay refreshed its delivery expiry");
+            require(nextHost.activeGrants(52_000).isEmpty()
+                            && nextHost.restore(recovery, 53_000)
+                            && nextHost.activeGrants(53_000).isEmpty(),
+                    "Airstrike replay resurrected an expired grant");
+        } finally {
+            stop.invoke(host);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static void verifyPowerupStandaloneFrameBound() throws Exception {
         Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
         java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
         parse.setAccessible(true);
-        Object config = parse.invoke(null, (Object) new String[]{"--powerup-qr", "2"});
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--powerup-qr", "2"});
         java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
         constructor.setAccessible(true);
         LaptopHost host = constructor.newInstance(config);
@@ -894,7 +991,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyDynamicPowerupRequirement() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1", "--powerup-qr", "8")
@@ -976,7 +1073,7 @@ public final class LaptopHostProtocolSmokeTest {
         Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
         java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
         parse.setAccessible(true);
-        Object config = parse.invoke(null, (Object) new String[]{"--powerup-qr", "2"});
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--powerup-qr", "2"});
         java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
         constructor.setAccessible(true);
         LaptopHost host = constructor.newInstance(config);
@@ -1063,6 +1160,468 @@ public final class LaptopHostProtocolSmokeTest {
         field.set(host, value);
     }
 
+    private static Object getHostField(Object host, String name) throws ReflectiveOperationException {
+        java.lang.reflect.Field field = host.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(host);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void verifyRoundReports() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Path directory = Files.createTempDirectory("simplecoil-round-reports");
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--no-browser", "--start-delay", "1",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--tile-port", String.valueOf(TILE_PORT),
+                "--reports", directory.toString()});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method startHost = LaptopHost.class.getDeclaredMethod("start");
+        java.lang.reflect.Method stopHost = LaptopHost.class.getDeclaredMethod("stop");
+        java.lang.reflect.Method endRound = LaptopHost.class.getDeclaredMethod("endRound", String.class);
+        startHost.setAccessible(true); stopHost.setAccessible(true); endRound.setAccessible(true);
+        String firstIdentity = UUID.randomUUID().toString(), secondIdentity = UUID.randomUUID().toString();
+        String completed;
+        String frozen;
+        try {
+            startHost.invoke(host); waitForHost();
+            require(responseCode("/api/report") == 404, "unfinished round exposed a final report");
+            require(get("/api/reports").contains("\"reports\":[]"), "fresh host invented a report");
+            String page = get("/round-report");
+            require(page.contains("<svg id=\"timeline\"") && page.contains("createElementNS")
+                            && page.contains("Timeline events") && !page.contains("innerHTML"),
+                    "round review did not provide a safe, filterable SVG timeline");
+            require(responseCode("/api/report?roundtoken=../../README.md") == 404,
+                    "report lookup accepted a non-UUID path");
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue \"<script>\\", firstIdentity, 0, false, true);
+                 FakePhone second = new FakePhone("127.0.0.2", 17, "Red", secondIdentity, 0, false, true)) {
+                first.send(JSON_PREFIX + "{\"telemetry\":\"shot\",\"count\":99}");
+                first.synchronizeClock(); second.synchronizeClock();
+                require(post("/api/start").contains("\"ok\":true"), "report fixture did not start");
+                String start = first.readUntil(frame -> frame.contains("\"gamestart\"")
+                        && !frame.contains("\"players\""));
+                completed = jsonString(start, "roundtoken");
+                sendScopedTelemetry(first, completed, 99, 0, "shot", ",\"total\":99,\"count\":99");
+                first.probeClock("");
+                require(waitForDashboard(s -> s.contains("\"state\":\"running\"")) != null,
+                        "report fixture did not finish countdown");
+                // Rejected bodies must not consume sequence 1 or invent an
+                // unknown-source death, allowing the next valid frame through.
+                for (String bad : new String[]{"", ",\"attacker\":\"1\"", ",\"attacker\":1.5",
+                        ",\"attacker\":false", ",\"attacker\":null", ",\"attacker\":999"})
+                    sendScopedTelemetry(second, completed, 1, 0, "elimination", bad);
+                sendScopedTelemetry(first, completed, 1, 0, "shot", ",\"total\":10,\"count\":\"10\"");
+                sendScopedTelemetry(first, completed, 1, 0, "shot", ",\"total\":10,\"count\":0");
+                sendScopedTelemetry(first, completed, 1, 0, "shot", ",\"total\":10,\"count\":4294967306");
+                sendScopedTelemetry(first, completed, 1, 0, "shot", ",\"total\":4294967306,\"count\":10");
+                sendScopedTelemetry(second, completed, 1, 0, "grenadehit", ",\"grenadeID\":\"1\"");
+                sendScopedTelemetry(first, completed, 1, 0, "shot", ",\"total\":10,\"count\":10");
+                sendScopedTelemetry(first, completed, 1, 0, "shot", ",\"total\":10,\"count\":10");
+                sendScopedTelemetry(first, UUID.randomUUID().toString(), 2, 0, "shot", ",\"total\":99,\"count\":89");
+                sendScopedTelemetry(second, completed, 1, 0, "hit", ",\"attacker\":1");
+                sendScopedTelemetry(second, completed, 1, 0, "hit", ",\"attacker\":1");
+                sendScopedTelemetry(second, completed, 2, 0, "elimination", ",\"attacker\":1");
+                sendScopedTelemetry(second, completed, 2, 0, "elimination", ",\"attacker\":1");
+                second.probeClock("");
+                second.send(MESSAGE_PREFIX + "RESPAWNCOMPLETE"); second.probeClock("");
+                sendScopedTelemetry(second, completed, 3, 1, "elimination", ",\"attacker\":1");
+                second.probeClock("");
+                second.send(MESSAGE_PREFIX + "RESPAWNCOMPLETE"); second.probeClock("");
+                sendScopedTelemetry(first, completed, 2, 0, "elimination", ",\"attacker\":17");
+                first.probeClock("");
+                require(!get("/api/state").contains("\"events\""), "high-rate live state included the full timeline");
+                endRound.invoke(host, "report regression");
+                String[] firstBeforeReport = {null};
+                String personal = first.readUntil(frame -> {
+                    if (frame.contains("\"roundreport\"")) return true;
+                    firstBeforeReport[0] = frame;
+                    return false;
+                });
+                require(personal != null && personal.contains("\"bestkillstreak\":2")
+                                && personal.contains("\"skillafter\":107"),
+                        "personal final report did not arrive before shutdown with streak / skill stats");
+                require(firstBeforeReport[0] != null && firstBeforeReport[0].startsWith(JSON_PREFIX)
+                                && firstBeforeReport[0].contains("\"playerdata\""),
+                        "frozen final scoreboard did not immediately precede the personal report");
+                List<java.util.Map<String, Object>> finalScores = (List<java.util.Map<String, Object>>)
+                        parseHostObject(firstBeforeReport[0].substring(JSON_PREFIX.length())).get("playerdata");
+                java.util.Map<String, Object> finalBlue = finalScores.stream().filter(p -> hostJsonNumber(p, "playerID") == 1)
+                        .findFirst().orElseThrow();
+                java.util.Map<String, Object> finalRed = finalScores.stream().filter(p -> hostJsonNumber(p, "playerID") == 17)
+                        .findFirst().orElseThrow();
+                require(hostJsonNumber(finalBlue, "points") == 2 && hostJsonNumber(finalBlue, "eliminated") == 1
+                                && hostJsonNumber(finalRed, "points") == 1 && hostJsonNumber(finalRed, "eliminated") == 2,
+                        "frozen final scoreboard omitted the last elimination / disagreed with the report");
+                require(first.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME")) != null,
+                        "ENDGAME did not follow the personal report");
+                String[] secondBeforeReport = {null};
+                require(second.readUntil(frame -> {
+                    if (frame.contains("\"roundreport\"")) return true;
+                    secondBeforeReport[0] = frame;
+                    return false;
+                }) != null && firstBeforeReport[0].equals(secondBeforeReport[0])
+                                && second.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME")) != null,
+                        "not every client received the same final scoreboard before its report / ENDGAME");
+                frozen = get("/api/report?roundtoken=" + completed);
+                java.util.Map<String, Object> report = parseHostObject(frozen);
+                List<java.util.Map<String, Object>> people = (List<java.util.Map<String, Object>>) report.get("players");
+                java.util.Map<String, Object> blue = people.get(0), red = people.get(1);
+                require(hostJsonNumber(blue, "kills") == 2 && hostJsonNumber(blue, "deaths") == 1
+                                && hostJsonNumber(blue, "shots") == 10 && hostJsonNumber(blue, "hits") == 1
+                                && ((Number) blue.get("accuracy")).doubleValue() == 10.0
+                                && hostJsonNumber(blue, "bestkillstreak") == 2
+                                && hostJsonNumber(red, "bestdeathstreak") == 2 && red.get("accuracy") == null,
+                        "round report counters, streaks, replay protection or zero-shot accuracy failed");
+                require("Blue \"<script>\\".equals(blue.get("name")), "report JSON mangled an escaped name");
+                require(Boolean.TRUE.equals(report.get("started")) && Boolean.TRUE.equals(report.get("complete")),
+                        "complete scoped round was marked missing or never started");
+                List<java.util.Map<String, Object>> events = (List<java.util.Map<String, Object>>) report.get("events");
+                require(events.stream().filter(e -> "kill".equals(e.get("kind"))).count() == 3
+                                && events.stream().anyMatch(e -> "respawn".equals(e.get("kind")))
+                                && events.stream().allMatch(e -> hostJsonNumber(e, "timeMs") >= 0
+                                    && hostJsonNumber(e, "timeMs") <= hostJsonNumber(report, "durationMs")),
+                        "timeline duplicated an elimination, missed a respawn or used countdown time");
+            }
+            require(waitForDashboard(s -> s.contains("\"playerCount\":0")) != null, "end-game sockets did not close");
+            try (FakePhone first = new FakePhone("127.0.0.3", 5, "Blue next", firstIdentity, 0);
+                 FakePhone second = new FakePhone("127.0.0.2", 21, "Red next", secondIdentity, 0)) {
+                require(frozen.equals(get("/api/report?roundtoken=" + completed)), "new lobby reset frozen report");
+                first.synchronizeClock(); second.synchronizeClock();
+                require(post("/api/start").contains("\"ok\":true"), "second report fixture did not start");
+                require(frozen.equals(get("/api/report?roundtoken=" + completed)), "new round reset frozen report");
+                endRound.invoke(host, "cancelled countdown");
+                require(frozen.equals(get("/api/report")), "cancelled countdown replaced the completed report");
+            }
+            for (int attempt = 0; attempt < 50 && !Files.exists(directory.resolve(completed + ".json")); attempt++)
+                Thread.sleep(20);
+            require(Files.readString(directory.resolve(completed + ".json")).equals(frozen),
+                    "saved report differed from final dashboard report");
+            ((java.util.Deque<?>) getHostField(host, "roundReports")).clear();
+            require(frozen.equals(get("/api/report?roundtoken=" + completed)), "saved report was not retrievable");
+        } finally { stopHost.invoke(host); }
+        LaptopHost restarted = constructor.newInstance(config);
+        try {
+            startHost.invoke(restarted); waitForHost();
+            require(get("/api/reports").contains(completed) && get("/api/report").equals(frozen),
+                    "restart did not reload the completed report");
+        } finally { stopHost.invoke(restarted); }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void verifyQueuedSourceSlotReuse() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--no-browser", "--start-delay", "1",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--tile-port", String.valueOf(TILE_PORT),
+                "--reports", Files.createTempDirectory("simplecoil-slot-reuse-reports").toString()});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method start = LaptopHost.class.getDeclaredMethod("start");
+        java.lang.reflect.Method stop = LaptopHost.class.getDeclaredMethod("stop");
+        java.lang.reflect.Method end = LaptopHost.class.getDeclaredMethod("endRound", String.class);
+        start.setAccessible(true); stop.setAccessible(true); end.setAccessible(true);
+        try {
+            start.invoke(host); waitForHost();
+            try (FakePhone old = new FakePhone("127.0.0.3", 1, "Original source", UUID.randomUUID().toString(), 0, false, true);
+                 FakePhone victim = new FakePhone("127.0.0.2", 17, "Victim", UUID.randomUUID().toString(), 0, false, true)) {
+                old.synchronizeClock(); victim.synchronizeClock();
+                require(post("/api/start").contains("\"ok\":true"), "slot-reuse round did not start");
+                String token = jsonString(old.readUntil(frame -> frame.contains("\"gamestart\"")
+                        && !frame.contains("\"players\"")), "roundtoken");
+                require(waitForDashboard(s -> s.contains("\"state\":\"running\"")) != null,
+                        "slot-reuse countdown did not finish");
+                sendScopedTelemetry(old, token, 1, 0, "shot", ",\"total\":4,\"count\":4");
+                old.probeClock("");
+                old.send(MESSAGE_PREFIX + "LEAVE");
+                require(waitForDashboard(s -> currentPlayerState(s, 1).contains("\"connected\":false")) != null,
+                        "original source did not vacate its slot");
+                String replacementIdentity = UUID.randomUUID().toString();
+                try (FakePhone replacement = new FakePhone("127.0.0.8", 1, "Replacement source",
+                        replacementIdentity, 1, false, true,
+                        ",\"priorkills\":12,\"priordeaths\":1,\"historyroundtoken\":\"" + token
+                                + "\",\"historybaselinekills\":10,\"historybaselinedeaths\":0");
+                     FakePhone previousRound = new FakePhone("127.0.0.9", 18, "Prior baseline",
+                        UUID.randomUUID().toString(), 2, false, true,
+                        ",\"priorkills\":20,\"priordeaths\":4,\"historyroundtoken\":\"" + UUID.randomUUID()
+                                + "\",\"historybaselinekills\":5,\"historybaselinedeaths\":0")) {
+                    require(replacement.playerID == 1 && replacement.seatGeneration == 1,
+                            "new identity did not reuse source slot with a new generation");
+                    for (String bad : new String[]{"", "\"10\"", "-1", "100001", "1.5", "true", "4294967306"}) {
+                        String baseline = bad.isEmpty() ? "" : ",\"historybaselinekills\":" + bad;
+                        replacement.send(JSON_PREFIX + "{\"playerID\":1,\"playername\":\"Bad baseline\","
+                                + "\"playeridentity\":\"" + replacementIdentity + "\",\"roundanalytics\":true,"
+                                + "\"historyroundtoken\":\"" + token + "\",\"historybaselinedeaths\":0" + baseline + "}");
+                    }
+                    replacement.probeClock("");
+                    require(currentPlayerState(get("/api/state"), 1).contains("Replacement source"),
+                            "malformed same-round history committed registration changes");
+                    sendScopedTelemetry(replacement, token, 1, 0, "shot", ",\"total\":7,\"count\":7");
+                    replacement.probeClock("");
+                    // Malformed or absent source generations must not consume
+                    // victim sequence 1 before its legitimate current-source hit.
+                    victim.send(JSON_PREFIX + "{\"telemetry\":\"hit\",\"roundtoken\":\"" + token
+                            + "\",\"generation\":0,\"life\":0,\"telemetryseq\":1,\"attacker\":1}");
+                    for (String bad : new String[]{"\"1\"", "-1", "256", "1.5", "true", "null", "4294967297"})
+                        sendScopedTelemetry(victim, token, 1, 0, "hit",
+                                ",\"attacker\":1,\"attackergeneration\":" + bad);
+                    sendScopedTelemetry(victim, token, 1, 0, "hit", ",\"attacker\":1,\"attackergeneration\":1");
+                    // These queued reports refer to the departed generation 0,
+                    // not the connected generation-1 replacement of the same ID.
+                    sendScopedTelemetry(victim, token, 2, 0, "hit", ",\"attacker\":1,\"attackergeneration\":0");
+                    sendScopedTelemetry(victim, token, 3, 0, "elimination", ",\"attacker\":1,\"attackergeneration\":0");
+                    sendScopedTelemetry(victim, token, 3, 0, "elimination", ",\"attacker\":1,\"attackergeneration\":0");
+                    victim.probeClock("");
+                    String state = get("/api/state");
+                    require(currentPlayerState(state, 1).contains("\"kills\":0")
+                                    && currentPlayerState(state, 1).contains("\"hits\":1")
+                                    && currentPlayerState(state, 17).contains("\"deaths\":1")
+                                    && currentPlayerState(state, 17).contains("\"awaitingRespawn\":true"),
+                            "queued old-source telemetry credited a replacement or lost the victim death");
+                    victim.send(MESSAGE_PREFIX + "RESPAWNCOMPLETE"); victim.probeClock("");
+                    sendScopedTelemetry(victim, token, 4, 1, "elimination", ",\"attacker\":1,\"attackergeneration\":1");
+                    victim.probeClock("");
+                    require(replacement.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ELIMINATED17")) != null,
+                            "stale-source death blocked respawn / the next legitimate elimination");
+                    end.invoke(host, "queued source regression");
+                    java.util.Map<String, Object> report = parseHostObject(get("/api/report?roundtoken=" + token));
+                    List<java.util.Map<String, Object>> people = (List<java.util.Map<String, Object>>) report.get("players");
+                    java.util.Map<String, Object> original = people.stream().filter(p -> "Original source".equals(p.get("name"))).findFirst().orElseThrow();
+                    java.util.Map<String, Object> current = people.stream().filter(p -> "Replacement source".equals(p.get("name"))).findFirst().orElseThrow();
+                    java.util.Map<String, Object> target = people.stream().filter(p -> "Victim".equals(p.get("name"))).findFirst().orElseThrow();
+                    java.util.Map<String, Object> previous = people.stream().filter(p -> "Prior baseline".equals(p.get("name"))).findFirst().orElseThrow();
+                    require(hostJsonNumber(original, "shots") == 4 && hostJsonNumber(original, "kills") == 0
+                                    && hostJsonNumber(current, "shots") == 7 && hostJsonNumber(current, "hits") == 1
+                                    && hostJsonNumber(current, "kills") == 1 && hostJsonNumber(current, "bestkillstreak") == 1
+                                    && hostJsonNumber(current, "skillbefore") == 150 && hostJsonNumber(current, "skillafter") == 152
+                                    && hostJsonNumber(previous, "skillbefore") == 147 && hostJsonNumber(previous, "skillafter") == 147
+                                    && hostJsonNumber(target, "deaths") == 2 && Boolean.FALSE.equals(report.get("complete")),
+                            "archived source identity, replacement statistics or stale-source partial flag failed");
+                    List<java.util.Map<String, Object>> events = (List<java.util.Map<String, Object>>) report.get("events");
+                    require(events.stream().filter(e -> "hit".equals(e.get("kind"))).count() == 1
+                                    && events.stream().filter(e -> "kill".equals(e.get("kind"))).count() == 1
+                                    && events.stream().filter(e -> "death".equals(e.get("kind")) && e.get("target") == null).count() == 1,
+                            "timeline invented a replacement source for old queued hits / kills");
+                }
+            }
+        } finally { stop.invoke(host); }
+    }
+
+    private static void sendScopedTelemetry(FakePhone phone, String token, long sequence, int life,
+                                            String kind, String extra) throws IOException {
+        if (("hit".equals(kind) || "elimination".equals(kind)) && !extra.contains("attackergeneration"))
+            extra += ",\"attackergeneration\":0";
+        phone.send(JSON_PREFIX + "{\"telemetry\":\"" + kind + "\",\"roundtoken\":\"" + token
+                + "\",\"generation\":" + phone.seatGeneration + ",\"life\":" + life
+                + ",\"telemetryseq\":" + sequence + extra + "}");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void verifyRoundReportBounds() throws Exception {
+        Class<?> reviewClass = Class.forName("com.simplecoil.laptophost.LaptopHost$RoundReview");
+        Class<?> playerClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Player");
+        Class<?> settingsClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Settings");
+        java.lang.reflect.Method settings = settingsClass.getDeclaredMethod("tournament"); settings.setAccessible(true);
+        java.lang.reflect.Constructor<?> playerCtor = playerClass.getDeclaredConstructor(int.class, String.class,
+                InetAddress.class, settingsClass); playerCtor.setAccessible(true);
+        Object player = playerCtor.newInstance(1, "Player", InetAddress.getLoopbackAddress(), settings.invoke(null));
+        java.lang.reflect.Constructor<?> reviewCtor = reviewClass.getDeclaredConstructor(String.class, long.class,
+                long.class, String.class); reviewCtor.setAccessible(true);
+        Object review = reviewCtor.newInstance(UUID.randomUUID().toString(), 1L, 1000L, "teams");
+        java.lang.reflect.Method enroll = reviewClass.getDeclaredMethod("enroll", playerClass, int.class);
+        java.lang.reflect.Method started = reviewClass.getDeclaredMethod("started");
+        java.lang.reflect.Method shots = reviewClass.getDeclaredMethod("shots", long.class, playerClass, int.class);
+        java.lang.reflect.Method event = reviewClass.getDeclaredMethod("event", long.class, String.class,
+                playerClass, playerClass, int.class, String.class);
+        java.lang.reflect.Method freeze = reviewClass.getDeclaredMethod("freeze", long.class, String.class);
+        enroll.setAccessible(true); started.setAccessible(true); shots.setAccessible(true);
+        event.setAccessible(true); freeze.setAccessible(true);
+        enroll.invoke(review, player, 1); started.invoke(review);
+        for (int n = 0; n < 2005; n++) shots.invoke(review, 1000L + n * 1000L, player, 1);
+        for (int n = 0; n < 10005; n++) event.invoke(review, 1000L + n, "hit", player, null, 1, "Observed hit");
+        Object returning = playerCtor.newInstance(9, "Player returns", InetAddress.getLoopbackAddress(), settings.invoke(null));
+        setHostField(returning, "identity", getHostField(player, "identity"));
+        enroll.invoke(review, returning, 1);
+        Object seatReplacement = playerCtor.newInstance(1, "Different player", InetAddress.getLoopbackAddress(), settings.invoke(null));
+        enroll.invoke(review, seatReplacement, 1);
+        Object result = freeze.invoke(review, 3_000_000L, "bounds");
+        String json = (String) getHostField(result, "json");
+        java.util.Map<String, Object> report = parseHostObject(json);
+        List<java.util.Map<String, Object>> events = (List<java.util.Map<String, Object>>) report.get("events");
+        List<java.util.Map<String, Object>> people = (List<java.util.Map<String, Object>>) report.get("players");
+        require(events.size() == 12001 && "end".equals(events.get(events.size() - 1).get("kind"))
+                        && hostJsonNumber(report, "omittedEvents") == 11
+                        && hostJsonNumber(people.get(0), "shots") == 2005
+                        && people.size() == 2 && hostJsonNumber(people.get(0), "playerID") == 9
+                        && ((List<?>) people.get(0).get("seatIDs")).size() == 2
+                        && ((Number) ((List<?>) people.get(0).get("seatIDs")).get(0)).intValue() == 1
+                        && ((Number) ((List<?>) people.get(0).get("seatIDs")).get(1)).intValue() == 9
+                        && hostJsonNumber(people.get(1), "shots") == 0,
+                "timeline bounds / identity preservation failed: events=" + events.size()
+                        + " omitted=" + report.get("omittedEvents") + " players=" + people);
+        shots.invoke(review, 3_000_001L, player, 9);
+        require(freeze.invoke(review, 3_000_002L, "duplicate") == null
+                        && json.equals(getHostField(result, "json")), "frozen report remained mutable");
+        Object empty = reviewCtor.newInstance(UUID.randomUUID().toString(), 2L, 1000L, "teams");
+        enroll.invoke(empty, player, 1);
+        Object cancelled = freeze.invoke(empty, 500L, "cancelled");
+        java.util.Map<String, Object> noPlay = parseHostObject((String) getHostField(cancelled, "json"));
+        require(hostJsonNumber(noPlay, "durationMs") == 0 && Boolean.FALSE.equals(noPlay.get("started"))
+                        && ((List<?>) noPlay.get("events")).size() == 1,
+                "cancelled countdown invented actual play or combat events");
+    }
+
+    private static void verifyBalancedTeamRetention() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--balanced-qr", "--no-browser",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--tile-port", String.valueOf(TILE_PORT)});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method startHost = LaptopHost.class.getDeclaredMethod("start");
+        java.lang.reflect.Method stopHost = LaptopHost.class.getDeclaredMethod("stop");
+        java.lang.reflect.Method endRound = LaptopHost.class.getDeclaredMethod("endRound", String.class);
+        startHost.setAccessible(true);
+        stopHost.setAccessible(true);
+        endRound.setAccessible(true);
+        List<FakePhone> phones = new ArrayList<>();
+        String[] addresses = {"127.0.0.3", "127.0.0.2", "127.0.0.5", "127.0.0.6"};
+        int[] oldIDs = {1, 17, 2, 18};
+        int[] newIDs = {5, 21, 6, 22};
+        String[] identities = new String[4];
+        int[] teams = new int[4];
+        try {
+            startHost.invoke(host);
+            waitForHost();
+            require(get("/map").contains("Rebalance teams"), "dashboard omitted the rebalance button");
+            require(responseCode("/api/rebalance") == 405, "GET could mutate team assignments");
+            for (int index = 0; index < oldIDs.length; index++) {
+                identities[index] = UUID.nameUUIDFromBytes((addresses[index] + ":" + oldIDs[index])
+                        .getBytes(StandardCharsets.UTF_8)).toString();
+                FakePhone phone = new FakePhone(addresses[index], oldIDs[index], "Player " + index);
+                phones.add(phone);
+                phone.synchronizeClock();
+            }
+            require(post("/api/start").contains("90 seconds"), "first round did not prepare its QR check-ins");
+            String assigned = get("/api/state");
+            for (int index = 0; index < oldIDs.length; index++)
+                teams[index] = (int) jsonNumber(currentPlayerState(assigned, oldIDs[index]), "team");
+            phones.get(0).send(JSON_PREFIX + "{\"balancedcheckin\":true}");
+            require(waitForDashboard(value -> value.contains("\"checkedInCount\":1")) != null,
+                    "first scan was not recorded");
+            long deadline = (Long) getHostField(host, "balancedCheckInDeadline");
+            require(post("/api/start").contains("90 seconds")
+                            && get("/api/state").contains("\"checkedInCount\":1")
+                            && (Long) getHostField(host, "balancedCheckInDeadline") == deadline,
+                    "repeated Start reset a scan or extended its timeout");
+            for (int index = 1; index < phones.size(); index++)
+                phones.get(index).send(JSON_PREFIX + "{\"balancedcheckin\":true}");
+            require(waitForDashboard(value -> value.contains("\"state\":\"countdown\"")) != null,
+                    "initial round did not start");
+            long firstRoundID = (Long) getHostField(host, "roundID");
+            require(post("/api/rebalance").contains("\"ok\":false"),
+                    "rebalance moved players during countdown");
+            endRound.invoke(host, "retention regression");
+            require(waitForDashboard(value -> value.contains("\"playerCount\":0")) != null,
+                    "round-end connections did not close");
+            for (FakePhone phone : phones) phone.close();
+            phones.clear();
+            // Keep the production cooldown intact; advance this isolated test
+            // fixture instead of making the suite wait thirty seconds.
+            setHostField(host, "nextRoundStartAllowedAt", 0L);
+            for (int index = 0; index < newIDs.length; index++) {
+                FakePhone phone = new FakePhone(addresses[index], newIDs[index], "Player " + index,
+                        identities[index], 0);
+                phones.add(phone);
+                phone.synchronizeClock();
+            }
+            String retained = get("/api/state");
+            require(retained.contains("\"canStart\":true")
+                            && retained.contains("\"checkedInCount\":0"),
+                    "next round retained old QR readiness or could not start");
+            require(phones.get(0).lastRoster.contains("\"balancedprepared\":false"),
+                    "next lobby prematurely opened team QR preparation");
+            for (int index = 0; index < newIDs.length; index++)
+                require(jsonNumber(currentPlayerState(retained, newIDs[index]), "team") == teams[index],
+                        "a reconnect with a new player ID moved the player's team");
+            try (FakePhone newcomer = new FakePhone("127.0.0.7", 7, "Newcomer")) {
+                String joined = get("/api/state");
+                for (int index = 0; index < newIDs.length; index++)
+                    require(jsonNumber(currentPlayerState(joined, newIDs[index]), "team") == teams[index],
+                            "a newcomer moved an existing teammate");
+            }
+            require(waitForDashboard(value -> value.contains("\"playerCount\":4")) != null,
+                    "newcomer was not pruned from the active lobby");
+            require(post("/api/start").contains("90 seconds"), "next round did not prepare fresh scans");
+            retained = get("/api/state");
+            for (int index = 0; index < newIDs.length; index++)
+                require(jsonNumber(currentPlayerState(retained, newIDs[index]), "team") == teams[index],
+                        "starting the next round automatically reorganized teams");
+            phones.get(0).send(JSON_PREFIX + "{\"balancedcheckin\":true}");
+            require(waitForDashboard(value -> value.contains("\"checkedInCount\":1")) != null,
+                    "second-round scan was not recorded");
+            // Make the retained split deliberately uneven by skill so the
+            // manual button must produce a genuinely different split.
+            synchronized (getHostField(host, "stateLock")) {
+                java.util.Map<?, ?> players = (java.util.Map<?, ?>) getHostField(host, "players");
+                for (int index = 0; index < newIDs.length; index++) {
+                    Object player = players.get(newIDs[index]);
+                    setHostField(player, "priorKills", teams[index] == 1 ? 1_000 : 0);
+                    setHostField(player, "priorDeaths", teams[index] == 1 ? 0 : 1_000);
+                }
+            }
+            for (FakePhone phone : phones) phone.probeClock("");
+            require(post("/api/rebalance").contains("\"ok\":true"), "manual rebalance was refused in the lobby");
+            require(phones.get(0).readUntil(frame -> frame.contains("\"balancedprepared\":false")) != null,
+                    "rebalance did not disarm the phone's QR preparation");
+            String rebalanced = get("/api/state");
+            require(rebalanced.contains("\"checkedInCount\":0")
+                            && rebalanced.contains("\"checkInRemainingMs\":0")
+                            && rebalanced.contains("\"canStart\":true")
+                            && (Long) getHostField(host, "roundID") == firstRoundID,
+                    "rebalance started a round or retained previous check-ins");
+            int[] strong = new int[3];
+            int[] counts = new int[3];
+            for (int index = 0; index < newIDs.length; index++) {
+                int team = (int) jsonNumber(currentPlayerState(rebalanced, newIDs[index]), "team");
+                counts[team]++;
+                if (teams[index] == 1) strong[team]++;
+            }
+            require(strong[1] == 1 && strong[2] == 1 && Math.abs(counts[1] - counts[2]) <= 2,
+                    "manual rebalance did not use skill with the team-size bound");
+            for (FakePhone phone : phones) phone.send(JSON_PREFIX + "{\"balancedcheckin\":true}");
+            // A clock probe fences earlier frames on each TCP connection.
+            for (FakePhone phone : phones) phone.probeClock("");
+            require(get("/api/state").contains("\"state\":\"lobby\"")
+                            && get("/api/state").contains("\"checkedInCount\":0"),
+                    "scans before Start triggered a round after rebalance");
+            require(post("/api/start").contains("90 seconds"), "rebalance left Start unusable");
+            require(phones.get(0).readUntil(frame -> frame.contains("\"balancedprepared\":true")) != null,
+                    "armed QR preparation was not sent to phones");
+            for (FakePhone phone : phones) phone.send(JSON_PREFIX + "{\"balancedcheckin\":true}");
+            require(waitForDashboard(value -> value.contains("\"state\":\"countdown\"")) != null
+                            && (Long) getHostField(host, "roundID") == firstRoundID + 1,
+                    "fresh QR check-ins did not start exactly one next round");
+            require(post("/api/rebalance").contains("\"ok\":false"),
+                    "rebalance was enabled during the next countdown");
+            setHostField(host, "roundStartAt", 0L);
+            require(get("/api/state").contains("\"state\":\"running\"")
+                            && post("/api/rebalance").contains("\"ok\":false"),
+                    "rebalance was enabled during gameplay");
+        } finally {
+            for (FakePhone phone : phones) phone.close();
+            stopHost.invoke(host);
+        }
+    }
+
     private static void requireCountdownDuration(FakePhone phone, String before, String start,
                                                  long durationMs) throws IOException {
         String after = phone.probeClock("");
@@ -1076,7 +1635,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBalancedQr() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--balanced-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
@@ -1119,7 +1678,7 @@ public final class LaptopHostProtocolSmokeTest {
                 socket.bind(new InetSocketAddress("127.0.0." + (20 + index), UDP_PORT));
                 socket.setSoTimeout(1_000);
                 pendingJoins.add(socket);
-                byte[] request = "SimpleCoil:JOIN301".getBytes(StandardCharsets.UTF_8);
+                byte[] request = ("SimpleCoil:JOIN" + NETWORK_VERSION + "1").getBytes(StandardCharsets.UTF_8);
                 socket.send(new DatagramPacket(request, request.length,
                         InetAddress.getByName("127.0.0.1"), UDP_PORT));
                 byte[] reply = new byte[128];
@@ -1140,7 +1699,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBalancedNoQr() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--balanced-no-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
@@ -1151,6 +1710,10 @@ public final class LaptopHostProtocolSmokeTest {
                  FakePhone second = new FakePhone("127.0.0.2", 17, "Red")) {
                 first.synchronizeClock();
                 second.synchronizeClock();
+                require(post("/api/rebalance").contains("\"ok\":true")
+                                && get("/api/state").contains("\"state\":\"lobby\"")
+                                && get("/api/state").contains("\"canStart\":true"),
+                        "no-QR rebalance started a round or disabled Start");
                 String before = first.probeClock("");
                 require(post("/api/start").contains("\"ok\":true"),
                         "balanced no-QR mode did not start without check-in");
@@ -1172,7 +1735,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBalancedQrTimeout() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--balanced-qr",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT))
@@ -1219,7 +1782,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyDeadRejoin() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--timer-respawn", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
                 String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
@@ -1274,7 +1837,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyRespawnMode(boolean qrEnabled) throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 qrEnabled ? "--qr-respawn" : "--timer-respawn",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
@@ -1336,7 +1899,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyBossMode() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--boss",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
@@ -1378,7 +1941,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyCaptureTheFlagMode() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT), "--ctf",
                 "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
                 "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--start-delay", "1")
@@ -1401,7 +1964,7 @@ public final class LaptopHostProtocolSmokeTest {
     private static void verifyInfectionMode() throws Exception {
         Path classes = Path.of("laptop-host", "out").toAbsolutePath();
         String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
+        Process host = new ProcessBuilder(javaExecutable, "-Dsimplecoil.reports=" + System.getProperty("simplecoil.reports"), "-Dsimplecoil.players.file=" + Files.createTempDirectory("simplecoil-profiles-").resolve("players.json"), "-Dsimplecoil.event.file=" + Files.createTempDirectory("simplecoil-event-").resolve("event.properties"), "--add-modules", "jdk.httpserver", "-cp",
                 classes.toString(), "com.simplecoil.laptophost.LaptopHost", "--no-browser", "--no-event-mode", "--tile-port", String.valueOf(TILE_PORT),
                 "--infection", "--tcp-port", String.valueOf(TCP_PORT), "--udp-port",
                 String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
@@ -1470,7 +2033,7 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.3", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN301".getBytes(StandardCharsets.UTF_8);
+            byte[] request = ("SimpleCoil:JOIN" + NETWORK_VERSION + "1").getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -1486,14 +2049,14 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.9", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] query = "SimpleCoil:LOBBYQUERY:30".getBytes(StandardCharsets.UTF_8);
+            byte[] query = ("SimpleCoil:LOBBYQUERY:" + NETWORK_VERSION).getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(query, query.length, InetAddress.getLoopbackAddress(), UDP_PORT));
             DatagramPacket reply = new DatagramPacket(new byte[128], 128);
             socket.receive(reply);
             require(new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8)
-                            .matches("SimpleCoil:LOBBYSTATE:30:L:OPEN:[0-9]+"),
+                            .matches("SimpleCoil:LOBBYSTATE:" + NETWORK_VERSION + ":L:OPEN:[0-9]+"),
                     "shared lobby did not advertise a compatible dedicated host");
-            byte[] join = "SimpleCoil:JOIN300".getBytes(StandardCharsets.UTF_8);
+            byte[] join = ("SimpleCoil:JOIN" + NETWORK_VERSION + "0").getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(join, join.length, InetAddress.getLoopbackAddress(), UDP_PORT));
             socket.receive(reply);
             String assignment = new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8);
@@ -1507,12 +2070,39 @@ public final class LaptopHostProtocolSmokeTest {
         }
     }
 
+    private static void verifyPreviousProtocolRejected() throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(null)) {
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress("127.0.0.10", UDP_PORT));
+            socket.setSoTimeout(1_000);
+            byte[] request = ("SimpleCoil:JOIN" + (NETWORK_VERSION - 1) + "1")
+                    .getBytes(StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(request, request.length, InetAddress.getLoopbackAddress(), UDP_PORT));
+            DatagramPacket reply = new DatagramPacket(new byte[128], 128);
+            socket.receive(reply);
+            require("VERSIONERROR".equals(new String(reply.getData(), reply.getOffset(), reply.getLength(),
+                            StandardCharsets.UTF_8)),
+                    "the previous network protocol was not rejected by UDP discovery");
+        }
+        try (Socket socket = new Socket()) {
+            socket.bind(new InetSocketAddress("127.0.0.10", 0));
+            socket.connect(new InetSocketAddress("127.0.0.1", TCP_PORT), 1_000);
+            socket.setSoTimeout(1_000);
+            DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+            output.writeUTF("SimpleCoil:" + (NETWORK_VERSION - 1)
+                    + "JSON{\"playerID\":1,\"playername\":\"Old phone\"}");
+            output.flush();
+            require("VERSIONERROR".equals(new DataInputStream(socket.getInputStream()).readUTF()),
+                    "the previous network protocol was not rejected by TCP registration");
+        }
+    }
+
     private static void verifyLateJoinBlocked() throws Exception {
         try (DatagramSocket socket = new DatagramSocket(null)) {
             socket.setReuseAddress(true);
             socket.bind(new InetSocketAddress("127.0.0.4", UDP_PORT));
             socket.setSoTimeout(1_000);
-            byte[] request = "SimpleCoil:JOIN302".getBytes(StandardCharsets.UTF_8);
+            byte[] request = ("SimpleCoil:JOIN" + NETWORK_VERSION + "2").getBytes(StandardCharsets.UTF_8);
             socket.send(new DatagramPacket(request, request.length, InetAddress.getByName("127.0.0.1"), UDP_PORT));
             byte[] reply = new byte[128];
             DatagramPacket packet = new DatagramPacket(reply, reply.length);
@@ -1649,6 +2239,16 @@ public final class LaptopHostProtocolSmokeTest {
 
         FakePhone(String localAddress, int playerID, String name, String identity,
                   int joinTeam, boolean rejoin) throws IOException {
+            this(localAddress, playerID, name, identity, joinTeam, rejoin, false);
+        }
+
+        FakePhone(String localAddress, int playerID, String name, String identity,
+                  int joinTeam, boolean rejoin, boolean analytics) throws IOException {
+            this(localAddress, playerID, name, identity, joinTeam, rejoin, analytics, "");
+        }
+
+        FakePhone(String localAddress, int playerID, String name, String identity,
+                  int joinTeam, boolean rejoin, boolean analytics, String registrationExtra) throws IOException {
             this.playerID = playerID;
             udp = new DatagramSocket(null);
             udp.setReuseAddress(true);
@@ -1659,10 +2259,12 @@ public final class LaptopHostProtocolSmokeTest {
             socket.setSoTimeout(2_000);
             input = new DataInputStream(socket.getInputStream());
             output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-            send(JSON_PREFIX + "{\"playerID\":" + playerID + ",\"playername\":\"" + name
+            send(JSON_PREFIX + "{\"playerID\":" + playerID + ",\"playername\":\""
+                    + name.replace("\\", "\\\\").replace("\"", "\\\"")
                     + "\",\"playeridentity\":\"" + identity + "\",\"jointeam\":" + joinTeam
                     + ",\"lobbybenched\":" + (joinTeam > 0) + ",\"lobbyready\":true"
-                    + (rejoin ? ",\"rejoin\":true" : "") + "}");
+                    + ",\"roundanalytics\":" + analytics
+                    + (rejoin ? ",\"rejoin\":true" : "") + registrationExtra + "}");
             if (joinTeam > 0) {
                 String assigned = readUntil(frame -> frame.contains("\"joinedplayerid\""));
                 require(assigned != null, "team QR admission was not acknowledged");
@@ -1696,7 +2298,7 @@ public final class LaptopHostProtocolSmokeTest {
             UUID token = UUID.fromString(roundToken);
             packet.putInt(STATE_PACKET_MAGIC);
             packet.put((byte) 4); // state-packet format
-            packet.put((byte) 30); // network protocol
+            packet.put((byte) NETWORK_VERSION); // network protocol
             packet.put((byte) playerID);
             packet.put((byte) 2); // two-team mode
             packet.putLong(++statePacketSequence);
@@ -1737,7 +2339,7 @@ public final class LaptopHostProtocolSmokeTest {
             UUID token = UUID.fromString(roundToken);
             packet.putInt(0x53434F43); // SCOC
             packet.put((byte) 2); // combat-packet format
-            packet.put((byte) 30); // network protocol
+            packet.put((byte) NETWORK_VERSION); // network protocol
             packet.put((byte) 1); // event, not ACK
             packet.put((byte) eventType);
             packet.put((byte) playerID);
@@ -1856,9 +2458,12 @@ public final class LaptopHostProtocolSmokeTest {
                 require(reply != null, "clock sample was not answered");
             }
             send(JSON_PREFIX + "{\"clockready\":true}");
-            // Wait for the host to process readiness before an HTTP start can
-            // race it. A following clock reply is a FIFO processing barrier.
-            require(probeClock("") != null, "clock readiness was not processed");
+            // The HTTP start request uses another connection. Fence the readiness
+            // frame on this ordered TCP stream before that request can overtake it.
+            String readinessFence = probeClock("");
+            require(readinessFence != null && jsonNumber(readinessFence, "clockreceive") >= 0
+                            && jsonNumber(readinessFence, "clocksend") >= jsonNumber(readinessFence, "clockreceive"),
+                    "the host did not acknowledge the clock-readiness fence");
         }
 
         void send(String frame) throws IOException {

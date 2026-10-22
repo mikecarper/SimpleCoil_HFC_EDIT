@@ -8,7 +8,11 @@ final class InactivityVoice {
             R.string.inactivity_battle_voice_prompt,
             R.string.inactivity_recruit_voice_prompt,
             R.string.inactivity_legs_voice_prompt,
-            R.string.inactivity_breaking_news_voice_prompt
+            R.string.inactivity_breaking_news_voice_prompt,
+            R.string.inactivity_battlefield_voice_prompt,
+            R.string.inactivity_movement_tutorial_voice_prompt,
+            R.string.inactivity_laser_camping_voice_prompt,
+            R.string.inactivity_standing_still_voice_prompt
     };
 
     private final Random random;

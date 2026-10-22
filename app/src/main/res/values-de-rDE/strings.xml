@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <string name="gun_battery">Waffenbatterie: %1$s</string>
     <string name="gun_one_battery">Waffe 1 Batterie: %1$s</string>
     <string name="gun_two_battery">Waffe 2 Batterie: %1$s</string>
@@ -30,6 +30,14 @@
     <string name="lobby_stat_hits">%1$d\nGETROFFEN</string>
     <string name="lobby_stat_team_kills">Dein Team: %1$d Kills</string>
     <string name="lobby_stat_team_captures">Dein Team: %1$d Flaggen</string>
+    <string name="lobby_stat_accuracy">Waffengenauigkeit: %1$.1f%%</string>
+    <string name="lobby_stat_accuracy_unavailable">Waffengenauigkeit: nicht verfuegbar</string>
+    <string name="lobby_stat_gun_hits">%1$d bestaetigte Waffentreffer / %2$d Schuesse</string>
+    <string name="lobby_stat_local_confirmations">%1$d erfasste Bestaetigungen / %2$d erfasste Schuesse</string>
+    <string name="lobby_stat_streaks">Beste Serien: %1$d Kills / %2$d Tode</string>
+    <string name="lobby_stat_skill">Staerkeindex: %1$d -&gt; %2$d (%3$+d)</string>
+    <string name="lobby_stat_analytics_note">Staerke ist ein geglaetteter Index aus Kills und Toden aller Runden (0-200, neutral 100), keine kalibrierte Elo-Wertung. Waffengenauigkeit zaehlt keine Granaten oder Power-ups.</string>
+    <string name="lobby_stat_analytics_limited">Begrenzte Statistik: Einige Rundenereignisse fehlen. Lokale Bestaetigungen koennen fehlen, gedrosselt sein oder Granaten enthalten. Genauigkeit ist nicht verfuegbar. Staerke ist ein geglaetteter Index aus Kills und Toden aller Runden (0-200, neutral 100), keine kalibrierte Elo-Wertung.</string>
     <string name="lobby_eyebrow">SIMPLECOIL / SPIELTREFF</string>
     <string name="lobby_title">Deine Spiellobby</string>
     <string name="lobby_searching">Suche Spieler in diesem WLAN...</string>
@@ -241,6 +249,11 @@
     <string name="inactivity_recruit_voice_prompt">Beweg dich, Rekrut!</string>
     <string name="inactivity_legs_voice_prompt">Soldat, benutze deine Beine!</string>
     <string name="inactivity_breaking_news_voice_prompt">Eilmeldung: Der Spieler steht immer noch genau am selben Ort.</string>
+    <string name="inactivity_battlefield_voice_prompt">Das Schlachtfeld hat angerufen. Es will dich woanders sehen. Beweg dich!</string>
+    <!-- Intentional ASCII spelling for repository policy. -->
+    <string name="inactivity_movement_tutorial_voice_prompt" tools:ignore="Typos">Bewegungsanleitung: linker Fuss, rechter Fuss, wiederholen. Los, los, los!</string>
+    <string name="inactivity_laser_camping_voice_prompt">Das ist Lasertag, nicht Lasercamping. Beweg deine Beine, Soldat!</string>
+    <string name="inactivity_standing_still_voice_prompt">Stillstehen ist kein Power-up. Beweg dich!</string>
     <string name="powerup_emp">EMP</string>
     <string name="powerup_shield_player">Schildbonus</string>
     <string name="powerup_shield_team">Team-Schildbonus</string>
@@ -250,6 +263,7 @@
     <string name="powerup_heal_team">Team heilen</string>
     <string name="powerup_damage_team">Gegnerteam schaden</string>
     <string name="powerup_invulnerable">Unverwundbarkeit</string>
+    <string name="powerup_airstrike">Luftangriff</string>
     <string name="powerup_emp_voice">Power-up! EMP. Gegnerische Blaster und Anzeigen sind zehn Sekunden gestoert.</string>
     <string name="powerup_shield_player_voice">Power-up! Schildbonus fuer fuenfzehn Sekunden.</string>
     <string name="powerup_shield_team_voice">Power-up! Schildbonus fuer dein ganzes Team fuer fuenfzehn Sekunden.</string>
@@ -259,6 +273,8 @@
     <string name="powerup_heal_team_voice">Power-up! Dein ganzes Team ist geheilt.</string>
     <string name="powerup_damage_team_voice">Power-up! Gegnerteam getroffen.</string>
     <string name="powerup_invulnerable_voice">Power-up! Du bist fuenfzehn Sekunden unverwundbar.</string>
+    <string name="powerup_airstrike_voice">Power-up! Luftangriff. Stillstehende Gegner werden ins Visier genommen.</string>
+    <string name="powerup_airstrike_eliminated_voice">Luftangriff! Du wurdest wegen Stillstehens ausgeschaltet.</string>
     <string name="powerup_roulette_spinning">Power-up-Roulette</string>
     <string name="powerup_emp_disrupted">EMP! Blaster deaktiviert</string>
     <string name="powerup_waiting_host">Power-up verdient. Warte auf den Host.</string>
@@ -379,8 +395,13 @@
     <string name="balanced_waiting">Team %1$d – angemeldet: %2$d/%3$d</string>
     <string name="balanced_no_qr_ready">Ausgeglichene Teams zugewiesen. Countdown beginnt.</string>
     <string name="balanced_lobby_locked">Die Runde hat begonnen. Spielerdaten können nicht mehr geändert werden.</string>
-    <string name="balanced_waiting_for_checkin">Warte auf die Team-QR-Scans. Nach 90 Sekunden beginnt der 24-Sekunden-Countdown, auch wenn nicht alle gescannt haben.</string>
+    <string name="balanced_waiting_for_checkin">Warte auf die Team-QR-Scans. Nach 90 Sekunden beginnt der 23-Sekunden-Countdown, auch wenn nicht alle gescannt haben.</string>
     <string name="balanced_host_checkins">QR-Anmeldungen: %1$d/%2$d (max. 90 s)</string>
+    <string name="rebalance_teams_button">Teams neu ausgleichen</string>
+    <string name="rebalance_teams_hint">Teams bleiben zwischen den Runden gleich. Neu ausgleichen erstellt Teams anhand der Spielerstatistik.</string>
+    <string name="rebalance_teams_unavailable">Neu ausgleichen braucht mindestens zwei Spieler in einer wartenden Gastgeber-Lobby.</string>
+    <string name="rebalance_teams_requested">Teams werden neu ausgeglichen. Danach Start druecken.</string>
+    <string name="balanced_waiting_for_start">Teams zugewiesen. Warte, bis der Gastgeber Start drueckt.</string>
     <string name="scan_players_button">Suche nach spielern</string>
     <string name="scan_started_toast">Spieler Suche gestartet!</string>
     <string name="network_player_1count">1 Spieler</string>
@@ -433,7 +454,7 @@
     <string name="location_settings_prompt_high_accuracy">Stelle den Android-Standortmodus auf Hohe Genauigkeit (GPS und Netzwerke), damit deine Position im Spiel geteilt werden kann.</string>
     <string name="location_settings_prompt_modern">Aktiviere den Android-Standort, damit deine Position im Spiel geteilt werden kann.</string>
     <string name="location_settings_open">Standorteinstellungen oeffnen</string>
-    <string name="gps_coordinates_format">LAT %1$.5f\nLON %2$.5f</string>
+    <string name="gps_coordinates_format">LAT %1$.6f\nLON %2$.6f</string>
     <string name="player_name_not_connected">{Nicht Verbunden}</string>
     <string name="scoreboard_button">KILLS</string>
     <string name="player_list_position">%d</string>

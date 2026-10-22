@@ -2,6 +2,7 @@ package com.simplecoil.simplecoil;
 
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattService;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.content.BroadcastReceiver;
@@ -26,6 +27,8 @@ import org.junit.runner.RunWith;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -43,9 +46,14 @@ public class BluetoothLifecycleRegressionTest {
     private SharedPreferences preferences;
     private String savedDeviceAddress;
     private boolean hadDeviceAddress;
+    private boolean savedBossMode;
+    private byte savedPlayerID;
 
     @Before
     public void setUp() {
+        savedBossMode = Globals.getInstance().mBossMode;
+        savedPlayerID = Globals.getInstance().mPlayerID;
+        Globals.getInstance().mBossMode = false;
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().mUseGPS = false;
         scenario = ActivityScenario.launch(FullscreenActivity.class);
@@ -84,6 +92,110 @@ public class BluetoothLifecycleRegressionTest {
             else editor.remove(FullscreenActivity.PREF_DEVICE_ADDRESS);
             editor.commit();
         }
+        Globals.getInstance().mBossMode = savedBossMode;
+        Globals.getInstance().mPlayerID = savedPlayerID;
+    }
+
+    @Test
+    public void missedPrimaryServiceDiscoveryRestoresSetupWithoutConnectingAgain() {
+        scenario.onActivity(current -> {
+            BluetoothGattService recoil = recoilService();
+            bluetooth.connected = true;
+            bluetooth.services = Collections.singletonList(recoil);
+            set("mGattReceiverRegistered", true);
+            set("mTelemetryCharacteristic", null);
+            set("mCommandCharacteristic", null);
+            set("mConnected", false);
+
+            invoke("restoreMissedGattSetup");
+
+            assertTrue((boolean) get("mConnected"));
+            assertFalse((boolean) get("mCommunicating"));
+            assertSame(recoil.getCharacteristic(BluetoothLeService.UUID_RECOIL_TELEMETRY),
+                    get("mTelemetryCharacteristic"));
+            assertSame(recoil.getCharacteristic(UUID.fromString(GattAttributes.RECOIL_COMMAND_UUID)),
+                    get("mCommandCharacteristic"));
+            assertEquals(1, bluetooth.notifications);
+            assertEquals(1, bluetooth.reads);
+            assertEquals(0, bluetooth.connections);
+            assertEquals(0, bluetooth.writes);
+        });
+    }
+
+    @Test
+    public void missedSecondaryServiceDiscoveryRestoresOnlyTheBossSecondGun() {
+        scenario.onActivity(current -> {
+            Globals.getInstance().mBossMode = true;
+            Globals.getInstance().mPlayerID = Globals.BOSS_PLAYER_ID;
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            BluetoothGattService recoil = recoilService();
+            RecordingBluetoothService secondary = new RecordingBluetoothService();
+            secondary.connected = true;
+            secondary.services = Collections.singletonList(recoil);
+            set("mSecondaryBluetoothLeService", secondary);
+            set("mSecondaryBLEServiceBound", false);
+            set("mGattReceiverRegistered", true);
+            set("mSecondaryTelemetryCharacteristic", null);
+            set("mSecondaryCommandCharacteristic", null);
+            set("mSecondaryConnected", false);
+
+            invoke("restoreMissedGattSetup");
+
+            assertTrue((boolean) get("mSecondaryConnected"));
+            assertFalse((boolean) get("mSecondaryCommunicating"));
+            assertSame(recoil.getCharacteristic(BluetoothLeService.UUID_RECOIL_TELEMETRY),
+                    get("mSecondaryTelemetryCharacteristic"));
+            assertSame(recoil.getCharacteristic(UUID.fromString(GattAttributes.RECOIL_COMMAND_UUID)),
+                    get("mSecondaryCommandCharacteristic"));
+            assertEquals(1, secondary.notifications);
+            assertEquals(1, secondary.reads);
+            assertEquals(1, secondary.writes);
+            assertEquals(0, secondary.connections);
+            assertEquals(0, bluetooth.notifications);
+            assertEquals(0, bluetooth.writes);
+        });
+    }
+
+    @Test
+    public void alreadyInitializedBothGunsDoNotRepeatSetupOrReload() {
+        scenario.onActivity(current -> {
+            Globals.getInstance().mBossMode = true;
+            Globals.getInstance().mPlayerID = Globals.BOSS_PLAYER_ID;
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            BluetoothGattService recoil = recoilService();
+            RecordingBluetoothService secondary = new RecordingBluetoothService();
+            bluetooth.connected = secondary.connected = true;
+            bluetooth.services = secondary.services = Collections.singletonList(recoil);
+            set("mSecondaryBluetoothLeService", secondary);
+            set("mSecondaryBLEServiceBound", false);
+            set("mGattReceiverRegistered", true);
+            set("mTelemetryCharacteristic", recoil.getCharacteristic(BluetoothLeService.UUID_RECOIL_TELEMETRY));
+            set("mSecondaryTelemetryCharacteristic", recoil.getCharacteristic(BluetoothLeService.UUID_RECOIL_TELEMETRY));
+            set("mSecondaryCommunicating", true);
+
+            invoke("restoreMissedGattSetup");
+            invoke("restoreMissedGattSetup");
+
+            assertTrue((boolean) get("mCommunicating"));
+            assertTrue((boolean) get("mSecondaryCommunicating"));
+            assertEquals(0, bluetooth.notifications + secondary.notifications);
+            assertEquals(0, bluetooth.reads + secondary.reads);
+            assertEquals(0, bluetooth.writes + secondary.writes);
+            assertEquals(0, bluetooth.connections + secondary.connections);
+        });
+    }
+
+    private static BluetoothGattService recoilService() {
+        BluetoothGattService recoil = new BluetoothGattService(
+                UUID.fromString(GattAttributes.RECOIL_MAIN_SERVICE), BluetoothGattService.SERVICE_TYPE_PRIMARY);
+        for (String uuid : new String[] {GattAttributes.RECOIL_TELEMETRY_UUID,
+                GattAttributes.RECOIL_COMMAND_UUID, GattAttributes.RECOIL_CONFIG_UUID,
+                GattAttributes.RECOIL_ID_UUID})
+            recoil.addCharacteristic(new BluetoothGattCharacteristic(UUID.fromString(uuid),
+                    BluetoothGattCharacteristic.PROPERTY_READ | BluetoothGattCharacteristic.PROPERTY_WRITE
+                            | BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                    BluetoothGattCharacteristic.PERMISSION_READ | BluetoothGattCharacteristic.PERMISSION_WRITE));
+        return recoil;
     }
 
     @Test
@@ -481,6 +593,11 @@ public class BluetoothLifecycleRegressionTest {
         int initializations;
         int connections;
         int closes;
+        int notifications;
+        int reads;
+        int writes;
+        boolean connected;
+        List<BluetoothGattService> services = Collections.emptyList();
         String address;
 
         @Override public boolean initialize() { initializations++; return true; }
@@ -490,5 +607,10 @@ public class BluetoothLifecycleRegressionTest {
             return true;
         }
         @Override public synchronized void close() { closes++; super.close(); }
+        @Override public synchronized boolean isConnected() { return connected; }
+        @Override public List<BluetoothGattService> getSupportedGattServices() { return services; }
+        @Override public synchronized void readCharacteristic(BluetoothGattCharacteristic characteristic) { reads++; }
+        @Override public synchronized void writeCharacteristic(BluetoothGattCharacteristic characteristic, byte[] value) { writes++; }
+        @Override public synchronized void setCharacteristicNotification(BluetoothGattCharacteristic characteristic, boolean enabled) { notifications++; }
     }
 }

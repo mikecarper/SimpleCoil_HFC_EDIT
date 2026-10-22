@@ -164,6 +164,99 @@ public class BluetoothConnectionRegressionTest {
     }
 
     @Test
+    public void resumingTheSameConnectedGunDoesNotReconnectRediscoverOrDiscardPendingWrites() throws Exception {
+        queueOriginalCommands();
+        completeCommand(original);
+        Runnable timeout = (Runnable) serviceField("mGattOperationTimeout").get(service);
+        assertNotNull(timeout);
+        assertNotNull(service.getCompletedWriteResult(original.command, new byte[]{16, 0, 2}));
+        List<String> before = new ArrayList<>(original.operations);
+        assertTrue(service.connect(original.address));
+        assertSame(original.gatt, serviceField("mBluetoothGatt").get(service));
+        assertEquals(2, connectionState());
+        assertEquals(before, original.operations);
+        assertSame(timeout, serviceField("mGattOperationTimeout").get(service));
+        assertNotNull(service.getCompletedWriteResult(original.command, new byte[]{16, 0, 2}));
+        completeCommand(original);
+        assertTrue(serviceField("mActionAvailable").getBoolean(service));
+    }
+
+    @Test
+    public void connectionReadinessRequiresBothTheCurrentHandleAndConnectedState() throws Exception {
+        assertTrue(service.isConnected());
+        publish(original, 1);
+        assertFalse("Connecting is not ready for missed-setup replay", service.isConnected());
+        callback.onConnectionStateChange(original.gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_CONNECTED);
+        assertTrue(service.isConnected());
+        callback.onConnectionStateChange(original.gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_DISCONNECTED);
+        assertFalse(service.isConnected());
+        assertSame(original.gatt, serviceField("mBluetoothGatt").get(service));
+        service.close();
+        serviceField("mConnectionState").setInt(service, 2);
+        assertFalse("A retired handle cannot be connected", service.isConnected());
+    }
+
+    @Test
+    public void aStaleOperationTimeoutWaitingDuringReplacementCannotRetireTheNewGun() throws Exception {
+        queueOriginalCommands();
+        Runnable oldTimeout = (Runnable) serviceField("mGattOperationTimeout").get(service);
+        assertNotNull(oldTimeout);
+        AtomicReference<BluetoothGatt> current = new AtomicReference<>();
+        runAcrossTransition(oldTimeout, () -> {
+            current.set(connectReplacement());
+            service.writeCharacteristic(replacement.command, new byte[]{48, 0, 6});
+        });
+        // connectGatt creates a new framework handle; replacement.gatt is
+        // only the separately constructed transport fixture.
+        assertSame(current.get(), serviceField("mBluetoothGatt").get(service));
+        assertNotSame(oldTimeout, serviceField("mGattOperationTimeout").get(service));
+        assertTrue(service.events.isEmpty());
+        assertEquals(Arrays.asList("registerClient", "writeCharacteristic"), replacement.operations);
+        completeCommand(current.get(), replacement.command);
+        assertEquals(1, service.events.size());
+        assertArrayEquals(new byte[]{48, 0, 6}, service.events.get(0).getByteArrayExtra(BluetoothLeService.EXTRA_DATA));
+    }
+
+    @Test
+    public void watchdogRetiresTheHandleBeforeFrameworkCloseCanDeliverItsLateAck() throws Exception {
+        queueOriginalCommands();
+        original.duringClose = () -> {
+            try { completeCommand(original); }
+            catch (Exception failure) { throw new AssertionError(failure); }
+        };
+        ((Runnable) serviceField("mGattOperationTimeout").get(service)).run();
+        assertClosed();
+        assertEquals(Arrays.asList(BluetoothLeService.CHARACTERISTIC_WRITE_FINISHED,
+                BluetoothLeService.CHARACTERISTIC_WRITE_FINISHED, BluetoothLeService.ACTION_GATT_DISCONNECTED), actions());
+        assertEquals(BluetoothGatt.GATT_FAILURE,
+                service.events.get(0).getIntExtra(BluetoothLeService.EXTRA_STATUS, -1));
+        assertEquals(BluetoothGatt.GATT_FAILURE,
+                service.events.get(1).getIntExtra(BluetoothLeService.EXTRA_STATUS, -1));
+        assertArrayEquals(new byte[]{16, 0, 2}, service.events.get(0).getByteArrayExtra(BluetoothLeService.EXTRA_DATA));
+        assertArrayEquals(new byte[]{32, 0, 4}, service.events.get(1).getByteArrayExtra(BluetoothLeService.EXTRA_DATA));
+        assertNull(service.getCompletedWriteResult(original.command, new byte[]{16, 0, 2}));
+    }
+
+    @Test
+    public void telemetryWaitingForTheServiceMonitorKeepsItsOwnNotificationSnapshot() throws Exception {
+        byte[] first = new byte[20], second = new byte[20];
+        first[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = 29;
+        second[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = 28;
+        original.telemetry.setValue(first);
+        runAcrossTransition(() -> callback.onCharacteristicChanged(original.gatt, original.telemetry), () -> {
+            first[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = 99;
+            original.telemetry.setValue(second);
+        });
+        callback.onCharacteristicChanged(original.gatt, original.telemetry);
+        assertEquals(Arrays.asList(BluetoothLeService.TELEMETRY_DATA_AVAILABLE,
+                BluetoothLeService.TELEMETRY_DATA_AVAILABLE), actions());
+        assertEquals(29, service.events.get(0).getByteArrayExtra(BluetoothLeService.EXTRA_DATA)
+                [FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING]);
+        assertEquals(28, service.events.get(1).getByteArrayExtra(BluetoothLeService.EXTRA_DATA)
+                [FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING]);
+    }
+
+    @Test
     public void replacementConnectionDiscardsOldOperationsAndCanSendNewCommands() throws Exception {
         queueOriginalCommands();
         service.readCharacteristic(original.telemetry);

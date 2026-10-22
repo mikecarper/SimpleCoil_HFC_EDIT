@@ -21,6 +21,7 @@ import com.simplecoil.protocol.GpsOffset;
 import com.simplecoil.protocol.GameStartCountdown;
 import com.simplecoil.protocol.Powerups;
 import com.simplecoil.protocol.EventMode;
+import com.simplecoil.protocol.RoundStatistics;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -48,6 +49,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -83,7 +85,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * of the combat path means it remains useful with a full 32-player game.</p>
  */
 public final class LaptopHost {
-    private static final int NETWORK_VERSION = 30;
+    private static final int NETWORK_VERSION = 31;
     private static final String MESSAGE_PREFIX = "SimpleCoil:";
     private static final String TCP_PREFIX = MESSAGE_PREFIX + NETWORK_VERSION;
     private static final String TCP_JSON_PREFIX = TCP_PREFIX + "JSON";
@@ -159,8 +161,18 @@ public final class LaptopHost {
     private boolean hostCustomRules;
     private final PlayerDirectory playerDirectory;
     private RoundRoster roundRoster;
+    private RoundReview roundReview;
+    // Reports are frozen before any end-game socket is closed. Rejoining the
+    // lobby or starting another round must not replace the previous results.
+    private final Deque<RoundReport> roundReports = new ArrayDeque<>();
+    private static final int MAX_REPORT_HISTORY = 10;
+    private static final int MAX_TIMELINE_EVENTS = 12_000;
+    private static final int MAX_SHOT_TIMELINE_EVENTS = 2_000;
     private final Powerups.Authority powerupAuthority = new Powerups.Authority();
     private volatile Map<Integer, Integer> balancedTeams = Collections.emptyMap();
+    // Phones reconnect after each round and can receive a different seat ID.
+    // Keep the team attached to the person until the operator rebalances.
+    private final Map<String, Integer> retainedBalancedTeams = new HashMap<>();
     private final Set<Integer> balancedCheckedIn = new HashSet<>();
     // Relative to clockOriginNanos; zero when no QR lobby is waiting.
     private long balancedCheckInDeadline;
@@ -349,6 +361,7 @@ public final class LaptopHost {
     }
 
     private void start() throws IOException {
+        loadSavedReports();
         tcpServer = new ServerSocket();
         tcpServer.setReuseAddress(true);
         tcpServer.bind(new InetSocketAddress(config.tcpPort));
@@ -372,11 +385,15 @@ public final class LaptopHost {
         dashboard.createContext("/api/wifi", this::handleWifiApi);
         dashboard.createContext("/api/players", this::handlePlayersApi);
         dashboard.createContext("/api/event", this::handleEventApi);
+        dashboard.createContext("/round-report", exchange -> sendHtml(exchange, ROUND_REPORT_PAGE));
         dashboard.createContext("/assets/leaflet/", this::handleLeafletAsset);
         dashboard.createContext("/tiles/", this::handleMapTile);
         dashboard.createContext("/api/map-config", this::handleMapConfigApi);
         dashboard.createContext("/api/state", this::handleStateApi);
+        dashboard.createContext("/api/reports", this::handleReportsApi);
+        dashboard.createContext("/api/report", this::handleReportApi);
         dashboard.createContext("/api/start", this::handleStartApi);
+        dashboard.createContext("/api/rebalance", this::handleRebalanceApi);
         dashboard.createContext("/api/end", this::handleEndApi);
         dashboard.createContext("/api/respawn", this::handleRespawnApi);
         dashboard.createContext("/api/bench", this::handleBenchApi);
@@ -428,7 +445,15 @@ public final class LaptopHost {
             client.close();
         scheduler.shutdownNow();
         clientExecutor.shutdownNow();
-        dashboardExecutor.shutdownNow();
+        // Let queued report writes finish without holding the combat/state lock.
+        dashboardExecutor.shutdown();
+        try {
+            if (!dashboardExecutor.awaitTermination(2, TimeUnit.SECONDS))
+                dashboardExecutor.shutdownNow();
+        } catch (InterruptedException interrupted) {
+            dashboardExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void printStartupInstructions() {
@@ -646,6 +671,13 @@ public final class LaptopHost {
             lastGossipPacketSequence[decoded.senderID] = decoded.packetSequence;
             StateRow current = gossipState[decoded.senderID];
             if (current == null || owned.ownerSequence > current.ownerSequence) {
+                updateRoundStateLocked();
+                if (roundState == RoundState.RUNNING && roundReview != null) {
+                    int capturesBefore = current == null ? 0 : current.ctfCaptures;
+                    if (owned.ctfCaptures > capturesBefore)
+                        roundReview.event(elapsedMillis(), "objective", player, null,
+                                owned.ctfCaptures - capturesBefore, "Flag capture(s)");
+                }
                 // The TCP lobby owns the fixed origin. A delayed or inconsistent
                 // GPS header must not move a marker, but its combat counters can
                 // still repair phones that missed the sender's earlier state.
@@ -1011,6 +1043,9 @@ public final class LaptopHost {
                         required, ownTeam, teams, scores, alive, now, balanceRandom);
                 if (grant == null) break;
                 grants.add(grant);
+                if (roundReview != null)
+                    roundReview.event(now, "powerup", source, null, 1,
+                            "Power-up " + powerupName(grant.kind));
             }
             Map<String, Object> snapshot = new LinkedHashMap<>();
             putPowerupSnapshotLocked(snapshot, now);
@@ -1157,17 +1192,70 @@ public final class LaptopHost {
             Player reporter = playerForClientLocked(client);
             if (reporter == null)
                 return;
+            if (!Set.of("shot", "hit", "grenadehit", "elimination").contains(event)) return;
+            if (!validTelemetryScopeLocked(reporter, json)) return;
+            int resolvedAttackerID = 0;
+            boolean staleSource = false;
+            // Reject malformed bodies before consuming their replay sequence.
+            // Missing or string attackers must not become an unknown (0) death.
+            if ("shot".equals(event)) {
+                int count = intValue(json.get("count"), -1);
+                if (!integerLiteral(json.get("count")) || count < 1 || count > 255) return;
+                if (json.containsKey("telemetryseq") && (!integerLiteral(json.get("total"))
+                        || intValue(json.get("total"), -1) < 0
+                        || intValue(json.get("total"), -1) > MAX_SCOREBOARD_VALUE)) return;
+            } else if ("hit".equals(event) || "elimination".equals(event)) {
+                int attackerID = intValue(json.get("attacker"), -1);
+                Player attacker = players.get(attackerID);
+                if (!integerLiteral(json.get("attacker")) || reporter.awaitingRespawn
+                        || attackerID != 0 && !validPlayerID(attackerID)
+                        || attackerID == 0 && !"elimination".equals(event)) return;
+                resolvedAttackerID = attackerID;
+                if (attackerID > 0 && json.containsKey("telemetryseq")) {
+                    int sourceGeneration = intValue(json.get("attackergeneration"), -1);
+                    if (!integerLiteral(json.get("attackergeneration"))
+                            || sourceGeneration < 0 || sourceGeneration > 255) return;
+                    RoundRoster.Member source = roundRoster == null ? null : roundRoster.seat(attackerID);
+                    staleSource = attacker == null || !attacker.connected || source == null || !source.active
+                            || source.generation != sourceGeneration
+                            || !source.identity.equals(attacker.identity);
+                    if (staleSource) resolvedAttackerID = 0;
+                }
+                if (attackerID > 0 && !staleSource && (attacker == null || !attacker.connected
+                        || attacker == reporter || !areOpponents(attackerID, reporter.id))) return;
+            } else {
+                int grenadeID = intValue(json.get("grenadeID"), -1);
+                if (!integerLiteral(json.get("grenadeID")) || grenadeID <= 0
+                        || grenadeID >= MAX_GRENADE_IDS || reporter.awaitingRespawn) return;
+            }
+            if (roundReview == null || !roundReview.acceptTelemetry(reporter, json))
+                return;
+            if (staleSource) {
+                // A well-formed queued report can outlive the source's seat.
+                // Never give a replacement that person's hit or kill. The
+                // victim's death still advances life and permits respawn.
+                roundReview.person(reporter).complete = false;
+                if ("hit".equals(event)) return;
+            }
             if ("shot".equals(event)) {
                 int count = intValue(json.get("count"), 0);
-                if (count >= 1 && count <= 255)
+                if (json.containsKey("total")) {
+                    int total = intValue(json.get("total"), -1);
+                    if (total < 0 || total > MAX_SCOREBOARD_VALUE) return;
+                    count = Math.max(0, total - roundReview.person(reporter).shots);
+                }
+                if (count >= 1 && (json.containsKey("total") || count <= 255)) {
                     reporter.shots = addScore(reporter.shots, count);
+                    roundReview.shots(elapsedMillis(), reporter, count);
+                }
             } else if ("hit".equals(event)) {
-                int attackerID = intValue(json.get("attacker"), 0);
+                int attackerID = resolvedAttackerID;
                 Player attacker = players.get(attackerID);
                 if (attacker == null || attacker == reporter || !attacker.connected
                         || !areOpponents(attacker.id, reporter.id))
                     return;
                 attacker.hits = addScore(attacker.hits, 1);
+                roundReview.hit(elapsedMillis(), attacker, reporter);
                 reporter.lastGrenadeHitAt = 0;
                 addLaserLocked(attacker, reporter, "hit");
                 grantEnemyGpsRevealLocked(attacker.id, reporter.id);
@@ -1181,7 +1269,6 @@ public final class LaptopHost {
                 Player owner = players.get(ownerID);
                 if (owner != null && owner != reporter && owner.connected
                         && areOpponents(owner.id, reporter.id)) {
-                    owner.hits = addScore(owner.hits, 1);
                     reporter.lastGrenadeHitAt = elapsedMillis();
                     reporter.lastGrenadeOwnerID = ownerID;
                     // The elimination UDP event can reach the host before
@@ -1190,8 +1277,34 @@ public final class LaptopHost {
                             && laser.targetID == reporter.id && "kill".equals(laser.kind)
                             && elapsedMillis() - laser.createdAt <= GRENADE_BURST_WINDOW_MS);
                 }
+                roundReview.event(elapsedMillis(), "grenade", owner, reporter, 1,
+                        "Grenade #" + grenadeID + " hit");
+            } else if ("elimination".equals(event)) {
+                processElimination(client, String.valueOf(resolvedAttackerID));
             }
         }
+    }
+
+    /** Caller holds stateLock. Optional protocol-31 fields are all-or-nothing. */
+    private boolean validTelemetryScopeLocked(Player reporter, Map<String, Object> json) {
+        boolean scoped = json.containsKey("roundtoken") || json.containsKey("generation")
+                || json.containsKey("life") || json.containsKey("telemetryseq") || json.containsKey("total")
+                || json.containsKey("attackergeneration");
+        if (!scoped) return !reporter.analyticsCapable;
+        RoundRoster.Member member = roundRoster == null ? null : roundRoster.seat(reporter.id);
+        int life = intValue(json.get("life"), -1);
+        return roundToken != null && roundToken.equals(json.get("roundtoken"))
+                && member != null && member.identity.equals(reporter.identity)
+                && integerLiteral(json.get("generation")) && integerLiteral(json.get("life"))
+                && integerLiteral(json.get("telemetryseq"))
+                && intValue(json.get("generation"), -1) == member.generation
+                && life >= 0 && ("shot".equals(json.get("telemetry"))
+                        ? life <= reporter.deaths : life == reporter.deaths)
+                && longValue(json.get("telemetryseq"), -1) > 0;
+    }
+
+    private static boolean integerLiteral(Object value) {
+        return value instanceof Integer || value instanceof Long;
     }
 
     private void handlePlayerSettings(ClientConnection client, Map<String, Object> json) {
@@ -1234,10 +1347,12 @@ public final class LaptopHost {
         synchronized (stateLock) {
             if (!balancedQrEnabledLocked() || !Boolean.TRUE.equals(json.get("balancedcheckin"))
                     || roundState != RoundState.LOBBY || !balancedTeams.containsKey(client.playerID)
+                    || balancedCheckInDeadline == 0
                     || playerForClientLocked(client) == null)
                 return;
             balancedCheckedIn.add(client.playerID);
-            readyToStart = balancedCheckedIn.containsAll(balancedTeams.keySet());
+            readyToStart = balancedCheckInDeadline > 0
+                    && balancedCheckedIn.containsAll(balancedTeams.keySet());
         }
         broadcastRoster();
         if (readyToStart)
@@ -1273,6 +1388,17 @@ public final class LaptopHost {
         if (!RoundRoster.validIdentity(deviceIdentity)) return;
         int priorKills = intValue(json.get("priorkills"), 0);
         int priorDeaths = intValue(json.get("priordeaths"), 0);
+        boolean historyProvided = json.containsKey("historyroundtoken")
+                || json.containsKey("historybaselinekills") || json.containsKey("historybaselinedeaths");
+        String historyToken = json.get("historyroundtoken") instanceof String
+                ? (String) json.get("historyroundtoken") : null;
+        int historyKills = intValue(json.get("historybaselinekills"), -1);
+        int historyDeaths = intValue(json.get("historybaselinedeaths"), -1);
+        if (historyProvided && (!validReportToken(historyToken)
+                || !integerLiteral(json.get("historybaselinekills"))
+                || !integerLiteral(json.get("historybaselinedeaths"))
+                || historyKills < 0 || historyKills > 100_000 || historyDeaths < 0 || historyDeaths > 100_000))
+            return;
         if (!validPlayerID(requestedID) || name == null)
             return;
         if (priorKills < 0 || priorKills > 100_000 || priorDeaths < 0 || priorDeaths > 100_000)
@@ -1287,7 +1413,9 @@ public final class LaptopHost {
             else profile.name = name;
             if (client.playerID != 0 && client.playerID != requestedID)
                 return;
-            if (roundState == RoundState.FINISHED && activeClients.isEmpty())
+            // The first returning phone starts the next lobby even if the
+            // previous round's socket workers have not finished closing yet.
+            if (roundState == RoundState.FINISHED)
                 resetForNewLobbyLocked();
             removeExpiredAssignmentsLocked(elapsedMillis());
             rememberRoundStatsLocked();
@@ -1385,6 +1513,8 @@ public final class LaptopHost {
                 existing = new Player(requestedID, name, client.address(), defaultSettings(requestedID));
                 players.put(requestedID, existing);
             }
+            if (!existing.identity.equals(identity))
+                balancedCheckedIn.remove(requestedID);
             existing.identity = identity;
             existing.deviceIdentity = deviceIdentity;
             Settings editedSettings = hostPlayerSettings.get(identity);
@@ -1401,8 +1531,18 @@ public final class LaptopHost {
             client.lobbyBenched = joined != null ? false : hostPlayerParticipation.getOrDefault(identity,
                     existing.connection != null ? existing.benched()
                             : Boolean.TRUE.equals(json.get("lobbybenched")));
-            existing.priorKills = Math.max(priorKills, Math.min(100_000, profile.totalKills));
-            existing.priorDeaths = Math.max(priorDeaths, Math.min(100_000, profile.totalDeaths));
+            boolean sameRoundBaseline = historyProvided && isRoundActiveLocked()
+                    && roundToken != null && roundToken.equals(historyToken);
+            // Saved laptop totals may already include this round's partial
+            // scores. Compare frozen baselines before calculating final skill.
+            boolean profileIncludesRound = roundToken != null && roundToken.equals(profile.lastRound);
+            int savedKills = Math.max(0, profile.totalKills - (profileIncludesRound ? profile.lastKills : 0));
+            int savedDeaths = Math.max(0, profile.totalDeaths - (profileIncludesRound ? profile.lastDeaths : 0));
+            existing.priorKills = Math.max(sameRoundBaseline ? historyKills : priorKills,
+                    Math.min(100_000, savedKills));
+            existing.priorDeaths = Math.max(sameRoundBaseline ? historyDeaths : priorDeaths,
+                    Math.min(100_000, savedDeaths));
+            existing.analyticsCapable = Boolean.TRUE.equals(json.get("roundanalytics"));
             existing.address = client.address();
             existing.connected = true;
             existing.connection = client;
@@ -1411,6 +1551,11 @@ public final class LaptopHost {
             client.playerID = requestedID;
             client.eventControlVersion = intValue(json.get(EventMode.CAPABILITY), 0);
             activeClients.put(requestedID, client);
+            if (isRoundActiveLocked() && roundReview != null) {
+                roundReview.enroll(existing, config.gameMode == GameMode.FFA ? 0 : teamFor(existing.id));
+                roundReview.event(elapsedMillis(), "join", existing, null, 1,
+                        rejoin ? "Reconnected" : "Joined during round");
+            }
             if (roundState == RoundState.LOBBY && (replaced.isEmpty() || movedSeat)) invalidateTeamAssignmentsLocked();
             accepted = true;
             savePlayerDirectoryLocked();
@@ -1420,6 +1565,18 @@ public final class LaptopHost {
         if (accepted) {
             broadcastRoster();
             broadcastGrenadePairings();
+            String resume = null;
+            synchronized (stateLock) {
+                Player player = playerForClientLocked(client);
+                ReviewPlayer person = roundReview == null || player == null ? null : roundReview.person(player);
+                RoundRoster.Member member = roundRoster == null ? null : roundRoster.seat(client.playerID);
+                if (isRoundActiveLocked() && player != null && player.analyticsCapable
+                        && person != null && member != null)
+                    resume = jsonFrame(mapOf("telemetryresume", mapOf("roundtoken", roundToken,
+                            "generation", member.generation, "life", person.deaths,
+                            "telemetryseq", person.telemetrySequence, "total", person.shots)));
+            }
+            if (resume != null) client.send(resume);
         }
     }
 
@@ -1462,6 +1619,12 @@ public final class LaptopHost {
         }
         if (client.lobbyBenched) return;
         if (message.startsWith(MSG_ELIMINATED)) {
+            synchronized (stateLock) {
+                Player reporter = playerForClientLocked(client);
+                if (reporter != null && reporter.analyticsCapable) return;
+                if (roundReview != null && reporter != null && roundReview.person(reporter) != null)
+                    roundReview.person(reporter).complete = false;
+            }
             processElimination(client, message.substring(MSG_ELIMINATED.length()));
             return;
         }
@@ -1477,6 +1640,8 @@ public final class LaptopHost {
                 if (roundState == RoundState.RUNNING && player != null && player.awaitingRespawn) {
                     player.awaitingRespawn = false;
                     player.eliminated = false;
+                    if (roundReview != null)
+                        roundReview.event(elapsedMillis(), "respawn", player, null, 1, "Respawn completed");
                 }
             }
             return;
@@ -1513,17 +1678,18 @@ public final class LaptopHost {
         boolean reachedScoreLimit = false;
         synchronized (stateLock) {
             updateRoundStateLocked();
-            if (roundState != RoundState.RUNNING || !validPlayerID(attackerID))
+            if (roundState != RoundState.RUNNING || attackerID != 0 && !validPlayerID(attackerID))
                 return;
             Player victim = playerForClientLocked(victimConnection);
             Player attacker = players.get(attackerID);
-            if (victim == null || attacker == null || attacker == victim || !attacker.connected
-                    || !areOpponents(attacker.id, victim.id) || victim.awaitingRespawn)
+            if (victim == null || attackerID != 0 && (attacker == null || attacker == victim
+                    || !attacker.connected || !areOpponents(attacker.id, victim.id)) || victim.awaitingRespawn)
                 return;
             victim.awaitingRespawn = true;
             victim.eliminated = true;
             victim.deaths = addScore(victim.deaths, 1);
-            attacker.kills = addScore(attacker.kills, 1);
+            if (attacker != null) attacker.kills = addScore(attacker.kills, 1);
+            if (roundReview != null) roundReview.kill(elapsedMillis(), attacker, victim);
             if (victim.lastGrenadeOwnerID != attackerID
                     || elapsedMillis() - victim.lastGrenadeHitAt > GRENADE_BURST_WINDOW_MS)
                 addLaserLocked(attacker, victim, "kill");
@@ -1531,9 +1697,9 @@ public final class LaptopHost {
             // A death ends the short confirmed-hit map reveal immediately so
             // a respawn cannot inherit an opponent's last known position.
             clearEnemyGpsRevealsForPlayerLocked(victim.id);
-            clearEnemyGpsRevealsForPlayerLocked(attacker.id);
-            scorerConnection = attacker.connection;
-            if (config.gameMode != GameMode.FFA) {
+            if (attacker != null) clearEnemyGpsRevealsForPlayerLocked(attacker.id);
+            scorerConnection = attacker == null ? null : attacker.connection;
+            if (attacker != null && config.gameMode != GameMode.FFA) {
                 scorerTeam = new ArrayList<>();
                 int scoringTeam = teamFor(attacker.id);
                 for (Player player : players.values()) {
@@ -1541,7 +1707,7 @@ public final class LaptopHost {
                         scorerTeam.add(player.connection);
                 }
             }
-            reachedScoreLimit = hasReachedScoreLimitLocked(attacker);
+            reachedScoreLimit = attacker != null && hasReachedScoreLimitLocked(attacker);
         }
         if (scorerConnection != null)
             scorerConnection.send(messageFrame(MSG_ELIMINATED + victimConnection.playerID));
@@ -1583,6 +1749,12 @@ public final class LaptopHost {
             }
             if (assignedTeamsEnabledLocked() && balancedTeams.isEmpty()) {
                 balancedTeams = computeBalancedTeamsLocked();
+                rememberBalancedTeamsLocked();
+                publishedAssignment = true;
+            } else if (config.balanced && hostPlayerTeams.isEmpty()) {
+                publishedAssignment = synchronizeBalancedTeamsLocked();
+            }
+            if (balancedQrEnabledLocked() && balancedCheckInDeadline == 0) {
                 balancedCheckedIn.clear();
                 balancedCheckInDeadline = balancedQrEnabledLocked()
                         ? elapsedMillis() + BALANCED_QR_CHECK_IN_TIMEOUT_MS : 0;
@@ -1648,6 +1820,9 @@ public final class LaptopHost {
             roundDuration = config.durationMinutes * 60_000L;
             roundEndAt = roundDuration == 0 ? 0 : roundStartAt + roundDuration;
             roundState = RoundState.COUNTDOWN;
+            roundReview = new RoundReview(roundToken, roundID, roundStartAt,
+                    config.boss ? "boss" : config.infection ? "infection"
+                            : config.captureTheFlag ? "capture-the-flag" : "teams");
             if (config.boss)
                 bossHunterCount = Math.max(1, recipients.size() - 1);
             balancedCheckInDeadline = 0;
@@ -1660,6 +1835,8 @@ public final class LaptopHost {
                 player.lastGrenadeOwnerID = 0;
                 player.awaitingRespawn = false;
                 player.eliminated = false;
+                if (player.connected && !player.benched())
+                    roundReview.enroll(player, config.gameMode == GameMode.FFA ? 0 : teamFor(player.id));
             }
             Map<String, Object> start = new LinkedHashMap<>();
             start.put("roundid", roundID);
@@ -1681,6 +1858,69 @@ public final class LaptopHost {
         broadcastRoster();
         broadcastGameInvite(token);
         return StartResult.ok();
+    }
+
+    /** Caller holds stateLock. Cache assignments by person rather than temporary seat ID. */
+    private void rememberBalancedTeamsLocked() {
+        for (Player player : players.values()) {
+            Integer team = balancedTeams.get(player.id);
+            if (team != null)
+                retainedBalancedTeams.put(player.identity, team);
+        }
+    }
+
+    /** Caller holds stateLock. Prune departures and place newcomers without moving their teammates. */
+    private boolean synchronizeBalancedTeamsLocked() {
+        if (!config.balanced || !hostPlayerTeams.isEmpty() || retainedBalancedTeams.isEmpty())
+            return false; // The first Start still balances the complete initial lobby.
+        Map<Integer, Integer> assigned = new HashMap<>();
+        int[] counts = new int[3];
+        int[] strengths = new int[3];
+        List<Player> newcomers = new ArrayList<>();
+        for (Player player : players.values()) {
+            if (!player.connected || player.benched()) continue;
+            Integer team = retainedBalancedTeams.get(player.identity);
+            if (team == null) {
+                newcomers.add(player);
+            } else {
+                assigned.put(player.id, team);
+                counts[team]++;
+                strengths[team] += player.strength();
+            }
+        }
+        for (Player player : newcomers) {
+            int team = counts[1] < counts[2] ? 1 : counts[2] < counts[1] ? 2
+                    : strengths[1] <= strengths[2] ? 1 : 2;
+            assigned.put(player.id, team);
+            retainedBalancedTeams.put(player.identity, team);
+            counts[team]++;
+            strengths[team] += player.strength();
+        }
+        if (assigned.equals(balancedTeams)) return false;
+        // Only changed seats need to check in again; unrelated arrivals or
+        // departures must not reset other players' scans or extend the timeout.
+        balancedCheckedIn.removeIf(id -> !assigned.containsKey(id)
+                || !assigned.get(id).equals(balancedTeams.get(id)));
+        balancedTeams = Collections.unmodifiableMap(assigned);
+        return true;
+    }
+
+    private StartResult rebalanceTeams() {
+        synchronized (stateLock) {
+            updateRoundStateLocked();
+            if (roundState != RoundState.LOBBY || !config.balanced || !hostPlayerTeams.isEmpty()
+                    || config.gameMode != GameMode.TWO_TEAMS)
+                return StartResult.error("Teams can only be rebalanced in a Balanced Random lobby.", false);
+            if (playingClientsLocked().size() < 2)
+                return StartResult.error("At least two phones must join first.", false);
+            balancedTeams = computeBalancedTeamsLocked();
+            retainedBalancedTeams.clear();
+            rememberBalancedTeamsLocked();
+            balancedCheckedIn.clear();
+            balancedCheckInDeadline = 0;
+        }
+        broadcastRoster();
+        return new StartResult(true, "Teams rebalanced. Press Start when ready.", false);
     }
 
     /** Caller holds stateLock. Dynamic programming keeps a 32-player lobby practical. */
@@ -1795,18 +2035,48 @@ public final class LaptopHost {
 
     private void endRound(String reason) {
         List<ClientConnection> recipients;
+        RoundReport report;
+        final String finalPlayerData;
+        Map<ClientConnection, Map<String, Object>> personalFrames = new HashMap<>();
         synchronized (stateLock) {
             if (roundState != RoundState.COUNTDOWN && roundState != RoundState.RUNNING)
                 return;
+            updateRoundStateLocked();
+            rememberRoundStatsLocked();
+            finalPlayerData = playerDataFrame();
+            report = roundReview == null || !roundReview.hasStarted ? null
+                    : roundReview.freeze(elapsedMillis(), reason);
+            if (report != null) {
+                roundReports.addFirst(report);
+                while (roundReports.size() > MAX_REPORT_HISTORY) roundReports.removeLast();
+            }
             roundState = RoundState.FINISHED;
+            rememberBalancedTeamsLocked();
+            balancedCheckedIn.clear();
+            balancedCheckInDeadline = 0;
             nextRoundStartAllowedAt = Math.max(nextRoundStartAllowedAt,
                     com.simplecoil.protocol.RoundRestart.allowedAt(elapsedMillis(), roundStartAt));
             recipients = connectedClientsLocked();
             savePlayerDirectoryLocked();
+            if (report != null) for (ClientConnection client : recipients) {
+                Player player = players.get(client.playerID);
+                if (player != null && report.personal.containsKey(player.identity))
+                    personalFrames.put(client, report.personal.get(player.identity));
+            }
         }
+        if (report != null) persistReport(report);
         System.out.println("Game finished: " + reason);
-        for (ClientConnection client : recipients)
-            client.sendAndClose(messageFrame(MSG_END_GAME));
+        for (ClientConnection client : recipients) {
+            // Hold the outbound queue lock across the final ordered batch so a late
+            // live-score broadcast cannot overwrite the frozen scoreboard
+            // between it, the personal report, and ENDGAME.
+            synchronized (client.outboundLock) {
+                client.send(finalPlayerData);
+                Map<String, Object> personal = personalFrames.get(client);
+                if (personal != null) client.send(jsonFrame(mapOf("roundreport", personal)));
+                client.sendAndClose(messageFrame(MSG_END_GAME));
+            }
+        }
     }
 
     private boolean grantRespawn(int playerID) {
@@ -1822,6 +2092,8 @@ public final class LaptopHost {
             if (lives > 0 && player.deaths >= lives) return false;
             player.awaitingRespawn = false;
             player.eliminated = false;
+            if (roundReview != null)
+                roundReview.event(elapsedMillis(), "respawn", player, null, 1, "Respawn granted");
             recipient = player.connection;
         }
         recipient.send(messageFrame(MSG_RESPAWN_GRANTED));
@@ -1911,8 +2183,10 @@ public final class LaptopHost {
     }
 
     private void updateRoundStateLocked() {
-        if (roundState == RoundState.COUNTDOWN && elapsedMillis() >= roundStartAt)
+        if (roundState == RoundState.COUNTDOWN && elapsedMillis() >= roundStartAt) {
             roundState = RoundState.RUNNING;
+            if (roundReview != null) roundReview.started();
+        }
     }
 
     private void sendHeartbeats() {
@@ -2141,6 +2415,7 @@ public final class LaptopHost {
             if (players.containsKey(targetPlayerID)) game.put(EventMode.PLAYER_IDENTITY, players.get(targetPlayerID).identity);
             if (players.containsKey(targetPlayerID)) game.put(EventMode.PIN_HASH,
                     EventMode.pinHash(players.get(targetPlayerID).identity, eventSettings.pin()));
+            game.put("balancedprepared", isRoundActiveLocked() || balancedCheckInDeadline > 0);
             game.put("powerupqrrequired", config.powerupQrRequired);
             game.put("respawnqrenabled", config.respawnQrEnabled);
             game.put("bossmode", config.boss);
@@ -2290,6 +2565,8 @@ public final class LaptopHost {
             roundRoster.update(player.id, member.generation, player.kills, player.deaths,
                     row == null ? member.captures : row.ctfCaptures,
                     row != null && (row.flags & StatePacket.FLAG_INFECTED) != 0);
+            if (roundReview != null && isRoundActiveLocked())
+                roundReview.synchronize(player, row == null ? member.captures : row.ctfCaptures);
         }
     }
 
@@ -2444,6 +2721,7 @@ public final class LaptopHost {
         roundState = RoundState.LOBBY;
         roundToken = null;
         roundRoster = null;
+        roundReview = null;
         endVotes = 0;
         endVoteRequested = false;
         roundStartAt = 0;
@@ -2468,6 +2746,12 @@ public final class LaptopHost {
             if (player != null && player.connection == client) {
                 recordPlayerProfileLocked(player);
                 savePlayerDirectoryLocked();
+                if (isRoundActiveLocked() && roundReview != null) {
+                    roundReview.synchronize(player, gossipState[player.id] == null ? 0
+                            : gossipState[player.id].ctfCaptures);
+                    roundReview.event(elapsedMillis(), "drop", player, null, 1, "Disconnected / left");
+                    roundReview.person(player).complete = false;
+                }
                 activeClients.remove(player.id);
                 endVotes &= ~(1L << (player.id - 1));
                 player.connection = null;
@@ -2560,6 +2844,10 @@ public final class LaptopHost {
     }
 
     private void invalidateTeamAssignmentsLocked() {
+        if (config.balanced && hostPlayerTeams.isEmpty() && !retainedBalancedTeams.isEmpty()) {
+            synchronizeBalancedTeamsLocked();
+            return;
+        }
         balancedTeams = hostPlayerTeams.isEmpty() || fixedModeRules()
                 ? Collections.emptyMap() : computeBalancedTeamsLocked();
         balancedCheckedIn.clear();
@@ -2960,6 +3248,7 @@ public final class LaptopHost {
         int priorDeaths;
         int shots;
         int hits;
+        boolean analyticsCapable;
         boolean awaitingRespawn;
         boolean eliminated;
         UUID relayNode;
@@ -2976,8 +3265,7 @@ public final class LaptopHost {
         }
 
         int strength() {
-            long observations = (long) priorKills + priorDeaths;
-            return (int) (100 + 100L * (priorKills - (long) priorDeaths) / (observations + 10));
+            return RoundStatistics.skillIndex(priorKills, priorDeaths);
         }
 
         void addTrail(double longitude, double latitude, long now) {
@@ -2986,6 +3274,213 @@ public final class LaptopHost {
                 trail.addLast(new GeoPoint(longitude, latitude, now));
             while (trail.size() > 30)
                 trail.removeFirst();
+        }
+    }
+
+    private static String powerupName(int kind) {
+        String[] names = {"Unknown", "EMP", "Player shields", "Team shields", "Full auto",
+                "Full auto / 90 rounds", "Double damage", "Heal team", "Damage opponents",
+                "Invulnerability", "Airstrike"};
+        return kind > 0 && kind < names.length ? names[kind] : names[0];
+    }
+
+    /** Mutable only under stateLock; no GPS or high-rate dashboard traffic is needed. */
+    private static final class RoundReview {
+        final String token;
+        final long id;
+        final long startAt;
+        final String mode;
+        final Map<String, ReviewPlayer> people = new LinkedHashMap<>();
+        final List<Map<String, Object>> events = new ArrayList<>();
+        final Map<String, Map<String, Object>> lastShotBuckets = new HashMap<>();
+        int shotEvents;
+        int omittedEvents;
+        boolean hasStarted;
+        boolean frozen;
+
+        RoundReview(String token, long id, long startAt, String mode) {
+            this.token = token; this.id = id; this.startAt = startAt; this.mode = mode;
+        }
+
+        void enroll(Player player, int team) {
+            ReviewPlayer person = people.get(player.identity);
+            if (person == null) {
+                person = new ReviewPlayer("p" + people.size(), player.name, player.id, team,
+                        player.priorKills, player.priorDeaths);
+                person.complete = player.analyticsCapable;
+                people.put(player.identity, person);
+            }
+            person.name = player.name;
+            person.playerID = player.id;
+            if (!person.seats.contains(player.id)) person.seats.add(player.id);
+        }
+
+        ReviewPlayer person(Player player) { return player == null ? null : people.get(player.identity); }
+
+        void started() {
+            if (frozen || hasStarted) return;
+            hasStarted = true;
+            events.add(mapOf("timeMs", 0L, "kind", "start", "actor", null,
+                    "target", null, "count", 1, "detail", "Round started"));
+        }
+
+        boolean acceptTelemetry(Player reporter, Map<String, Object> json) {
+            ReviewPlayer person = person(reporter);
+            if (person == null || frozen) return false;
+            if (!json.containsKey("telemetryseq")) {
+                person.complete = false;
+                return true; // Old protocol-31 phones do not supply replay guards.
+            }
+            long sequence = longValue(json.get("telemetryseq"), -1);
+            if (sequence <= person.telemetrySequence) return false;
+            if (sequence > person.telemetrySequence + 1)
+                person.complete = false;
+            person.telemetrySequence = sequence;
+            return true;
+        }
+
+        void synchronize(Player player, int captures) {
+            ReviewPlayer person = person(player);
+            if (person == null || frozen) return;
+            if (player.kills > person.kills || player.deaths > person.deaths) person.complete = false;
+            person.kills = Math.max(person.kills, player.kills);
+            person.deaths = Math.max(person.deaths, player.deaths);
+            person.captures = Math.max(person.captures, captures);
+        }
+
+        void shots(long now, Player player, int count) {
+            ReviewPlayer person = person(player);
+            if (person == null || frozen) return;
+            person.shots = addScore(person.shots, count);
+            long time = Math.max(0, now - startAt);
+            long bucket = time / 1_000;
+            Map<String, Object> previous = lastShotBuckets.get(person.key);
+            if (previous != null && longValue(previous.get("timeMs"), 0) / 1_000 == bucket) {
+                previous.put("count", addScore(intValue(previous.get("count"), 0), count));
+                return;
+            }
+            if (shotEvents >= MAX_SHOT_TIMELINE_EVENTS || events.size() >= MAX_TIMELINE_EVENTS) {
+                omittedEvents++; return;
+            }
+            Map<String, Object> event = event(now, "shot", player, null, count,
+                    "Shots grouped by player / one-second receipt bucket");
+            if (event != null) { shotEvents++; lastShotBuckets.put(person.key, event); }
+        }
+
+        void hit(long now, Player attacker, Player victim) {
+            ReviewPlayer person = person(attacker);
+            if (person == null || frozen) return;
+            person.hits = addScore(person.hits, 1);
+            event(now, "hit", attacker, victim, 1, "Opponent phone confirmed an IR hit");
+        }
+
+        void kill(long now, Player attacker, Player victim) {
+            ReviewPlayer scorer = person(attacker), target = person(victim);
+            if (target == null || frozen) return;
+            if (scorer != null) {
+                scorer.kills = addScore(scorer.kills, 1);
+                scorer.streaks.onKill();
+            }
+            target.deaths = addScore(target.deaths, 1);
+            target.streaks.onDeath();
+            if (scorer != null) event(now, "kill", attacker, victim, 1, "Elimination confirmed by victim");
+            event(now, "death", victim, attacker, 1, "Eliminated");
+        }
+
+        Map<String, Object> event(long now, String kind, Player actor, Player target,
+                                  int count, String detail) {
+            if (frozen || !hasStarted) return null;
+            if (events.size() >= MAX_TIMELINE_EVENTS) { omittedEvents++; return null; }
+            ReviewPlayer source = person(actor), destination = person(target);
+            Map<String, Object> event = mapOf("timeMs", Math.max(0, now - startAt), "kind", kind,
+                    "actor", source == null ? null : source.key,
+                    "target", destination == null ? null : destination.key,
+                    "count", count, "detail", detail);
+            events.add(event);
+            return event;
+        }
+
+        RoundReport freeze(long now, String reason) {
+            if (frozen) return null;
+            long duration = hasStarted ? Math.max(0, now - startAt) : 0;
+            // End always survives truncation, and a cancelled countdown does
+            // not claim any actual play or invent a start event.
+            events.add(mapOf("timeMs", duration, "kind", "end", "actor", null,
+                    "target", null, "count", 1, "detail", reason));
+            List<Object> players = new ArrayList<>();
+            Map<String, Map<String, Object>> personal = new HashMap<>();
+            boolean complete = people.values().stream().allMatch(player -> player.complete);
+            for (Map.Entry<String, ReviewPlayer> entry : people.entrySet()) {
+                ReviewPlayer player = entry.getValue();
+                Map<String, Object> item = player.summary(token, duration);
+                item.put("complete", complete);
+                personal.put(entry.getKey(), Collections.unmodifiableMap(new LinkedHashMap<>(item)));
+                item.put("key", player.key);
+                item.put("name", player.name);
+                item.put("team", player.team);
+                item.put("seatIDs", new ArrayList<>(player.seats));
+                item.put("captures", player.captures);
+                item.put("accuracy", RoundStatistics.accuracyPercent(player.shots, player.hits));
+                players.add(item);
+            }
+            Map<String, Object> report = mapOf("roundtoken", token, "roundid", id,
+                    "mode", mode, "durationMs", duration, "finishedAtUtc", System.currentTimeMillis(),
+                    "reason", reason, "started", hasStarted, "complete", complete,
+                    "timing", "Host receipt times relative to actual GO; not exact trigger timestamps",
+                    "accuracyDefinition", "Opponent-confirmed gun IR hits / gun shots; grenades excluded",
+                    "skillDefinition", "Cumulative kills/deaths balancing index, 0..200; neutral 100. Not Elo; modes are not normalized",
+                    "shotGroupingMs", 1_000, "omittedEvents", omittedEvents,
+                    "players", players, "events", new ArrayList<>(events));
+            frozen = true;
+            return new RoundReport(token, Json.stringify(report), report, personal);
+        }
+    }
+
+    private static final class ReviewPlayer {
+        final String key;
+        String name;
+        int playerID;
+        final int team;
+        final int priorKills;
+        final int priorDeaths;
+        final List<Integer> seats = new ArrayList<>();
+        int kills, deaths, shots, hits, captures;
+        final RoundStatistics.Streaks streaks = new RoundStatistics.Streaks();
+        long telemetrySequence;
+        boolean complete = true;
+
+        ReviewPlayer(String key, String name, int playerID, int team, int priorKills, int priorDeaths) {
+            this.key = key; this.name = name; this.playerID = playerID; this.team = team;
+            this.priorKills = priorKills; this.priorDeaths = priorDeaths;
+        }
+
+        Map<String, Object> summary(String token, long duration) {
+            return mapOf("roundtoken", token, "playerID", playerID, "kills", kills, "deaths", deaths,
+                    "shots", shots, "hits", hits, "bestkillstreak", streaks.bestKillStreak(),
+                    "bestdeathstreak", streaks.bestDeathStreak(),
+                    "skillbefore", RoundStatistics.skillIndex(priorKills, priorDeaths),
+                    "skillafter", RoundStatistics.skillIndex(addScore(priorKills, kills), addScore(priorDeaths, deaths)),
+                    "durationms", duration, "complete", complete);
+        }
+    }
+
+    private static final class RoundReport {
+        final String token;
+        final String json;
+        final Map<String, Object> metadata;
+        final Map<String, Map<String, Object>> personal;
+
+        RoundReport(String token, String json, Map<String, Object> metadata,
+                    Map<String, Map<String, Object>> personal) {
+            this.token = token; this.json = json;
+            this.metadata = Collections.unmodifiableMap(new LinkedHashMap<>(metadata));
+            this.personal = Collections.unmodifiableMap(new HashMap<>(personal));
+        }
+
+        Map<String, Object> description() {
+            return mapOf("roundtoken", token, "roundid", metadata.get("roundid"),
+                    "durationMs", metadata.get("durationMs"), "mode", metadata.get("mode"),
+                    "finishedAtUtc", metadata.get("finishedAtUtc"), "reason", metadata.get("reason"));
         }
     }
 
@@ -3958,6 +4453,15 @@ public final class LaptopHost {
                         : "No active round to end."));
     }
 
+    private void handleRebalanceApi(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("error", "Use POST."));
+            return;
+        }
+        StartResult result = rebalanceTeams();
+        sendJson(exchange, result.ok ? 200 : 409, mapOf("ok", result.ok, "message", result.message));
+    }
+
     private void handleBenchApi(HttpExchange exchange) throws IOException {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             sendJson(exchange, 405, mapOf("error", "Use POST."));
@@ -4030,6 +4534,9 @@ public final class LaptopHost {
             state.put("benchedCount", activeClients.size() - playing.size());
             state.put("clockReady", clockReadyCountLocked());
             state.put("balancedQr", balancedQrEnabledLocked());
+            state.put("balancedRandom", config.balanced && hostPlayerTeams.isEmpty());
+            state.put("canRebalance", roundState == RoundState.LOBBY && config.balanced && hostPlayerTeams.isEmpty()
+                    && config.gameMode == GameMode.TWO_TEAMS && playing.size() >= 2);
             state.put("assignedCount", balancedTeams.size());
             state.put("checkedInCount", balancedCheckedIn.size());
             state.put("checkInRemainingMs", balancedQrEnabledLocked() && roundState == RoundState.LOBBY
@@ -4045,12 +4552,13 @@ public final class LaptopHost {
                     && (!config.infection || hasPlayingLeaderLocked())
                     && clockReadyCountLocked() == playing.size()
                     && playing.stream().allMatch(client -> client.lobbyReady)
-                    && (!balancedQrEnabledLocked() || balancedTeams.isEmpty()));
+                    && (!balancedQrEnabledLocked() || balancedCheckInDeadline == 0));
             state.put("gunsReady", playing.stream()
                     .filter(client -> client.lobbyReady).count());
             state.put("endVoteRequested", endVoteRequested);
             state.put("endVoteCount", Long.bitCount(endVotes));
             state.put("hostPort", config.tcpPort);
+            state.put("latestReport", roundReports.isEmpty() ? null : roundReports.peekFirst().token);
 
             List<Object> playerList = new ArrayList<>();
             for (Player player : players.values()) {
@@ -4137,6 +4645,110 @@ public final class LaptopHost {
         }
     }
 
+    private void handleReportsApi(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("error", "Use GET.")); return;
+        }
+        List<Object> reports = new ArrayList<>();
+        synchronized (stateLock) {
+            for (RoundReport report : roundReports) reports.add(report.description());
+        }
+        sendJson(exchange, 200, mapOf("reports", reports));
+    }
+
+    private void handleReportApi(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("error", "Use GET.")); return;
+        }
+        String token = queryParameters(exchange.getRequestURI()).get("roundtoken");
+        RoundReport selected = null;
+        synchronized (stateLock) {
+            if (token == null && !roundReports.isEmpty()) selected = roundReports.peekFirst();
+            else for (RoundReport report : roundReports)
+                if (report.token.equals(token)) { selected = report; break; }
+        }
+        if (selected != null) { sendReportJson(exchange, selected.json); return; }
+        // Only UUID filenames may be read; an arbitrary query cannot escape
+        // the app-owned report directory or expose another local file.
+        if (validReportToken(token)) {
+            Path file = config.reportDirectory.resolve(token + ".json");
+            if (Files.isRegularFile(file) && Files.size(file) <= 8_000_000) {
+                String json = Files.readString(file, StandardCharsets.UTF_8);
+                try {
+                    Object parsed = Json.parse(json);
+                    if (parsed instanceof Map && token.equals(castObject(parsed).get("roundtoken"))) {
+                        sendReportJson(exchange, json); return;
+                    }
+                } catch (IllegalArgumentException ignored) { }
+            }
+        }
+        sendJson(exchange, 404, mapOf("error", "No completed round report was found."));
+    }
+
+    private static boolean validReportToken(String token) {
+        if (token == null) return false;
+        try { return UUID.fromString(token).toString().equals(token); }
+        catch (IllegalArgumentException ignored) { return false; }
+    }
+
+    private static void sendReportJson(HttpExchange exchange, String json) throws IOException {
+        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        exchange.sendResponseHeaders(200, bytes.length);
+        exchange.getResponseBody().write(bytes);
+        exchange.close();
+    }
+
+    private void persistReport(RoundReport report) {
+        // Disk work never blocks the combat/state lock or the final TCP frames.
+        dashboardExecutor.execute(() -> {
+            try {
+                Files.createDirectories(config.reportDirectory);
+                Files.writeString(config.reportDirectory.resolve(report.token + ".json"), report.json,
+                        StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+            } catch (IOException e) {
+                System.err.println("Round report remains available in the dashboard; could not save "
+                        + config.reportDirectory + ": " + e.getMessage());
+            }
+        });
+    }
+
+    private void loadSavedReports() {
+        if (!Files.isDirectory(config.reportDirectory)) return;
+        List<Path> latest = new ArrayList<>();
+        try (DirectoryStream<Path> files = Files.newDirectoryStream(config.reportDirectory, "*.json")) {
+            for (Path file : files) {
+                String filename = file.getFileName().toString();
+                if (!validReportToken(filename.substring(0, filename.length() - 5))
+                        || !Files.isRegularFile(file)) continue;
+                latest.add(file);
+                latest.sort((a, b) -> {
+                    try { return Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a)); }
+                    catch (IOException ignored) { return 0; }
+                });
+                if (latest.size() > MAX_REPORT_HISTORY) latest.remove(latest.size() - 1);
+            }
+            for (Path file : latest) {
+                if (Files.size(file) > 8_000_000) continue;
+                String json = Files.readString(file, StandardCharsets.UTF_8);
+                Object parsed;
+                try { parsed = Json.parse(json); }
+                catch (IllegalArgumentException ignored) { continue; }
+                if (!(parsed instanceof Map)) continue;
+                Map<String, Object> data = castObject(parsed);
+                String token = file.getFileName().toString().replace(".json", "");
+                if (token.equals(data.get("roundtoken")) && data.get("players") instanceof List
+                        && data.get("events") instanceof List) {
+                    roundReports.addLast(new RoundReport(token, json, data, Collections.emptyMap()));
+                    roundID = Math.max(roundID, longValue(data.get("roundid"), 0));
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Could not load saved round reports: " + e.getMessage());
+        }
+    }
+
     private int clockReadyCountLocked() {
         int count = 0;
         for (ClientConnection client : activeClients.values()) {
@@ -4147,6 +4759,8 @@ public final class LaptopHost {
     }
 
     private static void sendHtml(HttpExchange exchange, String html) throws IOException {
+        if (html == INDEX_PAGE || html == MAP_PAGE || html == LEADERBOARD_PAGE)
+            html = html.replace("</body>", POST_ROUND_LINK_SCRIPT + "</body>");
         byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
         exchange.getResponseHeaders().set("Cache-Control", "no-store");
@@ -4305,6 +4919,8 @@ public final class LaptopHost {
         Path webDirectory = HOST_DIRECTORY.resolve("web");
         Path playerStore = Path.of(System.getProperty("simplecoil.players.file",
                 Path.of(System.getProperty("user.home"), ".local", "share", "simplecoil", "players.json").toString()));
+        Path reportDirectory = Path.of(System.getProperty("simplecoil.reports",
+                HOST_DIRECTORY.resolve("reports").toString())).toAbsolutePath().normalize();
         boolean noBrowser;
         boolean eventMode = true;
         boolean showHelp;
@@ -4398,6 +5014,9 @@ public final class LaptopHost {
                     case "--tiles":
                         config.tileDirectory = Path.of(value).toAbsolutePath().normalize();
                         break;
+                    case "--reports":
+                        config.reportDirectory = Path.of(value).toAbsolutePath().normalize();
+                        break;
                     case "--teams":
                         if ("2".equals(value)) {
                             config.gameMode = GameMode.TWO_TEAMS;
@@ -4480,6 +5099,7 @@ public final class LaptopHost {
                     + "  --score-limit 0..100        0 means unlimited\n"
                     + "  --lives-limit 0..100        0 means unlimited\n"
                     + "  --powerup-qr 2..8           Enable QR power-ups (default: off)\n"
+                    + "  --reports PATH             Save completed-round JSON reports here\n"
                     + "  --timer-respawn            Three-minute team respawns without QR scanning\n"
                     + "  --qr-respawn               QR checkpoint or timer respawns (default)\n"
                     + "  --gps all|team              Phone GPS visibility (default: team)\n"
@@ -4767,6 +5387,36 @@ public final class LaptopHost {
         }
     }
 
+    private static final String POST_ROUND_LINK_SCRIPT = """
+            <script>(()=>{const link=document.createElement('a');link.textContent='Review last round';link.hidden=true;link.style.cssText='color:#b4d9ff;font-size:15px;white-space:nowrap;padding:8px';(document.querySelector('header')||document.querySelector('.buttons')||document.querySelector('h1')?.parentElement||document.body).append(link);async function reports(){try{const r=await fetch('/api/reports',{cache:'no-store'}),data=await r.json(),latest=data.reports?.[0];link.hidden=!latest;if(latest)link.href='/round-report?roundtoken='+encodeURIComponent(latest.roundtoken)}catch(e){}setTimeout(reports,5000)}reports()})();</script>
+            """;
+
+    private static final String ROUND_REPORT_PAGE = """
+            <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SimpleCoil Round Review</title>
+            <style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b121b;color:#eef4f9;font:16px system-ui,sans-serif}main{max-width:1600px;margin:auto;padding:24px}header{display:flex;gap:14px;align-items:center;flex-wrap:wrap}h1{margin:0;flex:1}a{color:#7cbcff}select,button{padding:9px;background:#162b3e;color:#fff;border:1px solid #436079;border-radius:5px}p{color:#b9c9d6;line-height:1.5}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}.card{background:#152332;border:1px solid #2b455b;border-radius:8px;padding:12px 18px;min-width:160px}.card strong{display:block;font-size:25px}.note{font-size:13px;color:#9eb1c2}.warning{color:#ffd68a}fieldset{border:1px solid #2b455b;border-radius:7px;display:flex;gap:14px;flex-wrap:wrap;margin:18px 0}label{white-space:nowrap}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.scroll{overflow:auto;background:#111e2b;border:1px solid #2b455b;border-radius:8px}svg{display:block;min-width:1100px}table{border-collapse:collapse;width:100%;background:#111e2b}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #2b455b}th{color:#adc2d5;font-size:13px}h2{margin:28px 0 10px}#empty{padding:30px 0}.legend{font-size:14px}svg [tabindex]:focus{stroke:#fff;stroke-width:4;outline:none}@media(max-width:650px){main{padding:14px}h1{font-size:23px}th,td{padding:9px}}</style></head>
+            <body><main><header><h1>Round Review</h1><a href="/map">Live map</a><a href="/leaderboard">Leaderboard</a><label>Round <select id="round" aria-label="Completed round"></select></label><a id="download" hidden>Download JSON</a></header>
+            <p id="status" role="status">Waiting for a completed round...</p><div id="empty">Results and a timeline appear after a round finishes.</div><section id="review" hidden>
+            <div id="cards" class="cards"></div><p id="quality" class="warning"></p><p id="definitions" class="note"></p>
+            <h2>What happened</h2><p class="note">Time starts at actual GO, not the countdown. Each lane is one player, even if their phone reconnects with a different player ID. Hover or focus an event for details. Shot activity is grouped into one-second host-receipt buckets.</p>
+            <fieldset id="filters"><legend>Timeline events</legend></fieldset><div class="scroll"><svg id="timeline" role="img" aria-label="Round timeline by player"></svg></div>
+            <h2>After-round player statistics</h2><div class="scroll"><table><thead><tr><th scope="col">Player / team</th><th scope="col">Kills</th><th scope="col">Deaths</th><th scope="col">IR hits / shots</th><th scope="col">Accuracy</th><th scope="col">Best kill streak</th><th scope="col">Best death streak</th><th scope="col">Skill before / after</th><th scope="col">Data</th></tr></thead><tbody id="rows"></tbody></table></div>
+            <p class="note">A streak is consecutive kills without a death, or deaths without a kill. Skill is the existing cumulative kills/deaths balancing index (0-200, neutral 100), not Elo or a mode-adjusted competitive rating.</p></section></main>
+            <script>
+            const $=s=>document.querySelector(s),select=$('#round'),status=$('#status'),review=$('#review'),rows=$('#rows'),svg=$('#timeline');let report=null,selected=new URLSearchParams(location.search).get('roundtoken'),manual=!!selected,loaded=null;
+            const categories=[['shot','Shots','#8294aa'],['hit','IR hits','#f6d76e'],['kill','Kills','#76dc9b'],['death','Deaths','#ff617b'],['respawn','Respawns','#64c8ea'],['powerup','Power-ups','#c49aff'],['objective','Objectives','#ffb565'],['grenade','Grenade hits','#de8870'],['join','Joins','#b3d574'],['drop','Disconnects','#aaa'],['start','Start / end','#fff']],colors=Object.fromEntries(categories.map(c=>[c[0],c[2]]));colors.end=colors.start;const enabled=new Set(categories.filter(c=>c[0]!=='shot').map(c=>c[0]));
+            for(const [kind,name,color] of categories){const label=document.createElement('label'),check=document.createElement('input'),dot=document.createElement('span');check.type='checkbox';check.checked=enabled.has(kind);check.onchange=()=>{check.checked?enabled.add(kind):enabled.delete(kind);drawTimeline()};dot.className='dot';dot.style.backgroundColor=color;label.append(check,dot,document.createTextNode(name));$('#filters').append(label)}
+            function formatTime(ms){const seconds=Math.floor(Math.max(0,Number(ms)||0)/1000);return Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0')}
+            function cell(value){const td=document.createElement('td');td.textContent=value;return td}
+            function draw(){if(!report)return;review.hidden=false;$('#empty').hidden=true;status.textContent='Round '+report.roundid+' / '+report.mode+' / '+report.reason;$('#download').hidden=false;$('#download').href='/api/report?roundtoken='+encodeURIComponent(report.roundtoken);$('#download').download='SimpleCoil-round-'+report.roundid+'.json';$('#cards').replaceChildren();for(const [label,value] of [['Actual play',formatTime(report.durationMs)],['Players',report.players.length],['Kills',report.players.reduce((n,p)=>n+p.kills,0)],['IR hits / shots',report.players.reduce((n,p)=>n+p.hits,0)+' / '+report.players.reduce((n,p)=>n+p.shots,0)]]){const box=document.createElement('div'),strong=document.createElement('strong');box.className='card';strong.textContent=value;box.append(strong,document.createTextNode(label));$('#cards').append(box)}$('#quality').textContent=(report.started?'':'Countdown cancelled; no actual play. ')+(report.complete?'':'Some telemetry was incomplete or came from older phones; observed totals and streaks may be lower bounds. ')+(report.omittedEvents?report.omittedEvents+' event batches omitted by the bounded timeline; totals remain available.':'');$('#definitions').textContent=report.accuracyDefinition+'. '+report.timing+'.';rows.replaceChildren();for(const p of [...report.players].sort((a,b)=>b.kills-a.kills||a.playerID-b.playerID)){const tr=document.createElement('tr');tr.append(...[p.name+' / Team '+p.team,p.kills,p.deaths,p.hits+' / '+p.shots,p.accuracy==null?'N/A':p.accuracy.toFixed(1)+'%',p.bestkillstreak,p.bestdeathstreak,p.skillbefore+' / '+p.skillafter,p.complete?'Observed':'Partial'].map(cell));rows.append(tr)}drawTimeline()}
+            function node(tag,attrs,text){const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attrs||{}))n.setAttribute(k,String(v));if(text!==undefined)n.textContent=text;return n}
+            function drawTimeline(){if(!report)return;svg.replaceChildren();const w=1400,left=230,right=32,top=70,lane=46,people=report.players,h=top+(people.length+1)*lane+45,duration=Math.max(1000,Number(report.durationMs)||0),byKey=new Map(people.map(p=>[p.key,p])),laneY=new Map(people.map((p,i)=>[p.key,top+(i+1)*lane])),x=t=>left+Math.min(duration,Math.max(0,Number(t)||0))/duration*(w-left-right);svg.setAttribute('viewBox','0 0 '+w+' '+h);svg.style.width=w+'px';svg.style.height=h+'px';svg.append(node('title',{},'Round '+report.roundid+' timeline'),node('desc',{},'Player lanes with confirmed hits, kills, deaths, respawns and other observed round events. Times are host receipt times after actual GO.'));for(let i=0;i<=10;i++){const t=i*duration/10,at=x(t);svg.append(node('line',{x1:at,y1:45,x2:at,y2:h-38,stroke:'#294153'}),node('text',{x:at,y:28,fill:'#c2d4e2','text-anchor':'middle','font-size':13},formatTime(t)))}svg.append(node('text',{x:12,y:top,fill:'#9fb5c7','font-size':13},'ROUND'));for(const p of people){const y=laneY.get(p.key);svg.append(node('line',{x1:left,y1:y,x2:w-right,y2:y,stroke:'#294153'}));const text=node('text',{x:12,y:y+5,fill:p.team===1?'#79baff':'#ff9d9e','font-size':14},p.name.length>25?p.name.slice(0,25)+'...':p.name);text.append(node('title',{},p.name+' / Team '+p.team+' / IDs '+p.seatIDs.join(', ')));svg.append(text)}
+            for(const e of report.events){const category=e.kind==='end'?'start':e.kind;if(!enabled.has(category))continue;const at=x(e.timeMs),y=laneY.get(e.actor)||top,color=colors[e.kind]||'#fff',actor=byKey.get(e.actor),target=byKey.get(e.target);if(target&&laneY.has(e.target)&&['hit','kill','grenade'].includes(e.kind))svg.append(node('line',{x1:at,y1:y,x2:at,y2:laneY.get(e.target),stroke:color,'stroke-opacity':.38,'stroke-width':2}));const dot=node(e.kind==='death'?'rect':'circle',e.kind==='death'?{x:at-5,y:y-5,width:10,height:10,fill:color}:{cx:at,cy:y,r:e.kind==='shot'?Math.min(7,3+Math.log2(1+e.count)):5,fill:color});const description=formatTime(e.timeMs)+' / '+e.kind+' / '+(actor?actor.name:'Round')+(target?' -> '+target.name:'')+(e.count>1?' / '+e.count:'')+' / '+e.detail;dot.setAttribute('tabindex','0');dot.setAttribute('role','img');dot.setAttribute('aria-label',description);dot.append(node('title',{},description));svg.append(dot)} }
+            async function load(token){try{const r=await fetch('/api/report'+(token?'?roundtoken='+encodeURIComponent(token):''),{cache:'no-store'});if(!r.ok)throw Error();report=await r.json();loaded=report.roundtoken;selected=loaded;draw()}catch(e){status.textContent='No completed report available for this round.'}}
+            select.onchange=()=>{manual=true;selected=select.value;load(selected)};
+            async function refresh(){try{const r=await fetch('/api/reports',{cache:'no-store'});if(!r.ok)throw Error();const list=(await r.json()).reports;select.replaceChildren();for(const item of list){const option=document.createElement('option');option.value=item.roundtoken;option.textContent='Round '+item.roundid+' / '+item.mode+' / '+formatTime(item.durationMs);select.append(option)}if(!manual&&list.length)selected=list[0].roundtoken;if(selected){select.value=selected;if(loaded!==selected)await load(selected)}}catch(e){status.textContent='Disconnected from laptop host.'}setTimeout(refresh,5000)}refresh();
+            </script></body></html>
+            """;
+
     private static final String INDEX_PAGE = """
             <!doctype html><html><head><meta charset="utf-8"><title>LAZER GUN RUN · Laptop Host</title>
             <style>body{margin:0;background:#10141b;color:#eef3f8;font:18px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}main{max-width:660px;padding:32px}h1{margin-top:0}.buttons{display:flex;gap:14px;flex-wrap:wrap}a,button{border:0;border-radius:8px;background:#2585d8;color:white;padding:14px 18px;font:inherit;text-decoration:none;cursor:pointer}p{line-height:1.5;color:#c6d1dc}.note{font-size:.9em;color:#9dadbc}</style></head>
@@ -4781,23 +5431,23 @@ public final class LaptopHost {
             <link rel="stylesheet" href="/assets/leaflet/leaflet.css">
             <style>
             :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:15px system-ui,sans-serif;overflow:hidden}header{height:60px;display:flex;align-items:center;gap:12px;padding:9px 14px;background:#111c27;border-bottom:1px solid #274257}h1{font-size:20px;margin:0;white-space:nowrap}#status{color:#b8c8d8;flex:1}button{border:0;border-radius:7px;padding:9px 12px;background:#267ec8;color:#fff;font:inherit;cursor:pointer}button.danger{background:#b83d46}button:disabled{opacity:.45;cursor:not-allowed}#map{width:100vw;height:calc(100vh - 60px);background-color:#0d1720;background-image:linear-gradient(#203445 1px,transparent 1px),linear-gradient(90deg,#203445 1px,transparent 1px);background-size:50px 50px}.legend{position:fixed;z-index:1000;right:16px;bottom:16px;max-width:340px;background:#101a25e8;border:1px solid #34516a;border-radius:8px;padding:10px;line-height:1.7}.swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.team1{background:#49a5ff}.team2{background:#ff5d67}#tile-status{color:#ffd98a;font-size:12px}#respawns:empty{display:none}#respawns{border-top:1px solid #34516a;margin-top:7px;padding-top:7px}.respawn{font-size:12px;padding:5px 7px;margin:3px 3px 0 0;background:#466c32}.player-label{background:#101a25e8;border:1px solid #7890a5;color:#fff;font-weight:700;box-shadow:none}.player-label:before{border-top-color:#7890a5}.leaflet-control-zoom a{background:#152332;color:#fff;border-color:#35516a}.leaflet-control-zoom a:hover{background:#22384b;color:#fff}@media(max-width:760px){header{gap:6px;padding:7px}h1{font-size:15px}#status{font-size:11px}button{padding:7px 8px;font-size:12px}}
-            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button onclick="window.open('/players','simplecoil-players')">Players</button><button onclick="window.open('/wifi','simplecoil-wifi')">Wi-Fi</button><button id="fit">Fit players</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
+            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button onclick="window.open('/players','simplecoil-players')">Players</button><button onclick="window.open('/wifi','simplecoil-wifi')">Wi-Fi</button><button id="fit">Fit players</button><button id="rebalance" hidden disabled>Rebalance teams</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
             <script src="/assets/leaflet/leaflet.js"></script><script>
-            const status=document.querySelector('#status'),start=document.querySelector('#start'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status'),lobbyPlayers=document.querySelector('#lobby-players');let lobbySignature='';
+            const status=document.querySelector('#status'),start=document.querySelector('#start'),rebalance=document.querySelector('#rebalance'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status'),lobbyPlayers=document.querySelector('#lobby-players');let lobbySignature='';
             const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:true}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],grenadeLayers=[],fitted=false,mapConfig={maxZoom:19};
             function color(team){return team===1?'#49a5ff':team===2?'#ff5d67':`hsl(${(team*57)%360} 90% 63%)`}
             function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)&&(p.longitude!==0||p.latitude!==0)&&p.longitude>=-180&&p.longitude<=180&&p.latitude>=-90&&p.latitude<=90}function ll(p){return[p.latitude,p.longitude]}
             async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tileUrl='/tiles/{z}/{x}/{y}.png'+(mapConfig.version?'?v='+encodeURIComponent(mapConfig.version):'');const tiles=L.tileLayer(tileUrl,{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom+3,maxNativeZoom:mapConfig.maxZoom,bounds:mapConfig.bounds,attribution:mapConfig.attribution||'',noWrap:true,keepBuffer:4,updateWhenIdle:false});let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent='Offline map loaded.'}});tiles.addTo(map);tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.';if(!(state?.players||[]).some(valid)){if(mapConfig.center)map.setView(mapConfig.center,mapConfig.zoom);else if(mapConfig.bounds)map.fitBounds(mapConfig.bounds,{padding:[30,30],maxZoom:18})}}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
             async function control(path){try{const r=await fetch(path,{method:'POST'}),j=await r.json();status.textContent=j.message||(j.ok?'Done.':'Unable to complete action.')}catch(e){status.textContent='Host control error.'}}
-            start.onclick=()=>control('/api/start');end.onclick=()=>{if(confirm(state?.eventMode?'End the round for all players?':'Ask two participating players to approve ending the round?'))control('/api/end')};fitButton.onclick=()=>fitPlayers(true);
+            start.onclick=()=>control('/api/start');rebalance.onclick=()=>{if(confirm('Rebalance teams using player stats? Team QR check-ins will reset.'))control('/api/rebalance')};end.onclick=()=>{if(confirm(state?.eventMode?'End the round for all players?':'Ask two participating players to approve ending the round?'))control('/api/end')};fitButton.onclick=()=>fitPlayers(true);
             function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.canRespawn||p.benched||!p.connected)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}
             function drawLobby(s){const visible=s.state==='lobby';lobbyPlayers.hidden=!visible;if(!visible){lobbySignature='';return}const list=[...(s.players||[])].sort((a,b)=>Number(a.benched)-Number(b.benched)||a.team-b.team||a.id-b.id);const sig=JSON.stringify(list.map(p=>[p.id,p.name,p.team,p.connected,p.gunReady,p.clockReady,p.benched]));if(sig===lobbySignature)return;lobbySignature=sig;lobbyPlayers.replaceChildren();for(const p of list){const row=document.createElement('div'),name=document.createElement('span'),b=document.createElement('button');row.style.cssText='display:flex;gap:8px;align-items:center;margin-top:6px';name.style.flex='1';const status=p.benched?'Sitting out':!p.connected?'Reconnecting':!p.gunReady?'Needs gun':!p.clockReady?'Syncing clock':'Ready';name.textContent=`Team ${p.team} / ${p.name} #${p.id} - ${status}`;b.textContent=p.benched?'Play':'Sit out';b.disabled=!p.connected;b.onclick=()=>{b.disabled=true;control('/api/bench?id='+encodeURIComponent(p.id)+'&benched='+(!p.benched)).finally(()=>{lobbySignature=''})};const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>window.open('/players?id='+encodeURIComponent(p.id),'simplecoil-players');row.append(name,edit,b);lobbyPlayers.append(row)}}
-            function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores visible';if(s.balancedQr&&s.assignedCount)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount}`;const missing=(s.players||[]).filter(x=>x.connected&&!x.benched&&!x.gunReady).map(x=>x.name+' #'+x.id);return `${p} players - guns ${s.gunsReady||0}/${p} - clocks ${ready}/${p}`+(missing.length?' - Needs gun: '+missing.join(', '):'')}
+            function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores visible';if(s.balancedQr&&s.checkInRemainingMs>0)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount}`;const missing=(s.players||[]).filter(x=>x.connected&&!x.benched&&!x.gunReady).map(x=>x.name+' #'+x.id);return `${p} players - guns ${s.gunsReady||0}/${p} - clocks ${ready}/${p}`+(missing.length?' - Needs gun: '+missing.join(', '):'')}
             function fitPlayers(force){const points=(state?.players||[]).filter(valid).map(ll),maxZoom=Number.isFinite(mapConfig.maxZoom)?mapConfig.maxZoom:18;if(!points.length)return;if(points.length===1)map.setView(points[0],Math.min(18,maxZoom));else map.fitBounds(points,{padding:[70,70],maxZoom:Math.min(18,maxZoom)});if(force||!fitted)fitted=true}
             function drawPlayers(s){const visible=new Set();for(const p of s.players.filter(p=>!p.benched)){const points=(p.trail||[]).filter(valid).map(ll);if(!valid(p)&&!points.length)continue;visible.add(p.id);let item=players.get(p.id);if(!item){const trail=L.polyline([],{color:color(p.team),weight:3,opacity:.48,interactive:false}).addTo(map);item={marker:null,trail};players.set(p.id,item)}const opacity=p.connected?1:.4;if(valid(p)){if(!item.marker)item.marker=L.circleMarker(ll(p),{radius:11,color:'#fff',weight:2,fillColor:color(p.team),fillOpacity:1}).addTo(map).bindTooltip('',{permanent:true,direction:'top',className:'player-label',offset:[0,-9]});item.marker.setLatLng(ll(p)).setRadius(p.awaitingRespawn?8:11).setStyle({fillColor:color(p.team),opacity,fillOpacity:opacity});const label=document.createElement('span');label.textContent=`${p.name} #${p.id}${p.awaitingRespawn?' - RESPAWN':''}`;item.marker.setTooltipContent(label)}else if(item.marker){map.removeLayer(item.marker);item.marker=null}item.trail.setStyle({color:color(p.team),opacity:.48*opacity});item.trail.setLatLngs(points)}for(const [id,item] of players){if(visible.has(id))continue;if(item.marker)map.removeLayer(item.marker);map.removeLayer(item.trail);players.delete(id)}}
             function drawLasers(s){for(const layer of laserLayers)map.removeLayer(layer);laserLayers=[];const byId=Object.fromEntries(s.players.filter(valid).map(p=>[p.id,p]));function point(event,prefix,fallback){const p={longitude:event[prefix+'Longitude'],latitude:event[prefix+'Latitude']};return valid(p)?p:fallback}for(const event of s.lasers||[]){const a=point(event,'shooter',byId[event.shooter]),b=point(event,'target',byId[event.target]);if(!valid(a)||!valid(b))continue;const kill=event.kind==='kill',opacity=Math.max(0,1-event.ageMs/1500);laserLayers.push(L.polyline([ll(a),ll(b)],{color:kill?'#ff3047':'#fff36b',weight:kill?7:5,opacity,interactive:false}).addTo(map))}}
             function drawGrenades(s){for(const layer of grenadeLayers)map.removeLayer(layer);grenadeLayers=[];for(const burst of s.grenadeBursts||[]){const opacity=Math.max(0,1-burst.ageMs/8000);for(const hit of burst.hits||[]){if(!valid(hit))continue;grenadeLayers.push(L.circleMarker(ll(hit),{radius:17,color:'#ff3047',weight:3,opacity,fillColor:'#ff3047',fillOpacity:.24*opacity,interactive:true}).addTo(map).bindTooltip(`Grenade #${burst.grenadeID} hit player #${hit.playerID}`))}const center={latitude:burst.centerLatitude,longitude:burst.centerLongitude};if(!valid(center))continue;grenadeLayers.push(L.circleMarker(ll(center),{radius:8,color:'#fff',weight:2,opacity,fillColor:'#ff3047',fillOpacity:opacity,interactive:true}).addTo(map).bindTooltip(`Estimated grenade #${burst.grenadeID} center (${burst.hits.length} mapped hits)`))}}
-            function draw(s){document.title=(s.eventTitle||'LAZER GUN RUN')+' · Tactical Map';status.textContent=(s.eventTitle||'LAZER GUN RUN')+' · '+label(s);start.disabled=!s.canStart;end.disabled=!['countdown','running'].includes(s.state);end.textContent=!end.disabled&&!s.eventMode&&s.endVoteRequested?`End game (${s.endVoteCount}/2)`:'End game';drawRespawns(s);drawLobby(s);drawPlayers(s);drawLasers(s);drawGrenades(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}
+            function draw(s){document.title=(s.eventTitle||'LAZER GUN RUN')+' - Tactical Map';status.textContent=(s.eventTitle||'LAZER GUN RUN')+' - '+label(s);start.disabled=!s.canStart;rebalance.hidden=!s.balancedRandom;rebalance.disabled=!s.canRebalance;end.disabled=!['countdown','running'].includes(s.state);end.textContent=!end.disabled&&!s.eventMode&&s.endVoteRequested?`End game (${s.endVoteCount}/2)`:'End game';drawRespawns(s);drawLobby(s);drawPlayers(s);drawLasers(s);drawGrenades(s);if(!fitted&&(s.players||[]).some(valid))fitPlayers(false)}
             async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();draw(state)}catch(e){status.textContent='Disconnected from laptop host.'}setTimeout(refresh,150)}setupTiles();refresh();
             </script></body></html>
             """;

@@ -14,7 +14,7 @@ import java.util.function.Predicate;
 /** Exercises real TCP phones, persistence, transfers, host rules, and local-only controls. */
 public final class PlayerControlsTest {
     private static final int HTTP = 19711, TCP = 19710;
-    private static final String JSON = "SimpleCoil:30JSON", MESSAGE = "SimpleCoil:30MESG";
+    private static final String JSON = "SimpleCoil:31JSON", MESSAGE = "SimpleCoil:31MESG";
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
     private static Path root;
     public static void main(String[] args) throws Exception {
@@ -22,6 +22,7 @@ public final class PlayerControlsTest {
         verifyDirectory();
         verifyReturningIdentityHasOnlyOneSeat();
         verifyRelay();
+        verifyManualTeamsOverrideBalancedRandom();
         String firstDevice = UUID.randomUUID().toString(), secondDevice = UUID.randomUUID().toString(), replacementDevice = UUID.randomUUID().toString();
         Process host = start();
         try (Phone first = new Phone("127.0.0.2", 1, "Blue", firstDevice);
@@ -203,7 +204,7 @@ public final class PlayerControlsTest {
                 newcomer.setReuseAddress(true);
                 newcomer.bind(new InetSocketAddress("127.0.0.4",19700));
                 newcomer.setSoTimeout(1000);
-                byte[] request = "SimpleCoil:JOIN3017".getBytes(StandardCharsets.UTF_8);
+                byte[] request = "SimpleCoil:JOIN3117".getBytes(StandardCharsets.UTF_8);
                 newcomer.send(new DatagramPacket(request,request.length,InetAddress.getByName("127.0.0.1"),19700));
                 DatagramPacket reply = new DatagramPacket(new byte[128],128);
                 newcomer.receive(reply);
@@ -262,9 +263,38 @@ public final class PlayerControlsTest {
         Files.writeString(file,"{broken");try{new PlayerDirectory(file);throw new AssertionError("Corrupt directory silently replaced");}catch(IOException expected){}
         check(Files.readString(file).equals("{broken"),"Corrupt directory overwritten");
     }
+    private static void verifyManualTeamsOverrideBalancedRandom() throws Exception {
+        Path previousRoot = root;
+        root = Files.createTempDirectory("simplecoil-manual-balanced-teams");
+        Process host = start("--balanced-qr");
+        try (Phone first = new Phone("127.0.0.2", 1, "First", UUID.randomUUID().toString());
+             Phone second = new Phone("127.0.0.3", 17, "Second", UUID.randomUUID().toString())) {
+            check(post("/api/players", Map.of("id", 1, "identity", active(1).get("identity"), "team", 2))
+                    .statusCode() == 200, "Operator team assignment failed in a balanced lobby");
+            check(post("/api/players", Map.of("id", 17, "identity", active(17).get("identity"), "team", 1))
+                    .statusCode() == 200, "Operator opponent assignment failed");
+            first.syncClock(); second.syncClock();
+            Map<String, Object> lobby = state();
+            check(Boolean.FALSE.equals(lobby.get("balancedQr"))
+                            && Boolean.FALSE.equals(lobby.get("canRebalance")),
+                    "Operator teams still required random-team QR check-ins or rebalancing");
+            check(post("/api/rebalance", Map.of()).statusCode() == 409,
+                    "Random rebalancing overrode the operator's teams");
+            check(post("/api/start", Map.of()).statusCode() == 200,
+                    "Operator teams could not start without random-team QR scans");
+            first.until(game -> game.containsKey("gamestart"));
+            check(number(active(1).get("team")) == 2 && number(active(17).get("team")) == 1,
+                    "Starting the round replaced the operator's team assignments");
+        } finally {
+            stop(host);
+            root = previousRoot;
+        }
+    }
+
     private static Process start(String... extra) throws Exception {
         ProcessBuilder builder=new ProcessBuilder(Path.of(System.getProperty("java.home"),"bin/java").toString(),
                 "-Dsimplecoil.players.file="+root.resolve("players.json"),"-Dsimplecoil.event.file="+root.resolve("event.properties"),
+                "-Dsimplecoil.reports="+root.resolve("reports"),
                 "--add-modules","jdk.httpserver","-cp",Path.of("laptop-host/out").toAbsolutePath().toString(),
                 "com.simplecoil.laptophost.LaptopHost","--no-browser","--tcp-port","19710","--udp-port","19700","--dashboard-port","19711","--tile-port","19712","--start-delay","1");
         builder.command().addAll(Arrays.asList(extra));

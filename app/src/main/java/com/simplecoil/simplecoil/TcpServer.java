@@ -68,6 +68,7 @@ public class TcpServer extends Service {
     private static final String TAG = "TCPServer";
 
     public static final int SEND_ALL = -100;
+    static final String EXTRA_ROUND_REPORTS_DELIVERED = "com.simplecoil.simplecoil.ROUND_REPORTS_DELIVERED";
     // Rejoin feedback is useful, but a disconnected player must not retain an
     // unlimited round's worth of game events in the host process.
     // One supported 32-player power-up burst must survive a short outage,
@@ -115,6 +116,7 @@ public class TcpServer extends Service {
     public static final String JSON_GAMEMODE = "gamemode";
     public static final String JSON_BALANCED_MODE = "balancedrandom";
     public static final String JSON_BALANCED_QR = "balancedqr";
+    public static final String JSON_BALANCED_PREPARED = "balancedprepared";
     public static final String JSON_POWERUP_QR_REQUIRED = "powerupqrrequired";
     public static final String JSON_POWERUP_SCAN = "powerupscan";
     public static final String JSON_POWERUP_LIFE = "poweruplife";
@@ -126,6 +128,10 @@ public class TcpServer extends Service {
     public static final String JSON_BALANCED_CHECKIN = "balancedcheckin";
     public static final String JSON_PRIOR_KILLS = "priorkills";
     public static final String JSON_PRIOR_DEATHS = "priordeaths";
+    public static final String JSON_ROUND_ANALYTICS = "roundanalytics";
+    public static final String JSON_HISTORY_ROUND_TOKEN = "historyroundtoken";
+    public static final String JSON_HISTORY_BASELINE_KILLS = "historybaselinekills";
+    public static final String JSON_HISTORY_BASELINE_DEATHS = "historybaselinedeaths";
     public static final String JSON_REJOIN = "rejoin";
     public static final String JSON_DEDICATED = "dedicatedserver";
     public static final String JSON_MAP_TILE_PORT = "maptileport";
@@ -157,10 +163,17 @@ public class TcpServer extends Service {
     public static final String JSON_TELEMETRY = "telemetry";
     public static final String JSON_TELEMETRY_COUNT = "count";
     public static final String JSON_TELEMETRY_ATTACKER = "attacker";
+    public static final String JSON_TELEMETRY_ATTACKER_GENERATION = "attackergeneration";
     public static final String JSON_TELEMETRY_GRENADE_ID = "grenadeID";
     public static final String JSON_TELEMETRY_SHOT = "shot";
     public static final String JSON_TELEMETRY_HIT = "hit";
     public static final String JSON_TELEMETRY_GRENADE_HIT = "grenadehit";
+    public static final String JSON_TELEMETRY_ELIMINATION = "elimination";
+    public static final String JSON_TELEMETRY_SEQUENCE = "telemetryseq";
+    public static final String JSON_TELEMETRY_TOTAL = "total";
+    public static final String JSON_TELEMETRY_GENERATION = "generation";
+    public static final String JSON_TELEMETRY_LIFE = "life";
+    public static final String JSON_TELEMETRY_RESUME = "telemetryresume";
     public static final String JSON_TEAMPOINTS = "teampoints";
     public static final String JSON_TIMEREMAINING = "timeremaining";
     static final String JSON_CLOCK_REQUEST = "clocksync";
@@ -210,6 +223,8 @@ public class TcpServer extends Service {
     private final Random mBalanceRandom = new Random();
     private static final long BALANCED_QR_CHECK_IN_TIMEOUT_MS = 90_000L;
     private volatile long mBalancedCheckInDeadline = -1;
+    private long mBalancedPreparationGeneration;
+    private boolean mPreserveBalancedTeamsOnCancellation;
     // Guarded by mServerStateLock; stale callbacks must not start a later lobby.
     private Runnable mBalancedCheckInTimeout;
     private long mScheduledStart = -1;
@@ -277,6 +292,13 @@ public class TcpServer extends Service {
     private volatile Map<Integer, ClientData> mClientData = null;
     // Explicitly leaving must not reset a player's score or spent lives in this round.
     private final Map<Byte, ScoreData> mDepartedScores = new ConcurrentHashMap<>();
+    // Statistics belong to a person, not a reusable lobby seat. All access is
+    // protected by mServerStateLock, independently of slow socket writes.
+    private String mAnalyticsToken;
+    private boolean mAnalyticsComplete;
+    private long mAnalyticsEndAt = -1;
+    private final Map<String, RoundAnalytics> mRoundAnalytics = new HashMap<>();
+    private final Map<String, RoundReport> mCompletedRoundReports = new HashMap<>();
     private volatile boolean mIsDedicated = false;
     private volatile boolean mManualPhoneHost;
     private volatile long mLobbyHostStartedAt = -1;
@@ -495,8 +517,10 @@ public class TcpServer extends Service {
                 Log.w(TAG, "Dropping stale TCP send because the task backlog is full");
                 return false;
             }
-            if (endsRound)
+            if (endsRound) {
                 mEndingGame = true;
+                if (mAnalyticsEndAt < 0) mAnalyticsEndAt = SystemClock.elapsedRealtime();
+            }
             if (startsRound)
                 mStartingGame = true;
             Thread task = new Thread(() -> {
@@ -768,6 +792,12 @@ public class TcpServer extends Service {
                 if (Globals.getInstance().mInfectionMode && roundRoster.seat(1) != null)
                     roundRoster.seat(1).infected = true;
                 Globals.getInstance().installRoundRoster(roundRoster);
+                synchronized (mServerStateLock) {
+                    initializeRoundAnalyticsLocked(roundToken, true);
+                    for (ClientRecipient recipient : recipients)
+                        if (recipient.canStartGame()) analyticsLocked(recipient.client);
+                    if (!mIsDedicated) localAnalyticsLocked();
+                }
                 JSONObject startInfo = createStartInfo(roundID, startAt, duration, roundToken, gpsStartTime);
                 try { startInfo.put(LiveJoin.ROSTER, roundRoster.encode()); }
                 catch (JSONException e) { return; }
@@ -869,13 +899,14 @@ public class TcpServer extends Service {
                 for (ClientRecipient recipient : getClientRecipients()) {
                     if (recipient.playerID != playerID || !recipient.isConnectedPlayer()) continue;
                     recipient.client.lobbyBenched = benched;
-                    Globals.getInstance().clearBalancedAssignments();
-                    cancelBalancedCheckInTimeoutLocked();
+                    updateRetainedBalancedLobby(getClientRecipients());
                     break;
                 }
             }
             sendGameInfo(SEND_ALL, getClientRecipients());
             sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+            if (Globals.getInstance().mBalancedRandom)
+                sendBroadcast(new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
         });
     }
 
@@ -893,6 +924,8 @@ public class TcpServer extends Service {
 
     private void armBalancedCheckInTimeout() {
         synchronized (mServerStateLock) {
+            if (!isBalancedLobbyEditableLocked() || !Globals.getInstance().mBalancedGamePrepared)
+                return;
             cancelBalancedCheckInTimeoutLocked();
             mBalancedCheckInDeadline = SystemClock.elapsedRealtime()
                     + BALANCED_QR_CHECK_IN_TIMEOUT_MS;
@@ -908,6 +941,7 @@ public class TcpServer extends Service {
                         }
                         if (!keepListening || mDestroyed || mEndingGame || mStartAnnounced
                                 || !Globals.getInstance().mBalancedRandom
+                                || !Globals.getInstance().mBalancedGamePrepared
                                 || Globals.getInstance().mBalancedTeams.isEmpty()) {
                             cancelBalancedCheckInTimeoutLocked();
                             return;
@@ -940,30 +974,148 @@ public class TcpServer extends Service {
         mBalancedCheckInDeadline = -1;
     }
 
-    /** The host freezes the lobby roster, balances it, then waits for QR check-in if enabled. */
+    public boolean isBalancedGamePrepared() {
+        synchronized (mServerStateLock) {
+            return Globals.getInstance().mBalancedGamePrepared;
+        }
+    }
+
+    private boolean isBalancedLobbyEditableLocked() {
+        Globals globals = Globals.getInstance();
+        return keepListening && !mDestroyed && !mEndingGame && mCancellationThread == null
+                && !mStartAnnounced && !mStartingGame
+                && globals.mGameState == Globals.GAME_STATE_NONE
+                && globals.mBalancedRandom && globals.mGameMode == Globals.GAME_MODE_2TEAMS;
+    }
+
+    /** Explicit host action. Accepted work publishes new teams but does not start a round. */
+    public boolean rebalanceTeams() {
+        synchronized (mServerStateLock) {
+            if (!isBalancedLobbyEditableLocked()) return false;
+            Globals globals = Globals.getInstance();
+            int players = !mIsDedicated && globals.mPlayerID > 0
+                    && Globals.isValidPlayerID(globals.mPlayerID) ? 1 : 0;
+            for (ClientRecipient recipient : getClientRecipients())
+                if (recipient.canStartGame()) players++;
+            if (players < 2) return false;
+        }
+        return runClientTask(() -> {
+            List<ClientRecipient> recipients = getClientRecipients();
+            synchronized (mServerStateLock) {
+                if (!isBalancedLobbyEditableLocked()) return;
+                List<BalancedTeams.Player> players = balancedPlayers(recipients, false);
+                if (players == null || players.size() < 2) return;
+                Globals globals = Globals.getInstance();
+                globals.setBalancedAssignments(BalancedTeams.assign(players, mBalanceRandom),
+                        new HashSet<>());
+                rememberBalancedTeams(recipients, true);
+                globals.mBalancedGamePrepared = false;
+                mBalancedPreparationGeneration++;
+                cancelBalancedCheckInTimeoutLocked();
+            }
+            sendGameInfo(SEND_ALL, recipients);
+            sendBroadcast(new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
+        });
+    }
+
+    private List<BalancedTeams.Player> balancedPlayers(List<ClientRecipient> recipients,
+                                                       boolean requireClocks) {
+        Globals globals = Globals.getInstance();
+        List<BalancedTeams.Player> players = new ArrayList<>();
+        if (!mIsDedicated && globals.mPlayerID > 0 && Globals.isValidPlayerID(globals.mPlayerID))
+            players.add(new BalancedTeams.Player(globals.mPlayerID,
+                    PlayerHistory.kills(this), PlayerHistory.deaths(this)));
+        for (ClientRecipient recipient : recipients) {
+            if (!recipient.canStartGame()) continue;
+            if (requireClocks && !recipient.client.clockSynchronized) return null;
+            players.add(new BalancedTeams.Player(recipient.playerID,
+                    recipient.client.priorKills, recipient.client.priorDeaths));
+        }
+        return players;
+    }
+
+    private Map<Byte, Integer> retainedBalancedSeats(List<ClientRecipient> recipients) {
+        Globals globals = Globals.getInstance();
+        Map<Byte, Integer> previous = new HashMap<>();
+        // Older in-memory snapshots have no UUID cache yet. Keep their seat assignments
+        // until this host first records the identities alongside the current roster.
+        if (globals.mRetainedBalancedTeams.isEmpty())
+            previous.putAll(globals.mBalancedTeams);
+        if (!mIsDedicated && globals.mPlayerID > 0) {
+            Integer team = globals.mRetainedBalancedTeams.get(LiveJoin.identity(this));
+            if (team != null) previous.put(globals.mPlayerID, team);
+        }
+        for (ClientRecipient recipient : recipients) {
+            if (!recipient.canStartGame()) continue;
+            Integer team = globals.mRetainedBalancedTeams.get(recipient.client.playerIdentity);
+            if (team != null) previous.put(recipient.playerID, team);
+        }
+        return previous;
+    }
+
+    private void rememberBalancedTeams(List<ClientRecipient> recipients, boolean replace) {
+        Globals globals = Globals.getInstance();
+        Map<String, Integer> retained = replace ? new HashMap<>()
+                : new HashMap<>(globals.mRetainedBalancedTeams);
+        if (!mIsDedicated && globals.mPlayerID > 0) {
+            Integer team = globals.mBalancedTeams.get(globals.mPlayerID);
+            if (team != null) retained.put(LiveJoin.identity(this), team);
+        }
+        for (ClientRecipient recipient : recipients) {
+            if (!recipient.canStartGame()) continue;
+            Integer team = globals.mBalancedTeams.get(recipient.playerID);
+            if (team != null) retained.put(recipient.client.playerIdentity, team);
+        }
+        globals.setRetainedBalancedTeams(retained);
+    }
+
+    /** Reconcile an idle roster without moving any established player to another team. */
+    private void updateRetainedBalancedLobby(List<ClientRecipient> recipients) {
+        synchronized (mServerStateLock) {
+            Globals globals = Globals.getInstance();
+            if (!isBalancedLobbyEditableLocked()
+                    || globals.mBalancedTeams.isEmpty() && globals.mRetainedBalancedTeams.isEmpty())
+                return;
+            List<BalancedTeams.Player> players = balancedPlayers(recipients, false);
+            if (players == null || players.isEmpty()) {
+                globals.clearBalancedRoundState();
+                cancelBalancedCheckInTimeoutLocked();
+                mBalancedPreparationGeneration++;
+                return;
+            }
+            Map<Byte, Integer> teams = BalancedTeams.retain(players, retainedBalancedSeats(recipients),
+                    mBalanceRandom);
+            Set<Byte> checkedIn = new HashSet<>(globals.mBalancedCheckedIn);
+            checkedIn.retainAll(teams.keySet());
+            globals.setBalancedAssignments(teams, checkedIn);
+            rememberBalancedTeams(recipients, false);
+        }
+    }
+
+    /** Start preparation retains teams and opens a fresh, per-round QR check-in window. */
     public boolean prepareBalancedGame() {
         Globals globals = Globals.getInstance();
-        if (!globals.mBalancedRandom || globals.mGameMode != Globals.GAME_MODE_2TEAMS)
-            return false;
+        synchronized (mServerStateLock) {
+            if (!isBalancedLobbyEditableLocked()) return false;
+        }
         return runClientTask(() -> {
-            if (mStartAnnounced || mStartingGame
-                    || globals.mGameState != Globals.GAME_STATE_NONE)
-                return;
             List<ClientRecipient> recipients = getClientRecipients();
-            List<BalancedTeams.Player> players = new ArrayList<>();
-            if (!mIsDedicated)
-                players.add(new BalancedTeams.Player(globals.mPlayerID,
-                        PlayerHistory.kills(this), PlayerHistory.deaths(this)));
-            for (ClientRecipient recipient : recipients) {
-                if (!recipient.canStartGame() || !recipient.client.clockSynchronized)
+            final long preparationGeneration;
+            synchronized (mServerStateLock) {
+                if (!isBalancedLobbyEditableLocked()) return;
+                if (globals.mBalancedGamePrepared) {
+                    // A repeated Start must not erase scans or extend the timeout.
+                    startGame();
                     return;
-                players.add(new BalancedTeams.Player(recipient.playerID,
-                        recipient.client.priorKills, recipient.client.priorDeaths));
+                }
+                List<BalancedTeams.Player> players = balancedPlayers(recipients, true);
+                if (players == null || players.size() < 2) return;
+                globals.setBalancedAssignments(BalancedTeams.retain(players,
+                        retainedBalancedSeats(recipients), mBalanceRandom), new HashSet<>());
+                rememberBalancedTeams(recipients, false);
+                globals.mBalancedGamePrepared = true;
+                preparationGeneration = ++mBalancedPreparationGeneration;
             }
-            if (players.size() < 2)
-                return;
-            globals.setBalancedAssignments(BalancedTeams.assign(players, mBalanceRandom),
-                    new HashSet<>());
             sendGameInfo(SEND_ALL, recipients);
             sendBroadcast(new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
             if (globals.mBalancedRequireQr)
@@ -974,8 +1126,13 @@ public class TcpServer extends Service {
                     long wait = getNextGameStartWaitMillis();
                     if (wait > 0)
                         mShutdownHandler.postDelayed(() -> {
-                            if (globals.mBalancedRandom && globals.mGameState == Globals.GAME_STATE_NONE)
-                                startGame();
+                            synchronized (mServerStateLock) {
+                                if (globals.mBalancedGamePrepared
+                                        && mBalancedPreparationGeneration == preparationGeneration
+                                        && globals.mBalancedRandom
+                                        && globals.mGameState == Globals.GAME_STATE_NONE)
+                                    startGame();
+                            }
                         }, wait);
                 }
             }
@@ -994,6 +1151,7 @@ public class TcpServer extends Service {
         boolean everyoneCheckedIn;
         synchronized (mServerStateLock) {
             if (!globals.mBalancedRandom || !globals.mBalancedRequireQr
+                    || !globals.mBalancedGamePrepared
                     || globals.mGameState != Globals.GAME_STATE_NONE || mStartAnnounced
                     || !globals.mBalancedTeams.containsKey(playerID))
                 return false;
@@ -1511,19 +1669,35 @@ public class TcpServer extends Service {
     }
 
     public void endGame() {
+        requestOrderedRoundEnd();
+    }
+
+    /** Lets a phone host wait for the ordered report/ENDGAME delivery task. */
+    public boolean requestOrderedRoundEnd() {
         synchronized (mServerStateLock) {
             recordRoundCooldownLocked();
         }
-        runClientTask(() -> {
+        return runClientTask(() -> {
             // Keep registration excluded until every shared roster has been
             // cleared, not just until the old client sockets have been closed.
             if (mClientData != null) {
                 sendPlayerData(SEND_ALL);
+                freezeRoundReports();
                 // We want to send the end-game message before removing clients.
                 String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME;
                 for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
                     if (!isClientTaskActive())
                         return;
+                    RoundReport report;
+                    synchronized (mServerStateLock) {
+                        report = mCompletedRoundReports.get(entry.getValue().playerIdentity);
+                    }
+                    if (report != null) {
+                        try {
+                            entry.getValue().sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
+                                    + new JSONObject().put(RoundReport.KEY, report.toJson()));
+                        } catch (JSONException invalid) { Log.w(TAG, "Unable to encode round report", invalid); }
+                    }
                     entry.getValue().sendTCPMessage(message);
                     entry.getValue().close();
                 }
@@ -1535,9 +1709,14 @@ public class TcpServer extends Service {
             if (!isClientTaskActive())
                 return;
             clearSharedRosterState();
-            Globals.getInstance().clearBalancedAssignments();
-            cancelBalancedCheckInTimeout();
             synchronized (mServerStateLock) {
+                // A playing phone still needs its actual assigned round team
+                // when consuming the completion broadcast. Its activity clears
+                // this state after saving statistics; dedicated hosts have no
+                // local player snapshot to preserve.
+                if (mIsDedicated) Globals.getInstance().clearBalancedRoundState();
+                mBalancedPreparationGeneration++;
+                cancelBalancedCheckInTimeoutLocked();
                 if (isClientTaskActive()) {
                     mStartAnnounced = false;
                     mScheduledStart = -1;
@@ -1545,7 +1724,8 @@ public class TcpServer extends Service {
                     mRoundToken = null;
                     mBossHunterCount = -1;
                     Globals.getInstance().mBossHunterCount = -1;
-                    sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME));
+                    sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME)
+                            .putExtra(EXTRA_ROUND_REPORTS_DELIVERED, true));
                 }
             }
         }, RoundTask.END);
@@ -1567,8 +1747,14 @@ public class TcpServer extends Service {
             mClientData.clear();
         }
         mDepartedScores.clear();
-        Globals.getInstance().clearBalancedAssignments();
-        cancelBalancedCheckInTimeout();
+        synchronized (mServerStateLock) {
+            if (mPreserveBalancedTeamsOnCancellation)
+                Globals.getInstance().clearBalancedRoundState();
+            else
+                Globals.getInstance().clearBalancedAssignments();
+            mBalancedPreparationGeneration++;
+            cancelBalancedCheckInTimeoutLocked();
+        }
         clearSharedRosterState();
     }
 
@@ -1797,6 +1983,7 @@ public class TcpServer extends Service {
             game.put(JSON_GAMEMODE, Globals.getInstance().mGameMode);
             game.put(JSON_BALANCED_MODE, Globals.getInstance().mBalancedRandom);
             game.put(JSON_BALANCED_QR, Globals.getInstance().mBalancedRequireQr);
+            game.put(JSON_BALANCED_PREPARED, Globals.getInstance().mBalancedGamePrepared);
             game.put(JSON_POWERUP_QR_REQUIRED, Globals.getInstance().mPowerupQrRequired);
             game.put(JSON_RESPAWN_QR_ENABLED, Globals.getInstance().mRespawnQrEnabled);
             game.put(JSON_GRENADE_DAMAGE, Globals.getInstance().mGrenadeDamage);
@@ -1863,6 +2050,20 @@ public class TcpServer extends Service {
                 if (recipient.isCurrent()) {
                     recipient.client.sendTCPMessage(recipient.playerID == id ? idMessage : allMessage, false);
                     synchronized (mServerStateLock) {
+                        if (recipient.client.analyticsCapable && mStartAnnounced) {
+                            RoundAnalytics stats = analyticsLocked(recipient.client);
+                            RoundRoster roster = Globals.getInstance().mRoundRoster;
+                            RoundRoster.Member member = roster == null ? null : roster.seat(recipient.playerID);
+                            if (stats != null && member != null && member.identity.equals(recipient.client.playerIdentity)) {
+                                JSONObject resume = new JSONObject().put(JSON_ROUND_TOKEN, mRoundToken)
+                                        .put(JSON_TELEMETRY_GENERATION, member.generation)
+                                        .put(JSON_TELEMETRY_LIFE, stats.deaths)
+                                        .put(JSON_TELEMETRY_SEQUENCE, stats.lastSequence)
+                                        .put(JSON_TELEMETRY_TOTAL, stats.shots);
+                                recipient.client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
+                                        + new JSONObject().put(JSON_TELEMETRY_RESUME, resume), false);
+                            }
+                        }
                         if (mStartAnnounced && Globals.getInstance().mPowerupQrRequired >= Powerups.MIN_REQUIRED)
                             // Keep this bounded authority snapshot in its own UTF frame.
                             // A long roster history must not consume the grant frame's budget.
@@ -2465,6 +2666,59 @@ public class TcpServer extends Service {
         return true;
     }
 
+    /** Configure Balanced Random on an idle host without preparing or starting a round. */
+    public boolean setBalancedGameMode(boolean requireQr) {
+        Globals globals = Globals.getInstance();
+        final boolean changingProfile;
+        final boolean tournamentProfile;
+        synchronized (mServerStateLock) {
+            if (!keepListening || mDestroyed || mEndingGame || mCancellationThread != null
+                    || globals.mGameState != Globals.GAME_STATE_NONE
+                    || mStartingGame || mStartAnnounced)
+                return false;
+            if (globals.mBalancedRandom && globals.mGameMode == Globals.GAME_MODE_2TEAMS
+                    && globals.mBalancedRequireQr == requireQr)
+                return true;
+            changingProfile = !globals.mBalancedRandom || globals.mGameMode != Globals.GAME_MODE_2TEAMS;
+            tournamentProfile = globals.mTournamentMode;
+            if (changingProfile) {
+                if (tournamentProfile) {
+                    globals.mBossMode = false;
+                    globals.mCaptureTheFlag = false;
+                    globals.mInfectionMode = false;
+                    globals.resetInfectedPlayers();
+                    globals.mBossHunterCount = -1;
+                    globals.clearBalancedAssignments();
+                    globals.applyTournamentRules();
+                } else {
+                    globals.applyClassicRules(Globals.GAME_MODE_2TEAMS);
+                }
+                globals.mBalancedRandom = true;
+                mBossHunterCount = -1;
+            }
+            globals.mBalancedRequireQr = requireQr;
+            globals.mBalancedGamePrepared = false;
+            globals.clearBalancedCheckIns();
+            mBalancedPreparationGeneration++;
+            cancelBalancedCheckInTimeoutLocked();
+        }
+        if (changingProfile) {
+            Globals.getmPlayerSettingsSemaphore();
+            try {
+                for (Globals.PlayerSettings settings : globals.mPlayerSettings.values()) {
+                    if (tournamentProfile) Globals.applyTournamentRules(settings);
+                    else Globals.applyClassicRules(settings);
+                }
+            } finally {
+                globals.mPlayerSettingsSemaphore.release();
+            }
+        }
+        sendAllGameInfo(SEND_ALL);
+        sendPlayerSettingsUpdate(SEND_ALL, false);
+        sendBroadcast(new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
+        return true;
+    }
+
     /** Switch between standard Tournament and the fixed Player-1 Boss variant. */
     public boolean setBossMode(boolean enabled) {
         Globals globals = Globals.getInstance();
@@ -2570,6 +2824,7 @@ public class TcpServer extends Service {
             mScheduledDuration = endAt > 0 ? Math.max(1, endAt - startAt) : 0;
             mRoundCooldownRecorded = false;
             mBossHunterCount = Globals.getInstance().mBossHunterCount;
+            initializeRoundAnalyticsLocked(token, false);
         }
         startTcpServer();
     }
@@ -2610,7 +2865,7 @@ public class TcpServer extends Service {
                 }
                 clearSharedRosterState();
                 Globals.getInstance().mRoundRoster = null;
-                Globals.getInstance().clearBalancedAssignments();
+                Globals.getInstance().clearBalancedRoundState();
                 cancelBalancedCheckInTimeout();
                 clearPlayerSettingsForNewListener();
             }
@@ -2734,6 +2989,7 @@ public class TcpServer extends Service {
             scoreData.eliminated = client.eliminated;
             scoreData.shots = client.shots;
             scoreData.hits = client.hits;
+            scoreData.playerIdentity = client.playerIdentity;
             scoreData.isConnected = client.out != null;
         } else {
             ScoreData departed = mDepartedScores.get(playerID);
@@ -2744,6 +3000,7 @@ public class TcpServer extends Service {
             scoreData.shots = departed.shots;
             scoreData.hits = departed.hits;
             scoreData.playerName = departed.playerName;
+            scoreData.playerIdentity = departed.playerIdentity;
         }
         return scoreData;
     }
@@ -2777,6 +3034,313 @@ public class TcpServer extends Service {
         boolean isConnected = false;
         // Retained when a player leaves and their name is removed from the lobby.
         String playerName = "";
+        String playerIdentity = "";
+    }
+
+    private static final class RoundAnalytics {
+        String identity;
+        int playerID, priorKills, priorDeaths, kills, deaths, shots, hits;
+        int killStreak, deathStreak, bestKillStreak, bestDeathStreak;
+        long lastSequence;
+        boolean complete, capable;
+
+        void killed() {
+            kills = Math.min(Globals.MAX_SCOREBOARD_VALUE, kills + 1);
+            deathStreak = 0;
+            killStreak = Math.min(Globals.MAX_SCOREBOARD_VALUE, killStreak + 1);
+            bestKillStreak = Math.max(bestKillStreak, killStreak);
+        }
+
+        void died() {
+            deaths = Math.min(Globals.MAX_SCOREBOARD_VALUE, deaths + 1);
+            killStreak = 0;
+            deathStreak = Math.min(Globals.MAX_SCOREBOARD_VALUE, deathStreak + 1);
+            bestDeathStreak = Math.max(bestDeathStreak, deathStreak);
+        }
+    }
+
+    private void initializeRoundAnalyticsLocked(String token, boolean complete) {
+        if (token != null && token.equals(mAnalyticsToken)) return;
+        mAnalyticsToken = token;
+        mAnalyticsComplete = complete;
+        mAnalyticsEndAt = -1;
+        mRoundAnalytics.clear();
+    }
+
+    private RoundAnalytics analyticsLocked(ClientData client) {
+        RoundAnalytics stats = analyticsLocked(client.playerIdentity, client.mPlayerID, client.priorKills, client.priorDeaths);
+        if (stats != null) stats.capable |= client.analyticsCapable;
+        return stats;
+    }
+
+    private RoundAnalytics localAnalyticsLocked() {
+        RoundAnalytics stats = analyticsLocked(LiveJoin.identity(this), Globals.getInstance().mPlayerID,
+                PlayerHistory.baselineKills(this, mRoundToken), PlayerHistory.baselineDeaths(this, mRoundToken));
+        if (stats != null) stats.capable = true;
+        return stats;
+    }
+
+    private RoundAnalytics analyticsLocked(String identity, int playerID, int priorKills, int priorDeaths) {
+        if (!isValidRoundToken(mRoundToken) || !RoundRoster.validIdentity(identity)
+                || playerID < 1 || !Globals.isValidPlayerID(playerID)) return null;
+        if (!mRoundToken.equals(mAnalyticsToken)) initializeRoundAnalyticsLocked(mRoundToken, false);
+        RoundAnalytics stats = mRoundAnalytics.get(identity);
+        if (stats == null) {
+            if (mRoundAnalytics.size() >= RoundRoster.HISTORY_LIMIT) return null;
+            stats = new RoundAnalytics();
+            stats.identity = identity;
+            stats.priorKills = priorKills;
+            stats.priorDeaths = priorDeaths;
+            stats.complete = mAnalyticsComplete;
+            RoundRoster roster = Globals.getInstance().mRoundRoster;
+            RoundRoster.Member member = roster == null ? null : roster.person(identity);
+            if (!mAnalyticsComplete && member != null) {
+                stats.kills = member.kills;
+                stats.deaths = member.deaths;
+            }
+            mRoundAnalytics.put(identity, stats);
+        }
+        stats.playerID = playerID;
+        return stats;
+    }
+
+    private boolean analyticsRoundRunningLocked() {
+        return keepListening && !mDestroyed && !mEndingGame
+                && (mIsDedicated ? Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                : Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) && hasRoundStarted()
+                && isValidRoundToken(mRoundToken);
+    }
+
+    /** Primary and paired secondary gun decrements share the host player's total. */
+    public void reportLocalRoundShots(int count) {
+        if (count < 1 || count > Globals.MAX_RELOAD_COUNT) return;
+        synchronized (mServerStateLock) {
+            if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING || !analyticsRoundRunningLocked()) return;
+            RoundAnalytics stats = localAnalyticsLocked();
+            if (stats != null) stats.shots = (int) Math.min(Globals.MAX_SCOREBOARD_VALUE, (long) stats.shots + count);
+        }
+    }
+
+    /** Victim-side IR confirmation, not shooter-side OUT feedback. */
+    public void reportLocalRoundHit(int attackerID) {
+        synchronized (mServerStateLock) {
+            if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING || !analyticsRoundRunningLocked()) return;
+            RoundAnalytics victim = localAnalyticsLocked();
+            RoundAnalytics attacker = findAnalyticsLocked(attackerID);
+            if (opponentsLocked(victim, attacker)) {
+                attacker.hits = Math.min(Globals.MAX_SCOREBOARD_VALUE, attacker.hits + 1);
+                grantEnemyGPSRevealLocked((byte) attackerID, (byte) victim.playerID);
+            }
+        }
+    }
+
+    /** Called once for an accepted local death, before its local life advances. */
+    public void reportLocalRoundDeath(int attackerID) {
+        synchronized (mServerStateLock) {
+            RoundAnalytics stats = localAnalyticsLocked();
+            reportLocalRoundDeath(attackerID, stats == null ? -1 : stats.deaths);
+        }
+    }
+
+    public void reportLocalRoundDeath(int attackerID, int lifeBefore) {
+        synchronized (mServerStateLock) {
+            if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING || !analyticsRoundRunningLocked()) return;
+            RoundAnalytics victim = localAnalyticsLocked();
+            RoundAnalytics attacker = findAnalyticsLocked(attackerID);
+            if (victim != null && lifeBefore == victim.deaths) {
+                victim.died();
+                if (opponentsLocked(victim, attacker)) attacker.killed();
+            }
+        }
+    }
+
+    private RoundAnalytics findAnalyticsLocked(int id) {
+        if (!mIsDedicated && id == Globals.getInstance().mPlayerID) return localAnalyticsLocked();
+        if (mClientData != null) {
+            ClientData client = mClientData.get(clientIDFromPlayerID((byte) id));
+            if (client != null && !client.lobbyBenched) return analyticsLocked(client);
+        }
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        RoundRoster.Member member = roster == null ? null : roster.seat(id);
+        return member == null || !member.active ? null : mRoundAnalytics.get(member.identity);
+    }
+
+    private boolean opponentsLocked(RoundAnalytics victim, RoundAnalytics attacker) {
+        return victim != null && attacker != null && victim != attacker
+                && (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
+                || Globals.getInstance().calcNetworkTeam((byte) victim.playerID)
+                != Globals.getInstance().calcNetworkTeam((byte) attacker.playerID));
+    }
+
+    private void freezeRoundReports() {
+        synchronized (mServerStateLock) {
+            if (!isValidRoundToken(mRoundToken) || mScheduledStart < 0
+                    || SystemClock.elapsedRealtime() < mScheduledStart) return;
+            if (!mIsDedicated) localAnalyticsLocked();
+            if (mClientData != null) for (ClientData client : mClientData.values()) {
+                analyticsLocked(client);
+                if (!client.lobbyBenched && client.mPlayerID > 0
+                        && (client.clientSocket == null || client.out == null || client.connectionFailed))
+                    mAnalyticsComplete = false;
+            }
+            // A second end request must not change the first frozen result.
+            if (!mCompletedRoundReports.isEmpty()
+                    && mRoundToken.equals(mCompletedRoundReports.values().iterator().next().roundToken)) return;
+            mCompletedRoundReports.clear();
+            long duration = Math.min(7L * 24 * 60 * 60 * 1000,
+                    Math.max(0, (mAnalyticsEndAt >= 0 ? mAnalyticsEndAt : SystemClock.elapsedRealtime())
+                            - mScheduledStart));
+            boolean allCapable = true;
+            for (RoundAnalytics stats : mRoundAnalytics.values()) allCapable &= stats.capable;
+            for (RoundAnalytics stats : mRoundAnalytics.values()) {
+                int before = com.simplecoil.protocol.RoundStatistics.skillIndex(stats.priorKills, stats.priorDeaths);
+                int after = com.simplecoil.protocol.RoundStatistics.skillIndex(
+                        Math.min(PlayerHistory.MAX_TOTAL, stats.priorKills + stats.kills),
+                        Math.min(PlayerHistory.MAX_TOTAL, stats.priorDeaths + stats.deaths));
+                mCompletedRoundReports.put(stats.identity, new RoundReport(mRoundToken, stats.playerID,
+                        stats.kills, stats.deaths, stats.shots, stats.hits,
+                        stats.bestKillStreak, stats.bestDeathStreak, before, after, duration,
+                        stats.complete && mAnalyticsComplete && allCapable));
+            }
+        }
+    }
+
+    public RoundReport getCompletedRoundReport(String token) {
+        synchronized (mServerStateLock) {
+            RoundReport report = mCompletedRoundReports.get(LiveJoin.identity(this));
+            return report != null && report.roundToken.equals(token) ? report : null;
+        }
+    }
+
+    /** Freeze before the local activity clears the active round and its token. */
+    public RoundReport freezeCompletedRoundReport(String token) {
+        synchronized (mServerStateLock) {
+            if (token == null || !token.equals(mRoundToken)) return getCompletedRoundReport(token);
+            freezeRoundReports();
+            return getCompletedRoundReport(token);
+        }
+    }
+
+    private boolean processScopedTelemetryLocked(JSONObject frame, ClientData client) throws JSONException {
+        if (!frame.has(JSON_ROUND_TOKEN) && !frame.has(JSON_TELEMETRY_GENERATION)
+                && !frame.has(JSON_TELEMETRY_LIFE) && !frame.has(JSON_TELEMETRY_SEQUENCE)
+                && !frame.has(JSON_TELEMETRY_TOTAL)) return false;
+        Object token = frame.get(JSON_ROUND_TOKEN);
+        Object rawEvent = frame.get(JSON_TELEMETRY);
+        int generation = TcpJson.getInt(frame, JSON_TELEMETRY_GENERATION);
+        int life = TcpJson.getInt(frame, JSON_TELEMETRY_LIFE);
+        long sequence = TcpJson.getLong(frame, JSON_TELEMETRY_SEQUENCE);
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        RoundRoster.Member member = roster == null ? null : roster.seat(client.mPlayerID);
+        if (!(token instanceof String) || !(rawEvent instanceof String)
+                || !analyticsRoundRunningLocked() || !mRoundToken.equals(token)
+                || member == null || !member.active || !member.identity.equals(client.playerIdentity)
+                || member.generation != generation || life < 0 || sequence < 1) return true;
+        RoundAnalytics reporter = analyticsLocked(client);
+        if (reporter == null || sequence <= reporter.lastSequence) return true;
+        String event = (String) rawEvent;
+        if (JSON_TELEMETRY_SHOT.equals(event)) {
+            int total = TcpJson.getInt(frame, JSON_TELEMETRY_TOTAL);
+            int count = TcpJson.getInt(frame, JSON_TELEMETRY_COUNT);
+            if (total < 0 || total > Globals.MAX_SCOREBOARD_VALUE
+                    || count < 1 || count > Globals.MAX_RELOAD_COUNT
+                    || life > reporter.deaths) return true;
+            acceptTelemetrySequenceLocked(reporter, sequence);
+            reporter.shots = Math.max(reporter.shots, total);
+            client.shots = reporter.shots;
+        } else if (JSON_TELEMETRY_HIT.equals(event)
+                || JSON_TELEMETRY_ELIMINATION.equals(event)) {
+            int attackerID = TcpJson.getInt(frame, JSON_TELEMETRY_ATTACKER);
+            if (life != reporter.deaths || client.awaitingRespawn
+                    || attackerID < 0 || !Globals.isValidPlayerID(attackerID)) return true;
+            int attackerGeneration = attackerID == 0 ? -1
+                    : TcpJson.getInt(frame, JSON_TELEMETRY_ATTACKER_GENERATION);
+            if (attackerID > 0 && (attackerGeneration < 0 || attackerGeneration > 255)) return true;
+            RoundRoster.Member source = roster.seat(attackerID);
+            RoundAnalytics attacker = findAnalyticsLocked(attackerID);
+            if (attackerID > 0 && (source == null || !source.active
+                    || source.generation != attackerGeneration || attacker == null
+                    || !source.identity.equals(attacker.identity))) {
+                acceptTelemetrySequenceLocked(reporter, sequence);
+                mAnalyticsComplete = false;
+                if (JSON_TELEMETRY_ELIMINATION.equals(event) && recordClientEliminationLocked(client, 0))
+                    sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+                return true;
+            }
+            if (!opponentsLocked(reporter, attacker)
+                    && !(attackerID == 0 && JSON_TELEMETRY_ELIMINATION.equals(event))) return true;
+            acceptTelemetrySequenceLocked(reporter, sequence);
+            if (JSON_TELEMETRY_ELIMINATION.equals(event)) {
+                recordClientEliminationLocked(client, attackerID);
+            } else {
+                attacker.hits = Math.min(Globals.MAX_SCOREBOARD_VALUE, attacker.hits + 1);
+                ClientData shooter = mClientData.get(clientIDFromPlayerID((byte) attackerID));
+                if (shooter != null) shooter.hits = attacker.hits;
+                grantEnemyGPSRevealLocked((byte) attackerID, client.mPlayerID);
+            }
+        } else if (JSON_TELEMETRY_GRENADE_HIT.equals(event)) {
+            int grenadeID = TcpJson.getInt(frame, JSON_TELEMETRY_GRENADE_ID);
+            if (life != reporter.deaths || client.awaitingRespawn
+                    || grenadeID < 1 || !Globals.isValidGrenadeID(grenadeID)) return true;
+            // Grenade damage belongs in combat history, not gun accuracy.
+            acceptTelemetrySequenceLocked(reporter, sequence);
+        } else return true;
+        // Ammo decrements can arrive many times per second from both guns.
+        // Post-round bookkeeping must not rebuild the host UI per bullet.
+        if (!JSON_TELEMETRY_SHOT.equals(event))
+            sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
+        return true;
+    }
+
+    private void acceptTelemetrySequenceLocked(RoundAnalytics reporter, long sequence) {
+        if (sequence != reporter.lastSequence + 1) mAnalyticsComplete = false;
+        reporter.capable = true;
+        reporter.lastSequence = sequence;
+    }
+
+    private boolean recordClientEliminationLocked(ClientData victim, int attackerID) {
+        if (victim.awaitingRespawn) return false;
+        RoundAnalytics victimStats = analyticsLocked(victim);
+        RoundAnalytics attackerStats = findAnalyticsLocked(attackerID);
+        ClientData scoringPlayer = mClientData.get(clientIDFromPlayerID((byte) attackerID));
+        if (attackerID != 0 && (attackerID == victim.mPlayerID || attackerID < 1
+                || !Globals.isValidPlayerID(attackerID)
+                || scoringPlayer == null && (mIsDedicated || attackerID != Globals.getInstance().mPlayerID)
+                || scoringPlayer != null && scoringPlayer.lobbyBenched
+                || Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
+                && Globals.getInstance().calcNetworkTeam((byte) attackerID) == victim.getNetworkTeam())) return false;
+        if (mIsDedicated) victim.awaitingRespawn = true;
+        victim.eliminated = Math.min(Globals.MAX_SCOREBOARD_VALUE, victim.eliminated + 1);
+        if (scoringPlayer != null) scoringPlayer.points = Math.min(Globals.MAX_SCOREBOARD_VALUE, scoringPlayer.points + 1);
+        if (victimStats != null) {
+            victimStats.died();
+            if (attackerStats != null) attackerStats.killed();
+        }
+        clearEnemyGPSRevealsForPlayerLocked(victim.mPlayerID);
+        clearEnemyGPSRevealsForPlayerLocked((byte) attackerID);
+        RoundRoster roster = Globals.getInstance().mRoundRoster;
+        RoundRoster.Member member = roster == null ? null : roster.seat(victim.mPlayerID);
+        if (member != null && roster.token.equals(mRoundToken)) {
+            int life = Math.max(member.deaths, victim.eliminated);
+            roster.update(member.id, member.generation, member.kills, life, member.captures, member.infected);
+            RoundRoster.Member attacker = roster.seat(attackerID);
+            if (attacker != null && attackerStats != null)
+                roster.update(attacker.id, attacker.generation, attackerStats.kills, attacker.deaths,
+                        attacker.captures, attacker.infected);
+            Globals.getInstance().recordPowerupRuntime(roster.token, member.id,
+                    member.generation, life, Globals.GAME_STATE_ELIMINATED, 0, false);
+            if (Globals.getInstance().mPowerupQrRequired >= Powerups.MIN_REQUIRED) publishPowerupStateLocked(null);
+        }
+        // Peer UDP already delivers its own OUT/team confirmations.
+        if (mIsDedicated && attackerID > 0) {
+            sendTCPMessageID(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ELIMINATED + victim.mPlayerID,
+                    (byte) attackerID, true);
+            if (Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA)
+                sendTCPMessageTeam(TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_TEAMELIMINATED,
+                        (byte) attackerID, false, true);
+        }
+        if (scoringPlayer != null && hasReachedScoreLimit(scoringPlayer)) endGame();
+        return true;
     }
 
     private class ClientData {
@@ -2809,6 +3373,7 @@ public class TcpServer extends Service {
         private volatile int priorDeaths;
         // Dedicated-host state: only a server-observed death may be revived.
         private volatile boolean awaitingRespawn;
+        private volatile boolean analyticsCapable;
 
         private int getNetworkTeam() {
             // The host can change the game mode after players have joined the lobby.
@@ -3005,6 +3570,10 @@ public class TcpServer extends Service {
                                             } else if (entry.getValue().lobbyBenched) {
                                                 continue;
                                             } else if (message.startsWith(NetMsg.NETMSG_ELIMINATED)) {
+                                                if (entry.getValue().analyticsCapable) {
+                                                    Log.w(TAG, "Ignoring unscoped elimination from an analytics-capable phone");
+                                                    continue;
+                                                }
                                                 if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
                                                         || !hasRoundStarted()
                                                         || entry.getValue().mPlayerID <= 0
@@ -3054,6 +3623,12 @@ public class TcpServer extends Service {
                                                 scoringPlayer.points = Math.min(Globals.MAX_SCOREBOARD_VALUE,
                                                         scoringPlayer.points + 1);
                                                 synchronized (mServerStateLock) {
+                                                    RoundAnalytics victimStats = analyticsLocked(entry.getValue());
+                                                    RoundAnalytics killerStats = analyticsLocked(scoringPlayer);
+                                                    if (victimStats != null && killerStats != null) {
+                                                        victimStats.died();
+                                                        killerStats.killed();
+                                                    }
                                                     // Do not leak an opponent's last location into a
                                                     // respawn: a death ends every reveal involving either
                                                     // player without waiting for the normal 10-second expiry.
@@ -3297,15 +3872,20 @@ public class TcpServer extends Service {
             }
             if (player.has(JSON_TELEMETRY)) {
                 if (client.lobbyBenched) return;
-                // Telemetry is intentionally best-effort. It feeds hosted-game
-                // scoreboards and visualizers, but never decides who was killed
-                // or whether a respawn is allowed.
+                // Scoped telemetry feeds the post-round ledger; only the
+                // victim's validated elimination can award a kill. A playing
+                // phone host's own respawn is not a pause of the shared round.
                 if (client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)
-                        || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                        || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                        || mIsDedicated && Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
                         || !hasRoundStarted()) {
                     return;
                 }
                 try {
+                    synchronized (mServerStateLock) {
+                        if (processScopedTelemetryLocked(player, client)) return;
+                    }
+                    if (client.analyticsCapable) return;
                     Object eventValue = player.get(JSON_TELEMETRY);
                     if (!(eventValue instanceof String))
                         return;
@@ -3318,6 +3898,10 @@ public class TcpServer extends Service {
                         if (count < 1 || count > Globals.MAX_RELOAD_COUNT)
                             return;
                         client.shots = Math.min(Globals.MAX_SCOREBOARD_VALUE, client.shots + count);
+                        synchronized (mServerStateLock) {
+                            RoundAnalytics stats = analyticsLocked(client);
+                            if (stats != null) stats.shots = client.shots;
+                        }
                         sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                     } else if (JSON_TELEMETRY_HIT.equals(event)) {
                         int rawAttackerID = TcpJson.getInt(player, JSON_TELEMETRY_ATTACKER);
@@ -3332,6 +3916,8 @@ public class TcpServer extends Service {
                         }
                         attacker.hits = Math.min(Globals.MAX_SCOREBOARD_VALUE, attacker.hits + 1);
                         synchronized (mServerStateLock) {
+                            RoundAnalytics stats = analyticsLocked(attacker);
+                            if (stats != null) stats.hits = attacker.hits;
                             grantEnemyGPSRevealLocked(attackerID, client.mPlayerID);
                         }
                         sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
@@ -3351,7 +3937,7 @@ public class TcpServer extends Service {
                         if (owner != null && owner != client
                                 && (Globals.getInstance().mGameMode == Globals.GAME_MODE_FFA
                                 || owner.getNetworkTeam() != client.getNetworkTeam())) {
-                            owner.hits = Math.min(Globals.MAX_SCOREBOARD_VALUE, owner.hits + 1);
+                            // Grenade hits are not gun hits and cannot improve accuracy.
                             sendBroadcast(new Intent(NetMsg.NETMSG_PLAYERDATAUPDATE));
                         }
                     }
@@ -3514,6 +4100,7 @@ public class TcpServer extends Service {
             String playerName;
             int priorKills;
             int priorDeaths;
+            boolean analyticsCapable;
             try {
                 // Presence alone is not a reconnect request. In particular, a
                 // normal second player can send {"rejoin":false}; treating that
@@ -3533,6 +4120,22 @@ public class TcpServer extends Service {
                 playerName = TcpJson.getPlayerName(player, JSON_PLAYERNAME);
                 priorKills = player.has(JSON_PRIOR_KILLS) ? TcpJson.getInt(player, JSON_PRIOR_KILLS) : 0;
                 priorDeaths = player.has(JSON_PRIOR_DEATHS) ? TcpJson.getInt(player, JSON_PRIOR_DEATHS) : 0;
+                analyticsCapable = player.has(JSON_ROUND_ANALYTICS)
+                        && TcpJson.getBoolean(player, JSON_ROUND_ANALYTICS);
+                if (player.has(JSON_HISTORY_ROUND_TOKEN) || player.has(JSON_HISTORY_BASELINE_KILLS)
+                        || player.has(JSON_HISTORY_BASELINE_DEATHS)) {
+                    Object historyToken = player.get(JSON_HISTORY_ROUND_TOKEN);
+                    int baselineKills = TcpJson.getInt(player, JSON_HISTORY_BASELINE_KILLS);
+                    int baselineDeaths = TcpJson.getInt(player, JSON_HISTORY_BASELINE_DEATHS);
+                    if (!(historyToken instanceof String) || !isValidRoundToken((String) historyToken)
+                            || baselineKills < 0 || baselineKills > PlayerHistory.MAX_TOTAL
+                            || baselineDeaths < 0 || baselineDeaths > PlayerHistory.MAX_TOTAL) return;
+                    if ((mStartAnnounced || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                            && historyToken.equals(mRoundToken)) {
+                        priorKills = baselineKills;
+                        priorDeaths = baselineDeaths;
+                    }
+                }
                 if (priorKills < 0 || priorKills > PlayerHistory.MAX_TOTAL
                         || priorDeaths < 0 || priorDeaths > PlayerHistory.MAX_TOTAL)
                     return;
@@ -3548,6 +4151,10 @@ public class TcpServer extends Service {
             Globals globals = Globals.getInstance();
             RoundRoster roster = globals.mRoundRoster;
             boolean playing = mStartAnnounced || globals.mGameState != Globals.GAME_STATE_NONE;
+            if (playing && client.mPlayerID != 0 && !client.playerIdentity.equals(identity)) {
+                Log.w(TAG, "Ignoring a registered player's identity change during a round");
+                return;
+            }
             if (playing && client.mPlayerID == 0) {
                 RoundRoster.Member member = roster == null ? null : roster.person(identity);
                 if (requestedTeam != 0 && roster != null && roster.token.equals(mRoundToken)) {
@@ -3567,6 +4174,9 @@ public class TcpServer extends Service {
                             Set<Byte> checked = new HashSet<>(globals.mBalancedCheckedIn);
                             checked.add(id);
                             globals.setBalancedAssignments(teams, checked);
+                            Map<String, Integer> retained = new HashMap<>(globals.mRetainedBalancedTeams);
+                            retained.put(identity, member.team);
+                            globals.setRetainedBalancedTeams(retained);
                         }
                         globals.replaceInfectionSeat(id, member.infected);
                         try { client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
@@ -3669,14 +4279,24 @@ public class TcpServer extends Service {
             client.lobbyAddress = inetAddress;
             client.priorKills = priorKills;
             client.priorDeaths = priorDeaths;
+            client.analyticsCapable = analyticsCapable;
+            synchronized (mServerStateLock) {
+                if (playing) {
+                    RoundAnalytics stats = analyticsLocked(client);
+                    if (stats != null) {
+                        client.shots = stats.shots;
+                        client.hits = stats.hits;
+                    }
+                }
+            }
             if (newRegistration && Globals.getInstance().mBalancedRandom && !playing) {
-                Globals.getInstance().clearBalancedAssignments();
-                cancelBalancedCheckInTimeout();
+                updateRetainedBalancedLobby(getClientRecipients());
                 sendBroadcast(new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
             }
             requestFullGPSUpdate(); // Send all GPS info because of the accepted client
             ScoreData departed = mDepartedScores.remove(id);
-            if (newRegistration && departed != null && requestedTeam == 0) {
+            if (newRegistration && departed != null && requestedTeam == 0
+                    && identity.equals(departed.playerIdentity)) {
                 client.points = departed.points;
                 client.eliminated = departed.eliminated;
                 client.shots = departed.shots;
@@ -3702,6 +4322,16 @@ public class TcpServer extends Service {
             if (mClientData.get(clientID) != client)
                 return;
             synchronized (mServerStateLock) {
+                if (client.mPlayerID > 0 && !mEndingGame && mStartAnnounced && hasRoundStarted()
+                        && isValidRoundToken(mRoundToken)
+                        && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+                    // A close can lose its trailing reports while peer UDP
+                    // continues. Keep observed totals, but do not claim full
+                    // round coverage after a participant's transport is lost.
+                    mAnalyticsComplete = false;
+                    RoundAnalytics stats = analyticsLocked(client);
+                    if (stats != null) stats.complete = false;
+                }
                 mEndVotes &= ~EndGameVotes.playerBit(client.mPlayerID);
                 Globals.getInstance().mEndGameVotes = mEndVotes;
             }
@@ -3762,8 +4392,7 @@ public class TcpServer extends Service {
                     if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                             && !mStartAnnounced
                             && Globals.getInstance().mBalancedRandom) {
-                        Globals.getInstance().clearBalancedAssignments();
-                        cancelBalancedCheckInTimeout();
+                        updateRetainedBalancedLobby(getClientRecipients());
                         sendBroadcast(new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
                     }
                     sendAllGameInfo(SEND_ALL);
@@ -3780,10 +4409,16 @@ public class TcpServer extends Service {
         }
     }
 
-    public void cancelServer() {
+    public void cancelServer() { cancelServer(false); }
+
+    /** Ordinary round teardown retains team membership for the replacement lobby. */
+    public void cancelServer(boolean preserveBalancedTeams) {
         synchronized (mServerStateLock) {
             if (mCancellationThread != null)
                 return;
+            mPreserveBalancedTeamsOnCancellation = preserveBalancedTeams;
+            Globals.getInstance().mBalancedGamePrepared = false;
+            mBalancedPreparationGeneration++;
             // Also retire a peer host's start retained after its listener stopped.
             mStartAnnounced = false;
             mScheduledStart = -1;

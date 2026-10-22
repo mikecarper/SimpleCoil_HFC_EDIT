@@ -29,6 +29,43 @@ final class BalancedTeams {
 
     private BalancedTeams() { }
 
+    /** Keep existing players together; only assign players who do not have a team yet. */
+    static Map<Byte, Integer> retain(List<Player> players, Map<Byte, Integer> previous, Random random) {
+        if (players == null || players.isEmpty() || players.size() > Globals.MAX_PLAYER_ID)
+            throw new IllegalArgumentException("Invalid retained balanced roster");
+        if ((previous == null || previous.isEmpty()) && players.size() > 1)
+            return assign(players, random);
+        if (previous == null) previous = Collections.emptyMap();
+        Map<Byte, Integer> result = new HashMap<>();
+        int[] counts = new int[3];
+        int[] strengths = new int[3];
+        List<Player> newcomers = new ArrayList<>();
+        for (Player player : players) {
+            Integer team = previous.get(player.id);
+            if (team == null || team < 1 || team > 2) {
+                newcomers.add(player);
+                continue;
+            }
+            result.put(player.id, team);
+            counts[team]++;
+            strengths[team] += player.strength();
+        }
+        Collections.shuffle(newcomers, random);
+        for (Player player : newcomers) {
+            int team;
+            if (counts[1] != counts[2])
+                team = counts[1] < counts[2] ? 1 : 2;
+            else if (strengths[1] != strengths[2])
+                team = strengths[1] < strengths[2] ? 1 : 2;
+            else
+                team = random.nextBoolean() ? 1 : 2;
+            result.put(player.id, team);
+            counts[team]++;
+            strengths[team] += player.strength();
+        }
+        return result;
+    }
+
     static Map<Byte, Integer> assign(List<Player> players, Random random) {
         if (players == null || players.size() < 2 || players.size() > Globals.MAX_PLAYER_ID)
             throw new IllegalArgumentException("Balanced teams need 2 to "

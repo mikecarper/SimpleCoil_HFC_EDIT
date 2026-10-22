@@ -280,16 +280,34 @@ public class Globals {
     public volatile int mBossHunterCount = -1;
     public volatile boolean mBalancedRandom = false;
     public volatile boolean mBalancedRequireQr = true;
+    public volatile boolean mBalancedGamePrepared = false;
     // Zero disables the gameplay camera and QR rewards. The host advertises
     // this setting to every phone before a round starts.
     public volatile int mPowerupQrRequired = 0;
     // Published as immutable snapshots so UDP and UI readers never see a partial assignment.
     public volatile Map<Byte, Integer> mBalancedTeams = Collections.emptyMap();
     public volatile Set<Byte> mBalancedCheckedIn = Collections.emptySet();
+    // Host-local session memory survives round teardown and seat ID changes.
+    // It is never advertised to peers; their UUID is resolved during registration.
+    public volatile Map<String, Integer> mRetainedBalancedTeams = Collections.emptyMap();
 
     public void clearBalancedAssignments() {
+        clearBalancedRoundState();
+        mRetainedBalancedTeams = Collections.emptyMap();
+    }
+
+    public void clearBalancedRoundState() {
         mBalancedTeams = Collections.emptyMap();
         mBalancedCheckedIn = Collections.emptySet();
+        mBalancedGamePrepared = false;
+    }
+
+    public void clearBalancedCheckIns() {
+        mBalancedCheckedIn = Collections.emptySet();
+    }
+
+    public void setRetainedBalancedTeams(Map<String, Integer> teams) {
+        mRetainedBalancedTeams = Collections.unmodifiableMap(new HashMap<>(teams));
     }
 
     public synchronized void resetInfectedPlayers() {

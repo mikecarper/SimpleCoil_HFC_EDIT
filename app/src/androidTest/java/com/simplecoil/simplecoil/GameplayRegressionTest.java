@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothGattService;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -48,6 +49,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -83,9 +85,21 @@ public class GameplayRegressionTest {
     private boolean originalWaitingForRoundEnd;
     private String originalSittingOutToken;
     private com.simplecoil.protocol.RoundRoster originalRoundRoster;
+    private boolean originalBalancedRandom, originalBalancedRequireQr, originalBalancedPrepared, originalLobbyRoundActive;
+    private Map<Byte, Integer> originalBalancedTeams;
+    private Set<Byte> originalBalancedCheckedIn;
+    private Map<String, Integer> originalRetainedBalancedTeams;
 
     @Before
     public void setUp() {
+        Globals initialGlobals = Globals.getInstance();
+        originalBalancedRandom = initialGlobals.mBalancedRandom;
+        originalBalancedRequireQr = initialGlobals.mBalancedRequireQr;
+        originalBalancedPrepared = initialGlobals.mBalancedGamePrepared;
+        originalLobbyRoundActive = initialGlobals.mLobbyRoundActive;
+        originalBalancedTeams = initialGlobals.mBalancedTeams;
+        originalBalancedCheckedIn = initialGlobals.mBalancedCheckedIn;
+        originalRetainedBalancedTeams = initialGlobals.mRetainedBalancedTeams;
         InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
             originalEliminationCount = (int) get(null, "mEliminationCount");
             eliminationCountCaptured = true;
@@ -147,6 +161,10 @@ public class GameplayRegressionTest {
             Globals globals = Globals.getInstance();
             globals.mPlayerID = 1;
             globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            globals.mBalancedRandom = false;
+            globals.mBalancedRequireQr = true;
+            globals.clearBalancedAssignments();
+            globals.mLobbyRoundActive = false;
             globals.mFullShields = 0;
             globals.mFullReload = 30;
             globals.mRespawnTime = 10;
@@ -214,12 +232,267 @@ public class GameplayRegressionTest {
         Globals.getInstance().mSittingOutRoundToken = originalSittingOutToken;
         Globals.getInstance().mRoundRoster = originalRoundRoster;
         Globals.getInstance().mRequestedJoinTeam = 0;
+        Globals.getInstance().mBalancedRandom = originalBalancedRandom;
+        Globals.getInstance().mBalancedRequireQr = originalBalancedRequireQr;
+        Globals.getInstance().mBalancedGamePrepared = originalBalancedPrepared;
+        Globals.getInstance().mBalancedTeams = originalBalancedTeams;
+        Globals.getInstance().mBalancedCheckedIn = originalBalancedCheckedIn;
+        Globals.getInstance().mRetainedBalancedTeams = originalRetainedBalancedTeams;
+        Globals.getInstance().mLobbyRoundActive = originalLobbyRoundActive;
     }
 
     private void restoreEliminationCount() {
         if (eliminationCountCaptured)
             InstrumentationRegistry.getInstrumentation().runOnMainSync(() ->
                     set(null, "mEliminationCount", originalEliminationCount));
+    }
+
+    @Test
+    public void balancedLobbyHostRebalanceButtonRequestsExactlyOneRebalance() {
+        scenario.onActivity(activity -> {
+            try (BalancedModePreferences ignored = new BalancedModePreferences(activity)) {
+                RecordingLobbyTcpServer server = prepareBalancedLobby(activity);
+                invoke(activity, "renderLobby");
+                View button = activity.findViewById(R.id.lobby_rebalance_button);
+                assertEquals(View.VISIBLE, button.getVisibility());
+                assertTrue(button.isEnabled());
+                assertEquals(View.VISIBLE, activity.findViewById(R.id.lobby_rebalance_hint).getVisibility());
+
+                button.performClick();
+
+                assertEquals(1, server.rebalances);
+            }
+        });
+    }
+
+    @Test
+    public void balancedLobbyRebalanceRejectsClientsCountdownPendingStartsAndUnavailableHost() {
+        scenario.onActivity(activity -> {
+            try (BalancedModePreferences ignored = new BalancedModePreferences(activity)) {
+                RecordingLobbyTcpServer server = prepareBalancedLobby(activity);
+                View button = activity.findViewById(R.id.lobby_rebalance_button);
+                set(activity, "mIsServer", false);
+                invoke(activity, "renderLobby");
+                assertEquals(View.GONE, button.getVisibility());
+                invoke(activity, "rebalanceLobbyTeams");
+                set(activity, "mIsServer", true);
+                for (int blocked = 0; blocked < 6; blocked++) {
+                    server.ready = blocked != 0;
+                    server.pendingStart = blocked == 1;
+                    set(activity, "mLobbyTakeoverPending", blocked == 2);
+                    set(activity, "mReady", blocked != 3);
+                    Globals.getInstance().mLobbyRoundActive = blocked == 4;
+                    Globals.getInstance().mGameState = blocked == 5
+                            ? Globals.GAME_STATE_ELIMINATED : Globals.GAME_STATE_NONE;
+                    invoke(activity, "renderLobby");
+                    assertFalse("Unsafe lobby state enabled Rebalance", button.isEnabled());
+                    invoke(activity, "rebalanceLobbyTeams");
+                }
+                assertEquals("A rejected action still reached the host", 0, server.rebalances);
+                Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+                Globals.getInstance().mLobbyRoundActive = false;
+                set(activity, "mLobbyTakeoverPending", false);
+                set(activity, "mReady", true);
+                server.pendingStart = false;
+                server.ready = true;
+                Globals.getInstance().mBalancedRandom = false;
+                invoke(activity, "renderLobby");
+                assertEquals(View.GONE, button.getVisibility());
+                invoke(activity, "rebalanceLobbyTeams");
+                assertEquals(0, server.rebalances);
+            }
+        });
+    }
+
+    @Test
+    public void balancedRoundEndRetainsModeAndUuidTeamsButClearsRoundCheckIns() {
+        scenario.onActivity(activity -> {
+            try (BalancedModePreferences preferences = new BalancedModePreferences(activity)) {
+                RecordingLobbyTcpServer server = prepareBalancedLobby(activity);
+                // A network-selected mode can differ from the old local preference.
+                preferences.preferences.edit().putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).commit();
+                Globals globals = Globals.getInstance();
+                Map<String, Integer> remembered = Collections.singletonMap(
+                        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 2);
+                globals.setRetainedBalancedTeams(remembered);
+                globals.setBalancedAssignments(Collections.singletonMap((byte) 1, 2),
+                        Collections.singleton((byte) 1));
+                globals.mBalancedGamePrepared = true;
+                globals.mGameState = Globals.GAME_STATE_RUNNING;
+
+                invoke(activity, "endGame");
+
+                assertTrue(globals.mBalancedRandom);
+                assertTrue(globals.mBalancedRequireQr);
+                assertEquals(Globals.GAME_MODE_2TEAMS, globals.mGameMode);
+                assertEquals(remembered, globals.mRetainedBalancedTeams);
+                assertTrue(globals.mBalancedTeams.isEmpty());
+                assertTrue(globals.mBalancedCheckedIn.isEmpty());
+                assertFalse(globals.mBalancedGamePrepared);
+                assertEquals(1, server.preservedCancellations);
+                assertFalse((boolean) get(activity, "mReady"));
+            }
+        });
+    }
+
+    @Test
+    public void leavingBalancedRoundClearsRememberedTeamsAndReturnsToLocalDefaultMode() {
+        scenario.onActivity(activity -> {
+            try (BalancedModePreferences preferences = new BalancedModePreferences(activity)) {
+                prepareBalancedLobby(activity);
+                preferences.preferences.edit().putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false)
+                        .putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, false)
+                        .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_4TEAMS).commit();
+                Globals globals = Globals.getInstance();
+                globals.setRetainedBalancedTeams(Collections.singletonMap(
+                        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 2));
+                globals.mGameState = Globals.GAME_STATE_RUNNING;
+
+                invoke(activity, "endGame", new Class<?>[]{boolean.class}, true);
+
+                assertFalse(globals.mBalancedRandom);
+                assertEquals(Globals.GAME_MODE_4TEAMS, globals.mGameMode);
+                assertTrue(globals.mRetainedBalancedTeams.isEmpty());
+            }
+        });
+    }
+
+    @Test
+    public void balancedQrScanWaitsForRoundPreparationEvenWhenTeamsAreRetained() {
+        scenario.onActivity(activity -> {
+            try (BalancedModePreferences ignored = new BalancedModePreferences(activity)) {
+                prepareBalancedLobby(activity);
+                Globals globals = Globals.getInstance();
+                globals.setBalancedAssignments(Collections.singletonMap(globals.mPlayerID, 1), Collections.emptySet());
+                globals.mBalancedGamePrepared = false;
+                assertEquals(false, invokeResult(activity, "isBalancedQrCheckInPending"));
+                assertEquals(false, invokeResult(activity, "isTeamAssignmentScanAvailable"));
+                invoke(activity, "renderLobby");
+                assertFalse(activity.findViewById(R.id.lobby_scan_button).isEnabled());
+
+                globals.mBalancedGamePrepared = true;
+
+                assertEquals(true, invokeResult(activity, "isBalancedQrCheckInPending"));
+                assertEquals(true, invokeResult(activity, "isTeamAssignmentScanAvailable"));
+                globals.setBalancedAssignments(globals.mBalancedTeams, Collections.singleton(globals.mPlayerID));
+                assertEquals(false, invokeResult(activity, "isBalancedQrCheckInPending"));
+            }
+        });
+    }
+
+    @Test
+    public void balancedClientRebalanceClosesOldCheckInScannerAndCancelsPendingResume() {
+        scenario.onActivity(activity -> {
+            try (BalancedModePreferences ignored = new BalancedModePreferences(activity)) {
+                prepareBalancedLobby(activity);
+                set(activity, "mIsServer", false);
+                Globals globals = Globals.getInstance();
+                globals.setBalancedAssignments(Collections.singletonMap(globals.mPlayerID, 2), Collections.emptySet());
+                globals.mBalancedGamePrepared = true;
+                set(activity, "mTeamAssignmentQrScannerActive", true);
+                set(activity, "mTeamAssignmentQrOpenWhenResumed", true);
+                View overlay = activity.findViewById(R.id.respawn_qr_scanner_overlay);
+                overlay.setVisibility(View.VISIBLE);
+
+                // The client receives the new assignment before another Start prepares check-in.
+                globals.mBalancedGamePrepared = false;
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
+
+                assertEquals(false, get(activity, "mTeamAssignmentQrScannerActive"));
+                assertEquals(false, get(activity, "mTeamAssignmentQrOpenWhenResumed"));
+                assertEquals(View.GONE, overlay.getVisibility());
+                assertEquals(false, invokeResult(activity, "isBalancedQrCheckInPending"));
+                assertFalse(activity.findViewById(R.id.lobby_scan_button).isEnabled());
+            }
+        });
+    }
+
+    @Test
+    public void balancedLobbyUpdateDoesNotCloseGameplayRespawnOrCtfScanners() {
+        scenario.onActivity(activity -> {
+            boolean previousCtf = Globals.getInstance().mCaptureTheFlag;
+            try (BalancedModePreferences ignored = new BalancedModePreferences(activity)) {
+                prepareBalancedLobby(activity);
+                set(activity, "mIsServer", false);
+                View overlay = activity.findViewById(R.id.respawn_qr_scanner_overlay);
+                for (boolean ctf : new boolean[]{false, true}) {
+                    invoke(activity, "hideQrScanner");
+                    Globals.getInstance().mGameState = ctf
+                            ? Globals.GAME_STATE_RUNNING : Globals.GAME_STATE_ELIMINATED;
+                    Globals.getInstance().mCaptureTheFlag = ctf;
+                    set(activity, ctf ? "mCtfQrScannerActive" : "mRespawnQrScannerActive", true);
+                    set(activity, ctf ? "mCtfQrOpenWhenResumed" : "mRespawnQrOpenWhenResumed", true);
+                    overlay.setVisibility(View.VISIBLE);
+
+                    receiveNetwork(activity, new Intent(NetMsg.NETMSG_BALANCEDLOBBY));
+
+                    assertEquals("A lobby refresh closed a gameplay scanner", true,
+                            get(activity, ctf ? "mCtfQrScannerActive" : "mRespawnQrScannerActive"));
+                    assertEquals("A lobby refresh canceled gameplay scanner recovery", true,
+                            get(activity, ctf ? "mCtfQrOpenWhenResumed" : "mRespawnQrOpenWhenResumed"));
+                    assertEquals(View.VISIBLE, overlay.getVisibility());
+                }
+            } finally {
+                Globals.getInstance().mCaptureTheFlag = previousCtf;
+            }
+        });
+    }
+
+    @Test
+    public void balancedModeMenuOffersQrAndNoQrAndChangesOnlyAnUncommittedHostLobby() {
+        scenario.onActivity(activity -> {
+            try (BalancedModePreferences ignored = new BalancedModePreferences(activity)) {
+                RecordingLobbyTcpServer server = prepareBalancedLobby(activity);
+                Globals.getInstance().mBalancedRandom = false;
+                Globals.getInstance().applyTournamentRules();
+                PopupMenu menu = new PopupMenu(activity, activity.findViewById(android.R.id.content));
+                menu.getMenuInflater().inflate(R.menu.game_mode_menu, menu.getMenu());
+                assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_qr_item).isVisible());
+                assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item).isVisible());
+                assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_qr_item).isEnabled());
+                assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item).isEnabled());
+                assertTrue(activity.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item)));
+                assertTrue(Globals.getInstance().mBalancedRandom);
+                assertFalse(Globals.getInstance().mBalancedRequireQr);
+                assertTrue("Selecting balanced teams disabled tournament rules", Globals.getInstance().mTournamentMode);
+                assertTrue(Globals.getInstance().mVibrateOnHit);
+                assertFalse(Globals.getInstance().mAllowAutoShotMode);
+                assertFalse(Globals.getInstance().mAllowBurst3ShotMode);
+                assertEquals(Globals.RELOAD_COUNT, Globals.getInstance().mFullReload);
+                assertEquals(1, server.modeChanges);
+                assertTrue(activity.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_qr_item)));
+                assertTrue(Globals.getInstance().mBalancedRequireQr);
+                assertEquals(2, server.modeChanges);
+                server.pendingStart = true;
+                activity.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item));
+                set(activity, "mIsServer", false);
+                server.pendingStart = false;
+                activity.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item));
+                assertEquals("A committed round or client changed the host's mode", 2, server.modeChanges);
+                assertTrue(Globals.getInstance().mBalancedRequireQr);
+            }
+        });
+    }
+
+    private RecordingLobbyTcpServer prepareBalancedLobby(FullscreenActivity activity) {
+        Globals globals = Globals.getInstance();
+        globals.mGameState = Globals.GAME_STATE_NONE;
+        globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+        globals.mTournamentMode = false;
+        globals.mBossMode = false;
+        globals.mCaptureTheFlag = false;
+        globals.mInfectionMode = false;
+        globals.mBalancedRandom = true;
+        globals.mBalancedRequireQr = true;
+        globals.mBalancedGamePrepared = false;
+        globals.mLobbyRoundActive = false;
+        set(activity, "mUseNetwork", true);
+        set(activity, "mReady", true);
+        set(activity, "mIsServer", true);
+        set(activity, "mLobbyTakeoverPending", false);
+        RecordingLobbyTcpServer server = new RecordingLobbyTcpServer();
+        set(activity, "mTcpServer", server);
+        return server;
     }
 
     @Test
@@ -287,6 +560,438 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void roundAnalyticsCountsBothGunDeltasButNotCountdownReloadEmpOrReconnect() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                set(activity, "mRoundShots", 0);
+                set(activity, "mLastShotCount", (byte) 30);
+                set(activity, "mSecondaryLastShotCount", (byte) 30);
+                powerupAmmoTelemetry(activity, false, 27);
+                powerupAmmoTelemetry(activity, true, 25);
+                assertEquals(8, get(activity, "mRoundShots"));
+                powerupAmmoTelemetry(activity, true, 25);
+                assertEquals(8, get(activity, "mRoundShots"));
+                set(activity, "mStartGameTimer", true);
+                powerupAmmoTelemetry(activity, false, 26);
+                set(activity, "mStartGameTimer", false);
+                set(activity, "mReloading", 1);
+                powerupAmmoTelemetry(activity, false, 0);
+                set(activity, "mReloading", 0);
+                set(activity, "mLastShotCount", (byte) 30);
+                ((long[]) get(activity, "mPowerupUntil"))[Powerups.EMP] = SystemClock.elapsedRealtime() - 1;
+                powerupAmmoTelemetry(activity, false, 0);
+                ((long[]) get(activity, "mPowerupUntil"))[Powerups.EMP] = 0;
+                set(activity, "mSecondaryCommunicating", false);
+                powerupAmmoTelemetry(activity, true, 20);
+                assertEquals("A reconnect sample is a baseline, not five shots", 8,
+                        get(activity, "mRoundShots"));
+            }
+        });
+    }
+
+    @Test
+    public void roundAnalyticsCountsConfirmationsBeforeAnimationThrottleButNotAlreadyDeadOrCountdown() {
+        scenario.onActivity(activity -> {
+            set(activity, "mRoundConfirmations", 0);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_OUT));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ALREADYDEAD));
+            assertEquals(3, get(activity, "mRoundConfirmations"));
+            set(activity, "mStartGameTimer", true);
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertEquals(3, get(activity, "mRoundConfirmations"));
+            assertEquals(0, get(activity, "mScore"));
+        });
+    }
+
+    @Test
+    public void roundAnalyticsStreaksFollowKillCreditAndDeathsRatherThanVoicePlayback() {
+        scenario.onActivity(activity -> {
+            com.simplecoil.protocol.RoundStatistics.Streaks streaks =
+                    (com.simplecoil.protocol.RoundStatistics.Streaks) get(activity, "mRoundStreaks");
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            invoke(activity, "handlePlayerElimination", new Class<?>[]{byte.class}, (byte) 17);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            invoke(activity, "handlePlayerElimination", new Class<?>[]{byte.class}, (byte) 17);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+            assertEquals(3, streaks.bestKillStreak());
+            assertEquals(2, streaks.bestDeathStreak());
+            assertEquals(3, streaks.currentKillStreak());
+            assertEquals(0, streaks.currentDeathStreak());
+        });
+    }
+
+    @Test
+    public void completedMatchingHostReportOverridesLocalEstimatesAndPersistsPostRoundAccuracy() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "11111111-1111-1111-1111-111111111111";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                set(activity, "mScore", 2);
+                set(activity, "mEliminationCount", 1);
+                tcp.completedReport = new RoundReport(token, 1, 5, 2, 20, 9, 3, 1, 100, 118, 60000, true);
+                invoke(activity, "endGame");
+                LastGameStats stats = LastGameStats.load(ignored.preferences);
+                assertEquals(5, stats.kills);
+                assertEquals(2, stats.deaths);
+                assertEquals(20, stats.shots);
+                assertEquals(9, stats.confirmedHits);
+                assertEquals(3, stats.bestKillStreak);
+                assertTrue(stats.analyticsComplete);
+                assertEquals(activity.getString(R.string.lobby_stat_accuracy, 45.0),
+                        ((TextView) activity.findViewById(R.id.lobby_last_game_accuracy)).getText().toString());
+                assertEquals(activity.getString(R.string.lobby_stat_skill, 100, 118, 18),
+                        ((TextView) activity.findViewById(R.id.lobby_last_game_skill)).getText().toString());
+                int history = PlayerHistory.kills(activity);
+                invoke(activity, "endGame");
+                assertEquals(history, PlayerHistory.kills(activity));
+            }
+        });
+    }
+
+    @Test
+    public void staleHostReportDoesNotInventAccuracyAndAbortedCountdownPreservesPriorSnapshot() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "11111111-1111-1111-1111-111111111111";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                set(activity, "mRoundShots", 10);
+                set(activity, "mRoundConfirmations", 3);
+                set(activity, "mScore", 2);
+                tcp.completedReport = new RoundReport("22222222-2222-2222-2222-222222222222",
+                        1, 9, 4, 50, 20, 5, 2, 100, 125, 60000, true);
+                invoke(activity, "endGame");
+                LastGameStats saved = LastGameStats.load(ignored.preferences);
+                assertEquals(2, saved.kills);
+                assertEquals(10, saved.shots);
+                assertEquals(3, saved.confirmedHits);
+                assertFalse(saved.analyticsComplete);
+                assertEquals(activity.getString(R.string.lobby_stat_accuracy_unavailable),
+                        ((TextView) activity.findViewById(R.id.lobby_last_game_accuracy)).getText().toString());
+                int kills = PlayerHistory.kills(activity);
+                Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+                set(activity, "mStartGameTimer", true);
+                set(activity, "mScore", 100);
+                invoke(activity, "endGame");
+                assertEquals(2, LastGameStats.load(ignored.preferences).kills);
+                assertEquals(kills, PlayerHistory.kills(activity));
+            }
+        });
+    }
+
+    @Test
+    public void balancedPhoneHostWaitsForOrderedReportsAndKeepsItsRoundTeamAndWin() {
+        withRecordingSpeech((activity, speech) -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                Globals globals = Globals.getInstance();
+                globals.mBalancedRandom = true;
+                Map<Byte, Integer> teams = new HashMap<>();
+                teams.put((byte) 1, 2);
+                teams.put((byte) 17, 2);
+                teams.put((byte) 2, 1);
+                globals.setBalancedAssignments(teams, Collections.emptySet());
+                set(activity, "mIsServer", true);
+                set(activity, "mTeamScore", 10);
+                RecordingOrderedEndServer server = new RecordingOrderedEndServer();
+                set(activity, "mTcpServer", server);
+                udp.roundScores = new int[Globals.MAX_PLAYER_ID + 1];
+                Arrays.fill(udp.roundScores, -1);
+                udp.roundScores[17] = 12;
+                udp.roundScores[2] = 7;
+                assertEquals(GameOutcome.Result.WON, invokeResult(activity, "completedRoundOutcome"));
+                invoke(activity, "endUDPGame");
+                invoke(activity, "endGame");
+                assertEquals(1, server.endRequests);
+                assertEquals(0, udp.endRequests);
+                assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
+                globals.clearBalancedRoundState();
+                assertEquals(GameOutcome.Result.LOST, invokeResult(activity, "completedRoundOutcome"));
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME)
+                        .putExtra(TcpServer.EXTRA_ROUND_REPORTS_DELIVERED, true));
+                assertEquals(Globals.GAME_STATE_NONE, globals.mGameState);
+                LastGameStats saved = LastGameStats.load(ignored.preferences);
+                assertEquals(activity.getString(R.string.lobby_team_format, 2), saved.team);
+                assertEquals("normal:1.0:" + activity.getString(R.string.game_end_won_voice_prompt),
+                        speech.queued.get(speech.queued.size() - 1));
+            }
+        });
+    }
+
+    @Test
+    public void newRoundResetsAnalyticsWithoutUpdatingTheRatingDuringCountdown() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                int priorKills = PlayerHistory.kills(activity);
+                int priorDeaths = PlayerHistory.deaths(activity);
+                set(activity, "mUseNetwork", false);
+                set(activity, "mRoundShots", 22);
+                set(activity, "mRoundConfirmations", 7);
+                com.simplecoil.protocol.RoundStatistics.Streaks streaks =
+                        (com.simplecoil.protocol.RoundStatistics.Streaks) get(activity, "mRoundStreaks");
+                streaks.onKill(); streaks.onKill(); streaks.onDeath();
+                invoke(activity, "startGame");
+                assertEquals(0, get(activity, "mRoundShots"));
+                assertEquals(0, get(activity, "mRoundConfirmations"));
+                assertEquals(0, streaks.bestKillStreak());
+                assertEquals(0, streaks.bestDeathStreak());
+                assertEquals(priorKills, PlayerHistory.kills(activity));
+                assertEquals(priorDeaths, PlayerHistory.deaths(activity));
+                invoke(activity, "endGame");
+                assertEquals(priorKills, PlayerHistory.kills(activity));
+                assertEquals(priorDeaths, PlayerHistory.deaths(activity));
+            }
+        });
+    }
+
+    @Test
+    public void incompleteHostReportCannotEraseAcceptedLocalProgressOrUseItsPartialRating() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "33333333-3333-3333-3333-333333333333";
+                int priorKills = PlayerHistory.kills(activity), priorDeaths = PlayerHistory.deaths(activity);
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                set(activity, "mRoundShots", 12);
+                set(activity, "mScore", 4);
+                set(activity, "mEliminationCount", 3);
+                com.simplecoil.protocol.RoundStatistics.Streaks streaks =
+                        (com.simplecoil.protocol.RoundStatistics.Streaks) get(activity, "mRoundStreaks");
+                streaks.onKill(); streaks.onKill(); streaks.onKill();
+                streaks.onDeath(); streaks.onDeath(); streaks.onDeath();
+                tcp.completedReport = new RoundReport(token, 1, 2, 1, 6, 2, 1, 1, 77, 0, 60000, false);
+                invoke(activity, "endGame");
+                LastGameStats stats = LastGameStats.load(ignored.preferences);
+                assertEquals(4, stats.kills);
+                assertEquals(3, stats.deaths);
+                assertEquals(12, stats.shots);
+                assertEquals(2, stats.confirmedHits);
+                assertEquals(3, stats.bestKillStreak);
+                assertEquals(3, stats.bestDeathStreak);
+                assertEquals(77, stats.skillBefore);
+                assertEquals(com.simplecoil.protocol.RoundStatistics.skillIndex(
+                        (long) priorKills + 4, (long) priorDeaths + 3), stats.skillAfter);
+                assertFalse(stats.analyticsComplete);
+            }
+        });
+    }
+
+    @Test
+    public void timedClientEndStopsBothGunsButKeepsTcpUntilTheOrderedHostReport() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity);
+                 PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                String token = "44444444-4444-4444-4444-444444444444";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                set(activity, "mRoundShots", 15);
+                tcp.connectedToLobby = true;
+                invoke(activity, "finishTimedGame");
+                assertTrue((boolean) get(activity, "mClientRoundEndPending"));
+                assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+                assertEquals(0, tcp.stopRequests);
+                assertEquals(2, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+                assertEquals(2, guns.second.writes.get(guns.second.writes.size() - 1)[2]);
+                invoke(activity, "finishReload");
+                invoke(activity, "finishSecondaryReload");
+                invoke(activity, "finishSpawn", new Class<?>[]{boolean.class}, false);
+                powerupAmmoTelemetry(activity, false, 0);
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_HIT));
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+                assertEquals(15, get(activity, "mRoundShots"));
+                assertEquals(0, get(activity, "mRoundConfirmations"));
+                assertEquals(0, get(activity, "mScore"));
+                assertEquals(2, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+                tcp.completedReport = new RoundReport(token, 1, 4, 1, 15, 6, 2, 1, 100, 120, 60000, true);
+                deliverRecordedTcpEnd(activity);
+                assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+                assertEquals(1, tcp.stopRequests);
+                assertTrue(LastGameStats.load(ignored.preferences).analyticsComplete);
+                assertEquals(activity.getString(R.string.lobby_stat_accuracy, 40.0),
+                        ((TextView) activity.findViewById(R.id.lobby_last_game_accuracy)).getText().toString());
+            }
+        });
+    }
+
+    @Test
+    public void matchingUdpEndWaitsForTcpReportAndUnrelatedRoundEndDoesNotFinishIt() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "55555555-5555-5555-5555-555555555555";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                tcp.connectedToLobby = true;
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+                assertTrue((boolean) get(activity, "mClientRoundEndPending"));
+                assertEquals(0, tcp.stopRequests);
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, "66666666-6666-6666-6666-666666666666"));
+                assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+                tcp.completedReport = new RoundReport(token, 1, 1, 0, 10, 2, 1, 0, 100, 109, 60000, true);
+                deliverRecordedTcpEnd(activity);
+                assertEquals(1, tcp.stopRequests);
+                assertEquals(2, LastGameStats.load(ignored.preferences).confirmedHits);
+                assertTrue(LastGameStats.load(ignored.preferences).analyticsComplete);
+            }
+        });
+    }
+
+    @Test
+    public void clientReportTimeoutFinishesWithLimitedStatsAndCannotRunTwice() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "77777777-7777-7777-7777-777777777777";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                set(activity, "mRoundShots", 10);
+                set(activity, "mScore", 3);
+                tcp.connectedToLobby = true;
+                invoke(activity, "endGame");
+                Runnable timeout = (Runnable) get(activity, "mClientRoundEndTimeout");
+                assertNotNull(timeout);
+                assertEquals(0, tcp.stopRequests);
+                timeout.run();
+                assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+                assertEquals(1, tcp.stopRequests);
+                LastGameStats saved = LastGameStats.load(ignored.preferences);
+                assertEquals(3, saved.kills);
+                assertEquals(10, saved.shots);
+                assertFalse(saved.analyticsComplete);
+                assertEquals(activity.getString(R.string.lobby_stat_accuracy_unavailable),
+                        ((TextView) activity.findViewById(R.id.lobby_last_game_accuracy)).getText().toString());
+                int history = PlayerHistory.kills(activity);
+                timeout.run();
+                assertEquals(1, tcp.stopRequests);
+                assertEquals(history, PlayerHistory.kills(activity));
+            }
+        });
+    }
+
+    @Test
+    public void newerRoundCancelsTheOlderClientReportTimeout() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "88888888-8888-8888-8888-888888888888";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                tcp.connectedToLobby = true;
+                invoke(activity, "endGame");
+                Runnable timeout = (Runnable) get(activity, "mClientRoundEndTimeout");
+                Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+                set(activity, "mUseNetwork", false);
+                invoke(activity, "startGame");
+                assertFalse((boolean) get(activity, "mClientRoundEndPending"));
+                assertNull(get(activity, "mClientRoundEndTimeout"));
+                timeout.run();
+                assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+                assertTrue((boolean) get(activity, "mStartGameTimer"));
+                assertEquals(0, tcp.stopRequests);
+                invoke(activity, "endGame");
+            }
+        });
+    }
+
+    @Test
+    public void explicitLeaveBypassesClientReportWaitAndCancelsItsTimeout() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "99999999-9999-9999-9999-999999999999";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                tcp.connectedToLobby = true;
+                invoke(activity, "endGame");
+                Runnable timeout = (Runnable) get(activity, "mClientRoundEndTimeout");
+                invoke(activity, "endGame", new Class<?>[]{boolean.class}, true);
+                assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+                assertEquals(1, tcp.stopRequests);
+                assertTrue(LastGameStats.load(ignored.preferences).leftEarly);
+                assertNull(get(activity, "mClientRoundEndTimeout"));
+                timeout.run();
+                assertEquals(1, tcp.stopRequests);
+            }
+        });
+    }
+
+    @Test
+    public void stoppedClientDoesNotDelayRoundCleanupForAMissingReport() {
+        scenario.onActivity(activity -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+                set(activity, "mActivePeerRoundToken", token);
+                set(activity, "mRoundAnalyticsToken", token);
+                tcp.connectedToLobby = false;
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME)
+                        .putExtra(NetMsg.INTENT_ROUND_TOKEN, token));
+                assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+                assertFalse((boolean) get(activity, "mClientRoundEndPending"));
+                assertNull(get(activity, "mClientRoundEndTimeout"));
+                assertEquals(1, tcp.stopRequests);
+                assertFalse(LastGameStats.load(ignored.preferences).analyticsComplete);
+            }
+        });
+    }
+
+    @Test
+    public void finalClientScoreboardRepairsTheDeadlineOutcomeIncludingTiedVoice() {
+        withRecordingSpeech((activity, speech) -> {
+            try (RoundAnalyticsPreferences ignored = new RoundAnalyticsPreferences(activity)) {
+                Globals globals = Globals.getInstance();
+                globals.mGameMode = Globals.GAME_MODE_FFA;
+                String[] tokens = {"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        "cccccccc-cccc-cccc-cccc-cccccccccccc"};
+                for (int index = 0; index < tokens.length; index++) {
+                    String token = tokens[index];
+                    globals.mGameState = Globals.GAME_STATE_RUNNING;
+                    set(activity, "mActivePeerRoundToken", token);
+                    set(activity, "mRoundAnalyticsToken", token);
+                    set(activity, "mScore", 5);
+                    udp.roundScores = new int[Globals.MAX_PLAYER_ID + 1];
+                    Arrays.fill(udp.roundScores, -1);
+                    udp.roundScores[17] = 1;
+                    assertEquals(GameOutcome.Result.WON, invokeResult(activity, "completedRoundOutcome"));
+                    tcp.connectedToLobby = true;
+                    invoke(activity, "endGame");
+                    int enemyScore = index == 0 ? 5 : 3;
+                    try {
+                        org.json.JSONArray players = new org.json.JSONArray()
+                                .put(finalScoreboardPlayer(1, 3, 1))
+                                .put(finalScoreboardPlayer(17, enemyScore, 0));
+                        String frame = new org.json.JSONObject().put(TcpServer.JSON_PLAYERDATA, players).toString();
+                        invoke(activity, "captureFinalClientScoreboard", new Class<?>[]{String.class}, frame);
+                    } catch (org.json.JSONException invalid) { throw new AssertionError(invalid); }
+                    tcp.completedReport = new RoundReport(token, 1, 3, 1, 10, 2, 2, 1, 100, 114, 60000, true);
+                    deliverRecordedTcpEnd(activity);
+                    int prompt = index == 0 ? R.string.game_end_lost_voice_prompt : R.string.game_end_tied_voice_prompt;
+                    assertEquals("normal:1.0:" + activity.getString(prompt),
+                            speech.queued.get(speech.queued.size() - 1));
+                    assertEquals(3, LastGameStats.load(ignored.preferences).kills);
+                }
+            }
+        });
+    }
+
+    private static org.json.JSONObject finalScoreboardPlayer(int id, int kills, int deaths)
+            throws org.json.JSONException {
+        return new org.json.JSONObject().put(TcpServer.JSON_PLAYERID, id)
+                .put(TcpServer.JSON_PLAYERNAME, "Player " + id)
+                .put(TcpServer.JSON_PLAYERPOINTS, kills).put(TcpServer.JSON_PLAYERELIMINATED, deaths);
+    }
+
+    private void deliverRecordedTcpEnd(FullscreenActivity activity) {
+        tcp.pendingTerminal = new Intent(NetMsg.NETMSG_ENDGAME);
+        receiveNetwork(activity, new Intent(NetMsg.NETMSG_ENDGAME)
+                .putExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID, 123L));
+    }
+
+    @Test
     public void leavingSavesLivesUsedAndMatchingCompletionClearsSitOutOnly() {
         scenario.onActivity(activity -> {
             String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -345,6 +1050,7 @@ public class GameplayRegressionTest {
             int[] calls = new int[3];
             set(activity, "mTcpServer", new TcpServer() {
                 @Override public void cancelServer() { calls[0]++; }
+                @Override public void cancelServer(boolean preserveBalancedTeams) { cancelServer(); }
                 @Override public void stopTcpServer() { calls[1]++; }
                 @Override public void sendTCPMessageAll(String message) { calls[2]++; }
             });
@@ -383,6 +1089,39 @@ public class GameplayRegressionTest {
             globals.mGameState = Globals.GAME_STATE_NONE;
             invoke(activity, "updateGpsCoordinatesDisplay");
             assertEquals(View.GONE, coordinates.getVisibility());
+        });
+    }
+
+    @Test
+    public void localGpsReadoutRetainsSixDecimalPlacesInTheLobbyAndGame() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+            globals.mUseGPS = true;
+            assertEquals("LAT %1$.6f\nLON %2$.6f",
+                    activity.getString(R.string.gps_coordinates_format));
+            TextView hud = activity.findViewById(R.id.gps_coordinates_tv);
+            TextView lobby = activity.findViewById(R.id.lobby_gps_coordinates);
+            Intent fix = new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                    .putExtra(NetMsg.INTENT_LATITUDE, 47.6062119)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, -122.3320719);
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class}, fix);
+            String first = hud.getText().toString();
+            assertEquals(activity.getString(R.string.gps_coordinates_format,
+                    47.6062119, -122.3320719), first);
+            assertEquals(first, lobby.getText().toString());
+
+            // Both fixes round to the same old five-place display, but the
+            // sixth digit now exposes the finer change without quantizing it.
+            fix.putExtra(NetMsg.INTENT_LATITUDE, 47.6062149)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, -122.3320749);
+            invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class}, fix);
+            assertEquals(activity.getString(R.string.gps_coordinates_format,
+                    47.6062149, -122.3320749), hud.getText().toString());
+            assertFalse(first.equals(hud.getText().toString()));
+            assertEquals(hud.getText().toString(), lobby.getText().toString());
+            assertEquals(47.6062149, (double) get(activity, "mLastGpsLatitude"), 0);
+            assertEquals(-122.3320749, (double) get(activity, "mLastGpsLongitude"), 0);
         });
     }
 
@@ -525,6 +1264,7 @@ public class GameplayRegressionTest {
             int[] calls = new int[1];
             set(activity, "mTcpServer", new TcpServer() {
                 @Override public void cancelServer() { calls[0]++; }
+                @Override public void cancelServer(boolean preserveBalancedTeams) { cancelServer(); }
             });
             set(activity, "mIsServer", true);
             set(activity, "mReady", true);
@@ -546,6 +1286,7 @@ public class GameplayRegressionTest {
             udp.hostingSince = Math.max(0, SystemClock.elapsedRealtime() - 30_000);
             set(activity, "mTcpServer", new TcpServer() {
                 @Override public void cancelServer() { }
+                @Override public void cancelServer(boolean preserveBalancedTeams) { cancelServer(); }
                 @Override boolean isTcpServerReady() { return true; }
             });
             invoke(activity, "endGame");
@@ -568,6 +1309,7 @@ public class GameplayRegressionTest {
             int[] calls = new int[1];
             set(activity, "mTcpServer", new TcpServer() {
                 @Override public void cancelServer() { calls[0]++; }
+                @Override public void cancelServer(boolean preserveBalancedTeams) { cancelServer(); }
             });
             set(activity, "mIsServer", true);
             set(activity, "mReady", true);
@@ -1451,6 +2193,8 @@ public class GameplayRegressionTest {
             Object normal = get(activity, "mDefaultSpeechVoice");
             Object streak = get(activity, "mKillStreakSpeechVoice");
             Object clips = get(activity, "mBundledAnnouncementAudioKeys");
+            Object closingAudio = get(activity, "mGameStartClosingAudio");
+            Object closingDuration = get(activity, "mGameStartClosingDurationMs");
             RecordingSpeech speech = new RecordingSpeech(activity);
             try {
                 set(activity, "mCountdownSpeech", speech);
@@ -1458,13 +2202,19 @@ public class GameplayRegressionTest {
                 set(activity, "mDefaultSpeechVoice", speech.normal);
                 set(activity, "mKillStreakSpeechVoice", speech.britishMale);
                 set(activity, "mBundledAnnouncementAudioKeys", new HashMap<String, String>());
+                set(activity, "mGameStartClosingAudio", null);
+                set(activity, "mGameStartClosingDurationMs", GameStartCountdown.ENDING_VOICE_MS);
                 check.run(activity, speech);
             } finally {
+                invoke(activity, "cancelScheduledGameStartClosingVoice");
+                set(activity, "mRoundStartVoicePending", false);
                 set(activity, "mCountdownSpeech", original);
                 set(activity, "mCountdownSpeechReady", ready);
                 set(activity, "mDefaultSpeechVoice", normal);
                 set(activity, "mKillStreakSpeechVoice", streak);
                 set(activity, "mBundledAnnouncementAudioKeys", clips);
+                set(activity, "mGameStartClosingAudio", closingAudio);
+                set(activity, "mGameStartClosingDurationMs", closingDuration);
                 speech.shutdown();
             }
         });
@@ -1793,7 +2543,7 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void synchronizedCountdownKeepsGunsLockedDuringFourSecondClosingLineBuffer() {
+    public void synchronizedCountdownPreloadsAmmoButKeepsGameplayLockedThroughClosingLine() {
         withRecordingSpeech((activity, speech) -> {
             prepareDedicatedJoin(activity);
             long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
@@ -1805,16 +2555,16 @@ public class GameplayRegressionTest {
                     + activity.getString(R.string.game_start_mississippi_voice_prompt, 10)), speech.queued);
             speech.queued.clear();
             speech.queueModes.clear();
-            int lockedWrites = bluetooth.writes.size();
-            assertEquals(2, bluetooth.writes.get(lockedWrites - 1)[2]);
+            completeRoundStartReload(activity, false);
+            int preparedWrites = bluetooth.writes.size();
             set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS);
 
             timer.onTick(0);
 
-            assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+            assertCountdownClosingLineKeepsGameplayLocked(activity, speech, timer, preparedWrites);
             set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + 1000);
             timer.onTick(Long.MAX_VALUE);
-            assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+            assertCountdownClosingLineKeepsGameplayLocked(activity, speech, timer, preparedWrites);
             set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() - 1);
 
             timer.onFinish();
@@ -1822,16 +2572,16 @@ public class GameplayRegressionTest {
             assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
             assertNull(get(activity, "mSpawnTimer"));
             assertEquals(false, get(activity, "mStartGameTimer"));
-            assertEquals("The blaster was not enabled at the absolute start deadline",
-                    4, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+            assertEquals("GO must not reload ammunition already prepared during countdown",
+                    preparedWrites, bluetooth.writes.size());
             assertMississippiFinishAndRoundStart(activity, speech);
             timer.onFinish();
-            assertEquals("A stale timer repeated the end-of-countdown speech", 3, speech.queued.size());
+            assertEquals("A stale timer repeated the end-of-countdown speech", 2, speech.queued.size());
         });
     }
 
     @Test
-    public void offlineStartWaitsTwentyFourSecondsIncludingClosingLineBuffer() {
+    public void offlineStartWaitsTwentyThreeSecondsIncludingClosingLineBuffer() {
         withRecordingSpeech((activity, speech) -> {
             Globals globals = Globals.getInstance();
             long previousRespawnTime = globals.mRespawnTime;
@@ -1848,7 +2598,7 @@ public class GameplayRegressionTest {
                 assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
                 CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
                 assertNotNull(timer);
-                timer.cancel(); // Drive the absolute deadline without sleeping for 24 seconds.
+                timer.cancel(); // Drive the absolute deadline without sleeping for 23 seconds.
                 assertEquals(Collections.singletonList("normal:1.0:"
                         + activity.getString(R.string.game_start_mississippi_voice_prompt, 10)), speech.queued);
 
@@ -1859,25 +2609,339 @@ public class GameplayRegressionTest {
                 assertEquals(1, speech.queued.size());
                 speech.queued.clear();
                 speech.queueModes.clear();
-                int lockedWrites = bluetooth.writes.size();
-                assertEquals(2, bluetooth.writes.get(lockedWrites - 1)[2]);
+                completeRoundStartReload(activity, false);
+                int preparedWrites = bluetooth.writes.size();
                 set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS);
                 timer.onTick(0);
-                assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+                assertCountdownClosingLineKeepsGameplayLocked(activity, speech, timer, preparedWrites);
                 set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() + 1000);
                 timer.onTick(Long.MAX_VALUE);
-                assertCountdownClosingLineKeepsGunsLocked(activity, speech, timer, lockedWrites);
+                assertCountdownClosingLineKeepsGameplayLocked(activity, speech, timer, preparedWrites);
                 set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() - 1);
                 timer.onTick(Long.MAX_VALUE);
                 assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
                 assertNull(get(activity, "mSpawnTimer"));
-                assertEquals("The blaster was not enabled at the absolute start deadline",
-                        4, bluetooth.writes.get(bluetooth.writes.size() - 1)[2]);
+                assertEquals("GO must not reload ammunition already prepared during countdown",
+                        preparedWrites, bluetooth.writes.size());
                 assertMississippiFinishAndRoundStart(activity, speech);
             } finally {
                 globals.mRespawnTime = previousRespawnTime;
             }
         });
+    }
+
+    @Test
+    public void roundStartCountdownPreloadsBothBossGunsWithoutMagazineDelayOrGoRefill() {
+        scenario.onActivity(activity -> {
+            long previousReloadTime = Globals.getInstance().mReloadTime;
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                Globals.getInstance().mReloadTime = 10_000L;
+                CountDownTimer countdown = beginRoundStartCountdown(activity);
+                completeRoundStartReload(activity, false);
+                completeRoundStartReload(activity, true);
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+                countdown.onTick(0);
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+
+                finishRoundStartCountdown(activity, countdown);
+
+                assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+                assertEquals("GO reloaded the prepared primary gun", primaryWrites, bluetooth.writes.size());
+                assertEquals("GO reloaded the prepared second gun", secondaryWrites, guns.second.writes.size());
+            } finally {
+                Globals.getInstance().mReloadTime = previousReloadTime;
+            }
+        });
+    }
+
+    @Test
+    public void roundStartLateDisableAcksRefillBothGunsOnceWithoutOvertakingPendingWrites() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                CountDownTimer countdown = beginRoundStartCountdown(activity);
+                byte[] primaryDisable = ((byte[]) get(activity, "mPendingReloadCommand")).clone();
+                byte[] secondaryDisable = ((byte[]) get(activity, "mSecondaryPendingReloadCommand")).clone();
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                invoke(activity, "finishReload");
+                invoke(activity, "finishSecondaryReload");
+                finishRoundStartCountdown(activity, countdown);
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+
+                for (boolean secondary : new boolean[]{false, true}) {
+                    byte[] disable = secondary ? secondaryDisable : primaryDisable;
+                    RecordingBluetoothService service = secondary ? guns.second : bluetooth;
+                    int before = service.writes.size();
+                    completePowerupWrite(activity, secondary, disable, BluetoothGatt.GATT_SUCCESS);
+                    byte[] refill = ((byte[]) get(activity,
+                            secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand")).clone();
+                    assertEquals(4, refill[2]);
+                    assertEquals(before + 1, service.writes.size());
+                    assertNull(get(activity, secondary ? "mSecondaryReloadTimer" : "mReloadTimer"));
+                    completePowerupWrite(activity, secondary, disable, BluetoothGatt.GATT_SUCCESS);
+                    assertEquals("A duplicate disable ACK repeated the refill", before + 1, service.writes.size());
+                    completePowerupWrite(activity, secondary, refill, BluetoothGatt.GATT_SUCCESS);
+                    completePowerupWrite(activity, secondary, refill, BluetoothGatt.GATT_SUCCESS);
+                    assertEquals(0, get(activity, secondary ? "mSecondaryReloading" : "mReloading"));
+                    assertEquals(before + 1, service.writes.size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void roundStartCancelledCountdownIgnoresBothOldReloadAcksAndTimer() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                CountDownTimer countdown = beginRoundStartCountdown(activity);
+                byte[] primaryDisable = ((byte[]) get(activity, "mPendingReloadCommand")).clone();
+                byte[] secondaryDisable = ((byte[]) get(activity, "mSecondaryPendingReloadCommand")).clone();
+                completePowerupWrite(activity, false, primaryDisable, BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, secondaryDisable, BluetoothGatt.GATT_SUCCESS);
+                byte[] primaryRefill = ((byte[]) get(activity, "mPendingReloadCommand")).clone();
+                byte[] secondaryRefill = ((byte[]) get(activity, "mSecondaryPendingReloadCommand")).clone();
+                invoke(activity, "endGame");
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+
+                completePowerupWrite(activity, false, primaryDisable, BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, secondaryDisable, BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, false, primaryRefill, BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, secondaryRefill, BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                countdown.onTick(0);
+                countdown.onFinish();
+
+                assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+                assertEquals(3, get(activity, "mReloading"));
+                assertEquals(3, get(activity, "mSecondaryReloading"));
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+                assertNull(get(activity, "mSpawnTimer"));
+            }
+        });
+    }
+
+    @Test
+    public void roundStartRediscoveredGunsPrepareDuringCountdownInsteadOfWaitingForGo() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                CountDownTimer countdown = beginRoundStartCountdown(activity);
+                completeRoundStartReload(activity, false);
+                completeRoundStartReload(activity, true);
+                int preparedSecondaryWrites = guns.second.writes.size();
+                receivePowerupGatt(activity, new Intent(BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED));
+                assertEquals("Primary discovery restarted the already prepared second gun",
+                        preparedSecondaryWrites, guns.second.writes.size());
+                completeRoundStartReload(activity, false);
+                receivePowerupGatt(activity, new Intent(BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED)
+                        .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, 1));
+                completeRoundStartReload(activity, true);
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                finishRoundStartCountdown(activity, countdown);
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+            }
+        });
+    }
+
+    @Test
+    public void roundStartFailedDisableWritesRetryAtMostThreeTimesBeforeGo() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                CountDownTimer countdown = beginRoundStartCountdown(activity);
+                for (int attempt = 1; attempt <= 3; attempt++) {
+                    assertEquals(attempt, get(activity, "mCountdownPrimaryReloadAttempts"));
+                    assertEquals(attempt, get(activity, "mCountdownSecondaryReloadAttempts"));
+                    completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                            BluetoothGatt.GATT_FAILURE);
+                    completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                            BluetoothGatt.GATT_FAILURE);
+                    assertEquals(3, get(activity, "mReloading"));
+                    assertEquals(3, get(activity, "mSecondaryReloading"));
+                    int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                    invoke(activity, "prepareRoundStartReloads");
+                    assertEquals("The primary retry ignored its one-second backoff", primaryWrites, bluetooth.writes.size());
+                    assertEquals("The secondary retry ignored its one-second backoff", secondaryWrites, guns.second.writes.size());
+                    set(activity, "mCountdownPrimaryReloadRetryAt", 0L);
+                    set(activity, "mCountdownSecondaryReloadRetryAt", 0L);
+                    invoke(activity, "prepareRoundStartReloads");
+                    assertEquals(primaryWrites + (attempt < 3 ? 1 : 0), bluetooth.writes.size());
+                    assertEquals(secondaryWrites + (attempt < 3 ? 1 : 0), guns.second.writes.size());
+                }
+                assertNull(get(activity, "mPendingReloadCommand"));
+                assertNull(get(activity, "mSecondaryPendingReloadCommand"));
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                finishRoundStartCountdown(activity, countdown);
+                assertEquals("A gun that never prepared still needs the GO fallback", primaryWrites + 1,
+                        bluetooth.writes.size());
+                assertEquals(secondaryWrites + 1, guns.second.writes.size());
+                assertEquals(4, ((byte[]) get(activity, "mPendingReloadCommand"))[2]);
+                assertEquals(4, ((byte[]) get(activity, "mSecondaryPendingReloadCommand"))[2]);
+            }
+        });
+    }
+
+    @Test
+    public void roundStartFailedSecondaryRefillRetryDoesNotDisturbPreparedPrimaryGun() {
+        assertRoundStartFailedRefillRetryDoesNotDisturbOtherGun(true);
+    }
+
+    @Test
+    public void roundStartFailedPrimaryRefillRetryDoesNotDisturbPreparedSecondGun() {
+        assertRoundStartFailedRefillRetryDoesNotDisturbOtherGun(false);
+    }
+
+    private void assertRoundStartFailedRefillRetryDoesNotDisturbOtherGun(boolean secondary) {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                CountDownTimer countdown = beginRoundStartCountdown(activity);
+                completeRoundStartReload(activity, !secondary);
+                String pendingField = secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand";
+                completePowerupWrite(activity, secondary, (byte[]) get(activity, pendingField),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, secondary, (byte[]) get(activity, pendingField),
+                        BluetoothGatt.GATT_FAILURE);
+                RecordingBluetoothService preparedGun = secondary ? bluetooth : guns.second;
+                int preparedWrites = preparedGun.writes.size();
+                set(activity, secondary ? "mCountdownSecondaryReloadRetryAt" : "mCountdownPrimaryReloadRetryAt", 0L);
+                invoke(activity, "prepareRoundStartReloads");
+                assertEquals(preparedWrites, preparedGun.writes.size());
+                assertEquals(0, get(activity, secondary ? "mReloading" : "mSecondaryReloading"));
+                completeRoundStartReload(activity, secondary);
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                finishRoundStartCountdown(activity, countdown);
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+            }
+        });
+    }
+
+    @Test
+    public void roundStartEmpBlockedDisableAcksRefillBothGunsOnceAfterProtectionClears() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                CountDownTimer countdown = beginRoundStartCountdown(activity);
+                long[] powerupUntil = (long[]) get(activity, "mPowerupUntil");
+                powerupUntil[Powerups.EMP] = SystemClock.elapsedRealtime() + Powerups.durationMillis(Powerups.EMP);
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                assertEquals(4, get(activity, "mReloading"));
+                assertEquals(4, get(activity, "mSecondaryReloading"));
+                assertNull(get(activity, "mPendingReloadCommand"));
+                assertNull(get(activity, "mSecondaryPendingReloadCommand"));
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                invoke(activity, "finishUnblockedRoundStartReloads");
+                invoke(activity, "prepareRoundStartReloads");
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+
+                powerupUntil[Powerups.EMP] = 0;
+                invoke(activity, "finishUnblockedRoundStartReloads");
+                invoke(activity, "finishUnblockedRoundStartReloads");
+
+                assertEquals(primaryWrites + 1, bluetooth.writes.size());
+                assertEquals(secondaryWrites + 1, guns.second.writes.size());
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                finishRoundStartCountdown(activity, countdown);
+                assertEquals(primaryWrites + 1, bluetooth.writes.size());
+                assertEquals(secondaryWrites + 1, guns.second.writes.size());
+            }
+        });
+    }
+
+    @Test
+    public void roundStartPreparedGunTelemetryCannotScoreReportShotsOrReloadBeforeGo() {
+        scenario.onActivity(activity -> {
+            boolean previousReloadOnEmpty = Globals.getInstance().mReloadOnEmpty;
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                beginRoundStartCountdown(activity);
+                completeRoundStartReload(activity, false);
+                completeRoundStartReload(activity, true);
+                Globals.getInstance().mReloadOnEmpty = true;
+                set(activity, "mUseNetwork", true);
+                tcp.dedicated = true;
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                int udpMessages = udp.messages.size(), health = (int) get(activity, "mHealth");
+                int hits = (int) get(activity, "mHitsTaken");
+                int primaryEmptyPulls = (int) get(activity, "mEmptyTriggerCount");
+                int secondaryEmptyPulls = (int) get(activity, "mSecondaryEmptyTriggerCount");
+                for (boolean secondary : new boolean[]{false, true}) {
+                    byte[] packet = telemetryPacket(17, 1, 0, 0);
+                    packet[FullscreenActivity.RECOIL_OFFSET_SHOTS_REMAINING] = 0;
+                    packet[FullscreenActivity.RECOIL_OFFSET_RELOAD_TRIGGER_COUNTER] = 0x11;
+                    receivePowerupGatt(activity, new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                            .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, secondary ? 1 : 0)
+                            .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+                }
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_ELIMINATED));
+                receiveNetwork(activity, new Intent(NetMsg.NETMSG_TEAMELIMINATED));
+                assertEquals(0, get(activity, "mScore"));
+                assertEquals(0, get(activity, "mTeamScore"));
+                assertEquals(health, get(activity, "mHealth"));
+                assertEquals(hits, get(activity, "mHitsTaken"));
+                assertEquals(0, tcp.hostedShots);
+                assertEquals(udpMessages, udp.messages.size());
+                assertEquals(primaryEmptyPulls, get(activity, "mEmptyTriggerCount"));
+                assertEquals(secondaryEmptyPulls, get(activity, "mSecondaryEmptyTriggerCount"));
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+                assertEquals(0, get(activity, "mReloading"));
+                assertEquals(0, get(activity, "mSecondaryReloading"));
+            } finally {
+                Globals.getInstance().mReloadOnEmpty = previousReloadOnEmpty;
+            }
+        });
+    }
+
+    private CountDownTimer beginRoundStartCountdown(FullscreenActivity activity) {
+        set(activity, "mUseNetwork", false);
+        set(activity, "mNextGameStartAllowedAt", 0L);
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        invoke(activity, "startGame");
+        CountDownTimer countdown = (CountDownTimer) get(activity, "mSpawnTimer");
+        assertNotNull(countdown);
+        countdown.cancel();
+        assertEquals(true, get(activity, "mStartGameTimer"));
+        assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+        return countdown;
+    }
+
+    private static void completeRoundStartReload(FullscreenActivity activity, boolean secondary) {
+        String stateField = secondary ? "mSecondaryReloading" : "mReloading";
+        String pendingField = secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand";
+        assertEquals("The gun did not begin countdown preparation", 4, get(activity, stateField));
+        byte[] disable = ((byte[]) get(activity, pendingField)).clone();
+        assertEquals(2, disable[2]);
+        completePowerupWrite(activity, secondary, disable, BluetoothGatt.GATT_SUCCESS);
+        assertNull("Countdown preparation added the ordinary magazine reload delay",
+                get(activity, secondary ? "mSecondaryReloadTimer" : "mReloadTimer"));
+        assertEquals(2, get(activity, stateField));
+        byte[] refill = ((byte[]) get(activity, pendingField)).clone();
+        assertEquals(4, refill[2]);
+        assertEquals((int) invokeResult(activity, "activeMagazineSize"), refill[6] & 255);
+        completePowerupWrite(activity, secondary, refill, BluetoothGatt.GATT_SUCCESS);
+        assertEquals(0, get(activity, stateField));
+        assertNull(get(activity, pendingField));
+        assertEquals(refill[6], get(activity, secondary ? "mSecondaryLastShotCount" : "mLastShotCount"));
+    }
+
+    private static void finishRoundStartCountdown(FullscreenActivity activity, CountDownTimer countdown) {
+        set(activity, (boolean) get(activity, "mHasSynchronizedStart")
+                ? "mSynchronizedStartAt" : "mLocalGameStartAt", SystemClock.elapsedRealtime() - 1);
+        countdown.onTick(0);
+        assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+        assertEquals(false, get(activity, "mStartGameTimer"));
+        assertNull(get(activity, "mSpawnTimer"));
     }
 
     @Test
@@ -1903,8 +2967,8 @@ public class GameplayRegressionTest {
         });
     }
 
-    private void assertCountdownClosingLineKeepsGunsLocked(FullscreenActivity activity, RecordingSpeech speech,
-                                                          CountDownTimer timer, int lockedWrites) {
+    private void assertCountdownClosingLineKeepsGameplayLocked(FullscreenActivity activity, RecordingSpeech speech,
+                                                              CountDownTimer timer, int preparedWrites) {
         assertEquals(Collections.singletonList("normal:1.0:"
                 + activity.getString(R.string.game_start_countdown_finished_voice_prompt)), speech.queued);
         assertEquals(Collections.singletonList(android.speech.tts.TextToSpeech.QUEUE_ADD), speech.queueModes);
@@ -1912,20 +2976,190 @@ public class GameplayRegressionTest {
                 Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
         assertEquals(true, get(activity, "mStartGameTimer"));
         assertSame(timer, get(activity, "mSpawnTimer"));
-        assertEquals(get(activity, "RELOADING_STATE_ELIMINATED"), get(activity, "mReloading"));
+        assertEquals("The starting magazine must already be ready", 0, get(activity, "mReloading"));
+        assertEquals((int) invokeResult(activity, "activeMagazineSize"), ((byte) get(activity, "mLastShotCount")) & 255);
         invoke(activity, "finishReload");
-        assertEquals("The blaster was enabled during the closing-line buffer", lockedWrites, bluetooth.writes.size());
+        assertEquals("The closing line repeated an already completed refill", preparedWrites, bluetooth.writes.size());
     }
 
     private static void assertMississippiFinishAndRoundStart(FullscreenActivity activity, RecordingSpeech speech) {
-        assertEquals(1_000L, get(activity, "ROUND_START_VOICE_DELAY_MS"));
         assertEquals(Arrays.asList("normal:1.0:"
                         + activity.getString(R.string.game_start_countdown_finished_voice_prompt),
-                "silence:1000", "normal:1.0:" + activity.getString(R.string.game_start_voice_prompt)), speech.queued);
+                "normal:1.0:" + activity.getString(R.string.game_start_voice_prompt)), speech.queued);
         assertEquals("The round-start phrase must not flush zero or the finish line",
                 Arrays.asList(android.speech.tts.TextToSpeech.QUEUE_ADD,
-                        android.speech.tts.TextToSpeech.QUEUE_ADD,
                         android.speech.tts.TextToSpeech.QUEUE_ADD), speech.queueModes);
+    }
+
+    @Test
+    public void measuredClosingLineWaitsUntilItCanEndAtTheSharedStart() {
+        withRecordingSpeech((activity, speech) -> {
+            RecordingClosingAudio audio = new RecordingClosingAudio(activity, speech, 2_000);
+            set(activity, "mGameStartClosingAudio", audio);
+            set(activity, "mGameStartClosingDurationMs", audio.durationMillis());
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+            timer.cancel();
+            speech.queued.clear();
+            speech.queueModes.clear();
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS);
+            timer.onTick(0);
+            Runnable scheduled = (Runnable) get(activity, "mGameStartClosingVoice");
+            assertNotNull(scheduled);
+            assertEquals(0, audio.plays);
+            assertTrue(speech.queued.isEmpty());
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+
+            // An early callback rechecks the absolute deadline instead of playing early.
+            scheduled.run();
+            assertEquals(0, audio.plays);
+            assertNotNull(get(activity, "mGameStartClosingVoice"));
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + 1_999);
+            timer.onTick(0);
+            assertEquals(1, audio.plays);
+            assertNull(get(activity, "mGameStartClosingVoice"));
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() - 1);
+            timer.onFinish();
+            assertEquals("No speech completion wait may hold up the shared game start",
+                    Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(true, get(activity, "mRoundStartVoicePending"));
+            assertTrue(speech.queued.isEmpty());
+            audio.finish();
+            assertEquals(Collections.singletonList("normal:1.0:"
+                    + activity.getString(R.string.game_start_voice_prompt)), speech.queued);
+            assertEquals(Collections.singletonList(android.speech.tts.TextToSpeech.QUEUE_ADD), speech.queueModes);
+            assertEquals(false, get(activity, "mRoundStartVoicePending"));
+            audio.finish();
+            assertEquals(1, speech.queued.size());
+        });
+    }
+
+    @Test
+    public void closingCompletionCannotStartTheGameBeforeTheAuthoritativeDeadline() {
+        withRecordingSpeech((activity, speech) -> {
+            RecordingClosingAudio audio = new RecordingClosingAudio(activity, speech, 2_000);
+            set(activity, "mGameStartClosingAudio", audio);
+            set(activity, "mGameStartClosingDurationMs", audio.durationMillis());
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+            timer.cancel();
+            int lockedWrites = bluetooth.writes.size();
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + 1_999);
+            timer.onTick(0);
+            audio.finish();
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(lockedWrites, bluetooth.writes.size());
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() - 1);
+            timer.onFinish();
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals("normal:1.0:" + activity.getString(R.string.game_start_voice_prompt),
+                    speech.queued.get(speech.queued.size() - 1));
+            assertFalse(speech.queued.contains("silence:1000"));
+        });
+    }
+
+    @Test
+    public void canceledClosingCallbackCannotSpeakInANewerRound() {
+        withRecordingSpeech((activity, speech) -> {
+            RecordingClosingAudio audio = new RecordingClosingAudio(activity, speech, 2_000);
+            set(activity, "mGameStartClosingAudio", audio);
+            set(activity, "mGameStartClosingDurationMs", audio.durationMillis());
+            set(activity, "mStartGameTimer", true);
+            set(activity, "mHasSynchronizedStart", false);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+            set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() + GameStartCountdown.ENDING_VOICE_MS);
+            invoke(activity, "resetGameStartCountdownSpeech");
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, GameStartCountdown.ENDING_VOICE_MS);
+            Runnable old = (Runnable) get(activity, "mGameStartClosingVoice");
+            assertNotNull(old);
+            invoke(activity, "resetGameStartCountdownSpeech");
+            old.run();
+            assertNull(get(activity, "mGameStartClosingVoice"));
+            assertEquals(0, audio.plays);
+            assertTrue(speech.queued.isEmpty());
+
+            set(activity, "mLocalGameStartAt", SystemClock.elapsedRealtime() + 1_000);
+            invoke(activity, "announceGameStartCountdown", new Class<?>[]{long.class}, 1_000L);
+            Runnable completion = audio.completion;
+            set(activity, "mGameControlGeneration", (long) get(activity, "mGameControlGeneration") + 1);
+            set(activity, "mRoundStartVoicePending", true);
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            completion.run();
+            assertTrue(speech.queued.isEmpty());
+        });
+    }
+
+    @Test
+    public void clockRefinementRealignsPlayingClosingAudioOrRearmsALaterClip() {
+        withRecordingSpeech((activity, speech) -> {
+            RecordingClosingAudio audio = new RecordingClosingAudio(activity, speech, 2_000);
+            set(activity, "mGameStartClosingAudio", audio);
+            set(activity, "mGameStartClosingDurationMs", audio.durationMillis());
+            prepareDedicatedJoin(activity);
+            long deadline = SystemClock.elapsedRealtime() + GameStartCountdown.DURATION_MS;
+            receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
+            CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
+            timer.cancel();
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + 1_999);
+            timer.onTick(0);
+            assertTrue(audio.playing);
+            long refined = SystemClock.elapsedRealtime() + 1_500;
+            receiveNetwork(activity, synchronizedStart(refined, refined + 60000)
+                    .putExtra(NetMsg.INTENT_START_TIME_ADJUSTMENT, true));
+            assertTrue(audio.alignedRemaining > 0 && audio.alignedRemaining <= 1_500);
+            assertEquals(1, audio.plays);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+
+            long later = SystemClock.elapsedRealtime() + 3_000;
+            receiveNetwork(activity, synchronizedStart(later, later + 60000)
+                    .putExtra(NetMsg.INTENT_START_TIME_ADJUSTMENT, true));
+            assertFalse(audio.playing);
+            Runnable scheduled = (Runnable) get(activity, "mGameStartClosingVoice");
+            assertNotNull(scheduled);
+            assertEquals(1, audio.plays);
+            set(activity, "mSynchronizedStartAt", SystemClock.elapsedRealtime() + 1_999);
+            timer.onTick(0);
+            assertTrue(audio.playing);
+            assertEquals(2, audio.plays);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+        });
+    }
+
+    private static class RecordingClosingAudio extends CountdownClosingAudio {
+        final long duration;
+        int plays;
+        boolean playing;
+        Runnable completion;
+        long alignedRemaining;
+        RecordingClosingAudio(Context context, RecordingSpeech speech, long duration) {
+            super(context, speech, "Closing countdown test", () -> { });
+            this.duration = duration;
+        }
+        @Override boolean isReady() { return true; }
+        @Override long durationMillis() { return duration; }
+        @Override boolean play(Runnable finished) {
+            plays++;
+            playing = true;
+            completion = finished;
+            return true;
+        }
+        @Override boolean isPlaying() { return playing; }
+        @Override void alignToRemaining(long remaining) { alignedRemaining = remaining; }
+        @Override void stop() { playing = false; completion = null; }
+        void finish() {
+            playing = false;
+            if (completion != null) {
+                Runnable finished = completion;
+                completion = null;
+                finished.run();
+            }
+        }
     }
 
     @Test
@@ -1964,6 +3198,313 @@ public class GameplayRegressionTest {
             assertTrue((long) get(activity, "mNextInactivityReminderAt")
                     >= before + 40_000L);
         });
+    }
+
+    @Test
+    public void reliableGpsJitterDoesNotCountAsMovementButThreeMetersDoes() {
+        scenario.onActivity(activity -> {
+            long sample = SystemClock.elapsedRealtime();
+            startReliableGpsInactivity(activity, 1f, sample - 1000L);
+            try {
+                set(activity, "mNextInactivityReminderAt", 123L);
+                receiveInactivityGps(activity, inactivityGpsFix(47.000005, 1f, sample - 500L));
+                assertEquals(123L, get(activity, "mNextInactivityReminderAt"));
+
+                long before = SystemClock.elapsedRealtime();
+                receiveInactivityGps(activity, inactivityGpsFix(47.00005, 1f, sample));
+                assertInactivityDelayReset(activity, before);
+            } finally { invoke(activity, "stopInactivityVoiceReminder"); }
+        });
+    }
+
+    @Test
+    public void reliableStationaryGpsStillVoicesAfterEitherGunTrigger() {
+        withRecordingSpeech((activity, speech) -> {
+            boolean resumed = (boolean) get(activity, "mActivityResumed");
+            set(activity, "mActivityResumed", true);
+            try (PowerupDualGunFixture fixture = new PowerupDualGunFixture(activity)) {
+                startReliableGpsInactivity(activity, 1f, SystemClock.elapsedRealtime() - 1000L);
+                set(activity, "mNextInactivityReminderAt", 1L);
+                for (boolean secondary : new boolean[]{false, true}) {
+                    inactivityTrigger(activity, secondary);
+                    assertEquals("A stationary GPS player postponed the reminder by firing", 1L,
+                            get(activity, "mNextInactivityReminderAt"));
+                }
+                long before = SystemClock.elapsedRealtime();
+                ((Runnable) get(activity, "mInactivityVoiceReminder")).run();
+                assertEquals(1, speech.queued.size());
+                assertInactivityVoice(activity, speech.queued.get(0));
+                assertEquals(Collections.singletonList(android.speech.tts.TextToSpeech.QUEUE_ADD), speech.queueModes);
+                assertTrue((long) get(activity, "mNextInactivityReminderAt") >= before + 10_000L);
+            } finally {
+                invoke(activity, "stopInactivityVoiceReminder");
+                set(activity, "mActivityResumed", resumed);
+            }
+        });
+    }
+
+    @Test
+    public void gpsMovementMustExceedCombinedFixUncertainty() {
+        scenario.onActivity(activity -> {
+            long sample = SystemClock.elapsedRealtime();
+            startReliableGpsInactivity(activity, 3f, sample - 1000L);
+            try {
+                set(activity, "mNextInactivityReminderAt", 123L);
+                // About 4.5m exceeds the old 3m threshold but remains inside 3m + 3m uncertainty.
+                receiveInactivityGps(activity, inactivityGpsFix(47.00004, 3f, sample - 500L));
+                assertEquals(123L, get(activity, "mNextInactivityReminderAt"));
+                long before = SystemClock.elapsedRealtime();
+                receiveInactivityGps(activity, inactivityGpsFix(47.00008, 3f, sample));
+                assertInactivityDelayReset(activity, before);
+                assertEquals(47.00008, (double) get(activity, "mInactivityGpsLatitude"), 0);
+            } finally { invoke(activity, "stopInactivityVoiceReminder"); }
+        });
+    }
+
+    @Test
+    public void duplicateAndOlderGpsMeasurementsCannotResetInactivity() {
+        scenario.onActivity(activity -> {
+            long sample = SystemClock.elapsedRealtime();
+            startReliableGpsInactivity(activity, 1f, sample - 1000L);
+            try {
+                set(activity, "mNextInactivityReminderAt", 123L);
+                receiveInactivityGps(activity, inactivityGpsFix(47.0003, 1f, sample - 1000L));
+                assertEquals(123L, get(activity, "mNextInactivityReminderAt"));
+                receiveInactivityGps(activity, inactivityGpsFix(47.0004, 1f, sample - 1001L));
+                assertEquals(123L, get(activity, "mNextInactivityReminderAt"));
+                assertEquals(47.0, (double) get(activity, "mInactivityGpsLatitude"), 0);
+                assertEquals(sample - 1000L, get(activity, "mInactivityLastGpsSampleElapsedMs"));
+                long before = SystemClock.elapsedRealtime();
+                receiveInactivityGps(activity, inactivityGpsFix(47.0003, 1f, sample - 500L));
+                assertInactivityDelayReset(activity, before);
+            } finally { invoke(activity, "stopInactivityVoiceReminder"); }
+        });
+    }
+
+    @Test
+    public void olderPoorAndNetworkGpsCannotDowngradeANewerReliableFix() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture fixture = new PowerupDualGunFixture(activity)) {
+                long sample = SystemClock.elapsedRealtime();
+                startReliableGpsInactivity(activity, 1f, sample - 500L);
+                set(activity, "mNextInactivityReminderAt", 123L);
+                List<Intent> reordered = Arrays.asList(
+                        inactivityGpsFix(47.0003, 20f, sample - 10_001L),
+                        inactivityGpsFix(47.0004, 1f, sample - 10_001L)
+                                .putExtra(NetMsg.INTENT_GPS_PROVIDER,
+                                        android.location.LocationManager.NETWORK_PROVIDER));
+                for (Intent fix : reordered) {
+                    receiveInactivityGps(activity, fix);
+                    assertEquals(123L, get(activity, "mNextInactivityReminderAt"));
+                    assertEquals(true, get(activity, "mInactivityUsesGps"));
+                    assertEquals(47.0, (double) get(activity, "mInactivityGpsLatitude"), 0);
+                    assertEquals(47.0, (double) get(activity, "mLastGpsLatitude"), 0);
+                    assertEquals(-122.0, (double) get(activity, "mLastGpsLongitude"), 0);
+                    assertEquals(sample - 500L, get(activity, "mLastGpsFixElapsedMs"));
+                    assertEquals(sample - 500L, get(activity, "mInactivityLastGpsSampleElapsedMs"));
+                    assertEquals(true, get(activity, "mLastGpsHasAccuracy"));
+                    assertEquals(1f, (float) get(activity, "mLastGpsAccuracyMeters"), 0);
+                    assertEquals(android.location.LocationManager.GPS_PROVIDER,
+                            get(activity, "mLastGpsProvider"));
+                    for (boolean secondary : new boolean[]{false, true}) {
+                        set(activity, secondary ? "mSecondaryLastTriggerCount" : "mLastTriggerCount", (byte) 0);
+                        inactivityTrigger(activity, secondary);
+                        assertEquals("An older fix allowed trigger-only fallback", 123L,
+                                get(activity, "mNextInactivityReminderAt"));
+                    }
+                }
+            } finally { invoke(activity, "stopInactivityVoiceReminder"); }
+        });
+    }
+
+    @Test
+    public void unusableGpsPreservesTriggerActivityForBothGuns() {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture fixture = new PowerupDualGunFixture(activity)) {
+                long now = SystemClock.elapsedRealtime();
+                List<Intent> fixes = Arrays.asList(
+                        inactivityGpsFix(47.0, 1f, now).putExtra(NetMsg.INTENT_GPS_HAS_ACCURACY, false),
+                        inactivityGpsFix(47.0, 6f, now),
+                        inactivityGpsFix(47.0, 0f, now),
+                        inactivityGpsFix(47.0, Float.NaN, now),
+                        inactivityGpsFix(47.0, Float.POSITIVE_INFINITY, now),
+                        inactivityGpsFix(47.0, 1f, now).putExtra(NetMsg.INTENT_GPS_PROVIDER,
+                                android.location.LocationManager.NETWORK_PROVIDER),
+                        inactivityGpsFix(47.0, 1f, now - InactivityGpsPolicy.MAX_FIX_AGE_MS - 1L),
+                        new Intent().putExtra(NetMsg.INTENT_LONGITUDE, -122.0)
+                                .putExtra(NetMsg.INTENT_LATITUDE, 47.0),
+                        inactivityGpsFix(47.0, 1f, now));
+                fixes.get(8).removeExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS);
+                for (int quality = 0; quality < fixes.size(); quality++) {
+                    invoke(activity, "stopInactivityVoiceReminder");
+                    // Each quality case represents its own fresh local state,
+                    // not a reordered measurement behind the preceding case.
+                    set(activity, "mLastGpsHasMeasurementTime", false);
+                    Globals.getInstance().mUseGPS = true;
+                    receiveInactivityGps(activity, fixes.get(quality));
+                    invoke(activity, "startInactivityVoiceReminder");
+                    assertEquals("Unusable GPS case " + quality + " enabled GPS-only inactivity", false,
+                            get(activity, "mInactivityUsesGps"));
+                    for (boolean secondary : new boolean[]{false, true}) {
+                        set(activity, secondary ? "mSecondaryLastTriggerCount" : "mLastTriggerCount", (byte) 0);
+                        set(activity, "mNextInactivityReminderAt", 1L);
+                        long before = SystemClock.elapsedRealtime();
+                        inactivityTrigger(activity, secondary);
+                        assertInactivityDelayReset(activity, before);
+                    }
+                }
+            } finally { invoke(activity, "stopInactivityVoiceReminder"); }
+        });
+    }
+
+    @Test
+    public void inactivityGpsModeTransitionsGrantOnlyOneFortySecondGrace() {
+        scenario.onActivity(activity -> {
+            Globals.getInstance().mUseGPS = true;
+            receiveInactivityGps(activity, inactivityGpsFix(47.0, 20f, SystemClock.elapsedRealtime()));
+            invoke(activity, "startInactivityVoiceReminder");
+            try {
+                assertEquals(false, get(activity, "mInactivityUsesGps"));
+                set(activity, "mNextInactivityReminderAt", 1L);
+                long before = SystemClock.elapsedRealtime();
+                receiveInactivityGps(activity, inactivityGpsFix(47.0, 1f, SystemClock.elapsedRealtime()));
+                assertEquals(true, get(activity, "mInactivityUsesGps"));
+                assertInactivityDelayReset(activity, before);
+                set(activity, "mNextInactivityReminderAt", 123L);
+                invoke(activity, "refreshInactivityGpsMode", new Class<?>[]{long.class}, SystemClock.elapsedRealtime());
+                invoke(activity, "refreshInactivityGpsMode", new Class<?>[]{long.class}, SystemClock.elapsedRealtime());
+                assertEquals("An unchanged reliable mode repeatedly renewed its grace", 123L,
+                        get(activity, "mNextInactivityReminderAt"));
+
+                before = SystemClock.elapsedRealtime();
+                receiveInactivityGps(activity, inactivityGpsFix(47.0, 20f, SystemClock.elapsedRealtime()));
+                assertEquals(false, get(activity, "mInactivityUsesGps"));
+                assertInactivityDelayReset(activity, before);
+                set(activity, "mNextInactivityReminderAt", 321L);
+                invoke(activity, "refreshInactivityGpsMode", new Class<?>[]{long.class}, SystemClock.elapsedRealtime());
+                invoke(activity, "refreshInactivityGpsMode", new Class<?>[]{long.class}, SystemClock.elapsedRealtime());
+                assertEquals("An unchanged fallback mode repeatedly renewed its grace", 321L,
+                        get(activity, "mNextInactivityReminderAt"));
+            } finally { invoke(activity, "stopInactivityVoiceReminder"); }
+        });
+    }
+
+    @Test
+    public void expiredGoodGpsGetsOneGraceThenUsesLegacyInactivityVoice() {
+        withRecordingSpeech((activity, speech) -> {
+            boolean resumed = (boolean) get(activity, "mActivityResumed");
+            set(activity, "mActivityResumed", true);
+            startReliableGpsInactivity(activity, 1f, SystemClock.elapsedRealtime() - 1000L);
+            try {
+                set(activity, "mLastGpsFixElapsedMs",
+                        SystemClock.elapsedRealtime() - InactivityGpsPolicy.MAX_FIX_AGE_MS - 1L);
+                set(activity, "mNextInactivityReminderAt", 1L);
+                long before = SystemClock.elapsedRealtime();
+                Runnable reminder = (Runnable) get(activity, "mInactivityVoiceReminder");
+                reminder.run();
+                assertEquals(false, get(activity, "mInactivityUsesGps"));
+                assertInactivityDelayReset(activity, before);
+                assertTrue(speech.queued.isEmpty());
+                set(activity, "mNextInactivityReminderAt", 1L);
+                reminder.run();
+                assertEquals("Stale GPS renewed its transition grace instead of allowing a reminder", 1,
+                        speech.queued.size());
+                assertInactivityVoice(activity, speech.queued.get(0));
+            } finally {
+                invoke(activity, "stopInactivityVoiceReminder");
+                set(activity, "mActivityResumed", resumed);
+            }
+        });
+    }
+
+    @Test
+    public void deathClearsGpsInactivityStateAndRejectsOldReminder() {
+        withRecordingSpeech((activity, speech) -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            assertTrue(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+            Runnable reminder = (Runnable) get(activity, "mInactivityVoiceReminder");
+            invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
+            assertGpsInactivityStopped(activity);
+            speech.queued.clear();
+            reminder.run();
+            assertTrue("A dead player heard a stale inactivity callback", speech.queued.isEmpty());
+        });
+    }
+
+    @Test
+    public void pauseClearsGpsInactivityStateAndRejectsOldReminder() {
+        withRecordingSpeech((activity, speech) -> {
+            boolean registered = (boolean) get(activity, "mGattReceiverRegistered");
+            try (ReloadResumeFixture fixture = new ReloadResumeFixture(activity, bluetooth)) {
+                primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+                assertTrue(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+                Runnable reminder = (Runnable) get(activity, "mInactivityVoiceReminder");
+                activity.onPause();
+                try {
+                    assertGpsInactivityStopped(activity);
+                    speech.queued.clear();
+                    reminder.run();
+                    assertTrue("A paused player heard a stale inactivity callback", speech.queued.isEmpty());
+                } finally {
+                    if (registered) activity.onResume();
+                    invoke(activity, "stopInactivityVoiceReminder");
+                }
+            }
+        });
+    }
+
+    private static Intent inactivityGpsFix(double latitude, float accuracy, long measuredAt) {
+        return new Intent(NetMsg.NETMSG_GPSLOCUPDATE)
+                .putExtra(NetMsg.INTENT_LONGITUDE, -122.0).putExtra(NetMsg.INTENT_LATITUDE, latitude)
+                .putExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS, measuredAt)
+                .putExtra(NetMsg.INTENT_GPS_HAS_ACCURACY, true)
+                .putExtra(NetMsg.INTENT_GPS_ACCURACY_METERS, accuracy)
+                .putExtra(NetMsg.INTENT_GPS_PROVIDER, android.location.LocationManager.GPS_PROVIDER);
+    }
+
+    private static void receiveInactivityGps(FullscreenActivity activity, Intent fix) {
+        invoke(activity, "receiveLocalGpsLocation", new Class<?>[]{Intent.class}, fix);
+    }
+
+    private static void startReliableGpsInactivity(FullscreenActivity activity, float accuracy, long measuredAt) {
+        Globals.getInstance().mUseGPS = true;
+        receiveInactivityGps(activity, inactivityGpsFix(47.0, accuracy, measuredAt));
+        invoke(activity, "startInactivityVoiceReminder");
+        assertEquals(true, get(activity, "mInactivityUsesGps"));
+    }
+
+    private static void inactivityTrigger(FullscreenActivity activity, boolean secondary) {
+        byte[] packet = telemetryPacket(0, 0, 0, 0);
+        packet[FullscreenActivity.RECOIL_OFFSET_RELOAD_TRIGGER_COUNTER] = 1;
+        receivePowerupGatt(activity, new Intent(BluetoothLeService.TELEMETRY_DATA_AVAILABLE)
+                .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, secondary ? 1 : 0)
+                .putExtra(BluetoothLeService.EXTRA_DATA, packet));
+    }
+
+    private static void assertInactivityDelayReset(FullscreenActivity activity, long before) {
+        long deadline = (long) get(activity, "mNextInactivityReminderAt");
+        assertTrue("Activity did not restore the full forty-second delay", deadline >= before + 40_000L);
+        assertTrue("Activity scheduled more than forty seconds from now",
+                deadline <= SystemClock.elapsedRealtime() + 40_000L);
+    }
+
+    private static void assertInactivityVoice(FullscreenActivity activity, String queued) {
+        boolean found = false;
+        for (int prompt : new int[]{R.string.inactivity_battle_voice_prompt, R.string.inactivity_recruit_voice_prompt,
+                R.string.inactivity_legs_voice_prompt, R.string.inactivity_breaking_news_voice_prompt,
+                R.string.inactivity_battlefield_voice_prompt, R.string.inactivity_movement_tutorial_voice_prompt,
+                R.string.inactivity_laser_camping_voice_prompt, R.string.inactivity_standing_still_voice_prompt})
+            found |= queued.equals("normal:1.0:" + activity.getString(prompt));
+        assertTrue("The due reminder did not speak an inactivity prompt: " + queued, found);
+    }
+
+    private static void assertGpsInactivityStopped(FullscreenActivity activity) {
+        assertEquals(false, get(activity, "mInactivityReminderActive"));
+        assertEquals(false, get(activity, "mInactivityUsesGps"));
+        assertTrue(Double.isNaN((double) get(activity, "mInactivityGpsLatitude")));
+        assertTrue(Double.isNaN((double) get(activity, "mInactivityGpsLongitude")));
+        assertEquals(-1L, get(activity, "mInactivityLastGpsSampleElapsedMs"));
+        assertFalse(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
     }
 
     @Test
@@ -2159,6 +3700,442 @@ public class GameplayRegressionTest {
             completeWrite(activity);
             assertSame(timer, get(activity, "mReloadTimer"));
         });
+    }
+
+    @Test
+    public void roundStartPausedDisableAcksPrepareBothGunsImmediatelyOnResume() {
+        assertRoundStartAckRecoveredOnResume(false);
+    }
+
+    @Test
+    public void roundStartPausedRefillAcksRestoreBothLoadedGunsWithoutAnotherWrite() {
+        assertRoundStartAckRecoveredOnResume(true);
+    }
+
+    private void assertRoundStartAckRecoveredOnResume(boolean refill) {
+        scenario.onActivity(activity -> {
+            long previousReloadTime = Globals.getInstance().mReloadTime;
+            try (ReloadResumeFixture fixture = new ReloadResumeFixture(activity, bluetooth)) {
+                Globals.getInstance().mReloadTime = 10_000L;
+                beginRoundStartCountdown(activity);
+                if (refill) {
+                    completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                            BluetoothGatt.GATT_SUCCESS);
+                    completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                            BluetoothGatt.GATT_SUCCESS);
+                }
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = fixture.dual.second.writes.size();
+                runReloadResumeCallbacks(activity, () -> {
+                    retainPendingReloadCompletion(activity, bluetooth, false, SystemClock.elapsedRealtime());
+                    retainPendingReloadCompletion(activity, fixture.dual.second, true, SystemClock.elapsedRealtime());
+                    assertEquals(refill ? 2 : 4, get(activity, "mReloading"));
+                    assertEquals(refill ? 2 : 4, get(activity, "mSecondaryReloading"));
+                }, () -> {
+                    assertEquals(refill ? 0 : 2, get(activity, "mReloading"));
+                    assertEquals(refill ? 0 : 2, get(activity, "mSecondaryReloading"));
+                    assertNull(get(activity, "mReloadTimer"));
+                    assertNull(get(activity, "mSecondaryReloadTimer"));
+                    assertEquals(primaryWrites + (refill ? 0 : 1), bluetooth.writes.size());
+                    assertEquals(secondaryWrites + (refill ? 0 : 1), fixture.dual.second.writes.size());
+                    if (refill) {
+                        assertNull(get(activity, "mPendingReloadCommand"));
+                        assertNull(get(activity, "mSecondaryPendingReloadCommand"));
+                        int magazine = (int) invokeResult(activity, "activeMagazineSize");
+                        assertEquals(magazine, ((byte) get(activity, "mLastShotCount")) & 255);
+                        assertEquals(magazine, ((byte) get(activity, "mSecondaryLastShotCount")) & 255);
+                    } else {
+                        assertEquals(4, ((byte[]) get(activity, "mPendingReloadCommand"))[2]);
+                        assertEquals(4, ((byte[]) get(activity, "mSecondaryPendingReloadCommand"))[2]);
+                    }
+                    int firstWrites = bluetooth.writes.size(), secondWrites = fixture.dual.second.writes.size();
+                    invoke(activity, "recoverCompletedReloadWrites");
+                    assertEquals(firstWrites, bluetooth.writes.size());
+                    assertEquals(secondWrites, fixture.dual.second.writes.size());
+                    assertEquals("Recovering ammunition started the game early",
+                            Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+                });
+            } finally {
+                Globals.getInstance().mReloadTime = previousReloadTime;
+            }
+        });
+    }
+
+    @Test
+    public void ordinaryDeathKeepsBothGunsDisabledUntilRespawnUnlikeRoundStartCountdown() {
+        scenario.onActivity(activity -> {
+            boolean previousQrEnabled = Globals.getInstance().mRespawnQrEnabled;
+            Globals.getInstance().mRespawnQrEnabled = false;
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Test attacker");
+                CountDownTimer respawn = (CountDownTimer) get(activity, "mSpawnTimer");
+                assertNotNull(respawn);
+                respawn.cancel();
+                completePowerupWrite(activity, false, (byte[]) get(activity, "mPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                completePowerupWrite(activity, true, (byte[]) get(activity, "mSecondaryPendingReloadCommand"),
+                        BluetoothGatt.GATT_SUCCESS);
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = guns.second.writes.size();
+                assertEquals(false, get(activity, "mStartGameTimer"));
+                assertEquals(3, get(activity, "mReloading"));
+                assertEquals(3, get(activity, "mSecondaryReloading"));
+                invoke(activity, "prepareRoundStartReloads");
+                invoke(activity, "finishReload");
+                invoke(activity, "finishSecondaryReload");
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, guns.second.writes.size());
+
+                respawn.onFinish();
+
+                assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+                assertEquals(primaryWrites + 1, bluetooth.writes.size());
+                assertEquals(secondaryWrites + 1, guns.second.writes.size());
+                assertEquals(4, ((byte[]) get(activity, "mPendingReloadCommand"))[2]);
+                assertEquals(4, ((byte[]) get(activity, "mSecondaryPendingReloadCommand"))[2]);
+            } finally {
+                Globals.getInstance().mRespawnQrEnabled = previousQrEnabled;
+            }
+        });
+    }
+
+    @Test
+    public void pausedPrimaryDisableCompletionResumesItsRemainingReloadWait() {
+        assertPausedReloadCompletionRecovered(false, false, false);
+    }
+
+    @Test
+    public void pausedSecondaryDisableCompletionResumesItsRemainingReloadWait() {
+        assertPausedReloadCompletionRecovered(true, false, false);
+    }
+
+    @Test
+    public void pausedPrimaryAgedDisableCompletionRefillsWithoutAnotherWait() {
+        assertPausedReloadCompletionRecovered(false, false, true);
+    }
+
+    @Test
+    public void pausedSecondaryAgedDisableCompletionRefillsWithoutAnotherWait() {
+        assertPausedReloadCompletionRecovered(true, false, true);
+    }
+
+    @Test
+    public void pausedPrimaryRefillCompletionRestoresAmmoOnResume() {
+        assertPausedReloadCompletionRecovered(false, true, false);
+    }
+
+    @Test
+    public void pausedSecondaryRefillCompletionRestoresAmmoOnResume() {
+        assertPausedReloadCompletionRecovered(true, true, false);
+    }
+
+    /** Exercise actual lifecycle callbacks without API-22's unreliable foreground task restore. */
+    private void assertPausedReloadCompletionRecovered(boolean secondary, boolean refill, boolean aged) {
+        String stateField = secondary ? "mSecondaryReloading" : "mReloading";
+        String timerField = secondary ? "mSecondaryReloadTimer" : "mReloadTimer";
+        String pendingField = secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand";
+        String shotsField = secondary ? "mSecondaryLastShotCount" : "mLastShotCount";
+        scenario.onActivity(activity -> {
+            try (ReloadResumeFixture fixture = new ReloadResumeFixture(activity, bluetooth)) {
+                Globals.getInstance().mReloadTime = 10_000L;
+                set(activity, shotsField, (byte) 0);
+                if (secondary) invoke(activity, "startSecondaryReload", new Class<?>[]{int.class}, 1);
+                else invoke(activity, "startReload");
+                RecordingBluetoothService service = secondary ? fixture.dual.second : bluetooth;
+                if (refill) {
+                    completePowerupWrite(activity, secondary, (byte[]) get(activity, pendingField),
+                            BluetoothGatt.GATT_SUCCESS);
+                    CountDownTimer timer = (CountDownTimer) get(activity, timerField);
+                    assertNotNull(timer);
+                    timer.cancel();
+                    timer.onFinish();
+                }
+                byte[] pending = ((byte[]) get(activity, pendingField)).clone();
+                assertEquals(refill ? 2 : 1, get(activity, stateField));
+                assertNull(get(activity, timerField));
+                int writesBeforeResume = service.writes.size();
+                runReloadResumeCallbacks(activity, () -> {
+                    BluetoothGattCharacteristic command = (BluetoothGattCharacteristic) get(activity,
+                            secondary ? "mSecondaryCommandCharacteristic" : "mCommandCharacteristic");
+                    long completedAt = SystemClock.elapsedRealtime() - (aged ? 10_001L : 0L);
+                    Intent completion = retainedReloadCompletion(secondary, pending, BluetoothGatt.GATT_SUCCESS,
+                            completedAt);
+                    service.retainWriteResult(command, completion);
+                    // The original broadcast arrives while paused and must be ignored.
+                    ((BroadcastReceiver) get(activity, "mGattUpdateReceiver")).onReceive(activity, completion);
+                    assertEquals(refill ? 2 : 1, get(activity, stateField));
+                    assertNotNull(get(activity, pendingField));
+                    assertNull(get(activity, timerField));
+                }, () -> {
+                    if (refill) {
+                        assertEquals(0, get(activity, stateField));
+                        assertEquals(pending[6], get(activity, shotsField));
+                        assertNull(get(activity, pendingField));
+                        assertEquals(writesBeforeResume, service.writes.size());
+                    } else if (aged) {
+                        assertEquals("Resume added a second full reload wait", 2, get(activity, stateField));
+                        assertNull(get(activity, timerField));
+                        assertEquals(writesBeforeResume + 1, service.writes.size());
+                        assertEquals(4, service.writes.get(service.writes.size() - 1)[2]);
+                    } else {
+                        assertEquals(1, get(activity, stateField));
+                        assertNotNull(get(activity, timerField));
+                        assertNull(get(activity, pendingField));
+                        assertEquals(writesBeforeResume, service.writes.size());
+                    }
+                    Object timer = get(activity, timerField);
+                    int writes = service.writes.size();
+                    invoke(activity, "recoverCompletedReloadWrites");
+                    assertSame("Replaying a retained ACK restarted its timer", timer, get(activity, timerField));
+                    assertEquals("Replaying a retained ACK issued another refill", writes, service.writes.size());
+                    assertEquals("Recovering one gun changed the other gun's reload state", 0,
+                            get(activity, secondary ? "mReloading" : "mSecondaryReloading"));
+                });
+            }
+        });
+    }
+
+    @Test
+    public void reloadResumeIgnoresStaleOrUnmatchedCompletionForBothGuns() {
+        scenario.onActivity(activity -> {
+            try (ReloadResumeFixture fixture = new ReloadResumeFixture(activity, bluetooth)) {
+                Globals.getInstance().mReloadTime = 10_000L;
+                invoke(activity, "startReload");
+                invoke(activity, "startSecondaryReload", new Class<?>[]{int.class}, 1);
+                for (boolean secondary : new boolean[]{false, true}) {
+                    RecordingBluetoothService service = secondary ? fixture.dual.second : bluetooth;
+                    String pendingField = secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand";
+                    BluetoothGattCharacteristic command = (BluetoothGattCharacteristic) get(activity,
+                            secondary ? "mSecondaryCommandCharacteristic" : "mCommandCharacteristic");
+                    byte[] pending = ((byte[]) get(activity, pendingField)).clone();
+                    byte[] stale = pending.clone();
+                    stale[0] += 0x10;
+                    service.retainWriteResult(command, retainedReloadCompletion(secondary, stale,
+                            BluetoothGatt.GATT_SUCCESS, SystemClock.elapsedRealtime()));
+                    invokeRegisteredReloadRecovery(activity);
+                    assertEquals(1, get(activity, secondary ? "mSecondaryReloading" : "mReloading"));
+                    assertNull(get(activity, secondary ? "mSecondaryReloadTimer" : "mReloadTimer"));
+                    assertTrue(Arrays.equals(pending, (byte[]) get(activity, pendingField)));
+                    service.retainWriteResult(characteristic(GattAttributes.RECOIL_COMMAND_UUID),
+                            retainedReloadCompletion(secondary, pending, BluetoothGatt.GATT_SUCCESS,
+                                    SystemClock.elapsedRealtime()));
+                    invokeRegisteredReloadRecovery(activity);
+                    assertNull(get(activity, secondary ? "mSecondaryReloadTimer" : "mReloadTimer"));
+                    assertTrue(Arrays.equals(pending, (byte[]) get(activity, pendingField)));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void reloadResumeCannotEnableEliminatedPlayersFromRetainedCompletion() {
+        assertProtectedReloadRecovery(false);
+    }
+
+    @Test
+    public void reloadResumeCannotEnableEitherGunDuringEmp() {
+        assertProtectedReloadRecovery(true);
+    }
+
+    @Test
+    public void retainedRoundEndWinsBeforeAgedReloadCompletionsOnResume() {
+        scenario.onActivity(activity -> {
+            try (ReloadResumeFixture fixture = new ReloadResumeFixture(activity, bluetooth)) {
+                Globals.getInstance().mReloadTime = 10_000L;
+                invoke(activity, "startReload");
+                invoke(activity, "startSecondaryReload", new Class<?>[]{int.class}, 1);
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = fixture.dual.second.writes.size();
+                runReloadResumeCallbacks(activity, () -> {
+                    retainPendingReloadCompletion(activity, bluetooth, false, SystemClock.elapsedRealtime() - 10_001L);
+                    retainPendingReloadCompletion(activity, fixture.dual.second, true,
+                            SystemClock.elapsedRealtime() - 10_001L);
+                    finishTcpSession(NetMsg.NETMSG_ENDGAME);
+                }, () -> {
+                    assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+                    assertEquals(3, get(activity, "mReloading"));
+                    assertEquals(3, get(activity, "mSecondaryReloading"));
+                    assertNull(get(activity, "mReloadTimer"));
+                    assertNull(get(activity, "mSecondaryReloadTimer"));
+                    assertNull(tcp.consumePendingTerminalEvent());
+                    for (int n = primaryWrites; n < bluetooth.writes.size(); n++)
+                        assertEquals("Resume refilled the primary gun before applying ENDGAME", 2,
+                                bluetooth.writes.get(n)[2]);
+                    for (int n = secondaryWrites; n < fixture.dual.second.writes.size(); n++)
+                        assertEquals("Resume refilled the second gun before applying ENDGAME", 2,
+                                fixture.dual.second.writes.get(n)[2]);
+                });
+            }
+        });
+    }
+
+    @Test
+    public void retainedEmpSnapshotPreventsRefillRecoveryBeforePowerupReplay() {
+        assertRetainedEmpReloadRecovery(0);
+    }
+
+    @Test
+    public void expiredRetainedEmpDoesNotBlockRefillRecovery() {
+        assertRetainedEmpReloadRecovery(1);
+    }
+
+    @Test
+    public void wrongLifeRetainedEmpDoesNotBlockRefillRecovery() {
+        assertRetainedEmpReloadRecovery(2);
+    }
+
+    @Test
+    public void wrongRoundRetainedEmpDoesNotBlockRefillRecovery() {
+        assertRetainedEmpReloadRecovery(3);
+    }
+
+    private void assertRetainedEmpReloadRecovery(int staleKind) {
+        scenario.onActivity(activity -> {
+            try (ReloadResumeFixture fixture = new ReloadResumeFixture(activity, bluetooth)) {
+                Globals globals = Globals.getInstance();
+                globals.mPowerupQrRequired = 2;
+                globals.mReloadTime = 10_000L;
+                String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+                com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(token);
+                roster.restore(new com.simplecoil.protocol.RoundRoster.Member(LiveJoin.identity(activity), 1, 1, 1));
+                roster.restore(new com.simplecoil.protocol.RoundRoster.Member(
+                        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 17, 2, 1));
+                globals.mRoundRoster = roster;
+                set(activity, "mActivePeerRoundToken", token);
+                for (boolean secondary : new boolean[]{false, true}) {
+                    if (secondary) invoke(activity, "startSecondaryReload", new Class<?>[]{int.class}, 1);
+                    else invoke(activity, "startReload");
+                    String pendingField = secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand";
+                    completePowerupWrite(activity, secondary, (byte[]) get(activity, pendingField),
+                            BluetoothGatt.GATT_SUCCESS);
+                    CountDownTimer timer = (CountDownTimer) get(activity,
+                            secondary ? "mSecondaryReloadTimer" : "mReloadTimer");
+                    assertNotNull(timer);
+                    timer.cancel();
+                    timer.onFinish();
+                    set(activity, secondary ? "mSecondaryLastShotCount" : "mLastShotCount", (byte) 0);
+                }
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = fixture.dual.second.writes.size();
+                long now = SystemClock.elapsedRealtime();
+                Powerups.Grant emp = new Powerups.Grant(752, 17, 0, Powerups.EMP, new int[]{1},
+                        new int[]{staleKind == 2 ? 1 : 0}, staleKind == 1 ? now - 1L : now + 5_000L, 2);
+                String snapshotToken = staleKind == 3 ? "cccccccc-cccc-cccc-cccc-cccccccccccc" : token;
+                try {
+                    tcp.retainedPowerupState = TcpServer.powerupSnapshotJson(snapshotToken,
+                            new Powerups.Snapshot(emp.id + 1, now, Collections.singletonList(emp),
+                                    Collections.emptyList()));
+                } catch (org.json.JSONException e) { throw new AssertionError(e); }
+                runReloadResumeCallbacks(activity, () -> {
+                    retainPendingReloadCompletion(activity, bluetooth, false, SystemClock.elapsedRealtime());
+                    retainPendingReloadCompletion(activity, fixture.dual.second, true, SystemClock.elapsedRealtime());
+                }, () -> {
+                    assertEquals(primaryWrites, bluetooth.writes.size());
+                    assertEquals(secondaryWrites, fixture.dual.second.writes.size());
+                    if (staleKind == 0) {
+                        assertEquals("Resume enabled the primary gun before the retained EMP replay", 2,
+                                get(activity, "mReloading"));
+                        assertEquals("Resume enabled the second gun before the retained EMP replay", 2,
+                                get(activity, "mSecondaryReloading"));
+                        assertEquals((byte) 0, get(activity, "mLastShotCount"));
+                        assertEquals((byte) 0, get(activity, "mSecondaryLastShotCount"));
+                        assertNotNull(get(activity, "mPendingReloadCommand"));
+                        assertNotNull(get(activity, "mSecondaryPendingReloadCommand"));
+                        // Deliver through the normal registered network receiver after its asynchronous replay.
+                        receiveNetwork(activity, TcpServer.powerupIntent(emp, token, true));
+                        assertEquals(3, get(activity, "mReloading"));
+                        assertEquals(3, get(activity, "mSecondaryReloading"));
+                        assertTrue(((long[]) get(activity, "mPowerupUntil"))[Powerups.EMP]
+                                > SystemClock.elapsedRealtime());
+                        assertEquals(primaryWrites + 1, bluetooth.writes.size());
+                        assertEquals(secondaryWrites + 1, fixture.dual.second.writes.size());
+                        assertEquals(2, bluetooth.writes.get(primaryWrites)[2]);
+                        assertEquals(2, fixture.dual.second.writes.get(secondaryWrites)[2]);
+                    } else {
+                        assertEquals(0, get(activity, "mReloading"));
+                        assertEquals(0, get(activity, "mSecondaryReloading"));
+                        assertEquals((byte) 30, get(activity, "mLastShotCount"));
+                        assertEquals((byte) 30, get(activity, "mSecondaryLastShotCount"));
+                        assertNull(get(activity, "mPendingReloadCommand"));
+                        assertNull(get(activity, "mSecondaryPendingReloadCommand"));
+                    }
+                });
+            } finally {
+                tcp.retainedPowerupState = null;
+            }
+        });
+    }
+
+    private static void retainPendingReloadCompletion(FullscreenActivity activity,
+            RecordingBluetoothService service, boolean secondary, long completedAt) {
+        BluetoothGattCharacteristic command = (BluetoothGattCharacteristic) get(activity,
+                secondary ? "mSecondaryCommandCharacteristic" : "mCommandCharacteristic");
+        byte[] pending = (byte[]) get(activity,
+                secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand");
+        service.retainWriteResult(command,
+                retainedReloadCompletion(secondary, pending, BluetoothGatt.GATT_SUCCESS, completedAt));
+    }
+
+    private static void runReloadResumeCallbacks(FullscreenActivity activity, Runnable whilePaused,
+            Runnable afterResume) {
+        boolean wasRegistered = (boolean) get(activity, "mGattReceiverRegistered");
+        if (wasRegistered) activity.onPause();
+        boolean resumed = false;
+        try {
+            assertFalse((boolean) get(activity, "mGattReceiverRegistered"));
+            whilePaused.run();
+            resumed = true;
+            activity.onResume();
+            afterResume.run();
+        } finally {
+            if (!resumed) activity.onResume();
+            if (!wasRegistered) activity.onPause();
+        }
+    }
+
+    private void assertProtectedReloadRecovery(boolean emp) {
+        scenario.onActivity(activity -> {
+            try (ReloadResumeFixture fixture = new ReloadResumeFixture(activity, bluetooth)) {
+                if (emp) {
+                    Globals.getInstance().mPowerupQrRequired = 2;
+                    applyPowerup(activity, personalPowerup(751, Powerups.EMP, 0), true);
+                } else {
+                    Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+                    invoke(activity, "startReload", new Class<?>[]{int.class}, 3);
+                }
+                int primaryWrites = bluetooth.writes.size(), secondaryWrites = fixture.dual.second.writes.size();
+                for (boolean secondary : new boolean[]{false, true}) {
+                    RecordingBluetoothService service = secondary ? fixture.dual.second : bluetooth;
+                    BluetoothGattCharacteristic command = (BluetoothGattCharacteristic) get(activity,
+                            secondary ? "mSecondaryCommandCharacteristic" : "mCommandCharacteristic");
+                    byte[] pending = (byte[]) get(activity,
+                            secondary ? "mSecondaryPendingReloadCommand" : "mPendingReloadCommand");
+                    service.retainWriteResult(command, retainedReloadCompletion(secondary, pending,
+                            BluetoothGatt.GATT_SUCCESS, SystemClock.elapsedRealtime() - 10_001L));
+                }
+                invokeRegisteredReloadRecovery(activity);
+                assertEquals(3, get(activity, "mReloading"));
+                assertEquals(3, get(activity, "mSecondaryReloading"));
+                assertNull(get(activity, "mReloadTimer"));
+                assertNull(get(activity, "mSecondaryReloadTimer"));
+                assertNull(get(activity, "mPendingReloadCommand"));
+                assertNull(get(activity, "mSecondaryPendingReloadCommand"));
+                assertEquals(primaryWrites, bluetooth.writes.size());
+                assertEquals(secondaryWrites, fixture.dual.second.writes.size());
+            }
+        });
+    }
+
+    private static Intent retainedReloadCompletion(boolean secondary, byte[] data, int status, long completedAt) {
+        return new Intent(BluetoothLeService.CHARACTERISTIC_WRITE_FINISHED)
+                .putExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, secondary ? 1 : 0)
+                .putExtra(BluetoothLeService.EXTRA_UUID, GattAttributes.RECOIL_COMMAND_UUID)
+                .putExtra(BluetoothLeService.EXTRA_STATUS, status)
+                .putExtra(BluetoothLeService.EXTRA_COMPLETED_AT, completedAt)
+                .putExtra(BluetoothLeService.EXTRA_DATA, data.clone());
+    }
+
+    private static void invokeRegisteredReloadRecovery(FullscreenActivity activity) {
+        boolean registered = (boolean) get(activity, "mGattReceiverRegistered");
+        set(activity, "mGattReceiverRegistered", true);
+        try { invoke(activity, "recoverCompletedReloadWrites"); }
+        finally { set(activity, "mGattReceiverRegistered", registered); }
     }
 
     @Test
@@ -4106,6 +6083,263 @@ public class GameplayRegressionTest {
     }
 
     @Test
+    public void airstrikeEliminatesStationaryPlayersThroughAllShieldsDespiteEitherGunTrigger() {
+        withRecordingSpeech((activity, speech) -> {
+            Globals globals = Globals.getInstance();
+            globals.mPowerupQrRequired = 2;
+            globals.mFullShields = 10;
+            set(activity, "mHealth", 20);
+            set(activity, "mShield", 10);
+            set(activity, "mRespawnShieldBonus", 5);
+            set(activity, "mPowerupShieldBonus", 5);
+            try (PowerupDualGunFixture fixture = new PowerupDualGunFixture(activity)) {
+                primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+                inactivityTrigger(activity, false);
+                inactivityTrigger(activity, true);
+                assertTrue(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+                applyPowerup(activity, targetedPowerup(2001, 17, 0, Powerups.AIRSTRIKE, 0), false);
+                assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
+                assertTrue((int) get(activity, "mHealth") <= 0);
+                assertEquals(1, get(activity, "mEliminationCount"));
+                assertEquals(1, udp.peerEliminationPublishes);
+                assertEquals(Byte.valueOf((byte) 17), udp.lastPeerEliminationRecipient);
+                assertNotNull(get(activity, "mSpawnTimer"));
+                assertTrue(speech.queued.contains("normal:1.0:"
+                        + activity.getString(R.string.powerup_airstrike_eliminated_voice)));
+                assertFalse(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+                assertFalse((boolean) get(activity, "mInactivityReminderActive"));
+            }
+        });
+    }
+
+    @Test
+    public void airstrikeRequiresTheFullStationaryObservationPeriod() {
+        scenario.onActivity(activity -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS - 5000L);
+            assertFalse(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+            applyPowerup(activity, targetedPowerup(2002, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+            assertEquals(0, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void airstrikeSparesAPlayerWhoseLatestReliableFixShowsMovement() {
+        scenario.onActivity(activity -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            receiveInactivityGps(activity, inactivityGpsFix(47.0002, 1f, SystemClock.elapsedRealtime()));
+            assertFalse(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+            applyPowerup(activity, targetedPowerup(2003, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(0, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void airstrikeNeverTreatsPoorNetworkMissingOrStaleGpsAsStationary() {
+        scenario.onActivity(activity -> {
+            for (int quality = 0; quality < 7; quality++) {
+                primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+                switch (quality) {
+                    case 0: set(activity, "mLastGpsHasAccuracy", false); break;
+                    case 1: set(activity, "mLastGpsAccuracyMeters", 6f); break;
+                    case 2: set(activity, "mLastGpsProvider", android.location.LocationManager.NETWORK_PROVIDER); break;
+                    case 3: set(activity, "mLastGpsHasMeasurementTime", false); break;
+                    case 4: set(activity, "mLastGpsFixElapsedMs", SystemClock.elapsedRealtime()
+                            - InactivityGpsPolicy.MAX_FIX_AGE_MS - 1L); break;
+                    case 5: Globals.getInstance().mUseGPS = false; break;
+                    default: set(activity, "mLastGpsAccuracyMeters", Float.NaN); break;
+                }
+                applyPowerup(activity, targetedPowerup(2010 + quality, 17, 0, Powerups.AIRSTRIKE, 0), false);
+                assertEquals("Unusable GPS case " + quality + " caused an elimination", 20,
+                        get(activity, "mHealth"));
+                assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
+                assertEquals(0, udp.peerEliminationPublishes);
+            }
+        });
+    }
+
+    @Test
+    public void newerInvalidGpsClearsAirstrikeEvidenceWithoutReplacingTheLastGoodCoordinates() {
+        scenario.onActivity(activity -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            long previous = (long) get(activity, "mLastGpsFixElapsedMs");
+            receiveInactivityGps(activity, inactivityGpsFix(0.0, 1f, previous - 1L)
+                    .putExtra(NetMsg.INTENT_LONGITUDE, 0.0));
+            assertTrue("An older reordered invalid fix discarded newer stationary evidence",
+                    stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+            receiveInactivityGps(activity, inactivityGpsFix(0.0, 1f, SystemClock.elapsedRealtime())
+                    .putExtra(NetMsg.INTENT_LONGITUDE, 0.0));
+            assertEquals(47.0, (double) get(activity, "mLastGpsLatitude"), 0.0);
+            assertEquals(-122.0, (double) get(activity, "mLastGpsLongitude"), 0.0);
+            assertFalse(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+            applyPowerup(activity, targetedPowerup(2018, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            // Good GPS returning starts new evidence; the previous stationary
+            // period cannot turn one fresh fix into an immediate elimination.
+            receiveInactivityGps(activity, inactivityGpsFix(47.0, 1f, SystemClock.elapsedRealtime()));
+            assertFalse(stationaryGpsTracker(activity).isStationary(SystemClock.elapsedRealtime()));
+            applyPowerup(activity, targetedPowerup(2019, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(0, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void airstrikeRejectsSelfAndAlliesButSameIdRangeIsAnEnemyInFreeForAll() {
+        scenario.onActivity(activity -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            applyPowerup(activity, targetedPowerup(2020, 1, 0, Powerups.AIRSTRIKE, 0), false);
+            applyPowerup(activity, targetedPowerup(2021, 2, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(0, udp.peerEliminationPublishes);
+            Globals.getInstance().mGameMode = Globals.GAME_MODE_FFA;
+            applyPowerup(activity, targetedPowerup(2022, 2, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(Byte.valueOf((byte) 2), udp.lastPeerEliminationRecipient);
+        });
+    }
+
+    @Test
+    public void airstrikeCannotCrossTheTargetsDeathGenerationOrHitAnAlreadyDeadPlayer() {
+        scenario.onActivity(activity -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            set(activity, "mEliminationCount", 1);
+            applyPowerup(activity, targetedPowerup(2030, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            set(activity, "mHealth", 0);
+            applyPowerup(activity, targetedPowerup(2031, 17, 0, Powerups.AIRSTRIKE, 1), false);
+            assertEquals(0, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mEliminationCount"));
+            assertEquals(0, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void awardedAirstrikeRemainsValidWhenItsCasterDiesBeforeLiveDelivery() {
+        scenario.onActivity(activity -> {
+            com.simplecoil.protocol.RoundRoster roster = airstrikeRoster();
+            roster.seat(17).deaths = 1;
+            Globals.getInstance().mRoundRoster = roster;
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            applyPowerup(activity, targetedPowerup(2040, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(1, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void airstrikeSnapshotsNeverKillAndLiveRetriesCannotApplyTwice() {
+        scenario.onActivity(activity -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            Powerups.Grant recovered = targetedPowerup(2050, 17, 0, Powerups.AIRSTRIKE, 0);
+            applyPowerup(activity, recovered, true);
+            applyPowerup(activity, recovered, false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(0, udp.peerEliminationPublishes);
+            Powerups.Grant live = targetedPowerup(2051, 17, 0, Powerups.AIRSTRIKE, 0);
+            applyPowerup(activity, live, false);
+            assertEquals(1, udp.peerEliminationPublishes);
+            // Model a later respawn. Even a changed retry target generation
+            // must not permit the same grant ID to be applied for a second life.
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            set(activity, "mHealth", 20);
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            applyPowerup(activity, targetedPowerup(2051, 17, 0, Powerups.AIRSTRIKE, 1), false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(1, get(activity, "mEliminationCount"));
+            assertEquals(1, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void airstrikeHonorsInvulnerabilityUntilItExpires() {
+        scenario.onActivity(activity -> {
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            ((long[]) get(activity, "mPowerupUntil"))[Powerups.INVULNERABLE]
+                    = SystemClock.elapsedRealtime() + Powerups.BUFF_MS;
+            applyPowerup(activity, targetedPowerup(2060, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(0, udp.peerEliminationPublishes);
+            ((long[]) get(activity, "mPowerupUntil"))[Powerups.INVULNERABLE] = 0;
+            applyPowerup(activity, targetedPowerup(2061, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
+            assertEquals(1, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void airstrikeHonorsOriginalZombieProtectionWithoutDrainingItsAmmo() {
+        scenario.onActivity(activity -> {
+            Globals globals = Globals.getInstance();
+            globals.mInfectionMode = true;
+            globals.setPlayerInfected((byte) 1, true);
+            set(activity, "mScore", 0);
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            assertEquals(true, invokeResult(activity, "isOriginalZombieProtected"));
+            applyPowerup(activity, targetedPowerup(2070, 17, 0, Powerups.AIRSTRIKE, 0), false);
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(30, ((byte) get(activity, "mLastShotCount")) & 255);
+            assertEquals(0, udp.peerEliminationPublishes);
+        });
+    }
+
+    @Test
+    public void airstrikeRejectsExpiredAndWrongRoundOrReplacedCasterIntentsBeforeDeduplication() {
+        scenario.onActivity(activity -> {
+            com.simplecoil.protocol.RoundRoster roster = airstrikeRoster();
+            Globals.getInstance().mRoundRoster = roster;
+            set(activity, "mActivePeerRoundToken", roster.token);
+            primeAirstrikeStationarity(activity, StationaryGpsTracker.STATIONARY_MS);
+            Powerups.Grant expired = new Powerups.Grant(2080, 17, 0, Powerups.AIRSTRIKE,
+                    new int[]{1}, new int[]{0}, SystemClock.elapsedRealtime() - 1L, 2);
+            applyPowerup(activity, expired, false);
+            assertFalse(((java.util.Set<?>) get(activity, "mSeenPowerupGrants")).contains(expired.id));
+            Powerups.Grant live = targetedPowerup(2081, 17, 0, Powerups.AIRSTRIKE, 0);
+            Intent wrongRound = TcpServer.powerupIntent(live, "cccccccc-cccc-cccc-cccc-cccccccccccc", false);
+            invoke(activity, "receivePowerup", new Class<?>[]{Intent.class}, wrongRound);
+            assertFalse(((java.util.Set<?>) get(activity, "mSeenPowerupGrants")).contains(live.id));
+            Intent replacedSource = TcpServer.powerupIntent(live, roster.token, false);
+            com.simplecoil.protocol.RoundRoster.Member replacement = new com.simplecoil.protocol.RoundRoster.Member(
+                    "dddddddd-dddd-dddd-dddd-dddddddddddd", 17, 2, 2);
+            roster.restore(replacement);
+            invoke(activity, "receivePowerup", new Class<?>[]{Intent.class}, replacedSource);
+            assertFalse(((java.util.Set<?>) get(activity, "mSeenPowerupGrants")).contains(live.id));
+            assertEquals(20, get(activity, "mHealth"));
+            assertEquals(0, udp.peerEliminationPublishes);
+        });
+    }
+
+    private static StationaryGpsTracker stationaryGpsTracker(FullscreenActivity activity) {
+        return (StationaryGpsTracker) get(activity, "mStationaryGpsTracker");
+    }
+
+    private static void primeAirstrikeStationarity(FullscreenActivity activity, long observationMs) {
+        Globals.getInstance().mPowerupQrRequired = 2;
+        long now = SystemClock.elapsedRealtime();
+        long latestMeasurement = now - 1L;
+        set(activity, "mLastGpsHasMeasurementTime", false);
+        startReliableGpsInactivity(activity, 1f, now - 2L);
+        StationaryGpsTracker tracker = stationaryGpsTracker(activity);
+        tracker.reset();
+        for (long sample = latestMeasurement - observationMs; sample < latestMeasurement; sample += 5000L)
+            tracker.observe(true, -122.0, 47.0, 1f, sample, sample);
+        tracker.observe(true, -122.0, 47.0, 1f, latestMeasurement, latestMeasurement);
+        receiveInactivityGps(activity, inactivityGpsFix(47.0, 1f, latestMeasurement));
+    }
+
+    private static com.simplecoil.protocol.RoundRoster airstrikeRoster() {
+        com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        roster.restore(new com.simplecoil.protocol.RoundRoster.Member(
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 1, 1, 1));
+        roster.restore(new com.simplecoil.protocol.RoundRoster.Member(
+                "cccccccc-cccc-cccc-cccc-cccccccccccc", 17, 2, 1));
+        return roster;
+    }
+
+    @Test
     public void powerupOldTargetLifeAndOldDamageSourceLifeCannotSurviveRespawning() {
         scenario.onActivity(activity -> {
             Globals globals = Globals.getInstance();
@@ -4764,6 +6998,33 @@ public class GameplayRegressionTest {
 
     private static final class RecordingBluetoothService extends BluetoothLeService {
         final List<byte[]> writes = new ArrayList<>();
+        final Map<BluetoothGattCharacteristic, Intent> retainedWriteResults = new java.util.IdentityHashMap<>();
+        boolean simulateConnected;
+
+        @Override
+        public synchronized boolean connect(String address) {
+            return simulateConnected || super.connect(address);
+        }
+
+        @Override
+        public synchronized boolean isConnected() {
+            return simulateConnected || super.isConnected();
+        }
+
+        void retainWriteResult(BluetoothGattCharacteristic characteristic, Intent completed) {
+            retainedWriteResults.put(characteristic, new Intent(completed)
+                    .putExtra(BluetoothLeService.EXTRA_DATA,
+                            completed.getByteArrayExtra(BluetoothLeService.EXTRA_DATA).clone()));
+        }
+
+        @Override
+        public synchronized Intent getCompletedWriteResult(BluetoothGattCharacteristic characteristic, byte[] value) {
+            Intent completed = retainedWriteResults.get(characteristic);
+            if (completed == null || !Arrays.equals(value, completed.getByteArrayExtra(BluetoothLeService.EXTRA_DATA)))
+                return null;
+            return new Intent(completed).putExtra(BluetoothLeService.EXTRA_DATA,
+                    completed.getByteArrayExtra(BluetoothLeService.EXTRA_DATA).clone());
+        }
 
         @Override
         public synchronized void writeCharacteristic(BluetoothGattCharacteristic characteristic) {
@@ -4788,6 +7049,48 @@ public class GameplayRegressionTest {
         @Override
         public synchronized void setCharacteristicNotification(BluetoothGattCharacteristic characteristic, boolean enabled) {
             // Discovery tests use only simulated characteristics.
+        }
+    }
+
+    /** Keep real resume callbacks from contacting hardware while retaining their receiver sequencing. */
+    private static final class ReloadResumeFixture implements AutoCloseable {
+        final PowerupDualGunFixture dual;
+        final FullscreenActivity activity;
+        final RecordingBluetoothService primary;
+        final Object previousAddress, previousSecondAddress, previousConnected, previousSecondConnected;
+        final Object previousSecondBound;
+
+        ReloadResumeFixture(FullscreenActivity activity, RecordingBluetoothService primary) {
+            this.activity = activity;
+            this.primary = primary;
+            previousAddress = get(activity, "mDeviceAddress");
+            previousSecondAddress = get(activity, "mSecondaryDeviceAddress");
+            previousConnected = get(activity, "mConnected");
+            previousSecondConnected = get(activity, "mSecondaryConnected");
+            previousSecondBound = get(activity, "mSecondaryBLEServiceBound");
+            dual = new PowerupDualGunFixture(activity);
+            primary.simulateConnected = true;
+            dual.second.simulateConnected = true;
+            set(activity, "mDeviceAddress", "AA:BB:CC:DD:EE:01");
+            set(activity, "mSecondaryDeviceAddress", "AA:BB:CC:DD:EE:02");
+            set(activity, "mConnected", true);
+            set(activity, "mSecondaryConnected", true);
+            // applyBossWeaponRole() runs on resume too; it must not bind a real second service.
+            set(activity, "mSecondaryBLEServiceBound", true);
+        }
+
+        @Override public void close() {
+            primary.retainedWriteResults.clear();
+            primary.simulateConnected = false;
+            CountDownTimer timer = (CountDownTimer) get(activity, "mReloadTimer");
+            if (timer != null) timer.cancel();
+            set(activity, "mReloadTimer", null);
+            set(activity, "mDeviceAddress", previousAddress);
+            set(activity, "mSecondaryDeviceAddress", previousSecondAddress);
+            set(activity, "mConnected", previousConnected);
+            set(activity, "mSecondaryConnected", previousSecondConnected);
+            set(activity, "mSecondaryBLEServiceBound", previousSecondBound);
+            dual.close();
         }
     }
 
@@ -4841,13 +7144,135 @@ public class GameplayRegressionTest {
         }
     }
 
+    private static final class RecordingLobbyTcpServer extends TcpServer {
+        boolean ready = true;
+        boolean pendingStart;
+        int rebalances, modeChanges, preservedCancellations;
+        @Override boolean isTcpServerReady() { return ready; }
+        @Override boolean hasPendingOrAnnouncedStart() { return pendingStart; }
+        @Override public boolean rebalanceTeams() { rebalances++; return true; }
+        @Override public boolean isBalancedGamePrepared() { return Globals.getInstance().mBalancedGamePrepared; }
+        @Override public boolean setBalancedGameMode(boolean requireQr) {
+            modeChanges++;
+            Globals globals = Globals.getInstance();
+            globals.mBalancedRandom = true;
+            globals.mBalancedRequireQr = requireQr;
+            globals.mBalancedGamePrepared = false;
+            globals.clearBalancedCheckIns();
+            return true;
+        }
+        @Override public void cancelServer() { cancelServer(false); }
+        @Override public void cancelServer(boolean preserveBalancedTeams) {
+            if (preserveBalancedTeams) {
+                preservedCancellations++;
+                Globals.getInstance().clearBalancedRoundState();
+            } else Globals.getInstance().clearBalancedAssignments();
+        }
+        @Override public void stopTcpServer() { Globals.getInstance().clearBalancedAssignments(); }
+        @Override void clearScheduledStart() { pendingStart = false; }
+        @Override public void sendAllGameInfo(int playerID) { }
+    }
+
+    private static final class RecordingOrderedEndServer extends TcpServer {
+        int endRequests;
+        @Override public boolean requestOrderedRoundEnd() { endRequests++; return true; }
+        @Override public RoundReport freezeCompletedRoundReport(String token) { return null; }
+        @Override void clearScheduledStart() { }
+        @Override public void cancelServer(boolean preserveBalancedTeams) { }
+    }
+
+    private static final class BalancedModePreferences implements AutoCloseable {
+        final SharedPreferences preferences;
+        final Map<String, Object> saved = new HashMap<>();
+        final String[] keys = {FullscreenActivity.PREF_BALANCED_MODE, FullscreenActivity.PREF_BALANCED_QR,
+                FullscreenActivity.PREF_TOURNAMENT_MODE, FullscreenActivity.PREF_BOSS_MODE,
+                FullscreenActivity.PREF_CTF_MODE, FullscreenActivity.PREF_INFECTION_MODE,
+                FullscreenActivity.PREF_GAME_MODE};
+        BalancedModePreferences(FullscreenActivity activity) {
+            preferences = activity.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
+            Map<String, ?> all = preferences.getAll();
+            for (String key : keys) if (all.containsKey(key)) saved.put(key, all.get(key));
+        }
+        @Override public void close() {
+            SharedPreferences.Editor editor = preferences.edit();
+            for (String key : keys) {
+                Object value = saved.get(key);
+                if (value == null) editor.remove(key);
+                else if (value instanceof Boolean) editor.putBoolean(key, (Boolean) value);
+                else if (value instanceof Integer) editor.putInt(key, (Integer) value);
+                else if (value instanceof Long) editor.putLong(key, (Long) value);
+                else if (value instanceof Float) editor.putFloat(key, (Float) value);
+                else if (value instanceof String) editor.putString(key, (String) value);
+                else if (value instanceof Set) {
+                    @SuppressWarnings("unchecked") Set<String> strings = (Set<String>) value;
+                    editor.putStringSet(key, strings);
+                }
+            }
+            editor.commit();
+        }
+    }
+
+    private static final class RoundAnalyticsPreferences implements AutoCloseable {
+        final SharedPreferences preferences;
+        final Map<String, Object> saved = new HashMap<>();
+        RoundAnalyticsPreferences(FullscreenActivity activity) {
+            preferences = activity.getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
+            for (Map.Entry<String, ?> entry : preferences.getAll().entrySet())
+                if (analyticsKey(entry.getKey())) saved.put(entry.getKey(), entry.getValue());
+        }
+        private static boolean analyticsKey(String key) {
+            return key.startsWith("LastGame.") || key.startsWith("HistoryRound")
+                    || key.startsWith("HistoryBaseline") || key.startsWith("BalancedPrior");
+        }
+        @Override public void close() {
+            SharedPreferences.Editor editor = preferences.edit();
+            for (String key : preferences.getAll().keySet())
+                if (analyticsKey(key)) editor.remove(key);
+            for (Map.Entry<String, Object> entry : saved.entrySet()) {
+                Object value = entry.getValue();
+                if (value instanceof Integer) editor.putInt(entry.getKey(), (Integer) value);
+                else if (value instanceof Boolean) editor.putBoolean(entry.getKey(), (Boolean) value);
+                else if (value instanceof String) editor.putString(entry.getKey(), (String) value);
+                else if (value instanceof Long) editor.putLong(entry.getKey(), (Long) value);
+                else if (value instanceof Float) editor.putFloat(entry.getKey(), (Float) value);
+            }
+            editor.commit();
+        }
+    }
+
     private static final class RecordingTcpClient extends TcpClient {
         boolean dedicated;
+        boolean connectedToLobby;
+        int stopRequests;
+        Intent pendingTerminal;
         int hostedShots;
         int startRequests;
         byte playerIdWhenStarted;
         final List<String> messages = new ArrayList<>();
         final List<Intent> broadcasts = new ArrayList<>();
+        org.json.JSONObject retainedPowerupState;
+        RoundReport completedReport;
+
+        @Override public synchronized boolean hasLobbyConnection() { return connectedToLobby; }
+        @Override public synchronized Intent consumePendingTerminalEvent(long id) {
+            if (id != 123 || pendingTerminal == null) return super.consumePendingTerminalEvent(id);
+            Intent terminal = pendingTerminal;
+            pendingTerminal = null;
+            // Deliberately leave the fake connection live: the activity must
+            // retain the consumed terminal marker even after its ID is removed.
+            return terminal;
+        }
+
+        @Override public synchronized RoundReport getCompletedRoundReport(String token) {
+            // Deliberately return even a mismatched token to exercise the UI's
+            // independent round/player guard, not just the service's guard.
+            return completedReport;
+        }
+
+        @Override
+        public synchronized org.json.JSONObject powerupAuthoritySnapshot() {
+            return retainedPowerupState == null ? super.powerupAuthoritySnapshot() : retainedPowerupState;
+        }
 
         @Override
         public void sendBroadcast(Intent intent) { broadcasts.add(intent); }
@@ -4877,10 +7302,16 @@ public class GameplayRegressionTest {
         @Override
         public void stopTcpClient() {
             // No network connection is opened by this test client.
+            stopRequests++;
+            connectedToLobby = false;
         }
     }
 
     private static final class RecordingUDPService extends UDPListenerService {
+        int[] roundScores;
+        @Override public int[] getRoundScoresSnapshot() {
+            return roundScores == null ? super.getRoundScoresSnapshot() : roundScores.clone();
+        }
         long hostingSince = -1;
         long resumedSince = -1;
         @Override long hostStartedAt() { return hostingSince; }

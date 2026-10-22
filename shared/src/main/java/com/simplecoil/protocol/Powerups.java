@@ -23,6 +23,7 @@ public final class Powerups {
     public static final int HEAL_TEAM = 7;
     public static final int DAMAGE_TEAM = 8;
     public static final int INVULNERABLE = 9;
+    public static final int AIRSTRIKE = 10;
     public static final int MIN_REQUIRED = 2;
     public static final int MAX_REQUIRED = 8;
     public static final int MAX_PLAYERS = 32;
@@ -47,11 +48,11 @@ public final class Powerups {
     }
 
     public static boolean isValidKind(int kind) {
-        return kind >= EMP && kind <= INVULNERABLE;
+        return kind >= EMP && kind <= AIRSTRIKE;
     }
 
     public static boolean isInstant(int kind) {
-        return kind == HEAL_TEAM || kind == DAMAGE_TEAM;
+        return kind == HEAL_TEAM || kind == DAMAGE_TEAM || kind == AIRSTRIKE;
     }
 
     public static long durationMillis(int kind) {
@@ -60,16 +61,16 @@ public final class Powerups {
     }
 
     /**
-     * Baseline weights by ID are 6,24,6,20,12,18,6,6,2 (100 tickets).
-     * Losing by 1-4 points doubles EMP/team-wide/invulnerability weights;
+     * Baseline weights by ID are 6,24,6,20,12,18,6,6,2,2 (102 tickets).
+     * Losing by 1-4 points doubles EMP/team-wide/invulnerability/airstrike weights;
      * losing by 5+ quadruples them. Personal rewards keep their base weights.
      * FFA excludes teammate shields/healing. Negative/missing scores mean zero.
      */
     public static int[] weights(int ownScore, int bestEnemyScore, boolean teamGame) {
-        int[] weights = {0, 6, 24, 6, 20, 12, 18, 6, 6, 2};
+        int[] weights = {0, 6, 24, 6, 20, 12, 18, 6, 6, 2, 2};
         long deficit = (long) Math.max(0, bestEnemyScore) - Math.max(0, ownScore);
         int multiplier = deficit >= 5 ? 4 : deficit > 0 ? 2 : 1;
-        for (int kind : new int[]{EMP, SHIELD_TEAM, HEAL_TEAM, DAMAGE_TEAM, INVULNERABLE})
+        for (int kind : new int[]{EMP, SHIELD_TEAM, HEAL_TEAM, DAMAGE_TEAM, INVULNERABLE, AIRSTRIKE})
             weights[kind] *= multiplier;
         if (!teamGame) {
             weights[SHIELD_TEAM] = 0;
@@ -84,7 +85,7 @@ public final class Powerups {
         int total = 0;
         for (int weight : weights) total += weight;
         int ticket = random.nextInt(total);
-        for (int kind = EMP; kind <= INVULNERABLE; kind++) {
+        for (int kind = EMP; kind <= AIRSTRIKE; kind++) {
             ticket -= weights[kind];
             if (ticket < 0) return kind;
         }
@@ -299,7 +300,7 @@ public final class Powerups {
                 bestEnemyScore = Math.max(bestEnemyScore, score(scores, competitor));
             }
             int kind = choose(random, ownScore, bestEnemyScore, teamGame);
-            List<Integer> selected = kind == EMP || kind == DAMAGE_TEAM ? enemies
+            List<Integer> selected = kind == EMP || kind == DAMAGE_TEAM || kind == AIRSTRIKE ? enemies
                     : kind == SHIELD_TEAM || kind == HEAL_TEAM ? allies
                     : Collections.singletonList(sourceID);
             // A solo survivor cannot receive a useless enemy-wide reward.

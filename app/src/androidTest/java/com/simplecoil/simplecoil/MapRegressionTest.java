@@ -429,6 +429,40 @@ public class MapRegressionTest {
     }
 
     @Test
+    public void localLocationBroadcastCopiesProviderAndAccuracyWithoutRounding() throws Exception {
+        scenario.onActivity(current -> {
+            Location fix = location(10, 20, 1000);
+            fix.setAccuracy(2.75f);
+            map.makeUseOfNewLocation(fix);
+            // The accepted location and broadcast retain their own metadata snapshot.
+            fix.setAccuracy(99);
+            fix.setProvider("network");
+        });
+        awaitLocationUpdates(1);
+        Intent fix = locationUpdates.get(0);
+        assertTrue(fix.hasExtra(NetMsg.INTENT_GPS_HAS_ACCURACY));
+        assertTrue(fix.getBooleanExtra(NetMsg.INTENT_GPS_HAS_ACCURACY, false));
+        assertEquals(2.75f, fix.getFloatExtra(NetMsg.INTENT_GPS_ACCURACY_METERS, -1), 0);
+        assertEquals("gps", fix.getStringExtra(NetMsg.INTENT_GPS_PROVIDER));
+    }
+
+    @Test
+    public void localNetworkLocationWithoutAccuracyDoesNotClaimAGoodGpsFix() throws Exception {
+        scenario.onActivity(current -> {
+            Location fix = location(10, 20, 1000);
+            fix.setProvider("network");
+            fix.removeAccuracy();
+            map.makeUseOfNewLocation(fix);
+        });
+        awaitLocationUpdates(1);
+        Intent fix = locationUpdates.get(0);
+        assertTrue(fix.hasExtra(NetMsg.INTENT_GPS_HAS_ACCURACY));
+        assertFalse(fix.getBooleanExtra(NetMsg.INTENT_GPS_HAS_ACCURACY, true));
+        assertEquals(0, fix.getFloatExtra(NetMsg.INTENT_GPS_ACCURACY_METERS, -1), 0);
+        assertEquals("network", fix.getStringExtra(NetMsg.INTENT_GPS_PROVIDER));
+    }
+
+    @Test
     public void cachedHeartbeatPreservesMeasurementAgeAndStopsWhenStale() throws Exception {
         scenario.onActivity(current -> {
             Location fix = location(10, 20, 1000);

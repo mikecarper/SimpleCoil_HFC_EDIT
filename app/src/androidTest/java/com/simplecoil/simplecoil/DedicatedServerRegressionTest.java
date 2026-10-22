@@ -15,6 +15,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ListView;
+import android.widget.PopupMenu;
 import android.widget.Switch;
 import android.widget.TextView;
 
@@ -32,7 +33,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.util.HashMap;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -69,6 +72,11 @@ public class DedicatedServerRegressionTest {
     private boolean originalAllowPlayerSettings;
     private boolean originalTournamentMode;
     private int originalGameMode;
+    private boolean originalBalancedRandom, originalBalancedRequireQr, originalBalancedPrepared;
+    private Map<Byte, Integer> originalBalancedTeams;
+    private Set<Byte> originalBalancedCheckedIn;
+    private Map<String, Integer> originalRetainedBalancedTeams;
+    private SavedModePreferences originalModePreferences;
     private boolean endGameDialogOpen;
 
     @Before
@@ -95,6 +103,14 @@ public class DedicatedServerRegressionTest {
         originalAllowPlayerSettings = globals.mAllowPlayerSettings;
         originalTournamentMode = globals.mTournamentMode;
         originalGameMode = globals.mGameMode;
+        originalBalancedRandom = globals.mBalancedRandom;
+        originalBalancedRequireQr = globals.mBalancedRequireQr;
+        originalBalancedPrepared = globals.mBalancedGamePrepared;
+        originalBalancedTeams = globals.mBalancedTeams;
+        originalBalancedCheckedIn = globals.mBalancedCheckedIn;
+        originalRetainedBalancedTeams = globals.mRetainedBalancedTeams;
+        originalModePreferences = new SavedModePreferences(preferences);
+        preferences.edit().putBoolean(FullscreenActivity.PREF_BALANCED_MODE, false).commit();
         // Dedicated hosting temporarily owns player ID zero. Use a non-zero
         // selection to verify that closing the host restores the player screen.
         globals.mPlayerID = 7;
@@ -125,6 +141,9 @@ public class DedicatedServerRegressionTest {
             globals.mUseGPS = false;
             globals.mGameLimit = Globals.GAME_LIMIT_NONE;
             globals.mRespawnTime = 10;
+            globals.mBalancedRandom = false;
+            globals.mBalancedRequireQr = true;
+            globals.clearBalancedAssignments();
         });
         scenario.moveToState(Lifecycle.State.RESUMED);
     }
@@ -179,6 +198,186 @@ public class DedicatedServerRegressionTest {
         globals.mAllowPlayerSettings = originalAllowPlayerSettings;
         globals.mTournamentMode = originalTournamentMode;
         globals.mGameMode = originalGameMode;
+        globals.mBalancedRandom = originalBalancedRandom;
+        globals.mBalancedRequireQr = originalBalancedRequireQr;
+        globals.mBalancedGamePrepared = originalBalancedPrepared;
+        globals.mBalancedTeams = originalBalancedTeams;
+        globals.mBalancedCheckedIn = originalBalancedCheckedIn;
+        globals.mRetainedBalancedTeams = originalRetainedBalancedTeams;
+        if (originalModePreferences != null) originalModePreferences.restore();
+    }
+
+    @Test
+    public void balancedDedicatedHostRebalanceButtonRequestsExactlyOneRebalance() {
+        scenario.onActivity(current -> {
+            prepareBalancedLobby();
+            invoke("updateBalancedLobbyStatus");
+            Button rebalance = current.findViewById(R.id.rebalance_teams_button);
+            assertEquals(View.VISIBLE, rebalance.getVisibility());
+            assertTrue(rebalance.isEnabled());
+
+            rebalance.performClick();
+
+            assertEquals(1, tcp.rebalances);
+        });
+    }
+
+    @Test
+    public void balancedDedicatedRebalanceRejectsPendingStartCountdownAndUnavailableListener() {
+        scenario.onActivity(current -> {
+            prepareBalancedLobby();
+            Button rebalance = current.findViewById(R.id.rebalance_teams_button);
+            for (int blocked = 0; blocked < 4; blocked++) {
+                tcp.ready = blocked != 0;
+                tcp.pendingStart = blocked == 1;
+                Globals.getInstance().mGameState = blocked == 2
+                        ? Globals.GAME_STATE_RUNNING : Globals.GAME_STATE_NONE;
+                Globals.getInstance().mBalancedRandom = blocked != 3;
+                invoke("updateBalancedLobbyStatus");
+                assertFalse(rebalance.isEnabled());
+                if (blocked >= 2) assertEquals(View.GONE, rebalance.getVisibility());
+                invoke("rebalanceTeams");
+            }
+            assertEquals("A rejected action still reached the host", 0, tcp.rebalances);
+        });
+    }
+
+    @Test
+    public void balancedDedicatedRoundEndRetainsModeAndUuidTeamsButClearsCheckIns() {
+        scenario.onActivity(current -> {
+            prepareBalancedLobby();
+            Globals globals = Globals.getInstance();
+            Map<String, Integer> retained = Collections.singletonMap(
+                    "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 2);
+            globals.setRetainedBalancedTeams(retained);
+            globals.setBalancedAssignments(Collections.singletonMap((byte) 1, 2),
+                    Collections.singleton((byte) 1));
+            globals.mBalancedGamePrepared = true;
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+
+            receive(NetMsg.NETMSG_ENDGAME);
+
+            assertTrue(globals.mBalancedRandom);
+            assertTrue(globals.mBalancedRequireQr);
+            assertEquals(retained, globals.mRetainedBalancedTeams);
+            assertTrue(globals.mBalancedTeams.isEmpty());
+            assertTrue(globals.mBalancedCheckedIn.isEmpty());
+            assertFalse(globals.mBalancedGamePrepared);
+            Button rebalance = current.findViewById(R.id.rebalance_teams_button);
+            assertEquals(View.VISIBLE, rebalance.getVisibility());
+            assertTrue(rebalance.isEnabled());
+        });
+    }
+
+    @Test
+    public void balancedDedicatedRetainedTeamsWaitForStartBeforeShowingQrCheckIns() {
+        scenario.onActivity(current -> {
+            prepareBalancedLobby();
+            Globals globals = Globals.getInstance();
+            globals.setBalancedAssignments(Collections.singletonMap((byte) 1, 1), Collections.emptySet());
+            globals.mBalancedGamePrepared = false;
+            invoke("updateBalancedLobbyStatus");
+            TextView status = current.findViewById(R.id.game_status_tv);
+            assertEquals(current.getString(R.string.balanced_waiting_for_start), status.getText().toString());
+
+            globals.mBalancedGamePrepared = true;
+            invoke("updateBalancedLobbyStatus");
+
+            assertEquals(current.getString(R.string.balanced_host_checkins, 0, 1), status.getText().toString());
+        });
+    }
+
+    @Test
+    public void balancedDedicatedModeMenuOffersBothVariantsAndCannotChangeCommittedRounds() {
+        scenario.onActivity(current -> {
+            prepareBalancedLobby();
+            Globals.getInstance().mBalancedRandom = false;
+            Globals.getInstance().applyTournamentRules();
+            PopupMenu menu = new PopupMenu(current, current.findViewById(android.R.id.content));
+            menu.getMenuInflater().inflate(R.menu.game_mode_menu, menu.getMenu());
+            assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_qr_item).isVisible());
+            assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item).isVisible());
+            assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_qr_item).isEnabled());
+            assertTrue(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item).isEnabled());
+            current.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item));
+            assertTrue(Globals.getInstance().mBalancedRandom);
+            assertFalse(Globals.getInstance().mBalancedRequireQr);
+            assertTrue("Selecting balanced teams disabled tournament rules", Globals.getInstance().mTournamentMode);
+            assertTrue(Globals.getInstance().mVibrateOnHit);
+            assertFalse(Globals.getInstance().mAllowAutoShotMode);
+            assertFalse(Globals.getInstance().mAllowBurst3ShotMode);
+            assertEquals(Globals.RELOAD_COUNT, Globals.getInstance().mFullReload);
+            assertEquals(1, tcp.modeChanges);
+            current.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_qr_item));
+            assertTrue(Globals.getInstance().mBalancedRequireQr);
+            assertEquals(2, tcp.modeChanges);
+            tcp.pendingStart = true;
+            current.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item));
+            tcp.pendingStart = false;
+            Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+            current.onMenuItemClick(menu.getMenu().findItem(R.id.game_mode_balanced_no_qr_item));
+            assertEquals("A committed round changed the host's mode", 2, tcp.modeChanges);
+            assertTrue(Globals.getInstance().mBalancedRequireQr);
+        });
+    }
+
+    @Test
+    public void balancedDedicatedSavedModeSurvivesHostCreation() {
+        SharedPreferences preferences = InstrumentationRegistry.getInstrumentation()
+                .getTargetContext().getSharedPreferences(FullscreenActivity.PREF_NAME, Context.MODE_PRIVATE);
+        for (boolean tournament : new boolean[]{false, true}) {
+            closeActivity();
+            preferences.edit().putBoolean(FullscreenActivity.PREF_BALANCED_MODE, true)
+                    .putBoolean(FullscreenActivity.PREF_BALANCED_QR, tournament)
+                    .putBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, tournament)
+                    .putBoolean(FullscreenActivity.PREF_BOSS_MODE, false)
+                    .putBoolean(FullscreenActivity.PREF_CTF_MODE, false)
+                    .putBoolean(FullscreenActivity.PREF_INFECTION_MODE, false)
+                    .putInt(FullscreenActivity.PREF_GAME_MODE, Globals.GAME_MODE_2TEAMS).commit();
+            scenario = ActivityScenario.launch(DedicatedServerActivity.class);
+            scenario.onActivity(current -> {
+                activity = current;
+                // Retain the real onCreate state while removing physical service traffic.
+                invoke("unbindUDPService");
+                invoke("unbindTcpServerService");
+                current.stopService(new Intent(current, UDPListenerService.class));
+                current.stopService(new Intent(current, TcpServer.class));
+                tcp = new RecordingTcpServer();
+                udp = new RecordingUDPService();
+                set("mTcpServer", tcp);
+                set("mUDPListenerService", udp);
+                beginBinding(true);
+                beginBinding(false);
+                Globals globals = Globals.getInstance();
+                globals.mUseGPS = false;
+                assertTrue("Host creation cleared the saved balanced mode", globals.mBalancedRandom);
+                assertEquals(tournament, globals.mBalancedRequireQr);
+                assertEquals("Host creation changed the saved weapon profile", tournament, globals.mTournamentMode);
+                assertTrue(preferences.getBoolean(FullscreenActivity.PREF_BALANCED_MODE, false));
+                assertEquals(tournament, preferences.getBoolean(FullscreenActivity.PREF_TOURNAMENT_MODE, !tournament));
+                Button mode = current.findViewById(R.id.game_mode_toggle_button);
+                assertEquals(current.getString(tournament ? R.string.game_mode_balanced_qr
+                        : R.string.game_mode_balanced_no_qr), mode.getText().toString());
+                Switch profile = current.findViewById(R.id.tournament_mode_switch);
+                assertEquals(tournament, profile.isChecked());
+                assertFalse(profile.isEnabled());
+            });
+        }
+    }
+
+    private void prepareBalancedLobby() {
+        Globals globals = Globals.getInstance();
+        globals.mGameState = Globals.GAME_STATE_NONE;
+        globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+        globals.mTournamentMode = false;
+        globals.mBossMode = false;
+        globals.mCaptureTheFlag = false;
+        globals.mInfectionMode = false;
+        globals.mBalancedRandom = true;
+        globals.mBalancedRequireQr = true;
+        globals.mBalancedGamePrepared = false;
+        tcp.ready = true;
+        tcp.pendingStart = false;
     }
 
     @Test
@@ -981,12 +1180,12 @@ public class DedicatedServerRegressionTest {
     private Button button(int id) { return activity.findViewById(id); }
 
     @Test
-    public void legacyHostStartKeepsTwentyFourSecondsWithAShortRespawnDelay() {
+    public void legacyHostStartKeepsTwentyThreeSecondsWithAShortRespawnDelay() {
         assertLegacyHostStartCountdown(1, false);
     }
 
     @Test
-    public void legacyHostStartKeepsTwentyFourSecondsWithALongRespawnDelay() {
+    public void legacyHostStartKeepsTwentyThreeSecondsWithALongRespawnDelay() {
         assertLegacyHostStartCountdown(90, true);
     }
 
@@ -1093,6 +1292,37 @@ public class DedicatedServerRegressionTest {
         } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
     }
 
+    private static final class SavedModePreferences {
+        final SharedPreferences preferences;
+        final Map<String, Object> saved = new HashMap<>();
+        final String[] keys = {FullscreenActivity.PREF_BALANCED_MODE, FullscreenActivity.PREF_BALANCED_QR,
+                FullscreenActivity.PREF_TOURNAMENT_MODE, FullscreenActivity.PREF_BOSS_MODE,
+                FullscreenActivity.PREF_CTF_MODE, FullscreenActivity.PREF_INFECTION_MODE,
+                FullscreenActivity.PREF_GAME_MODE};
+        SavedModePreferences(SharedPreferences preferences) {
+            this.preferences = preferences;
+            Map<String, ?> all = preferences.getAll();
+            for (String key : keys) if (all.containsKey(key)) saved.put(key, all.get(key));
+        }
+        void restore() {
+            SharedPreferences.Editor editor = preferences.edit();
+            for (String key : keys) {
+                Object value = saved.get(key);
+                if (value == null) editor.remove(key);
+                else if (value instanceof Boolean) editor.putBoolean(key, (Boolean) value);
+                else if (value instanceof Integer) editor.putInt(key, (Integer) value);
+                else if (value instanceof Long) editor.putLong(key, (Long) value);
+                else if (value instanceof Float) editor.putFloat(key, (Float) value);
+                else if (value instanceof String) editor.putString(key, (String) value);
+                else if (value instanceof Set) {
+                    @SuppressWarnings("unchecked") Set<String> strings = (Set<String>) value;
+                    editor.putStringSet(key, strings);
+                }
+            }
+            editor.commit();
+        }
+    }
+
     private static final class RecordingTcpServer extends TcpServer {
         int gameStarts;
         int gameEnds;
@@ -1101,6 +1331,9 @@ public class DedicatedServerRegressionTest {
         int listenerStarts;
         int listenerStops;
         int cancellations;
+        int rebalances;
+        int modeChanges;
+        boolean pendingStart;
         boolean acceptStart = true;
         boolean dedicated;
         boolean ready;
@@ -1113,8 +1346,21 @@ public class DedicatedServerRegressionTest {
         @Override void startTcpServer() { listenerStarts++; }
         @Override public void stopTcpServer() { listenerStops++; }
         @Override public void cancelServer() { cancellations++; }
+        @Override public void cancelServer(boolean preserveBalancedTeams) { cancellations++; }
         @Override public void setDedicated(boolean value) { dedicated = value; }
         @Override boolean isTcpServerReady() { return ready; }
+        @Override boolean hasPendingOrAnnouncedStart() { return pendingStart || scheduledStart != null; }
+        @Override public boolean rebalanceTeams() { rebalances++; return true; }
+        @Override public boolean isBalancedGamePrepared() { return Globals.getInstance().mBalancedGamePrepared; }
+        @Override public boolean setBalancedGameMode(boolean requireQr) {
+            modeChanges++;
+            Globals globals = Globals.getInstance();
+            globals.mBalancedRandom = true;
+            globals.mBalancedRequireQr = requireQr;
+            globals.mBalancedGamePrepared = false;
+            globals.clearBalancedCheckIns();
+            return true;
+        }
         @Override Intent getScheduledGameStart() {
             return scheduledStart == null ? null : new Intent(scheduledStart);
         }

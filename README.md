@@ -100,6 +100,15 @@ to prevent voltage-rebound cycling; reconnect with a healthy pack (initial
 smoothed reading at least 4.8 V) to restore normal recoil. This saves motor power
 but does not shut down the gun or make an empty pack safe to keep using.
 
+Bluetooth command recovery does not delay or schedule individual trigger pulls.
+A command, read, or notification-setup operation without a completion for five
+seconds retires that gun's stale connection and starts the normal reconnect path
+instead of leaving a disabled magazine stuck indefinitely. Each Boss gun has
+its own recovery. Returning to an already connected gun does not reconnect it
+or trigger an extra reload. Reload confirmations received while the app is
+paused are recovered on resume, retaining the original completion time so the
+configured reload wait is not restarted.
+
 ### Recorded announcements
 
 English game over results and all 20 kill streak lines use clips extracted
@@ -240,6 +249,19 @@ and stay visible while preparing the next game. Leaving early labels them
 **Stats at exit**. A canceled countdown does not replace the previous result.
 Games played before installing this update cannot be recovered retroactively.
 
+After actual play ends, this card also shows shots, confirmed gun-hit accuracy,
+best kill and death streaks, and skill before/after the round. Skill uses the
+existing smoothed cumulative kills/deaths team-balancing index (neutral 100),
+not Elo. Host reports take precedence over local estimates; missing telemetry
+is labeled partial and unavailable accuracy is never presented as zero percent.
+At the end deadline, shooting stops immediately. Phones keep the control
+connection open for up to two seconds to receive the final host summary; a
+missing summary falls back to clearly labeled local statistics.
+The laptop game master can open **Review last round** for a player-lane timeline,
+event filters, the final statistics, and a downloadable JSON report. Reports
+survive lobby resets and are saved locally; they do not require GPS or a cloud
+service. See [laptop-host/README.md](laptop-host/README.md) for report storage.
+
 In the lobby, tap **Make this phone host** to choose a phone explicitly. Idle
 phones on the same Wi-Fi move to it and suppress automatic phone hosting while
 it remains reachable. The selected phone shows **This phone is the selected host**;
@@ -268,7 +290,7 @@ of every address. While looking for Wi-Fi, fresh radio scans are limited to
 once every three seconds; scan results can still trigger an immediate join,
 and tapping Wi-Fi requests an immediate scan. The AP must allow client-to-client traffic and subnet
 broadcasts; turn off guest/client isolation. All phones and the laptop host
-must run this protocol-30 build. A phone arriving during an active game offers
+must run this protocol-31 build. A phone arriving during an active game offers
 team-QR admission or waits for the next round instead of creating a separate lobby.
 
 Network games use TCP for the lobby and an NTP-style exchange of monotonic-clock
@@ -295,21 +317,31 @@ does not turn an old fix into a new one. Expired fixes are removed from the map.
   allow up to 800 ms. Both use the lowest-delay valid sample, bounding network
   timing uncertainty to 40 ms per native phone or 400 ms per relayed phone.
 - The host sends one shared start deadline and every phone shows a countdown to
-  it, normally 24 seconds away. The voice counts "10 Mississippi" through
+  it, normally 23 seconds away. The voice counts "10 Mississippi" through
   "0 Mississippi" every two seconds, then says "All out of Mississippi's."
-  The count takes 20 seconds, leaving four seconds for the closing line before
-  play starts. Solo starts use the same timing. Timed games also use a shared
-  end deadline.
+  The count takes 20 seconds, followed by a three-second closing slot. The
+  translated closing line is prepared and timed to end at the shared 23-second
+  play deadline, with trailing audio silence removed and no added pause
+  afterward. Solo starts use the same timing. Timed
+  games also use a shared end deadline. If speech preparation fails, gameplay
+  still starts on time.
+- Both connected guns reload at the beginning of that countdown, including
+  the boss's second gun. A successfully prepared gun is not reloaded again at
+  the play deadline. Failed writes are retried during the countdown, and a
+  reconnect prepares only that gun. The hardware refill also unlocks its
+  trigger, so early pulls can consume ammo, but hits, firing announcements,
+  and scoring do not count until the round starts. Death respawns still refill
+  at the respawn point.
 - The network-offset target is below 50 ms on a healthy native Wi-Fi connection.
   Bluetooth fallback uses the larger bound above. Wi-Fi
   congestion, device suspension, and normal UI scheduling can still affect the
   moment a device visibly reacts.
-- All participants must use network protocol 30 (this build). Older protocol
+- All participants must use network protocol 31 (this build). Older protocol
   versions are rejected rather than starting an incompatible game.
 
 During every network game, each phone sends one subnet-directed IPv4 state
 broadcast per second instead of one unicast packet per player. The fixed
-1,264-byte protocol-30 snapshot fits 32 player records below the 1,472-byte UDP
+1,264-byte protocol-31 snapshot fits 32 player records below the 1,472-byte UDP
 payload ceiling and avoids normal IPv4 fragmentation. Each record carries
 cumulative score/deaths,
 health, shield, shots, player state, grenade pairing, a deduplicated important
@@ -337,7 +369,7 @@ the full-screen team QR scanner still opens after death when QR respawns are ena
 
 The host chooses the reward from current match scores, not prior player history.
 Teams behind by 1-4 points get twice the normal weight for EMP, team shield,
-team heal, enemy-team damage, and invulnerability; a gap of 5+ gives four times
+team heal, enemy-team damage, invulnerability, and airstrike; a gap of 5+ gives four times
 the weight. It is still random, not a guaranteed comeback reward. CTF uses flag
 captures. Personal rewards retain their base weights. Free-for-all excludes
 teammate-only shields/healing.
@@ -360,6 +392,19 @@ changes, but codes already spent on a reward cannot be spent again this life.
 | Heal team | Restore every living teammate's health; does not respawn dead players |
 | Damage enemy team | Hit living opponents for 25% of normal health, absorbed by shields first |
 | Invulnerability | Ignore incoming damage for 15 seconds |
+| Airstrike | Eliminate living opponents confirmed stationary by good GPS for at least 20 seconds; all shields are consumed, existing invulnerability/protected-zombie rules still apply |
+
+Airstrike is a rare random reward with a base weight of two tickets, like
+invulnerability. Each target phone checks its own unrounded GPS history when
+the live grant arrives: continuous satellite fixes must report positive accuracy
+of 5 meters or better and remain no more than 10 seconds old. Both observed
+time and genuinely advancing measurements must span 20 seconds. Meaningful
+movement restarts that window; tiny jitter and repeated cached fixes cannot
+establish or renew stationary evidence. Missing, disabled, poor, or stale GPS
+spares the player, so indoor players are not guessed to be stationary. Trigger
+pulls do not protect a stationary player. The normal elimination, score-credit,
+and respawn paths apply. This uses the existing power-up QR codes and adds no
+GPS quality fields to the gameplay UDP packet.
 
 Rare grants and bounded recovery snapshots use reliable TCP without increasing
 the gameplay UDP packet size. Recovery retains 128 grants, enough for all 32
@@ -370,9 +415,10 @@ Recovery history is bounded to the most recent 128 records; unusually rapid
 unlocks across multiple respawns can exceed that history, while effects already
 applied still honor their original expiry.
 Round tokens, per-life scan masks, grant IDs, and
-original expiry times prevent stale or duplicated rewards. Instant healing and
-damage are not replayed from recovery snapshots. Everyone must update to the
-protocol-30 build before joining the same match.
+original expiry times prevent stale or duplicated rewards. Instant healing,
+damage, and airstrikes are not replayed from recovery snapshots. Everyone must
+update to the protocol-31 build before joining the same match; older clients
+cannot safely participate in airstrike rounds.
 
 Combat feedback does not wait for that one-second state cadence. `HIT`, `OUT`,
 `ALREADY DEAD`, and elimination use a 32-byte subnet broadcast that every phone
@@ -383,6 +429,17 @@ three sends; duplicate events are ACKed but applied only once. Combat uses its
 own bounded sender so a hit cannot sit behind a full 32-phone authority
 fan-out. Untargeted shot feedback is sent once, while the cumulative one-second
 snapshots remain the final repair path for a completely missed combat burst.
+
+Movement voice reminders begin after 40 seconds of inactivity, then repeat
+every 10 seconds. With GPS enabled and a satellite fix no more than 10 seconds
+old reporting positive accuracy of 5 meters or better, firing either blaster
+does not postpone them. Movement must cover at least 3 meters and the combined
+reported uncertainty of the anchor and current fixes; small jitters and cached
+or older measurements do not count. When GPS is poor, missing, stale,
+network-derived, or disabled, the existing trigger-based behavior remains, including
+empty pulls and either boss gun. Acquiring or losing good GPS starts one new
+40-second grace period. Reload and respawn instructions keep voice priority;
+death, pausing, and leaving the game cancel movement reminders.
 
 ## Player capacity and hosting
 
@@ -444,25 +501,37 @@ survivor converts. Any survivor still alive and uninfected at the fixed
 five-minute deadline also wins. Score and lives limits are disabled for this mode. On a laptop host, use
 `./laptop-host/run.sh --infection`.
 
-Balanced Random is an optional two-team assignment method on the laptop host.
+Balanced Random is an optional two-team assignment method on phone and laptop hosts.
 Everyone joins the lobby, then the host presses **Start** to assign teams using
 the kills and deaths saved on each player's phone from previous network games.
-The team sizes differ by no more than two players. Player IDs no longer imply a
+The initial split and an explicit rebalance differ by no more than two players. Player IDs no longer imply a
 team in this mode, and lobby joins can take any free ID; each phone displays its
 assigned team. With **QR Check-in**,
 every player, including a playing phone host, scans the printed Team 1 or Team 2
-respawn QR that matches their assignment. The shared 24-second countdown begins
+respawn QR that matches their assignment. The shared 23-second countdown begins
 after the final check-in, or after a 90-second check-in timeout if someone has
 not scanned. Everyone keeps their assigned team when the timeout starts the game.
-**No QR** starts that countdown as soon as the teams are assigned. Names can be
-edited in the lobby; weapon and player rules remain locked. Clearing an app's data
+**No QR** starts that countdown as soon as teams are ready after Start. Names can be
+edited in the lobby; team assignment preserves the selected Tournament or Classic weapon rules. Clearing an app's data
 also clears that phone's past-match totals.
+
+Teams stay the same between rounds by default. Membership follows each player's
+identity when phones reconnect, even if their player numbers change. New arrivals
+join a smaller/weaker team without moving existing players; departures do not
+trigger a new split. Uneven departures can therefore leave uneven teams until
+the host chooses **Rebalance teams** in the phone or laptop lobby.
+
+Rebalance uses the latest saved match stats, clears QR check-ins, and never
+starts a game by itself. Press **Start** afterward. QR mode opens a fresh
+90-second check-in window each round; pressing Start again while waiting does
+not erase scans or restart that timeout. Rebalance is unavailable during the
+countdown or gameplay.
 
 While a QR check-in is pending, the phone repeats the assigned team number in
 its spoken scan reminder. Respawn QR reminders also say the player's team.
 
 Choose each player's desired team/ID before joining and confirm the displayed
-team before starting. If an ID conflicts, a protocol-30 host automatically
+team before starting. If an ID conflicts, a protocol-31 host automatically
 moves that player to the first free ID on the same team; a full team still
 rejects the join. The dedicated host is not a player. At the end of a dedicated
 round, the host keeps listening but closes the current client sessions and
@@ -511,14 +580,14 @@ The host selects **Match options > Respawn mode** in the lobby:
 
 This is a match-wide setting; joined players cannot override the host. Solo
 practice and free-for-all use the configured respawn duration, **10 seconds**
-by default. Initial game-start countdowns are independently set to 24 seconds.
+by default. Initial game-start countdowns are independently set to 23 seconds.
 The dedicated-phone host has the same respawn-mode control; the laptop uses
 `./laptop-host/run.sh --timer-respawn` (or `--qr-respawn` for the default).
 CTF flag/base scans, optional power-ups, and optional QR team check-in remain
 separate features; timer-only disables the respawn scanner, not those objectives.
 
 With QR respawns enabled, network two-team and four-team games use team QR checkpoints after a player is
-eliminated. Initial game starts still use the 24-second countdown. On later deaths,
+eliminated. Initial game starts still use the 23-second countdown. On later deaths,
 the app opens its built-in phone-camera scanner automatically and gives the
 player a choice:
 
@@ -541,7 +610,9 @@ also works in timer-only mode and free-for-all games.
 ## Coordinates on the phone
 
 Latitude and longitude appear in the lobby's player card and in the upper-right
-corner during play. The readout shows **GPS Off** when match location sharing
+corner during play, with six decimal places from the phone's local location
+fix. The extra displayed precision does not improve the sensor's accuracy or
+change the compact network packets. The readout shows **GPS Off** when match location sharing
 is disabled, or **GPS acquiring...** until a recent location arrives. A fix
 expires after 30 seconds without an update, including after GPS is disabled and
 re-enabled. The app accepts Android's GPS and network-location providers; the coordinate readout

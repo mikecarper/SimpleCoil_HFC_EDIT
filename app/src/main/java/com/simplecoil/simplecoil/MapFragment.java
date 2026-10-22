@@ -137,6 +137,9 @@ public class MapFragment extends GlobeMapFragment {
         intent.putExtra(NetMsg.INTENT_LATITUDE, mLatitude);
         intent.putExtra(NetMsg.INTENT_LONGITUDE, mLongitude);
         intent.putExtra(NetMsg.INTENT_GPS_FIX_ELAPSED_MS, fixElapsedMs);
+        intent.putExtra(NetMsg.INTENT_GPS_HAS_ACCURACY, location.hasAccuracy());
+        intent.putExtra(NetMsg.INTENT_GPS_ACCURACY_METERS, location.getAccuracy());
+        intent.putExtra(NetMsg.INTENT_GPS_PROVIDER, location.getProvider());
         activity.sendBroadcast(intent);
     }
 

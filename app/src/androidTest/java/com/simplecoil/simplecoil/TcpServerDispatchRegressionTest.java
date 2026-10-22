@@ -69,10 +69,24 @@ public class TcpServerDispatchRegressionTest {
     private com.simplecoil.protocol.RoundRoster originalRoundRoster;
     private byte originalPlayerID;
     private boolean originalLocalLobbyReady;
+    private boolean originalBalanced;
+    private boolean originalBalancedQr;
+    private boolean originalBalancedPrepared;
+    private Map<Byte, Integer> originalBalancedTeams;
+    private Set<Byte> originalBalancedCheckIns;
+    private Map<String, Integer> originalRetainedBalancedTeams;
 
     @Before
     public void setUp() throws Exception {
         Globals globals = Globals.getInstance();
+        originalBalanced = globals.mBalancedRandom;
+        originalBalancedQr = globals.mBalancedRequireQr;
+        originalBalancedPrepared = globals.mBalancedGamePrepared;
+        originalBalancedTeams = globals.mBalancedTeams;
+        originalBalancedCheckIns = globals.mBalancedCheckedIn;
+        originalRetainedBalancedTeams = globals.mRetainedBalancedTeams;
+        globals.mBalancedRandom = false;
+        globals.clearBalancedAssignments();
         originalRoundRoster = globals.mRoundRoster;
         originalPlayerID = globals.mPlayerID;
         originalLocalLobbyReady = globals.mLocalLobbyReady;
@@ -121,6 +135,11 @@ public class TcpServerDispatchRegressionTest {
         globals.mRoundRoster = originalRoundRoster;
         globals.mPlayerID = originalPlayerID;
         globals.mLocalLobbyReady = originalLocalLobbyReady;
+        globals.mBalancedRandom = originalBalanced;
+        globals.mBalancedRequireQr = originalBalancedQr;
+        globals.mBalancedGamePrepared = originalBalancedPrepared;
+        globals.setBalancedAssignments(originalBalancedTeams, originalBalancedCheckIns);
+        globals.setRetainedBalancedTeams(originalRetainedBalancedTeams);
         restore(globals.mTeamIPMap, originalAddresses, globals.mTeamIPMapSemaphore);
         restore(globals.mIPTeamMap, originalPlayers, globals.mIPTeamMapSemaphore);
         restore(globals.mTeamPlayerNameMap, originalNames, globals.mTeamPlayerNameSemaphore);
@@ -1185,22 +1204,286 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
-    public void shortRespawnDoesNotShortenTheTwentyFourSecondGameStart() throws Exception {
+    public void shortRespawnDoesNotShortenTheTwentyThreeSecondGameStart() throws Exception {
         assertFixedGameStartCountdown(1, false, false);
     }
 
     @Test
-    public void longRespawnDoesNotExtendTheTwentyFourSecondGameStart() throws Exception {
+    public void balancedStartRetainsTeamsAndRepeatedStartKeepsScansAndDeadline() throws Exception {
+        Globals globals = seedBalancedLobby();
+        Map<Byte, Integer> teams = new HashMap<>(globals.mBalancedTeams);
+        dispatchThenChange(() -> assertTrue(server.prepareBalancedGame()), () -> { });
+        assertEquals(teams, globals.mBalancedTeams);
+        assertTrue(globals.mBalancedCheckedIn.isEmpty());
+        assertTrue(server.isBalancedGamePrepared());
+        long deadline = (long) get(server, "mBalancedCheckInDeadline");
+        assertTrue(deadline > SystemClock.elapsedRealtime());
+        globals.setBalancedAssignments(teams, java.util.Collections.singleton((byte) 1));
+        set(clients.get(1), "priorKills", 100000);
+        dispatchThenChange(() -> assertTrue(server.prepareBalancedGame()), () -> { });
+        assertEquals(teams, globals.mBalancedTeams);
+        assertEquals(java.util.Collections.singleton((byte) 1), globals.mBalancedCheckedIn);
+        assertEquals(deadline, get(server, "mBalancedCheckInDeadline"));
+        assertFalse(server.events.contains(NetMsg.NETMSG_STARTGAME));
+    }
+
+    @Test
+    public void balancedNoQrStartRetainsTeamsWhileStillStartingNormally() throws Exception {
+        Globals globals = seedBalancedLobby();
+        globals.mBalancedRequireQr = false;
+        Map<Byte, Integer> teams = new HashMap<>(globals.mBalancedTeams);
+        assertTrue(server.prepareBalancedGame());
+        for (int pass = 0; pass < 10; pass++) {
+            List<Thread> tasks = captureClientTasks();
+            if (tasks.isEmpty()) break;
+            for (Thread task : tasks) {
+                task.join(2000);
+                assertFalse("Balanced start task did not finish", task.isAlive());
+            }
+        }
+        assertEquals(teams, globals.mBalancedTeams);
+        assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
+        assertTrue(globals.mBalancedGamePrepared);
+    }
+
+    @Test
+    public void roundEndRetainsIdentityTeamsWhenReturningPlayersChangeSeats() throws Exception {
+        Globals globals = seedBalancedLobby();
+        dispatchThenChange(() -> assertTrue(server.prepareBalancedGame()), () -> { });
+        Map<String, Integer> byIdentity = new HashMap<>(globals.mRetainedBalancedTeams);
+        assertEquals(4, byIdentity.size());
+        List<String> identities = new ArrayList<>(byIdentity.keySet());
+        dispatchThenChange(server::endGame, () -> { });
+        assertEquals(byIdentity, globals.mRetainedBalancedTeams);
+        assertTrue(globals.mBalancedTeams.isEmpty());
+        assertFalse(globals.mBalancedGamePrepared);
+        for (int index = 0; index < identities.size(); index++) {
+            int id = index + 7;
+            addClient(id, new MemorySocket());
+            set(clients.get(id), "playerIdentity", identities.get(index));
+            set(clients.get(id), "priorKills", 100000 - 10000 * index);
+        }
+        dispatchThenChange(() -> assertTrue(server.prepareBalancedGame()), () -> { });
+        for (int index = 0; index < identities.size(); index++)
+            assertEquals(byIdentity.get(identities.get(index)), globals.mBalancedTeams.get((byte) (index + 7)));
+        assertTrue(globals.mBalancedCheckedIn.isEmpty());
+    }
+
+    @Test
+    public void explicitRebalanceRecomputesStatsButCannotAutoStartBeforeStart() throws Exception {
+        Globals globals = seedBalancedLobby();
+        Map<Byte, Integer> unbalanced = new HashMap<>();
+        for (byte id = 1; id <= 4; id++) unbalanced.put(id, 1);
+        globals.setBalancedAssignments(unbalanced, unbalanced.keySet());
+        set(clients.get(1), "clockSynchronized", false);
+        dispatchThenChange(() -> assertTrue(server.rebalanceTeams()), () -> { });
+        assertEquals(4, globals.mBalancedTeams.size());
+        assertTrue(globals.mBalancedTeams.containsValue(1));
+        assertTrue(globals.mBalancedTeams.containsValue(2));
+        assertTrue(globals.mBalancedCheckedIn.isEmpty());
+        assertFalse(globals.mBalancedGamePrepared);
+        assertEquals(-1L, get(server, "mBalancedCheckInDeadline"));
+        Method confirm = TcpServer.class.getDeclaredMethod("confirmBalancedCheckIn", byte.class);
+        confirm.setAccessible(true);
+        for (byte id = 1; id <= 4; id++) assertFalse((boolean) confirm.invoke(server, id));
+        assertFalse(server.events.contains(NetMsg.NETMSG_STARTGAME));
+        assertFalse(readJson(sockets.get(0)).getBoolean(TcpServer.JSON_BALANCED_PREPARED));
+    }
+
+    @Test
+    public void rebalanceIsRejectedDuringRoundAndCommittedCountdown() throws Exception {
+        seedBalancedLobby();
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        assertFalse(server.rebalanceTeams());
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        set(server, "mStartingGame", true);
+        assertFalse(server.rebalanceTeams());
+        set(server, "mStartingGame", false);
+        set(server, "mStartAnnounced", true);
+        assertFalse(server.rebalanceTeams());
+    }
+
+    @Test
+    public void newRegistrationAndDepartureNeverShuffleExistingTeamsOrExtendQrTimeout() throws Exception {
+        Globals globals = seedBalancedLobby();
+        dispatchThenChange(() -> assertTrue(server.prepareBalancedGame()), () -> { });
+        Map<Byte, Integer> teams = new HashMap<>(globals.mBalancedTeams);
+        globals.setBalancedAssignments(teams, java.util.Collections.singleton((byte) 1));
+        long deadline = (long) get(server, "mBalancedCheckInDeadline");
+        MemorySocket newcomer = new MemorySocket() {
+            @Override public InetAddress getInetAddress() {
+                try { return InetAddress.getByName("127.0.0.5"); }
+                catch (Exception e) { throw new AssertionError(e); }
+            }
+        };
+        addClient(5, 0, newcomer);
+        parseClock(5, new JSONObject().put(TcpServer.JSON_PLAYERID, 5)
+                .put(TcpServer.JSON_PLAYERNAME, "New player")
+                .put(LiveJoin.IDENTITY, java.util.UUID.randomUUID().toString()));
+        for (Thread task : captureClientTasks()) task.join(2000);
+        for (byte id = 1; id <= 4; id++) assertEquals(teams.get(id), globals.mBalancedTeams.get(id));
+        assertEquals(5, globals.mBalancedTeams.size());
+        assertEquals(deadline, get(server, "mBalancedCheckInDeadline"));
+        assertEquals(java.util.Collections.singleton((byte) 1), globals.mBalancedCheckedIn);
+        Constructor<?> constructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
+                .getDeclaredConstructor(TcpServer.class);
+        constructor.setAccessible(true);
+        Object handler = constructor.newInstance(server);
+        Object departing = clients.get(5);
+        Method remove = handler.getClass().getDeclaredMethod("removeClient", departing.getClass(),
+                Integer.class, boolean.class);
+        remove.setAccessible(true);
+        remove.invoke(handler, departing, 5, true);
+        for (Thread task : captureClientTasks()) task.join(2000);
+        assertEquals(teams, globals.mBalancedTeams);
+        assertEquals(deadline, get(server, "mBalancedCheckInDeadline"));
+    }
+
+    @Test
+    public void ordinaryPhoneRoundCancellationRetainsTeamsButTrueLobbyResetClearsThem() throws Exception {
+        Globals globals = seedBalancedLobby();
+        dispatchThenChange(() -> assertTrue(server.prepareBalancedGame()), () -> { });
+        Map<String, Integer> retained = new HashMap<>(globals.mRetainedBalancedTeams);
+        dispatchThenChange(() -> server.cancelServer(true), () -> { });
+        assertEquals(retained, globals.mRetainedBalancedTeams);
+        assertTrue(globals.mBalancedTeams.isEmpty());
+        assertFalse(globals.mBalancedGamePrepared);
+        globals.clearBalancedAssignments();
+        assertTrue(globals.mRetainedBalancedTeams.isEmpty());
+    }
+
+    @Test
+    public void balancedAssignmentModePreservesTournamentOrClassicWeaponProfile() throws Exception {
+        Globals globals = Globals.getInstance();
+        String[] changedFields = {"mTournamentMode", "mBossMode", "mCaptureTheFlag", "mInfectionMode",
+                "mInfectedPlayers", "mBossHunterCount", "mFullHealth", "mFullShields", "mFullReload",
+                "mReloadTime", "mReloadOnEmpty", "mRespawnTime", "mDamage", "mOverrideLives",
+                "mOverrideLivesVal", "mAllowSingleShotMode", "mAllowBurst3ShotMode", "mAllowAutoShotMode",
+                "mCurrentFiringMode", "mAllowPlayerSettings", "mOnlyServerSettings", "mVibrateOnHit"};
+        Map<String, Object> oldGlobals = new HashMap<>();
+        for (String field : changedFields) oldGlobals.put(field, get(globals, field));
+        Map<Byte, Globals.PlayerSettings> oldSettings = copyPlayerSettings();
+        try {
+            for (boolean tournament : new boolean[]{true, false}) {
+                globals.mBalancedRandom = false;
+                globals.mTournamentMode = tournament;
+                globals.mBossMode = true;
+                globals.mCaptureTheFlag = true;
+                globals.mInfectionMode = true;
+                globals.resetInfectedPlayers();
+                globals.setRetainedBalancedTeams(java.util.Collections.singletonMap("old identity", 1));
+                Globals.PlayerSettings player = new Globals.PlayerSettings();
+                Globals.applyBossHealth(player, Globals.BOSS_PLAYER_ID, 3);
+                globals.mPlayerSettings.put((byte) 1, player);
+
+                assertTrue(server.setBalancedGameMode(true));
+                awaitBalancedModeTasks();
+                assertEquals(tournament, globals.mTournamentMode);
+                assertFalse(globals.mBossMode);
+                assertFalse(globals.mCaptureTheFlag);
+                assertFalse(globals.mInfectionMode);
+                assertTrue(globals.mInfectedPlayers.isEmpty());
+                assertTrue(globals.mRetainedBalancedTeams.isEmpty());
+                assertTrue(globals.mBalancedRandom);
+                assertEquals(Globals.GAME_MODE_2TEAMS, globals.mGameMode);
+                assertEquals(Globals.MAX_HEALTH, globals.mFullHealth);
+                assertEquals(Globals.RELOAD_COUNT, globals.mFullReload);
+                assertEquals(!tournament, globals.mAllowAutoShotMode);
+                assertEquals(!tournament, globals.mAllowBurst3ShotMode);
+                assertEquals(!tournament, globals.mAllowPlayerSettings);
+                assertEquals(tournament, globals.mOnlyServerSettings);
+                assertEquals(!tournament, player.allowShotModeAuto);
+                assertEquals(!tournament, player.allowShotModeBurst3);
+                assertEquals(Globals.MAX_HEALTH, player.health);
+                if (tournament) assertTrue(globals.mVibrateOnHit);
+
+                // A QR-option change is not a request to reset custom Classic settings.
+                if (!tournament) {
+                    globals.mFullHealth = 73;
+                    globals.mDamage = -2;
+                    player.health = 73;
+                    player.damage = -2;
+                }
+                int healthBefore = globals.mFullHealth;
+                int damageBefore = globals.mDamage;
+                assertTrue(server.setBalancedGameMode(false));
+                awaitBalancedModeTasks();
+                assertEquals(tournament, globals.mTournamentMode);
+                assertEquals(healthBefore, globals.mFullHealth);
+                assertEquals(damageBefore, globals.mDamage);
+                assertEquals(healthBefore, player.health);
+                assertEquals(damageBefore, player.damage);
+            }
+        } finally {
+            awaitBalancedModeTasks();
+            for (Map.Entry<String, Object> entry : oldGlobals.entrySet())
+                set(globals, entry.getKey(), entry.getValue());
+            Globals.getmPlayerSettingsSemaphore();
+            try {
+                globals.mPlayerSettings.clear();
+                globals.mPlayerSettings.putAll(oldSettings);
+            } finally { globals.mPlayerSettingsSemaphore.release(); }
+        }
+    }
+
+    private void awaitBalancedModeTasks() throws Exception {
+        for (int pass = 0; pass < 10; pass++) {
+            List<Thread> tasks = captureClientTasks();
+            if (tasks.isEmpty()) return;
+            for (Thread task : tasks) {
+                task.join(2000);
+                assertFalse("Balanced mode task did not finish", task.isAlive());
+            }
+        }
+        assertTrue("Balanced mode tasks did not settle", captureClientTasks().isEmpty());
+    }
+
+    @Test
+    public void qrModeToggleRetainsTeamsButSameModeKeepsArmedScans() throws Exception {
+        Globals globals = seedBalancedLobby();
+        dispatchThenChange(() -> assertTrue(server.prepareBalancedGame()), () -> { });
+        Map<Byte, Integer> teams = new HashMap<>(globals.mBalancedTeams);
+        Map<String, Integer> retained = new HashMap<>(globals.mRetainedBalancedTeams);
+        globals.setBalancedAssignments(teams, java.util.Collections.singleton((byte) 1));
+        long deadline = (long) get(server, "mBalancedCheckInDeadline");
+        assertTrue(server.setBalancedGameMode(true));
+        assertEquals(deadline, get(server, "mBalancedCheckInDeadline"));
+        assertTrue(globals.mBalancedCheckedIn.contains((byte) 1));
+        assertTrue(server.setBalancedGameMode(false));
+        for (Thread task : captureClientTasks()) task.join(2000);
+        assertEquals(teams, globals.mBalancedTeams);
+        assertEquals(retained, globals.mRetainedBalancedTeams);
+        assertFalse(globals.mBalancedGamePrepared);
+        assertTrue(globals.mBalancedCheckedIn.isEmpty());
+        assertEquals(-1L, get(server, "mBalancedCheckInDeadline"));
+    }
+
+    private Globals seedBalancedLobby() throws Exception {
+        Globals globals = Globals.getInstance();
+        globals.mBalancedRandom = true;
+        globals.mBalancedRequireQr = true;
+        Map<Byte, Integer> teams = new HashMap<>();
+        teams.put((byte) 1, 1);
+        for (byte id = 2; id <= 4; id++) {
+            addClient(id, new MemorySocket());
+            teams.put(id, id <= 2 ? 1 : 2);
+        }
+        globals.setBalancedAssignments(teams, teams.keySet());
+        return globals;
+    }
+
+    @Test
+    public void longRespawnDoesNotExtendTheTwentyThreeSecondGameStart() throws Exception {
         assertFixedGameStartCountdown(90, false, false);
     }
 
     @Test
-    public void balancedQrGameStartsWithTheSameTwentyFourSecondCountdown() throws Exception {
+    public void balancedQrGameStartsWithTheSameTwentyThreeSecondCountdown() throws Exception {
         assertFixedGameStartCountdown(90, true, true);
     }
 
     @Test
-    public void balancedNoQrGameStartsWithTheSameTwentyFourSecondCountdown() throws Exception {
+    public void balancedNoQrGameStartsWithTheSameTwentyThreeSecondCountdown() throws Exception {
         assertFixedGameStartCountdown(1, true, false);
     }
 
@@ -1705,6 +1988,303 @@ public class TcpServerDispatchRegressionTest {
                 server.arePlayerClocksSynchronized());
     }
 
+    @Test
+    public void finalRoundReportPrecedesEndAndFreezesAccuracyAndStreaks() throws Exception {
+        String token = prepareAnalyticsRound();
+        MemorySocket shooter = (MemorySocket) sockets.get(0);
+        String shooterIdentity = (String) get(clients.get(1), "playerIdentity");
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot")
+                .put("count", 10).put("total", 10));
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1));
+        parseClock(17, scopedTelemetry(token, 2, 0, "elimination").put("attacker", 1));
+        set(clients.get(17), "awaitingRespawn", false);
+        parseClock(17, scopedTelemetry(token, 3, 1, "hit").put("attacker", 1));
+        parseClock(17, scopedTelemetry(token, 4, 1, "elimination").put("attacker", 1));
+        parseClock(1, scopedTelemetry(token, 2, 0, "elimination").put("attacker", 17));
+        awaitBalancedModeTasks();
+        dispatchThenChange(server::endGame, () -> { });
+        DataInputStream frames = new DataInputStream(new ByteArrayInputStream(shooter.bytes.toByteArray()));
+        RoundReport report = null;
+        boolean sawEnd = false;
+        while (frames.available() > 0) {
+            String frame = frames.readUTF();
+            if (frame.endsWith(TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME)) {
+                assertTrue("Host closed the round before its personal report", report != null);
+                sawEnd = true;
+            } else if (frame.startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON)) {
+                JSONObject json = readJsonFrame(frame);
+                if (json.has(RoundReport.KEY)) report = RoundReport.fromJson(json.getJSONObject(RoundReport.KEY));
+            }
+        }
+        assertTrue(sawEnd);
+        assertEquals(token, report.roundToken);
+        assertEquals(2, report.kills);
+        assertEquals(1, report.deaths);
+        assertEquals(10, report.shots);
+        assertEquals(2, report.hits);
+        assertEquals(2, report.bestKillStreak);
+        assertEquals(1, report.bestDeathStreak);
+        assertTrue(report.complete);
+        assertTrue(report.durationMs >= 1000);
+        int previousBytes = shooter.bytes.size();
+        dispatchThenChange(server::endGame, () -> { });
+        assertEquals(previousBytes, shooter.bytes.size());
+        Map<?, ?> cached = (Map<?, ?>) get(server, "mCompletedRoundReports");
+        RoundReport frozen = (RoundReport) cached.get(shooterIdentity);
+        // The original client map is cleared on end; compare the immutable report
+        // retained by identity rather than a new occupant of its old seat.
+        assertEquals(token, frozen.roundToken);
+        assertEquals(report.kills, frozen.kills);
+    }
+
+    @Test
+    public void scopedCumulativeShotsRejectCountdownOldRoundAndMalformedFrames() throws Exception {
+        String token = prepareAnalyticsRound();
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() + 5000);
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 4).put("total", 4));
+        assertEquals(0, server.getScore((byte) 1).shots);
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 1000);
+        parseClock(1, scopedTelemetry("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 1, 0, "shot")
+                .put("count", 4).put("total", 4));
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("generation", 1)
+                .put("count", 4).put("total", 4));
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 4).put("total", "4"));
+        JSONObject partial = scopedTelemetry(token, 1, 0, "shot").put("count", 4).put("total", 4);
+        partial.remove("life");
+        parseClock(1, partial);
+        assertEquals(0, server.getScore((byte) 1).shots);
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 4).put("total", 12));
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 4).put("total", 99));
+        parseClock(1, scopedTelemetry(token, 2, 0, "shot").put("count", 4).put("total", 12));
+        assertEquals(12, server.getScore((byte) 1).shots);
+    }
+
+    @Test
+    public void scopedVictimReportsDoNotReplayKillsAndGrenadesDoNotImproveAccuracy() throws Exception {
+        String token = prepareAnalyticsRound();
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1));
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1));
+        Globals.getInstance().mGrenadePairings[2] = 1;
+        parseClock(17, scopedTelemetry(token, 2, 0, "grenadehit").put("grenadeID", 2));
+        parseClock(17, scopedTelemetry(token, 3, 0, "elimination").put("attacker", 1));
+        set(clients.get(17), "awaitingRespawn", false);
+        parseClock(17, scopedTelemetry(token, 4, 0, "elimination").put("attacker", 1));
+        parseClock(17, scopedTelemetry(token, 5, 0, "hit").put("attacker", 1));
+        assertEquals(1, server.getScore((byte) 1).points);
+        assertEquals(1, server.getScore((byte) 1).hits);
+        assertEquals(1, server.getScore((byte) 17).eliminated);
+    }
+
+    @Test
+    public void missingTelemetrySequenceMakesAllAccuracyReportsIncomplete() throws Exception {
+        String token = prepareAnalyticsRound();
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 2).put("total", 2));
+        parseClock(17, scopedTelemetry(token, 2, 0, "hit").put("attacker", 1));
+        dispatchThenChange(server::endGame, () -> { });
+        Map<?, ?> reports = (Map<?, ?>) get(server, "mCompletedRoundReports");
+        assertEquals(2, reports.size());
+        for (Object value : reports.values()) assertFalse(((RoundReport) value).complete);
+    }
+
+    @Test
+    public void countdownCancellationDoesNotCreateRatedRoundReports() throws Exception {
+        prepareAnalyticsRound();
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() + 5000);
+        dispatchThenChange(server::endGame, () -> { });
+        assertTrue(((Map<?, ?>) get(server, "mCompletedRoundReports")).isEmpty());
+    }
+
+    @Test
+    public void recycledSeatDoesNotInheritAnotherPlayersShotTotals() throws Exception {
+        String token = prepareAnalyticsRound();
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 5).put("total", 5));
+        String previousIdentity = (String) get(clients.get(1), "playerIdentity");
+        Globals.getInstance().mRoundRoster.leave(1);
+        String replacementIdentity = java.util.UUID.randomUUID().toString();
+        com.simplecoil.protocol.RoundRoster.Member replacement = Globals.getInstance().mRoundRoster.join(
+                replacementIdentity, 1, 2, false, false, 0);
+        assertEquals(1, replacement.id);
+        addClient(2, 1, new MemorySocket());
+        set(clients.get(2), "playerIdentity", replacementIdentity);
+        clients.remove(1);
+        parseClock(2, scopedTelemetry(token, 1, 0, "shot").put("generation", replacement.generation)
+                .put("count", 2).put("total", 2));
+        dispatchThenChange(server::endGame, () -> { });
+        Map<?, ?> reports = (Map<?, ?>) get(server, "mCompletedRoundReports");
+        assertEquals(5, ((RoundReport) reports.get(previousIdentity)).shots);
+        assertEquals(2, ((RoundReport) reports.get(replacementIdentity)).shots);
+    }
+
+    @Test
+    public void remoteTelemetryContinuesWhileThePlayingPhoneHostIsRespawning() throws Exception {
+        String token = prepareAnalyticsRound();
+        server.setDedicated(false);
+        Globals.getInstance().mGameState = Globals.GAME_STATE_ELIMINATED;
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 5).put("total", 5));
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1));
+        parseClock(17, scopedTelemetry(token, 2, 0, "elimination").put("attacker", 1));
+        assertEquals(5, server.getScore((byte) 1).shots);
+        assertEquals(1, server.getScore((byte) 1).hits);
+        assertEquals(1, server.getScore((byte) 1).points);
+        assertEquals(1, server.getScore((byte) 17).eliminated);
+    }
+
+    @Test
+    public void participantDisconnectKeepsObservedTotalsButMarksTheRoundIncomplete() throws Exception {
+        String token = prepareAnalyticsRound();
+        String shooterIdentity = (String) get(clients.get(1), "playerIdentity");
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 5).put("total", 5));
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1));
+        Constructor<?> constructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
+                .getDeclaredConstructor(TcpServer.class);
+        constructor.setAccessible(true);
+        Object handler = constructor.newInstance(server);
+        Object departing = clients.get(17);
+        Method remove = handler.getClass().getDeclaredMethod("removeClient", departing.getClass(),
+                Integer.class, boolean.class);
+        remove.setAccessible(true);
+        remove.invoke(handler, departing, 17, false);
+        awaitBalancedModeTasks();
+        dispatchThenChange(server::endGame, () -> { });
+        Map<?, ?> reports = (Map<?, ?>) get(server, "mCompletedRoundReports");
+        RoundReport shooter = (RoundReport) reports.get(shooterIdentity);
+        assertEquals(5, shooter.shots);
+        assertEquals(1, shooter.hits);
+        assertFalse(shooter.complete);
+    }
+
+    @Test
+    public void queuedHitAndDeathNeverCreditAReplacementInTheAttackersOldSeat() throws Exception {
+        String token = prepareAnalyticsRound();
+        parseClock(1, scopedTelemetry(token, 1, 0, "shot").put("count", 5).put("total", 5));
+        JSONObject queuedHit = scopedTelemetry(token, 1, 0, "hit").put("attacker", 1);
+        JSONObject queuedDeath = scopedTelemetry(token, 2, 0, "elimination").put("attacker", 1);
+        Globals.getInstance().mRoundRoster.leave(1);
+        String replacementIdentity = java.util.UUID.randomUUID().toString();
+        com.simplecoil.protocol.RoundRoster.Member replacement = Globals.getInstance().mRoundRoster.join(
+                replacementIdentity, 1, 2, false, false, 0);
+        assertEquals(1, replacement.id);
+        addClient(2, 1, new MemorySocket());
+        set(clients.get(2), "playerIdentity", replacementIdentity);
+        clients.remove(1);
+        parseClock(17, queuedHit);
+        parseClock(17, queuedDeath);
+        assertEquals(0, server.getScore((byte) 1).hits);
+        assertEquals(0, server.getScore((byte) 1).points);
+        assertEquals(1, server.getScore((byte) 17).eliminated);
+        assertTrue("A stale source must not prevent the victim's dedicated respawn",
+                (boolean) get(clients.get(17), "awaitingRespawn"));
+        assertFalse((boolean) get(server, "mAnalyticsComplete"));
+    }
+
+    @Test
+    public void malformedAttackerGenerationDoesNotConsumeAValidVictimSequence() throws Exception {
+        String token = prepareAnalyticsRound();
+        JSONObject missing = scopedTelemetry(token, 1, 0, "hit").put("attacker", 1);
+        missing.remove("attackergeneration");
+        parseClock(17, missing);
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1)
+                .put("attackergeneration", "0"));
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1)
+                .put("attackergeneration", 256));
+        assertEquals(0, server.getScore((byte) 1).hits);
+        parseClock(17, scopedTelemetry(token, 1, 0, "hit").put("attacker", 1));
+        assertEquals(1, server.getScore((byte) 1).hits);
+        assertTrue((boolean) get(server, "mAnalyticsComplete"));
+        JSONObject malformedDeath = scopedTelemetry(token, 2, 0, "elimination").put("attacker", 1);
+        malformedDeath.remove("attackergeneration");
+        parseClock(17, malformedDeath);
+        assertEquals(0, server.getScore((byte) 17).eliminated);
+        parseClock(17, scopedTelemetry(token, 2, 0, "elimination").put("attacker", 1));
+        assertEquals(1, server.getScore((byte) 17).eliminated);
+        assertEquals(1, server.getScore((byte) 1).points);
+    }
+
+    @Test
+    public void qrRejoinUsesMatchingOriginalHistoryBaselineRatherThanPartialTotals() throws Exception {
+        String token = prepareAnalyticsRound();
+        String identity = (String) get(clients.get(17), "playerIdentity");
+        com.simplecoil.protocol.RoundRoster.Member member = Globals.getInstance().mRoundRoster.seat(17);
+        member.kills = 2;
+        member.deaths = 1;
+        Globals.getInstance().mRoundRoster.leave(17);
+        clients.remove(17);
+        set(server, "mAnalyticsComplete", false); // A replacement control host has partial coverage.
+        addClient(2, 0, returningAnalyticsSocket());
+        JSONObject registration = historyRegistration(identity, token).put(LiveJoin.TEAM, 2);
+        JSONObject missing = new JSONObject(registration.toString());
+        missing.remove("historybaselinedeaths");
+        parseClock(2, missing);
+        parseClock(2, new JSONObject(registration.toString()).put("historybaselinekills", "5"));
+        assertEquals(0, ((Byte) get(clients.get(2), "mPlayerID")).byteValue());
+        parseClock(2, registration);
+        assertEquals(5, get(clients.get(2), "priorKills"));
+        assertEquals(3, get(clients.get(2), "priorDeaths"));
+        awaitBalancedModeTasks();
+        dispatchThenChange(server::endGame, () -> { });
+        RoundReport report = (RoundReport) ((Map<?, ?>) get(server, "mCompletedRoundReports")).get(identity);
+        assertEquals(com.simplecoil.protocol.RoundStatistics.skillIndex(5, 3), report.skillBefore);
+        assertEquals(com.simplecoil.protocol.RoundStatistics.skillIndex(7, 4), report.skillAfter);
+    }
+
+    @Test
+    public void oldHistoryBaselineHintDoesNotChangeCurrentLobbyBalanceHistory() throws Exception {
+        prepareAnalyticsRound();
+        String identity = (String) get(clients.get(17), "playerIdentity");
+        Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+        set(server, "mStartAnnounced", false);
+        set(server, "mRoundToken", null);
+        addClient(2, 0, returningAnalyticsSocket());
+        parseClock(2, historyRegistration(identity, "dddddddd-dddd-dddd-dddd-dddddddddddd"));
+        assertEquals(7, get(clients.get(17), "priorKills"));
+        assertEquals(4, get(clients.get(17), "priorDeaths"));
+        awaitBalancedModeTasks();
+    }
+
+    private JSONObject historyRegistration(String identity, String token) throws Exception {
+        return new JSONObject().put(TcpServer.JSON_PLAYERID, 17).put(TcpServer.JSON_PLAYERNAME, "Returning")
+                .put(LiveJoin.IDENTITY, identity).put(TcpServer.JSON_REJOIN, true)
+                .put(TcpServer.JSON_ROUND_ANALYTICS, true).put(TcpServer.JSON_PRIOR_KILLS, 7)
+                .put(TcpServer.JSON_PRIOR_DEATHS, 4).put("historyroundtoken", token)
+                .put("historybaselinekills", 5).put("historybaselinedeaths", 3);
+    }
+
+    private MemorySocket returningAnalyticsSocket() {
+        return new MemorySocket() {
+            @Override public InetAddress getInetAddress() {
+                try { return InetAddress.getByName("127.0.0.17"); }
+                catch (Exception invalid) { throw new AssertionError(invalid); }
+            }
+        };
+    }
+
+    private String prepareAnalyticsRound() throws Exception {
+        String token = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        addClient(17, new MemorySocket());
+        com.simplecoil.protocol.RoundRoster roster = new com.simplecoil.protocol.RoundRoster(token);
+        for (int id : new int[]{1, 17}) {
+            String identity = (String) get(clients.get(id), "playerIdentity");
+            roster.restore(new com.simplecoil.protocol.RoundRoster.Member(identity, id,
+                    id == 1 ? 1 : 2, 0));
+        }
+        Globals.getInstance().mRoundRoster = roster;
+        Globals.getInstance().mGameState = Globals.GAME_STATE_RUNNING;
+        set(server, "mRoundToken", token);
+        set(server, "mStartAnnounced", true);
+        set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 1000);
+        Method init = TcpServer.class.getDeclaredMethod("initializeRoundAnalyticsLocked", String.class, boolean.class);
+        init.setAccessible(true);
+        init.invoke(server, token, true);
+        return token;
+    }
+
+    private JSONObject scopedTelemetry(String token, long sequence, int life, String event) throws Exception {
+        JSONObject frame = new JSONObject().put("roundtoken", token).put("generation", 0)
+                .put("life", life).put("telemetryseq", sequence).put("telemetry", event);
+        if ("hit".equals(event) || "elimination".equals(event)) frame.put("attackergeneration", 0);
+        return frame;
+    }
+
     private void parseClock(int connection, JSONObject json) throws Exception {
         Constructor<?> constructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
                 .getDeclaredConstructor(TcpServer.class);
@@ -1812,6 +2392,12 @@ public class TcpServerDispatchRegressionTest {
         Field field = (target instanceof TcpServer ? TcpServer.class : target.getClass()).getDeclaredField(name);
         field.setAccessible(true);
         field.set(target, value);
+    }
+
+    private static Object get(Object target, String name) throws Exception {
+        Field field = (target instanceof TcpServer ? TcpServer.class : target.getClass()).getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(target);
     }
 
     private static <K, V> Map<K, V> copyAndClear(Map<K, V> map, Semaphore lock) throws Exception {

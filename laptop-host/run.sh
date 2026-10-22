@@ -20,6 +20,7 @@ javac --release 17 --add-modules jdk.httpserver -d "$output_dir" "$source_file" 
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/Powerups.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/GpsOffset.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RoundRoster.java" \
-    "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RoundRestart.java"
+    "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RoundRestart.java" \
+    "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RoundStatistics.java"
 exec java --add-modules jdk.httpserver -Dsimplecoil.home="$script_dir" -cp "$output_dir" \
     com.simplecoil.laptophost.LaptopHost "$@"

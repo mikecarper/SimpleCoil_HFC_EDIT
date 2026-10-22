@@ -36,6 +36,10 @@ public class InactivityVoiceTest {
         prompts.add(R.string.inactivity_recruit_voice_prompt);
         prompts.add(R.string.inactivity_legs_voice_prompt);
         prompts.add(R.string.inactivity_breaking_news_voice_prompt);
+        prompts.add(R.string.inactivity_battlefield_voice_prompt);
+        prompts.add(R.string.inactivity_movement_tutorial_voice_prompt);
+        prompts.add(R.string.inactivity_laser_camping_voice_prompt);
+        prompts.add(R.string.inactivity_standing_still_voice_prompt);
         return prompts;
     }
 }

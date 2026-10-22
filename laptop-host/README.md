@@ -4,7 +4,7 @@
 keeps the game authority and live display on a laptop; players still use the
 Android app and their BLE laser-tag hardware.
 
-It speaks the protocol-30 TCP lobby, clock synchronization, GPS,
+It speaks the protocol-31 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
 
@@ -45,20 +45,66 @@ run this from the repository root:
 ./laptop-host/run.sh
 ```
 
+## After-round review
+
+After a round finishes, **Review last round** appears on the launcher, map, and
+leaderboard. It opens `/round-report`, with final per-player accuracy, best kill
+and death streaks, and the skill index before and after the round. Accuracy is
+opponent-confirmed gun IR hits divided by gun shots; grenade damage is excluded,
+multiple-target hits are capped at 100%, and zero shots shows N/A. A kill streak
+ends on a death; a death streak ends on a kill. Skill uses the existing cumulative
+kills/deaths balancing index (0-200, neutral 100), not Elo; different game modes
+are not normalized. This does not automatically rebalance or move any players.
+
+The review includes an interactive SVG timeline with a time axis and one lane
+per player. Filter shots, confirmed IR hits, kills/deaths, respawns, power-ups,
+flag captures, grenade hits, and joins/disconnects. Hover or focus an event for
+details. Time zero is actual GO, not the countdown, and timestamps are when the
+host received reports, not exact physical trigger times. No GPS fix is needed.
+Shot activity is grouped into one-second buckets. At most 2,000 shot buckets
+and 12,000 total events are retained, plus the final end marker; the review
+clearly reports any omitted batches. Totals keep updating after this limit.
+Older phones, telemetry gaps, and disconnections mark the data as incomplete;
+unobserved hits or streaks are not invented.
+
+Reports are frozen before phones leave the round, and remain available when
+phones auto-join the next lobby or a new round starts. A cancelled countdown
+does not replace the latest completed round. Stable player identities preserve
+statistics across reconnections and keep a new occupant of the same player ID
+separate from its former occupant. The host sends the frozen final scoreboard,
+then each upgraded phone's small personal report, then the end-game message in
+one ordered batch. This keeps the final score and win/loss announcement in sync;
+the full timeline stays on the laptop.
+
+Completed reports are saved as JSON under `laptop-host/reports` by default.
+Use `--reports /path/to/directory` to choose another app-owned directory. Existing
+files are never overwritten or deleted. The latest ten reports are selectable
+and reload on host restart; older saved reports remain retrievable by their
+round token. JSON downloads contain names and game statistics, not GPS tracks.
+The read-only `/api/reports` lists report summaries, and
+`/api/report?roundtoken=UUID` retrieves one full report. The frequently refreshed
+`/api/state` does not include the full timeline.
+
 For Balanced Random teams, start the laptop with `--balanced-qr` to require
 each player to scan the assigned Team 1 or Team 2 QR, or `--balanced-no-qr` to
-start the 24-second countdown as soon as teams are assigned. The laptop uses
+start the 23-second countdown as soon as teams are assigned. The laptop uses
 the prior kills and deaths reported by each phone and keeps team sizes within
-two players. The dashboard Start button assigns teams; QR mode starts
+two players. The dashboard Start button assigns the first teams; QR mode starts
 automatically after the last check-in. These options also work with `--takeover`.
-If a player does not scan, QR mode starts the same 24-second countdown after
+If a player does not scan, QR mode starts the same 23-second countdown after
 90 seconds; that player stays on their assigned team.
+Teams stay together between games, including when phones reconnect with new
+player IDs. New players join the smaller team (or the weaker team when sizes
+are equal) without moving anyone already assigned. Use **Rebalance teams** on
+the map dashboard to make a fresh stats-based split in the lobby. Rebalancing
+resets team QR check-ins but does not start a game; press Start when ready.
+Each QR round requires fresh check-ins and its own 90-second timeout.
 
-Ordinary rounds also start with a shared 24-second countdown. An explicit
+Ordinary rounds also start with a shared 23-second countdown. An explicit
 `--start-delay 1` through `--start-delay 1000` overrides that duration for
-ordinary rounds; Balanced Random rounds always use 24 seconds. Phones announce
+ordinary rounds; Balanced Random rounds always use 23 seconds. Phones announce
 the countdown from "10 Mississippi" to "0 Mississippi" every two seconds over
-the first 20 seconds. The final four seconds leave time for
+the first 20 seconds. The final three seconds leave time for
 "All out of Mississippi's." before play starts. "May the odds be ever in
 your favor." follows as play starts.
 
@@ -78,7 +124,12 @@ requirement changes; only unspent progress counts toward another reward.
 Rewards are EMP (10 seconds); 50% extra shields for the player or their team;
 automatic fire; automatic fire with a 90-round magazine; double damage;
 full-health healing for the team; a burst damaging every living enemy for 25%
-of normal health; or invulnerability. Temporary buffs last 15 seconds unless
+of normal health; invulnerability; or a rare Airstrike. Airstrike eliminates
+living opponents confirmed stationary for at least 20 seconds by satellite GPS
+fixes no more than 10 seconds old with positive reported accuracy of 5 meters
+or better. Moving players and players without good GPS are exempt. Shields do
+not save stationary victims; existing invulnerability and the protected
+original zombie rules still apply. Temporary buffs last 15 seconds unless
 otherwise noted. The host sends one grant to every phone, so team effects and
 attacker damage buffs agree across the game. Reconnecting phones receive the
 remaining active grants without restarting their timers.
@@ -127,12 +178,21 @@ The laptop starts in **Event Mode**: the operator starts and ends rounds, edits
 players, and controls the event. **End game** ends the round directly. Phone
 start commands and name/rule edits cannot override the operator. Use
 `--no-event-mode` for the ordinary phone controls and two-player end-approval
-workflow. Use protocol-30 phones; update every phone to version 1.51 for the
-new Event Mode, kiosk, battery, and player-transfer controls.
+workflow. Use protocol-31 phones with this host and update the laptop and every
+phone together; the previous protocol is not compatible. This build also
+includes the Event Mode, kiosk, battery, and player-transfer controls from 1.51.
 
-The laptop sends the phone scoreboard only after a player-list request. Host edits,
-reconnections and round changes do not open that dialog, including on older phones.
-Updated phones show actual players without empty player slots.
+With `--no-event-mode`, the map's **End game** button asks participating players
+to approve an early end. Two different players must agree; the non-playing
+laptop operator and sitting-out phones do not count. The button shows the
+approval count. Players can withdraw approval or confirm **Leave game** on
+their phone at any time; leaving does not end the shared round. Timer and
+victory-condition endings remain automatic.
+
+Phone scoreboard dialogs open only after a player-list request. Host edits,
+reconnections, and round changes do not open that dialog. Final results still
+update each phone's round summary. Scoreboards show actual players without
+empty player slots.
 
 Nearby phone relays prepare automatically after admission.
 Version 1.51 prepares one Bluetooth buddy when a phone's Wi-Fi RSSI reaches
@@ -486,7 +546,7 @@ app forwards meaningful movement to a hosted game immediately. The laptop
 forwards changed positions at up to four updates per second and sends periodic
 complete snapshots to correct stale markers.
 
-Protocol 30 shares a fixed lobby GPS origin alongside clock synchronization.
+Protocol 31 shares a fixed lobby GPS origin alongside clock synchronization.
 The first fresh player fix establishes the laptop's origin. In-area updates
 use signed 16-bit north/east offsets in 2.5 cm units over a 1,638.4 m square
 (about 1.02 miles). Every binary snapshot carries its origin and remains
@@ -517,3 +577,26 @@ Laser lines are based on a phone that actually received a valid IR hit; they
 are not guessed from proximity. The host records each endpoint's latest GPS
 position with the confirmed hit. A miss has no target coordinate, so it counts
 in SHOTS and accuracy but intentionally does not invent a line on the map.
+
+## Automated checks
+
+From the repository root, compile the dependency-free host smoke test, then
+run just the post-round report checks (omit `--reports-only` for the full
+protocol suite):
+
+```bash
+javac --release 17 --add-modules jdk.httpserver -d laptop-host/out \
+  shared/src/main/java/com/simplecoil/protocol/*.java \
+  laptop-host/src/main/java/com/simplecoil/laptophost/*.java \
+  laptop-host/src/test/java/com/simplecoil/laptophost/LaptopHostProtocolSmokeTest.java
+java --add-modules jdk.httpserver -cp laptop-host/out \
+  com.simplecoil.laptophost.LaptopHostProtocolSmokeTest --reports-only
+node --test laptop-host/src/test/js/round-report-page.test.cjs
+```
+
+Report smoke tests use temporary report directories, not the operator's archive.
+The JavaScript checks exercise the actual embedded review code with a minimal
+DOM harness, including SVG lanes/events, filters, partial-data notices, and safe
+names. They complement rather than replace a browser or physical-gun check.
+Set `SIMPLECOIL_TIMELINE_SVG` to a local output filename when running the Node
+check to save its standalone SVG fixture for visual inspection.

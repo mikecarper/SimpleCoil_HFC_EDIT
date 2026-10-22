@@ -22,12 +22,12 @@ public class PowerupsTest {
     private final Set<Integer> alive = new HashSet<>(Arrays.asList(1, 2, 3, 4));
 
     @Test public void everyWeightedTicketSelectsExactlyItsDocumentedReward() {
-        assertTickets(2, 2, true, new int[]{0, 6, 24, 6, 20, 12, 18, 6, 6, 2});
-        assertTickets(2, 3, true, new int[]{0, 12, 24, 12, 20, 12, 18, 12, 12, 4});
-        assertTickets(2, 7, true, new int[]{0, 24, 24, 24, 20, 12, 18, 24, 24, 8});
-        assertTickets(0, 0, false, new int[]{0, 6, 24, 0, 20, 12, 18, 0, 6, 2});
+        assertTickets(2, 2, true, new int[]{0, 6, 24, 6, 20, 12, 18, 6, 6, 2, 2});
+        assertTickets(2, 3, true, new int[]{0, 12, 24, 12, 20, 12, 18, 12, 12, 4, 4});
+        assertTickets(2, 7, true, new int[]{0, 24, 24, 24, 20, 12, 18, 24, 24, 8, 8});
+        assertTickets(0, 0, false, new int[]{0, 6, 24, 0, 20, 12, 18, 0, 6, 2, 2});
         assertTickets(Integer.MIN_VALUE, Integer.MAX_VALUE, false,
-                new int[]{0, 24, 24, 0, 20, 12, 18, 0, 24, 8});
+                new int[]{0, 24, 24, 0, 20, 12, 18, 0, 24, 8, 8});
         assertArrayEquals(Powerups.weights(0, 0, true), Powerups.weights(-1, -5, true));
     }
 
@@ -72,17 +72,17 @@ public class PowerupsTest {
     }
 
     @Test public void rewardsUseLivingTeamsAndPreserveEachRecipientsGeneration() {
-        for (int kind = Powerups.EMP; kind <= Powerups.INVULNERABLE; kind++) {
+        for (int kind = Powerups.EMP; kind <= Powerups.AIRSTRIKE; kind++) {
             Powerups.Authority authority = seeded();
             authority.setPlayerLife(2, 2);
             authority.setPlayerLife(3, 1);
             authority.setPlayerLife(4, 3);
             Powerups.Grant grant = request(authority, 0, 3, 2, kind, 1000);
             assertEquals(kind, grant.kind);
-            int[] expected = kind == Powerups.EMP || kind == Powerups.DAMAGE_TEAM ? new int[]{3, 4}
+            int[] expected = isEnemyWide(kind) ? new int[]{3, 4}
                     : kind == Powerups.SHIELD_TEAM || kind == Powerups.HEAL_TEAM ? new int[]{1, 2}
                     : new int[]{1};
-            int[] expectedLives = kind == Powerups.EMP || kind == Powerups.DAMAGE_TEAM ? new int[]{1, 3}
+            int[] expectedLives = isEnemyWide(kind) ? new int[]{1, 3}
                     : kind == Powerups.SHIELD_TEAM || kind == Powerups.HEAL_TEAM ? new int[]{0, 2}
                     : new int[]{0};
             assertArrayEquals(expected, grant.targets);
@@ -95,9 +95,13 @@ public class PowerupsTest {
         assertEquals(10_000L, Powerups.durationMillis(Powerups.EMP));
         assertEquals(3_000L, Powerups.durationMillis(Powerups.HEAL_TEAM));
         assertEquals(3_000L, Powerups.durationMillis(Powerups.DAMAGE_TEAM));
-        assertEquals(0, Powerups.durationMillis(10));
+        assertEquals(3_000L, Powerups.durationMillis(Powerups.AIRSTRIKE));
+        assertEquals(0, Powerups.durationMillis(Powerups.AIRSTRIKE + 1));
         assertTrue(Powerups.isInstant(Powerups.DAMAGE_TEAM));
+        assertTrue(Powerups.isInstant(Powerups.AIRSTRIKE));
         assertFalse(Powerups.isInstant(Powerups.EMP));
+        assertTrue(Powerups.isValidKind(Powerups.AIRSTRIKE));
+        assertFalse(Powerups.isValidKind(Powerups.AIRSTRIKE + 1));
         assertEquals(50, Powerups.SHIELD_BONUS_PERCENT);
         assertEquals(25, Powerups.DAMAGE_PERCENT);
     }
@@ -107,11 +111,17 @@ public class PowerupsTest {
         Map<Integer, Integer> ffaTeams = map(1, 0, 2, 0, 3, 0);
         Map<Integer, Integer> ffaScores = map(1, 0, 2, 12, 3, 1);
         Set<Integer> ffaAlive = new HashSet<>(Arrays.asList(1, 2, 3));
-        Powerups.Grant enemyReward = authority.request(1, 0, 3, 2, 0, ffaTeams, ffaScores,
-                ffaAlive, 1000, forKind(Powerups.DAMAGE_TEAM, 0, 12, false));
-        assertEquals(Powerups.DAMAGE_TEAM, enemyReward.kind);
-        assertArrayEquals(new int[]{2, 3}, enemyReward.targets);
-        for (int unusable : new int[]{Powerups.EMP, Powerups.DAMAGE_TEAM}) {
+        for (int kind : new int[]{Powerups.EMP, Powerups.DAMAGE_TEAM, Powerups.AIRSTRIKE}) {
+            authority.resetRound();
+            authority.setPlayerLife(2, 2);
+            authority.setPlayerLife(3, 3);
+            Powerups.Grant enemyReward = authority.request(1, 0, 3, 2, 0, ffaTeams, ffaScores,
+                    ffaAlive, 1000, forKind(kind, 0, 12, false));
+            assertEquals(kind, enemyReward.kind);
+            assertArrayEquals(new int[]{2, 3}, enemyReward.targets);
+            assertArrayEquals(new int[]{2, 3}, enemyReward.targetLives);
+        }
+        for (int unusable : new int[]{Powerups.EMP, Powerups.DAMAGE_TEAM, Powerups.AIRSTRIKE}) {
             Powerups.Grant solo = new Powerups.Authority().request(1, 0, 3, 2, 0,
                     map(1, 0), map(1, 0), Collections.singleton(1), 1000,
                     forKind(unusable, 0, 0, false));
@@ -154,31 +164,33 @@ public class PowerupsTest {
     }
 
     @Test public void targetDeathAndSeatReplacementRemoveObsoleteEffects() {
-        Powerups.Authority authority = seeded();
-        Powerups.Grant emp = request(authority, 0, 3, 2, Powerups.EMP, 1000);
-        assertArrayEquals(new int[]{3, 4}, emp.targets);
-        authority.setPlayerLife(3, 1);
-        assertArrayEquals(new int[]{4}, authority.activeGrants(1000).get(0).targets);
-        assertNull(request(authority, 0, 3, 2, Powerups.EMP, 1000));
-        authority.resetPlayer(4);
-        assertTrue(authority.activeGrants(1000).isEmpty());
-        authority.resetPlayer(1);
-        assertNotNull(request(authority, 0, 3, 2, Powerups.SHIELD_PLAYER, 1000));
-        authority.resetRound();
-        assertTrue(authority.activeGrants(1000).isEmpty());
-        assertTrue(authority.snapshot(1000).players.isEmpty());
-        assertEquals(1, authority.snapshot(1000).nextId);
+        for (int kind : new int[]{Powerups.EMP, Powerups.AIRSTRIKE}) {
+            Powerups.Authority authority = seeded();
+            Powerups.Grant grant = request(authority, 0, 3, 2, kind, 1000);
+            assertArrayEquals(new int[]{3, 4}, grant.targets);
+            authority.setPlayerLife(3, 1);
+            assertArrayEquals(new int[]{4}, authority.activeGrants(1000).get(0).targets);
+            assertNull(request(authority, 0, 3, 2, kind, 1000));
+            authority.resetPlayer(4);
+            assertTrue(authority.activeGrants(1000).isEmpty());
+            authority.resetPlayer(1);
+            assertNotNull(request(authority, 0, 3, 2, Powerups.SHIELD_PLAYER, 1000));
+            authority.resetRound();
+            assertTrue(authority.activeGrants(1000).isEmpty());
+            assertTrue(authority.snapshot(1000).players.isEmpty());
+            assertEquals(1, authority.snapshot(1000).nextId);
+        }
     }
 
     @Test public void sourceDeathPreservesOtherLivingRecipientsAndTheirOriginalExpiry() {
-        for (int kind : new int[]{Powerups.EMP, Powerups.SHIELD_TEAM}) {
+        for (int kind : new int[]{Powerups.EMP, Powerups.SHIELD_TEAM, Powerups.AIRSTRIKE}) {
             Powerups.Authority authority = seeded();
             Powerups.Grant grant = request(authority, 0, 3, 2, kind, 1000);
             authority.setPlayerLife(1, 1);
             Powerups.Grant active = authority.activeGrants(2000).get(0);
             assertEquals(0, active.sourceLife);
             assertEquals(grant.expiresAt, active.expiresAt);
-            assertArrayEquals(kind == Powerups.EMP ? new int[]{3, 4} : new int[]{2}, active.targets);
+            assertArrayEquals(isEnemyWide(kind) ? new int[]{3, 4} : new int[]{2}, active.targets);
             Powerups.Authority nextHost = new Powerups.Authority();
             assertTrue(nextHost.restore(authority.snapshot(2000), 2000));
             assertEquals(grant.expiresAt, nextHost.activeGrants(2000).get(0).expiresAt);
@@ -204,6 +216,74 @@ public class PowerupsTest {
         assertEquals(grant.id + 1, next.id);
     }
 
+    @Test public void everyRewardKindCanRecoverWithOnlyItsRemainingDeliveryOrBuffTime() {
+        for (int kind = Powerups.EMP; kind <= Powerups.AIRSTRIKE; kind++) {
+            Powerups.Authority first = seeded();
+            Powerups.Grant grant = request(first, 0, 3, 2, kind, 1000);
+            Powerups.Snapshot snapshot = first.snapshot(2000);
+            Powerups.Authority second = new Powerups.Authority();
+            assertTrue(second.restore(snapshot, 50_000));
+            Powerups.Grant recovered = second.activeGrants(50_000).get(0);
+            assertEquals(kind, recovered.kind);
+            assertArrayEquals(grant.targets, recovered.targets);
+            assertArrayEquals(grant.targetLives, recovered.targetLives);
+            assertEquals(49_000 + Powerups.durationMillis(kind), recovered.expiresAt);
+            assertTrue(second.restore(snapshot, 51_000));
+            assertEquals(recovered.expiresAt, second.activeGrants(51_000).get(0).expiresAt);
+            assertTrue(second.activeGrants(recovered.expiresAt).isEmpty());
+            assertTrue(second.restore(snapshot, recovered.expiresAt));
+            assertTrue("A replay resurrected an expired reward", second.activeGrants(recovered.expiresAt).isEmpty());
+        }
+    }
+
+    @Test public void airstrikeTargetsAllOpposingTeamsButNotAlliesOrDeadPlayers() {
+        Powerups.Authority authority = seeded();
+        Map<Integer, Integer> fourTeams = map(1, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 2);
+        Set<Integer> living = new HashSet<>(Arrays.asList(1, 2, 3, 4, 5));
+        for (int player = 1; player <= 6; player++) authority.setPlayerLife(player, player);
+        Powerups.Grant grant = authority.request(1, 1, 3, 2, 1, fourTeams, map(1, 0),
+                living, 1000, forKind(Powerups.AIRSTRIKE, 0, 0, true));
+        assertEquals(Powerups.AIRSTRIKE, grant.kind);
+        assertArrayEquals(new int[]{3, 4, 5}, grant.targets);
+        assertArrayEquals(new int[]{3, 4, 5}, grant.targetLives);
+        assertEquals(4000, grant.expiresAt);
+        authority.setPlayerLife(3, 4);
+        assertArrayEquals(new int[]{4, 5}, authority.activeGrants(1000).get(0).targets);
+        assertArrayEquals(new int[]{4, 5}, authority.activeGrants(1000).get(0).targetLives);
+    }
+
+    @Test public void thirtyTwoPlayerAirstrikeKeepsAllThirtyOneEnemyLivesAndCompactRecipients() {
+        Powerups.Authority authority = new Powerups.Authority();
+        Map<Integer, Integer> allTeams = new HashMap<>();
+        Set<Integer> allAlive = new HashSet<>();
+        int[] expectedTargets = new int[31], expectedLives = new int[31];
+        for (int player = 1; player <= Powerups.MAX_PLAYERS; player++) {
+            allTeams.put(player, player == 1 ? 1 : 2 + player % 3);
+            allAlive.add(player);
+            authority.setPlayerLife(player, player - 1);
+            if (player > 1) {
+                expectedTargets[player - 2] = player;
+                expectedLives[player - 2] = player - 1;
+            }
+        }
+        Powerups.Grant grant = authority.request(1, 0, 3, 2, 1, allTeams, map(1, 0),
+                allAlive, 1000, forKind(Powerups.AIRSTRIKE, 0, 0, true));
+        assertArrayEquals(expectedTargets, grant.targets);
+        assertArrayEquals(expectedLives, grant.targetLives);
+        String recipients = Powerups.encodeRecipients(grant);
+        assertEquals(256, recipients.length());
+        assertEquals("fffffffe", recipients.substring(0, 8));
+        assertArrayEquals(expectedTargets, Powerups.decodeRecipients(recipients).targets);
+        assertArrayEquals(expectedLives, Powerups.decodeRecipients(recipients).targetLives);
+        Powerups.Authority nextHost = new Powerups.Authority();
+        assertTrue(nextHost.restore(authority.snapshot(2000), 50_000));
+        Powerups.Grant recovered = nextHost.activeGrants(50_000).get(0);
+        assertEquals(Powerups.AIRSTRIKE, recovered.kind);
+        assertArrayEquals(expectedTargets, recovered.targets);
+        assertArrayEquals(expectedLives, recovered.targetLives);
+        assertEquals(52_000, recovered.expiresAt);
+    }
+
     @Test public void arraysAndSnapshotsCannotMutateAuthorityState() {
         Powerups.Authority authority = seeded();
         Powerups.Grant grant = request(authority, 0, 3, 2, Powerups.EMP, 1000);
@@ -226,7 +306,7 @@ public class PowerupsTest {
         invalid.add(new Powerups.Snapshot(2, 1000, Collections.singletonList(new Powerups.Grant(
                 1, 1, 0, Powerups.SHIELD_PLAYER, new int[]{1}, new int[]{1}, 16_000, 2)), valid.players));
         invalid.add(new Powerups.Snapshot(2, 1000, Collections.singletonList(new Powerups.Grant(
-                1, 1, 0, 10, new int[]{1}, new int[]{0}, 16_000, 2)), valid.players));
+                1, 1, 0, Powerups.AIRSTRIKE + 1, new int[]{1}, new int[]{0}, 16_000, 2)), valid.players));
         invalid.add(new Powerups.Snapshot(2, 1000, Collections.singletonList(new Powerups.Grant(
                 1, 1, 0, Powerups.EMP, new int[]{4, 3}, new int[]{0, 0}, 11_000, 2)), valid.players));
         invalid.add(new Powerups.Snapshot(2, 1000, Collections.singletonList(new Powerups.Grant(
@@ -421,7 +501,8 @@ public class PowerupsTest {
     private static void assertTickets(int own, int enemy, boolean teamGame, int[] expected) {
         int total = 0;
         for (int count : expected) total += count;
-        int[] observed = new int[10];
+        assertArrayEquals(expected, Powerups.weights(own, enemy, teamGame));
+        int[] observed = new int[Powerups.AIRSTRIKE + 1];
         for (int ticket = 0; ticket < total; ticket++)
             observed[Powerups.choose(new TicketRandom(ticket), own, enemy, teamGame)]++;
         assertArrayEquals(expected, observed);
@@ -436,6 +517,10 @@ public class PowerupsTest {
     private static boolean contains(int[] values, int wanted) {
         for (int value : values) if (value == wanted) return true;
         return false;
+    }
+
+    private static boolean isEnemyWide(int kind) {
+        return kind == Powerups.EMP || kind == Powerups.DAMAGE_TEAM || kind == Powerups.AIRSTRIKE;
     }
 
     private static final class TicketRandom extends Random {

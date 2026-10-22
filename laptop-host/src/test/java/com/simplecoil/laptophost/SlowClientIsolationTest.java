@@ -28,7 +28,7 @@ import java.util.function.BooleanSupplier;
 
 /** A blocked radio writer must not stall other phones or laptop controls. No network is used. */
 public final class SlowClientIsolationTest {
-    private static final String JSON = "SimpleCoil:30JSON";
+    private static final String JSON = "SimpleCoil:31JSON";
     private static final Class<?> CLIENT;
     static {
         try { CLIENT = Class.forName("com.simplecoil.laptophost.LaptopHost$ClientConnection"); }
@@ -40,6 +40,7 @@ public final class SlowClientIsolationTest {
         verifyQueueBound("x", 128);
         verifyQueueBound("x".repeat(60_000), 4);
         verifyFinalFrameOrder();
+        verifyRoundFinalBatch();
         verifyFinalFrameDeadline();
         verifyClockSendTimestamp();
         verifyShutdownClosesUnregisteredWriter();
@@ -95,15 +96,60 @@ public final class SlowClientIsolationTest {
             Gate blocked = phone.socket.output.blockNextWrite();
             check(phone.send("earlier"), "Could not queue earlier frame");
             blocked.awaitEntered();
-            check((Boolean) call(phone.client, "sendAndClose", String.class, "SimpleCoil:30MESGENDGAME"),
+            check((Boolean) call(phone.client, "sendAndClose", String.class, "SimpleCoil:31MESGENDGAME"),
                     "Could not queue final frame");
             check(!phone.socket.closed.get(), "Socket closed before its final frame could flush");
             check(!phone.send("too late"), "Terminal queue accepted a later frame");
             blocked.release.countDown();
             await(phone.socket.closed::get, 1_000, "Socket stayed open after the final frame flushed");
-            check(phone.socket.output.frames().equals(List.of("earlier", "SimpleCoil:30MESGENDGAME")),
+            check(phone.socket.output.frames().equals(List.of("earlier", "SimpleCoil:31MESGENDGAME")),
                     "Final frame was lost or reordered before close");
         }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void verifyRoundFinalBatch() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            Phone slow = fixture.phone(1, true), healthy = fixture.phone(17, true);
+            String token = UUID.randomUUID().toString();
+            Class<?> reviewClass = Class.forName("com.simplecoil.laptophost.LaptopHost$RoundReview");
+            Constructor<?> constructor = reviewClass.getDeclaredConstructor(String.class, long.class,
+                    long.class, String.class);
+            constructor.setAccessible(true);
+            Object review = constructor.newInstance(token, 1L, 0L, "teams");
+            Map<Integer, Object> players = (Map<Integer, Object>) field(fixture.host, "players");
+            for (Object player : players.values())
+                call(review, "enroll", player.getClass(), player, int.class,
+                        (Integer) field(player, "id") == 1 ? 1 : 2);
+            call(review, "started");
+            setField(fixture.host, "roundReview", review);
+            setField(fixture.host, "roundToken", token);
+            Class<? extends Enum> stateClass = (Class<? extends Enum>) field(fixture.host, "roundState").getClass();
+            setField(fixture.host, "roundState", Enum.valueOf(stateClass, "RUNNING"));
+
+            await(() -> outboundEmpty(slow.client) && outboundEmpty(healthy.client), 1_000,
+                    "Registration frames did not flush before the round ended");
+            slow.socket.output.clear();healthy.socket.output.clear();
+            Gate blocked = slow.socket.output.blockNextWrite();
+            check(slow.send("earlier"), "Could not block the slow phone before round end");
+            blocked.awaitEntered();
+            call(fixture.host, "endRound", String.class, "final-batch regression");
+            check(!slow.socket.closed.get(), "Round end closed a phone before its report flushed");
+            check(!slow.send("late scoreboard"), "A late frame overtook the final round batch");
+            await(healthy.socket.closed::get, 1_000, "Slow phone blocked another phone's final report");
+            checkFinalRoundFrames(healthy.socket.output.frames(), 0);
+            blocked.release.countDown();
+            await(slow.socket.closed::get, 1_000, "Final report never flushed to the recovered phone");
+            checkFinalRoundFrames(slow.socket.output.frames(), 1);
+        }
+    }
+
+    private static void checkFinalRoundFrames(List<String> frames, int prefix) {
+        check(frames.size() == prefix + 3 && frames.get(prefix).startsWith(JSON)
+                        && frames.get(prefix).contains("\"playerdata\"")
+                        && frames.get(prefix + 1).contains("\"roundreport\"")
+                        && frames.get(prefix + 2).equals("SimpleCoil:31MESGENDGAME"),
+                "Final scoreboard, personal report and ENDGAME were lost or reordered: " + frames);
     }
 
     private static void verifyFinalFrameDeadline() throws Exception {
@@ -158,10 +204,12 @@ public final class SlowClientIsolationTest {
         final LaptopHost host;
         final String previousPlayers = System.getProperty("simplecoil.players.file");
         final String previousEvent = System.getProperty("simplecoil.event.file");
+        final String previousReports = System.getProperty("simplecoil.reports");
         Fixture() throws Exception {
             Path directory = Files.createTempDirectory("simplecoil-slow-client");
             System.setProperty("simplecoil.players.file", directory.resolve("players.json").toString());
             System.setProperty("simplecoil.event.file", directory.resolve("event.properties").toString());
+            System.setProperty("simplecoil.reports", directory.resolve("reports").toString());
             Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
             Method parse = configClass.getDeclaredMethod("parse", String[].class);parse.setAccessible(true);
             Object config = parse.invoke(null, (Object) new String[]{"--no-browser"});
@@ -194,6 +242,7 @@ public final class SlowClientIsolationTest {
                         "A fixture left a client worker running");
             } finally {
                 restore("simplecoil.players.file", previousPlayers);restore("simplecoil.event.file", previousEvent);
+                restore("simplecoil.reports", previousReports);
             }
         }
     }
@@ -267,6 +316,9 @@ public final class SlowClientIsolationTest {
     }
     private static Object field(Object target, String name) throws Exception {
         Field field = target.getClass().getDeclaredField(name);field.setAccessible(true);return field.get(target);
+    }
+    private static void setField(Object target, String name, Object value) throws Exception {
+        Field field = target.getClass().getDeclaredField(name);field.setAccessible(true);field.set(target, value);
     }
     private static boolean outboundEmpty(Object target) {
         try {

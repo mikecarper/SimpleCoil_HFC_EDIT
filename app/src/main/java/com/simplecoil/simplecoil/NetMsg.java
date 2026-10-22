@@ -22,9 +22,10 @@ public class NetMsg {
     public static final String NETMSG_PLAYERTRANSFERRED = "com.simplecoil.simplecoil.PLAYERTRANSFERRED";
     public static final String NETMSG_BATTERYREQUEST = "com.simplecoil.simplecoil.BATTERYREQUEST";
     public static final String MESSAGE_PREFIX = "SimpleCoil:";
-    // Protocol 30 adds host-authorized, life-scoped power-up grants over TCP.
-    public static final int NETWORK_VERSION_NUMBER = 30;
-    public static final String NETWORK_VERSION = "30";
+    // Protocol 31 adds GPS-qualified Airstrike grants to the life-scoped TCP
+    // power-ups. Existing binary packet layouts are unchanged.
+    public static final int NETWORK_VERSION_NUMBER = 31;
+    public static final String NETWORK_VERSION = "31";
     public static final String INTENT_LOBBY_HOST_AGE = "lobby_host_age";
     public static final String INTENT_LOBBY_HOST_KIND = "lobby_host_kind";
     public static final String NETMSG_LOBBYWAIT = "com.simplecoil.simplecoil.LOBBYWAIT";
@@ -158,6 +159,10 @@ public class NetMsg {
     public static final String INTENT_LONGITUDE = "longitude";
     public static final String INTENT_LATITUDE = "latitude";
     public static final String INTENT_GPS_FIX_ELAPSED_MS = "gps_fix_elapsed_ms";
+    // Local provider quality only; these extras never enter compact network packets.
+    public static final String INTENT_GPS_HAS_ACCURACY = "gps_has_accuracy";
+    public static final String INTENT_GPS_ACCURACY_METERS = "gps_accuracy_meters";
+    public static final String INTENT_GPS_PROVIDER = "gps_provider";
     public static final String INTENT_FULLUPDATE = "fullupdate";
     public static final String INTENT_PLAYERDATA = "playerdata";
 

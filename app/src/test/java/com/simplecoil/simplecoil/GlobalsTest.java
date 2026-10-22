@@ -1,5 +1,7 @@
 package com.simplecoil.simplecoil;
 
+import com.simplecoil.protocol.GameStartCountdown;
+
 import org.junit.Test;
 
 import java.net.InetAddress;
@@ -35,7 +37,8 @@ public class GlobalsTest {
             for (int mode : new int[]{Globals.GAME_MODE_FFA, Globals.GAME_MODE_2TEAMS,
                     Globals.GAME_MODE_4TEAMS}) {
                 for (long respawn : new long[]{1, 10, 90, Long.MIN_VALUE, Long.MAX_VALUE})
-                    assertEquals(24L, Globals.respawnWaitSeconds(networked, true, mode, respawn));
+                    assertEquals(GameStartCountdown.DURATION_SECONDS,
+                            Globals.respawnWaitSeconds(networked, true, mode, respawn));
             }
         }
         assertEquals(10L, Globals.respawnWaitSeconds(false, false, Globals.GAME_MODE_2TEAMS, 10));
@@ -52,7 +55,8 @@ public class GlobalsTest {
 
     @Test public void laptopCustomRulesUseTheEditedRespawnTimeForTeamGames() {
         assertEquals(42L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_2TEAMS, 42, true));
-        assertEquals(24L, Globals.respawnWaitSeconds(true, true, Globals.GAME_MODE_2TEAMS, 42, true));
+        assertEquals(GameStartCountdown.DURATION_SECONDS,
+                Globals.respawnWaitSeconds(true, true, Globals.GAME_MODE_2TEAMS, 42, true));
         assertEquals(180L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_2TEAMS, 42, false));
     }
 

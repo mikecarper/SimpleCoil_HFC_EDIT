@@ -25,9 +25,11 @@
         android:title="@string/game_mode_ffa"
         android:visible="true" />
     <item android:id="@+id/game_mode_balanced_qr_item"
+        android:checkable="true"
         android:title="@string/game_mode_balanced_qr"
-        android:visible="false" />
+        android:visible="true" />
     <item android:id="@+id/game_mode_balanced_no_qr_item"
+        android:checkable="true"
         android:title="@string/game_mode_balanced_no_qr"
-        android:visible="false" />
+        android:visible="true" />
 </menu>
