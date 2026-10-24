@@ -1081,7 +1081,7 @@ public class DedicatedServerRegressionTest {
                 assertEquals(5, player.eliminated);
                 assertFalse(player.isConnected);
                 assertEquals(current.getString(R.string.player_list_team2_total, 7, 0),
-                        adapter.getItem(Globals.MAX_PLAYER_ID + 1).playerName);
+                        adapter.getItem(adapter.getCount() - 1).playerName);
                 View row = adapter.getView(1, null, current.findViewById(R.id.player_list));
                 assertEquals(expectedName, ((TextView) row.findViewById(R.id.player_name_tv)).getText().toString());
             } finally {
@@ -1100,6 +1100,12 @@ public class DedicatedServerRegressionTest {
     public void liveScoreboardUpdatePreservesTheScrolledPosition() {
         scenario.onActivity(current -> {
             ListView list = current.findViewById(R.id.player_list);
+            for (int id = 1; id <= Globals.MAX_PLAYER_ID; id++) {
+                TcpServer.ScoreData score = tcp.new ScoreData();
+                score.playerName = "Player " + id;
+                tcp.playerScores.put((byte) id, score);
+            }
+            receive(NetMsg.NETMSG_PLAYERDATAUPDATE);
             // Use a fixed viewport so this checks scrolling on both phones and tablets.
             layoutScoreboard(list);
             list.setSelectionFromTop(8, -7);
@@ -1338,6 +1344,7 @@ public class DedicatedServerRegressionTest {
         boolean dedicated;
         boolean ready;
         ScoreData firstPlayerScore;
+        final Map<Byte, ScoreData> playerScores = new HashMap<>();
         Intent scheduledStart;
 
         @Override public boolean startGame() { gameStarts++; return acceptStart; }
@@ -1367,7 +1374,10 @@ public class DedicatedServerRegressionTest {
         @Override void clearScheduledStart() { scheduledStart = null; }
         @Override public void sendTCPMessageAll(String message) { }
         @Override public void sendAllGameInfo(int playerID) { gameInfoUpdates++; }
-        @Override public ScoreData getScore(byte playerID) { return playerID == 1 ? firstPlayerScore : null; }
+        @Override public ScoreData getScore(byte playerID) {
+            return playerScores.containsKey(playerID) ? playerScores.get(playerID)
+                    : playerID == 1 ? firstPlayerScore : null;
+        }
     }
 
     private static final class RecordingUDPService extends UDPListenerService {

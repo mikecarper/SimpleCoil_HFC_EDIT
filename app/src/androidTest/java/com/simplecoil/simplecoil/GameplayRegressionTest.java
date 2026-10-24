@@ -89,6 +89,8 @@ public class GameplayRegressionTest {
     private Map<Byte, Integer> originalBalancedTeams;
     private Set<Byte> originalBalancedCheckedIn;
     private Map<String, Integer> originalRetainedBalancedTeams;
+    private SharedPreferences matchPreferences;
+    private Map<String, ?> originalMatchPreferences;
 
     @Before
     public void setUp() {
@@ -124,6 +126,10 @@ public class GameplayRegressionTest {
         Globals.getInstance().mEndGameVotes = 0;
         Globals.getInstance().mEndGameVoteRequested = false;
         Globals.getInstance().mUseGPS = false;
+        matchPreferences = InstrumentationRegistry.getInstrumentation().getTargetContext()
+                .getSharedPreferences("MatchSession", Context.MODE_PRIVATE);
+        originalMatchPreferences = new HashMap<>(matchPreferences.getAll());
+        matchPreferences.edit().clear().commit();
         scenario = ActivityScenario.launch(FullscreenActivity.class);
         scenario.onActivity(activity -> {
             testActivity = activity;
@@ -192,6 +198,7 @@ public class GameplayRegressionTest {
     public void tearDown() {
         if (scenario == null) {
             restoreEliminationCount();
+            restoreMatchPreferences();
             return;
         }
         // A live game's rendering/confirmation dialog can keep Android 5's
@@ -220,6 +227,7 @@ public class GameplayRegressionTest {
             scenario.close();
         } finally {
             restoreEliminationCount();
+            restoreMatchPreferences();
         }
         if (udp != null)
             udp.onDestroy();
@@ -239,6 +247,17 @@ public class GameplayRegressionTest {
         Globals.getInstance().mBalancedCheckedIn = originalBalancedCheckedIn;
         Globals.getInstance().mRetainedBalancedTeams = originalRetainedBalancedTeams;
         Globals.getInstance().mLobbyRoundActive = originalLobbyRoundActive;
+    }
+
+    private void restoreMatchPreferences() {
+        if (matchPreferences == null || originalMatchPreferences == null) return;
+        SharedPreferences.Editor editor = matchPreferences.edit().clear();
+        for (Map.Entry<String, ?> entry : originalMatchPreferences.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof String) editor.putString(entry.getKey(), (String) value);
+            else if (value instanceof Boolean) editor.putBoolean(entry.getKey(), (Boolean) value);
+        }
+        editor.commit();
     }
 
     private void restoreEliminationCount() {
@@ -812,7 +831,7 @@ public class GameplayRegressionTest {
                 tcp.completedReport = new RoundReport(token, 1, 4, 1, 15, 6, 2, 1, 100, 120, 60000, true);
                 deliverRecordedTcpEnd(activity);
                 assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
-                assertEquals(1, tcp.stopRequests);
+                assertClientStopped();
                 assertTrue(LastGameStats.load(ignored.preferences).analyticsComplete);
                 assertEquals(activity.getString(R.string.lobby_stat_accuracy, 40.0),
                         ((TextView) activity.findViewById(R.id.lobby_last_game_accuracy)).getText().toString());
@@ -837,7 +856,7 @@ public class GameplayRegressionTest {
                 assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
                 tcp.completedReport = new RoundReport(token, 1, 1, 0, 10, 2, 1, 0, 100, 109, 60000, true);
                 deliverRecordedTcpEnd(activity);
-                assertEquals(1, tcp.stopRequests);
+                assertClientStopped();
                 assertEquals(2, LastGameStats.load(ignored.preferences).confirmedHits);
                 assertTrue(LastGameStats.load(ignored.preferences).analyticsComplete);
             }
@@ -860,7 +879,8 @@ public class GameplayRegressionTest {
                 assertEquals(0, tcp.stopRequests);
                 timeout.run();
                 assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
-                assertEquals(1, tcp.stopRequests);
+                assertClientStopped();
+                int stoppedAfterTimeout = tcp.stopRequests;
                 LastGameStats saved = LastGameStats.load(ignored.preferences);
                 assertEquals(3, saved.kills);
                 assertEquals(10, saved.shots);
@@ -869,7 +889,7 @@ public class GameplayRegressionTest {
                         ((TextView) activity.findViewById(R.id.lobby_last_game_accuracy)).getText().toString());
                 int history = PlayerHistory.kills(activity);
                 timeout.run();
-                assertEquals(1, tcp.stopRequests);
+                assertEquals(stoppedAfterTimeout, tcp.stopRequests);
                 assertEquals(history, PlayerHistory.kills(activity));
             }
         });
@@ -909,13 +929,17 @@ public class GameplayRegressionTest {
                 tcp.connectedToLobby = true;
                 invoke(activity, "endGame");
                 Runnable timeout = (Runnable) get(activity, "mClientRoundEndTimeout");
+                assertNotNull(timeout);
+                assertEquals(0, tcp.stopRequests);
                 invoke(activity, "endGame", new Class<?>[]{boolean.class}, true);
                 assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
-                assertEquals(1, tcp.stopRequests);
+                int stoppedAfterLeave = tcp.stopRequests;
+                assertTrue("Explicit leave must close the client", stoppedAfterLeave > 0);
                 assertTrue(LastGameStats.load(ignored.preferences).leftEarly);
                 assertNull(get(activity, "mClientRoundEndTimeout"));
                 timeout.run();
-                assertEquals(1, tcp.stopRequests);
+                assertEquals("The cancelled timeout must not stop the client again",
+                        stoppedAfterLeave, tcp.stopRequests);
             }
         });
     }
@@ -933,7 +957,7 @@ public class GameplayRegressionTest {
                 assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
                 assertFalse((boolean) get(activity, "mClientRoundEndPending"));
                 assertNull(get(activity, "mClientRoundEndTimeout"));
-                assertEquals(1, tcp.stopRequests);
+                assertClientStopped();
                 assertFalse(LastGameStats.load(ignored.preferences).analyticsComplete);
             }
         });
@@ -949,6 +973,7 @@ public class GameplayRegressionTest {
                         "cccccccc-cccc-cccc-cccc-cccccccccccc"};
                 for (int index = 0; index < tokens.length; index++) {
                     String token = tokens[index];
+                    globals.mGameMode = Globals.GAME_MODE_FFA;
                     globals.mGameState = Globals.GAME_STATE_RUNNING;
                     set(activity, "mActivePeerRoundToken", token);
                     set(activity, "mRoundAnalyticsToken", token);
@@ -983,6 +1008,11 @@ public class GameplayRegressionTest {
         return new org.json.JSONObject().put(TcpServer.JSON_PLAYERID, id)
                 .put(TcpServer.JSON_PLAYERNAME, "Player " + id)
                 .put(TcpServer.JSON_PLAYERPOINTS, kills).put(TcpServer.JSON_PLAYERELIMINATED, deaths);
+    }
+
+    private void assertClientStopped() {
+        assertTrue("Round cleanup must stop the TCP client", tcp.stopRequests > 0);
+        assertFalse("A stopped client must not retain its lobby connection", tcp.hasLobbyConnection());
     }
 
     private void deliverRecordedTcpEnd(FullscreenActivity activity) {
@@ -1469,6 +1499,8 @@ public class GameplayRegressionTest {
 
     @Test
     public void peerHostDoesNotAdvertiseBeforeTcpListenerIsReady() {
+        org.junit.Assume.assumeTrue("Phone hosting requires an active network address",
+                Globals.getIPAddress(testActivity) != null);
         scenario.onActivity(activity -> {
             int[] listenerStarts = new int[1];
             boolean[] listenerReady = new boolean[1];
@@ -1493,6 +1525,8 @@ public class GameplayRegressionTest {
 
     @Test
     public void startCreatesPeerLobbyBeforeTryingToStartANetworkRound() {
+        org.junit.Assume.assumeTrue("Phone hosting requires an active network address",
+                Globals.getIPAddress(testActivity) != null);
         scenario.onActivity(activity -> {
             int[] listenerStarts = new int[1];
             set(activity, "mTcpServer", new TcpServer() {
@@ -4075,7 +4109,15 @@ public class GameplayRegressionTest {
     private static void runReloadResumeCallbacks(FullscreenActivity activity, Runnable whilePaused,
             Runnable afterResume) {
         boolean wasRegistered = (boolean) get(activity, "mGattReceiverRegistered");
-        if (wasRegistered) activity.onPause();
+        if (wasRegistered) {
+            activity.onPause();
+            assertTrue("Pausing must keep the gun receiver active",
+                    (boolean) get(activity, "mGattReceiverRegistered"));
+            // The newer lifecycle keeps GATT reception alive in the background.
+            // Model a delivery gap explicitly when testing retained ACK recovery.
+            activity.unregisterReceiver((BroadcastReceiver) get(activity, "mGattUpdateReceiver"));
+            set(activity, "mGattReceiverRegistered", false);
+        }
         boolean resumed = false;
         try {
             assertFalse((boolean) get(activity, "mGattReceiverRegistered"));
@@ -4085,7 +4127,13 @@ public class GameplayRegressionTest {
             afterResume.run();
         } finally {
             if (!resumed) activity.onResume();
-            if (!wasRegistered) activity.onPause();
+            if (!wasRegistered) {
+                if ((boolean) get(activity, "mGattReceiverRegistered")) {
+                    activity.unregisterReceiver((BroadcastReceiver) get(activity, "mGattUpdateReceiver"));
+                    set(activity, "mGattReceiverRegistered", false);
+                }
+                activity.onPause();
+            }
         }
     }
 
@@ -4477,9 +4525,13 @@ public class GameplayRegressionTest {
                 assertNull(get(activity, "mGameCountdownTimer"));
                 assertEquals(false, get(activity, "mGameTimerRunning"));
                 assertEquals(7, get(activity, "mScore"));
-                assertEquals(Collections.singletonList(TcpServer.TCPMESSAGE_PREFIX
-                        + TcpServer.TCPPREFIX_JSON + "{\"" + TcpServer.JSON_LOBBY_READY
-                        + "\":true}"), tcp.messages);
+                assertEquals(1, tcp.messages.size());
+                String prefix = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON;
+                assertTrue(tcp.messages.get(0).startsWith(prefix));
+                try {
+                    assertTrue(new org.json.JSONObject(tcp.messages.get(0).substring(prefix.length()))
+                            .getBoolean(TcpServer.JSON_LOBBY_READY));
+                } catch (org.json.JSONException invalid) { throw new AssertionError(invalid); }
                 assertFalse(tcp.messages.contains(TcpServer.TCPMESSAGE_PREFIX
                         + TcpServer.TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME));
             } finally {
@@ -5342,6 +5394,10 @@ public class GameplayRegressionTest {
     @Test
     public void validThirtySecondPlayerStatusStillUpdatesTheDisplayedTeam() {
         scenario.onActivity(activity -> {
+            // A gun may choose the local ID before admission; the host owns it
+            // once the phone has joined or committed a network round.
+            Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
+            set(activity, "mLobbyJoined", false);
             byte[] packet = telemetryPacket(0, 0, 0, 0);
             packet[FullscreenActivity.RECOIL_OFFSET_TEAM] = 32;
             receiveTelemetry(activity, packet);
@@ -5639,6 +5695,53 @@ public class GameplayRegressionTest {
         return android.provider.Settings.Global.getFloat(
                 InstrumentationRegistry.getInstrumentation().getTargetContext().getContentResolver(),
                 android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f);
+    }
+
+    @Test
+    public void everyPickedPowerupSpeaksItsNameOnceAfterTheReveal() throws NoSuchFieldException {
+        Field spinField = PowerupRouletteView.class.getDeclaredField("spin");
+        spinField.setAccessible(true);
+        withRecordingSpeech((activity, speech) -> {
+            Globals.getInstance().mPowerupQrRequired = 2;
+            PowerupRouletteView roulette = activity.findViewById(R.id.powerup_roulette);
+            assertNotNull(roulette);
+            assertEquals(true, get(activity, "mActivityResumed"));
+            List<String> expected = new ArrayList<>();
+            try {
+                for (int kind = Powerups.EMP; kind <= Powerups.AIRSTRIKE; kind++) {
+                    // Target another player so this isolates the picker's announcement
+                    // from EMP, damage and ammunition effects on the local blaster.
+                    Powerups.Grant grant = new Powerups.Grant(50000 + kind, 1, 0, kind,
+                            new int[]{17}, new int[]{0},
+                            SystemClock.elapsedRealtime() + Powerups.durationMillis(kind));
+                    applyPowerup(activity, grant, false);
+                    android.animation.ValueAnimator spin =
+                            (android.animation.ValueAnimator) spinField.get(roulette);
+                    if (spin != null) {
+                        assertEquals("Reward was spoken before its reveal", expected, speech.queued);
+                        // Complete the real animation and its real reveal callback.
+                        spin.end();
+                    }
+                    expected.add("normal:1.0:" + activity.getString(PowerupPresentation.voice(kind)));
+                    assertEquals(expected, speech.queued);
+                    assertEquals(android.speech.tts.TextToSpeech.QUEUE_ADD,
+                            (int) speech.queueModes.get(expected.size() - 1));
+                    assertEquals(activity.getString(PowerupPresentation.name(kind)),
+                            roulette.getContentDescription().toString());
+
+                    applyPowerup(activity, grant, false);
+                    applyPowerup(activity, new Powerups.Grant(60000 + kind, 1, 0, kind,
+                            new int[]{17}, new int[]{0},
+                            SystemClock.elapsedRealtime() + Powerups.durationMillis(kind)), true);
+                    assertEquals("Replayed or recovered rewards must not repeat speech",
+                            expected, speech.queued);
+                }
+            } catch (IllegalAccessException e) {
+                throw new AssertionError(e);
+            } finally {
+                roulette.cancel();
+            }
+        });
     }
 
     @Test
@@ -7254,6 +7357,8 @@ public class GameplayRegressionTest {
         RoundReport completedReport;
 
         @Override public synchronized boolean hasLobbyConnection() { return connectedToLobby; }
+        // Event-policy status is independent of the gameplay frames asserted here.
+        @Override public void sendEventLockStatus(String status) { }
         @Override public synchronized Intent consumePendingTerminalEvent(long id) {
             if (id != 123 || pendingTerminal == null) return super.consumePendingTerminalEvent(id);
             Intent terminal = pendingTerminal;

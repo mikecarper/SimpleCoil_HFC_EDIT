@@ -585,7 +585,7 @@ public class TcpServerRegressionTest {
     }
 
     @Test
-    public void grenadeHitCreditsPairedOwnerWithoutRevealingOwnersPhone() throws Exception {
+    public void grenadeHitCannotInflateGunAccuracyOrRevealOwnersPhone() throws Exception {
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Object target = client(1, 1);
         Object owner = client(2, 9);
@@ -595,16 +595,17 @@ public class TcpServerRegressionTest {
         assertEquals((byte) 9, get(owner, "mPlayerID"));
         assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
         assertEquals(9, Globals.getInstance().mGrenadePairings[3]);
+        set(owner, "hits", 7);
 
         parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY,
                 TcpServer.JSON_TELEMETRY_GRENADE_HIT)
                 .put(TcpServer.JSON_TELEMETRY_GRENADE_ID, 3));
-        assertEquals(1, get(owner, "hits"));
+        assertEquals("Grenade damage must not count as a confirmed gun hit", 7, get(owner, "hits"));
 
         parse(target, new JSONObject().put(TcpServer.JSON_TELEMETRY,
                 TcpServer.JSON_TELEMETRY_GRENADE_HIT)
                 .put(TcpServer.JSON_TELEMETRY_GRENADE_ID, 4));
-        assertEquals(1, get(owner, "hits"));
+        assertEquals(7, get(owner, "hits"));
         @SuppressWarnings("unchecked")
         Map<Byte, Map<Byte, Long>> reveals = (Map<Byte, Map<Byte, Long>>) get(server,
                 "mEnemyGPSRevealUntil");
