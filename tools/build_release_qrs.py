@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Build labeled, vector QR posters in one US Letter landscape PDF.
+"""Build vector QR posters in one US Letter landscape PDF.
 
 Dependencies: reportlab and qrcode. Install them in a virtual environment.
-Usage: python tools/build_release_qrs.py --version 1.52 \
-    --gun 'Gun 1=AA:BB:CC:DD:EE:FF'
+Usage: python tools/build_release_qrs.py --version 1.52 --qr-only
 """
 
 import argparse
@@ -193,16 +192,28 @@ def draw_qr(canvas, payload, x, y, side):
                             module, module, stroke=0, fill=1)
 
 
-def build(version, output, guns=(), apk_name=None):
+def build(version, output, guns=(), apk_name=None, qr_only=False):
     cards = pages(version, guns=guns, apk_name=apk_name)
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas = Canvas(str(output), pagesize=landscape(letter), pageCompression=1)
     canvas.setTitle(f"LAZER GUN RUN {version} - All QR Codes - US Letter")
     canvas.setAuthor("LAZER GUN RUN")
-    canvas.setSubject("App download, Teams 1-4, CTF flags, power-up checkpoints, and optional gun pairing")
+    canvas.setSubject("App download, Teams 1-4, CTF flags, power-up checkpoints"
+                      + (", and gun pairing" if guns else ""))
+    if qr_only:
+        canvas.setViewerPreference("PrintScaling", "None")
     for number, card in enumerate(cards, start=1):
         canvas.bookmarkPage(f"qr-{number}")
         canvas.addOutlineEntry(card["title"], f"qr-{number}", level=0)
+        if qr_only:
+            width, height = landscape(letter)
+            side = min(width, height) - 72
+            x, y = (width - side) / 2, (height - side) / 2
+            draw_qr(canvas, card["payload"], x, y, side)
+            if number == 1:
+                canvas.linkURL(card["payload"], (x, y, x + side, y + side), relative=0)
+            canvas.showPage()
+            continue
         canvas.setFillColor(colors.HexColor("#15364A"))
         title_size = min(30, 30 * 720 / stringWidth(card["title"], "Helvetica-Bold", 30))
         canvas.setFont("Helvetica-Bold", title_size)
@@ -244,13 +255,16 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--apk-name", help="APK filename uploaded to the matching GitHub release")
+    parser.add_argument("--qr-only", action="store_true",
+                        help="Print only a large centered QR code on each page, without labels or instructions")
     parser.add_argument("--gun", action="append", type=parse_gun, default=[], metavar="LABEL=MAC",
                         help="Append a labeled gun pairing poster; repeat for each blaster")
     args = parser.parse_args()
     output = args.output or Path("output/pdf") / (
         f"LAZER-GUN-RUN-{args.version}-QR-Codes-US-Letter.pdf")
     try:
-        count = build(args.version, output, guns=args.gun, apk_name=args.apk_name)
+        count = build(args.version, output, guns=args.gun, apk_name=args.apk_name,
+                      qr_only=args.qr_only)
     except ValueError as error:
         parser.error(str(error))
     print(f"Created {output} ({count} pages, US Letter landscape)")

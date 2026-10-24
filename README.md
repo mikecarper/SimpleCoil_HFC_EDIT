@@ -667,9 +667,12 @@ The debug APK is written to
 ## Printable QR posters
 
 The [1.52 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.52)
-includes a labeled 20-page QR PDF in US Letter landscape format (11 x 8.5 in),
-plus a ZIP with the complete PDF, individual posters, and a payload index.
-Print at 100% / Actual Size and keep the white QR margins unobstructed.
+includes a 15-page QR-only PDF in US Letter landscape format (11 x 8.5 in),
+plus a ZIP with the complete PDF, individual pages, and a payload index.
+Each sheet has one large, centered black-and-white QR code with no printed
+labels or instructions. Open the PDF and print; it requests actual-size printing
+and keeps the white QR margins clear. The PDF bookmarks and ZIP index identify
+the pages without adding text to the printed sheets.
 
 - Page 1: APK download (use a normal QR reader, not the in-game scanner).
 - Pages 2-5: Teams 1-4. The same codes serve team selection, joining,
@@ -677,27 +680,21 @@ Print at 100% / Actual Size and keep the white QR margins unobstructed.
 - Pages 6-7: Team 1 and Team 2 CTF flags.
 - Pages 8-15: Power-up checkpoints 1-8. These identify distinct checkpoints,
   not fixed rewards; each can unlock any eligible random power-up.
-- Pages 16-20: Pairing codes for the five event blasters, labeled Gun 1-5.
-  Each contains only its Bluetooth MAC address. Use **Connect gun > QR weapon**;
-  this path requires an external ZXing-compatible Barcode Scanner app. These
-  labels identify physical blasters and do not assign player slots or names.
 
-Gun pairing codes are specific to each blaster; use different addresses for
-another gun set. Team posters do not contain a host address or Wi-Fi
-credentials; connect to the game network first.
+The release print pack contains no gun-specific pairing codes. Team codes do
+not contain a host address or Wi-Fi credentials; connect to the game network first.
 
 To regenerate the PDF, use a virtual environment with `reportlab` and `qrcode`
 installed, then run:
 
 ```sh
-python tools/build_release_qrs.py --version 1.52
+python tools/build_release_qrs.py --version 1.52 --qr-only
 ```
 
-This generates the 15 universal posters. Append a gun poster with
-`--gun 'Gun 1=AA:BB:CC:DD:EE:FF'`, repeating the option for each blaster.
+This generates the 15 universal codes, one per sheet.
 The generator writes `output/pdf/LAZER-GUN-RUN-1.52-QR-Codes-US-Letter.pdf`
-with vector QR graphics, large purpose labels, instructions, and exact payload
-text. The download QR expects the release asset `LAZER-GUN-RUN-1.52.apk`;
+with vector QR graphics. Omit `--qr-only` for the labeled layout with instructions.
+The download QR expects the release asset `LAZER-GUN-RUN-1.52.apk`;
 use `--apk-name` when publishing a different filename.
 
 ## Release signing
