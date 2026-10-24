@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build vector QR posters in one US Letter landscape PDF.
+"""Build vector QR posters in one US Letter PDF.
 
 Dependencies: reportlab and qrcode. Install them in a virtual environment.
-Usage: python tools/build_release_qrs.py --version 1.52 --qr-only
+Usage: python tools/build_release_qrs.py --version 1.52 --portrait
 """
 
 import argparse
@@ -192,19 +192,44 @@ def draw_qr(canvas, payload, x, y, side):
                             module, module, stroke=0, fill=1)
 
 
-def build(version, output, guns=(), apk_name=None, qr_only=False):
+def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False):
+    if qr_only and portrait:
+        raise ValueError("Choose either QR-only or portrait posters")
     cards = pages(version, guns=guns, apk_name=apk_name)
     output.parent.mkdir(parents=True, exist_ok=True)
-    canvas = Canvas(str(output), pagesize=landscape(letter), pageCompression=1)
+    canvas = Canvas(str(output), pagesize=letter if portrait else landscape(letter),
+                    pageCompression=1)
     canvas.setTitle(f"LAZER GUN RUN {version} - All QR Codes - US Letter")
     canvas.setAuthor("LAZER GUN RUN")
     canvas.setSubject("App download, Teams 1-4, CTF flags, power-up checkpoints"
                       + (", and gun pairing" if guns else ""))
-    if qr_only:
+    if qr_only or portrait:
         canvas.setViewerPreference("PrintScaling", "None")
     for number, card in enumerate(cards, start=1):
         canvas.bookmarkPage(f"qr-{number}")
         canvas.addOutlineEntry(card["title"], f"qr-{number}", level=0)
+        if portrait:
+            width, height = letter
+            title_size = min(40, 40 * (width - 72)
+                             / stringWidth(card["title"], "Helvetica-Bold", 40))
+            canvas.setFillColor(colors.black)
+            canvas.setFont("Helvetica-Bold", title_size)
+            canvas.drawCentredString(width / 2, height - 72, card["title"])
+            canvas.setFont("Helvetica", 10.5)
+            canvas.drawCentredString(width / 2, height - 96, card["subtitle"])
+            side = width - 72
+            x, y = (width - side) / 2, (height - side) / 2
+            draw_qr(canvas, card["payload"], x, y, side)
+            if number == 1:
+                canvas.linkURL(card["payload"], (x, y, x + side, y + side), relative=0)
+            canvas.setStrokeColor(colors.HexColor("#B8B8B8"))
+            canvas.line(36, 55, width - 36, 55)
+            canvas.setFillColor(colors.HexColor("#444444"))
+            canvas.setFont("Helvetica", 8.5)
+            canvas.drawString(36, 38, f"LAZER GUN RUN {version}")
+            canvas.drawRightString(width - 36, 38, f"{number} / {len(cards)}")
+            canvas.showPage()
+            continue
         if qr_only:
             width, height = landscape(letter)
             side = min(width, height) - 72
@@ -255,8 +280,11 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--apk-name", help="APK filename uploaded to the matching GitHub release")
-    parser.add_argument("--qr-only", action="store_true",
-                        help="Print only a large centered QR code on each page, without labels or instructions")
+    layouts = parser.add_mutually_exclusive_group()
+    layouts.add_argument("--qr-only", action="store_true",
+                         help="Print only a large centered QR code on each landscape page")
+    layouts.add_argument("--portrait", action="store_true",
+                         help="Use tall pages with a clear header, large QR code and small footer")
     parser.add_argument("--gun", action="append", type=parse_gun, default=[], metavar="LABEL=MAC",
                         help="Append a labeled gun pairing poster; repeat for each blaster")
     args = parser.parse_args()
@@ -264,10 +292,11 @@ def main():
         f"LAZER-GUN-RUN-{args.version}-QR-Codes-US-Letter.pdf")
     try:
         count = build(args.version, output, guns=args.gun, apk_name=args.apk_name,
-                      qr_only=args.qr_only)
+                      qr_only=args.qr_only, portrait=args.portrait)
     except ValueError as error:
         parser.error(str(error))
-    print(f"Created {output} ({count} pages, US Letter landscape)")
+    orientation = "portrait" if args.portrait else "landscape"
+    print(f"Created {output} ({count} pages, US Letter {orientation})")
 
 
 if __name__ == "__main__":

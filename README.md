@@ -667,12 +667,12 @@ The debug APK is written to
 ## Printable QR posters
 
 The [1.52 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.52)
-includes a 15-page QR-only PDF in US Letter landscape format (11 x 8.5 in),
+includes a 15-page QR PDF in US Letter portrait format (8.5 x 11 in),
 plus a ZIP with the complete PDF, individual pages, and a payload index.
-Each sheet has one large, centered black-and-white QR code with no printed
-labels or instructions. Open the PDF and print; it requests actual-size printing
-and keeps the white QR margins clear. The PDF bookmarks and ZIP index identify
-the pages without adding text to the printed sheets.
+Each tall sheet has a clear header, one large centered black-and-white QR code,
+and a small footer with the release version and page number. Open the PDF and
+print; it requests actual-size printing and keeps the white QR margins clear.
+PDF bookmarks and the ZIP index also identify each page.
 
 - Page 1: APK download (use a normal QR reader, not the in-game scanner).
 - Pages 2-5: Teams 1-4. The same codes serve team selection, joining,
@@ -688,12 +688,13 @@ To regenerate the PDF, use a virtual environment with `reportlab` and `qrcode`
 installed, then run:
 
 ```sh
-python tools/build_release_qrs.py --version 1.52 --qr-only
+python tools/build_release_qrs.py --version 1.52 --portrait
 ```
 
 This generates the 15 universal codes, one per sheet.
 The generator writes `output/pdf/LAZER-GUN-RUN-1.52-QR-Codes-US-Letter.pdf`
-with vector QR graphics. Omit `--qr-only` for the labeled layout with instructions.
+with vector QR graphics, headers, and small footers. Use `--qr-only` instead for
+plain landscape QR sheets, or omit both options for the original instructional layout.
 The download QR expects the release asset `LAZER-GUN-RUN-1.52.apk`;
 use `--apk-name` when publishing a different filename.
 
