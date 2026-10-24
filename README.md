@@ -4,6 +4,23 @@ SimpleCoil is an Android companion app for supported Bluetooth LE laser-tag
 hardware. This fork is based on [Dees-Troy/SimpleCoil](https://github.com/Dees-Troy/SimpleCoil)
 and retains the project's Apache-2.0 license.
 
+## Latest release (1.52)
+
+[Download version 1.52](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.52)
+for post-round statistics and saved laptop timelines, stable teams with explicit
+rebalancing, the GPS-based Airstrike reward, movement reminders, and improved
+countdown and gun-command recovery. Each of the ten power-ups has a spoken
+announcement after its reveal.
+
+Update every phone and use the matching laptop host from this release's source
+download. Version 1.52 uses network protocol 31; version 1.51 uses protocol 30
+and cannot join the same game. Android 5.0 or newer is required.
+
+The 1.52 APK uses the configured release signing key, which differs from the
+debug key used for the published 1.51 APK. Android cannot install 1.52 as an
+in-place update over 1.51. Reinstalling removes the old app's local settings
+and player history, so save any information you need before switching.
+
 ## Platform support
 
 - Minimum Android version: Android 5.0 / API 21. Android 5.1.1 is supported.
@@ -158,7 +175,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.51 on every phone for this build.
+messages cannot end a new round. Install 1.52 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
 remains the primary connection. If it fails, Bluetooth Classic links can forward
@@ -649,7 +666,7 @@ The debug APK is written to
 
 ## Printable QR posters
 
-The [1.51 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.51)
+The [1.52 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.52)
 includes a labeled 20-page QR PDF in US Letter landscape format (11 x 8.5 in),
 plus a ZIP with the complete PDF, individual posters, and a payload index.
 Print at 100% / Actual Size and keep the white QR margins unobstructed.
@@ -673,14 +690,14 @@ To regenerate the PDF, use a virtual environment with `reportlab` and `qrcode`
 installed, then run:
 
 ```sh
-python tools/build_release_qrs.py --version 1.51
+python tools/build_release_qrs.py --version 1.52
 ```
 
 This generates the 15 universal posters. Append a gun poster with
 `--gun 'Gun 1=AA:BB:CC:DD:EE:FF'`, repeating the option for each blaster.
-The generator writes `output/pdf/LAZER-GUN-RUN-1.51-QR-Codes-US-Letter.pdf`
+The generator writes `output/pdf/LAZER-GUN-RUN-1.52-QR-Codes-US-Letter.pdf`
 with vector QR graphics, large purpose labels, instructions, and exact payload
-text. The download QR expects the release asset `LAZER-GUN-RUN-1.51.apk`;
+text. The download QR expects the release asset `LAZER-GUN-RUN-1.52.apk`;
 use `--apk-name` when publishing a different filename.
 
 ## Release signing

@@ -2,7 +2,7 @@
 """Build labeled, vector QR posters in one US Letter landscape PDF.
 
 Dependencies: reportlab and qrcode. Install them in a virtual environment.
-Usage: python tools/build_release_qrs.py --version 1.51 \
+Usage: python tools/build_release_qrs.py --version 1.52 \
     --gun 'Gun 1=AA:BB:CC:DD:EE:FF'
 """
 
@@ -42,7 +42,7 @@ def checked_guns(guns):
 
 def pages(version, guns=(), apk_name=None):
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version):
-        raise ValueError("Use a numeric release version, such as 1.51")
+        raise ValueError("Use a numeric release version, such as 1.52")
     guns = checked_guns(guns)
     apk_name = apk_name or f"LAZER-GUN-RUN-{version}.apk"
     if (not apk_name.lower().endswith(".apk") or any(char in apk_name for char in "/\\")
