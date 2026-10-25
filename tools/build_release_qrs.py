@@ -65,7 +65,7 @@ def pages(version, guns=(), apk_name=None):
             "this source if Android asks.",
         ],
         "detail": "Game posters: teams on pages 2-5; CTF flags on pages 6-7; "
-                  "power-up checkpoints on pages 8-15. "
+                  "power-ups on pages 8-15. "
                   + ("Gun pairing posters follow on pages 16 onward." if guns else ""),
     }]
     for team in range(1, 5):
@@ -104,7 +104,7 @@ def pages(version, guns=(), apk_name=None):
         })
     for checkpoint in range(1, 9):
         result.append({
-            "title": f"POWER-UP CHECKPOINT {checkpoint}",
+            "title": f"Power-UP {checkpoint}",
             "subtitle": "DISTINCT SCAN | RANDOM REWARD",
             "payload": f"SIMPLECOIL:POWERUP:{checkpoint}",
             "heading": "COLLECT DIFFERENT CODES",
@@ -207,7 +207,7 @@ def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False
     canvas.setTitle(f"LAZER GUN RUN {version} - {qr_scope} QR Codes - US Letter")
     canvas.setAuthor("LAZER GUN RUN")
     canvas.setSubject(("" if skip_download else "App download, ")
-                      + "Teams 1-4, CTF flags, power-up checkpoints"
+                      + "Teams 1-4, CTF flags, power-ups"
                       + (", and gun pairing" if guns else ""))
     if qr_only or portrait:
         canvas.setViewerPreference("PrintScaling", "None")

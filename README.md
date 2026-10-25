@@ -678,7 +678,7 @@ PDF bookmarks and the ZIP index also identify each page.
 - Pages 1-4: Teams 1-4. The same codes serve team selection, joining,
   Balanced Random check-in, respawn, and CTF home bases.
 - Pages 5-6: Team 1 and Team 2 CTF flags.
-- Pages 7-14: Power-up checkpoints 1-8. These identify distinct checkpoints,
+- Pages 7-14: Power-UP 1-8. These identify distinct checkpoints,
   not fixed rewards; each can unlock any eligible random power-up.
 
 The print pack starts with Team 1 and omits the app-download cover.
