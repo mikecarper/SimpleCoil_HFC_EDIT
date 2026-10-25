@@ -212,14 +212,21 @@ def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False
             width, height = letter
             title_size = min(40, 40 * (width - 72)
                              / stringWidth(card["title"], "Helvetica-Bold", 40))
+            title_below_qr = card["payload"].startswith((
+                "SIMPLECOIL:RESPAWN:", "SIMPLECOIL:FLAG:", "SIMPLECOIL:POWERUP:"))
             canvas.setFillColor(colors.black)
-            canvas.setFont("Helvetica-Bold", title_size)
-            canvas.drawCentredString(width / 2, height - 72, card["title"])
+            if not title_below_qr:
+                canvas.setFont("Helvetica-Bold", title_size)
+                canvas.drawCentredString(width / 2, height - 72, card["title"])
             canvas.setFont("Helvetica", 10.5)
-            canvas.drawCentredString(width / 2, height - 96, card["subtitle"])
+            canvas.drawCentredString(width / 2, height - (72 if title_below_qr else 96),
+                                     card["subtitle"])
             side = width - 72
             x, y = (width - side) / 2, (height - side) / 2
             draw_qr(canvas, card["payload"], x, y, side)
+            if title_below_qr:
+                canvas.setFont("Helvetica-Bold", title_size)
+                canvas.drawCentredString(width / 2, y - 36, card["title"])
             if number == 1:
                 canvas.linkURL(card["payload"], (x, y, x + side, y + side), relative=0)
             canvas.setStrokeColor(colors.HexColor("#B8B8B8"))
@@ -284,7 +291,7 @@ def main():
     layouts.add_argument("--qr-only", action="store_true",
                          help="Print only a large centered QR code on each landscape page")
     layouts.add_argument("--portrait", action="store_true",
-                         help="Use tall pages with a clear header, large QR code and small footer")
+                         help="Use tall pages with game titles below the QR, headers and small footers")
     parser.add_argument("--gun", action="append", type=parse_gun, default=[], metavar="LABEL=MAC",
                         help="Append a labeled gun pairing poster; repeat for each blaster")
     args = parser.parse_args()
