@@ -13,7 +13,7 @@ from urllib.parse import quote
 import qrcode
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import landscape, letter
-from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfbase.pdfmetrics import getAscent, getDescent, stringWidth
 from reportlab.pdfgen.canvas import Canvas
 
 
@@ -190,6 +190,7 @@ def draw_qr(canvas, payload, x, y, side):
                 canvas.rect(x + column * module,
                             y + (len(matrix) - row - 1) * module,
                             module, module, stroke=0, fill=1)
+    return y + qr.border * module, y + side - qr.border * module
 
 
 def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False,
@@ -223,15 +224,19 @@ def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False
             if not title_below_qr:
                 canvas.setFont("Helvetica-Bold", title_size)
                 canvas.drawCentredString(width / 2, height - 72, card["title"])
-            canvas.setFont("Helvetica", 10.5)
-            canvas.drawCentredString(width / 2, height - (72 if title_below_qr else 96),
-                                     card["subtitle"])
+                canvas.setFont("Helvetica", 10.5)
+                canvas.drawCentredString(width / 2, height - 96, card["subtitle"])
             side = width - 72
             x, y = (width - side) / 2, (height - side) / 2
-            draw_qr(canvas, card["payload"], x, y, side)
+            qr_bottom, qr_top = draw_qr(canvas, card["payload"], x, y, side)
             if title_below_qr:
+                # Keep the same visible gap above and below every game QR.
+                gap = 22
+                canvas.setFont("Helvetica", 10.5)
+                subtitle_y = qr_top + gap - getDescent("Helvetica", 10.5)
+                canvas.drawCentredString(width / 2, subtitle_y, card["subtitle"])
                 canvas.setFont("Helvetica-Bold", title_size)
-                title_y = y + 24 if card["payload"] == "SIMPLECOIL:RESPAWN:1" else y - 36
+                title_y = qr_bottom - gap - getAscent("Helvetica-Bold", title_size)
                 canvas.drawCentredString(width / 2, title_y, card["title"])
             if card["payload"].startswith("https://"):
                 canvas.linkURL(card["payload"], (x, y, x + side, y + side), relative=0)
