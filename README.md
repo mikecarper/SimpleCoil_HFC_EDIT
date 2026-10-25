@@ -667,38 +667,39 @@ The debug APK is written to
 ## Printable QR posters
 
 The [1.52 release](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.52)
-includes a 15-page QR PDF in US Letter portrait format (8.5 x 11 in),
+includes a 14-page QR PDF in US Letter portrait format (8.5 x 11 in),
 plus a ZIP with the complete PDF, individual pages, and a payload index.
 Each tall sheet has a clear header, one large centered black-and-white QR code,
 and a small footer with the release version and page number. Team, flag, and
 power-up titles sit directly below their QR codes. Open the PDF and
-print; it requests actual-size printing and keeps the white QR margins clear.
+print; it requests actual-size printing.
 PDF bookmarks and the ZIP index also identify each page.
 
-- Page 1: APK download (use a normal QR reader, not the in-game scanner).
-- Pages 2-5: Teams 1-4. The same codes serve team selection, joining,
+- Pages 1-4: Teams 1-4. The same codes serve team selection, joining,
   Balanced Random check-in, respawn, and CTF home bases.
-- Pages 6-7: Team 1 and Team 2 CTF flags.
-- Pages 8-15: Power-up checkpoints 1-8. These identify distinct checkpoints,
+- Pages 5-6: Team 1 and Team 2 CTF flags.
+- Pages 7-14: Power-up checkpoints 1-8. These identify distinct checkpoints,
   not fixed rewards; each can unlock any eligible random power-up.
 
-The release print pack contains no gun-specific pairing codes. Team codes do
-not contain a host address or Wi-Fi credentials; connect to the game network first.
+The print pack starts with Team 1 and omits the app-download cover.
+Team 1's label sits closer beneath its QR code. The release print pack contains no
+gun-specific pairing codes. Team codes do not contain a host address or Wi-Fi
+credentials; connect to the game network first.
 
 To regenerate the PDF, use a virtual environment with `reportlab` and `qrcode`
 installed, then run:
 
 ```sh
-python tools/build_release_qrs.py --version 1.52 --portrait
+python tools/build_release_qrs.py --version 1.52 --portrait --skip-download
 ```
 
-This generates the 15 universal codes, one per sheet.
+This generates the 14 in-game codes, one per sheet.
 The generator writes `output/pdf/LAZER-GUN-RUN-1.52-QR-Codes-US-Letter.pdf`
 with vector QR graphics, game titles below their codes, headers, and small footers.
 Use `--qr-only` instead for plain landscape QR sheets, or omit both options for
 the original instructional layout.
-The download QR expects the release asset `LAZER-GUN-RUN-1.52.apk`;
-use `--apk-name` when publishing a different filename.
+Omit `--skip-download` to include the app-download cover. That QR expects the
+release asset `LAZER-GUN-RUN-1.52.apk`; use `--apk-name` for a different filename.
 
 ## Release signing
 

@@ -2,7 +2,7 @@
 """Build vector QR posters in one US Letter PDF.
 
 Dependencies: reportlab and qrcode. Install them in a virtual environment.
-Usage: python tools/build_release_qrs.py --version 1.52 --portrait
+Usage: python tools/build_release_qrs.py --version 1.52 --portrait --skip-download
 """
 
 import argparse
@@ -192,16 +192,21 @@ def draw_qr(canvas, payload, x, y, side):
                             module, module, stroke=0, fill=1)
 
 
-def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False):
+def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False,
+          skip_download=False):
     if qr_only and portrait:
         raise ValueError("Choose either QR-only or portrait posters")
     cards = pages(version, guns=guns, apk_name=apk_name)
+    if skip_download:
+        cards = cards[1:]
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas = Canvas(str(output), pagesize=letter if portrait else landscape(letter),
                     pageCompression=1)
-    canvas.setTitle(f"LAZER GUN RUN {version} - All QR Codes - US Letter")
+    qr_scope = "Game" if skip_download else "All"
+    canvas.setTitle(f"LAZER GUN RUN {version} - {qr_scope} QR Codes - US Letter")
     canvas.setAuthor("LAZER GUN RUN")
-    canvas.setSubject("App download, Teams 1-4, CTF flags, power-up checkpoints"
+    canvas.setSubject(("" if skip_download else "App download, ")
+                      + "Teams 1-4, CTF flags, power-up checkpoints"
                       + (", and gun pairing" if guns else ""))
     if qr_only or portrait:
         canvas.setViewerPreference("PrintScaling", "None")
@@ -226,8 +231,9 @@ def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False
             draw_qr(canvas, card["payload"], x, y, side)
             if title_below_qr:
                 canvas.setFont("Helvetica-Bold", title_size)
-                canvas.drawCentredString(width / 2, y - 36, card["title"])
-            if number == 1:
+                title_y = y + 24 if card["payload"] == "SIMPLECOIL:RESPAWN:1" else y - 36
+                canvas.drawCentredString(width / 2, title_y, card["title"])
+            if card["payload"].startswith("https://"):
                 canvas.linkURL(card["payload"], (x, y, x + side, y + side), relative=0)
             canvas.setStrokeColor(colors.HexColor("#B8B8B8"))
             canvas.line(36, 55, width - 36, 55)
@@ -242,7 +248,7 @@ def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False
             side = min(width, height) - 72
             x, y = (width - side) / 2, (height - side) / 2
             draw_qr(canvas, card["payload"], x, y, side)
-            if number == 1:
+            if card["payload"].startswith("https://"):
                 canvas.linkURL(card["payload"], (x, y, x + side, y + side), relative=0)
             canvas.showPage()
             continue
@@ -268,7 +274,7 @@ def build(version, output, guns=(), apk_name=None, qr_only=False, portrait=False
                       size=9.5, leading=12, font="Courier")
         if y < 55:
             raise ValueError(f"Payload exceeds page bounds: {card['title']}")
-        if number == 1:
+        if card["payload"].startswith("https://"):
             canvas.linkURL(card["payload"], (36, 109, 432, 505), relative=0)
         canvas.setStrokeColor(colors.HexColor("#CAD3D9"))
         canvas.line(36, 51, 756, 51)
@@ -287,6 +293,8 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--apk-name", help="APK filename uploaded to the matching GitHub release")
+    parser.add_argument("--skip-download", action="store_true",
+                        help="Omit the app-download cover and start with Team 1")
     layouts = parser.add_mutually_exclusive_group()
     layouts.add_argument("--qr-only", action="store_true",
                          help="Print only a large centered QR code on each landscape page")
@@ -299,7 +307,8 @@ def main():
         f"LAZER-GUN-RUN-{args.version}-QR-Codes-US-Letter.pdf")
     try:
         count = build(args.version, output, guns=args.gun, apk_name=args.apk_name,
-                      qr_only=args.qr_only, portrait=args.portrait)
+                      qr_only=args.qr_only, portrait=args.portrait,
+                      skip_download=args.skip_download)
     except ValueError as error:
         parser.error(str(error))
     orientation = "portrait" if args.portrait else "landscape"
