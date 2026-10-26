@@ -1747,6 +1747,158 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
+    public void calibratingLargeLobbyDoesNotReceiveRepeatedRosterBursts() throws Exception {
+        for (int id = 2; id <= 32; id++) addClient(id, new MemorySocket());
+        for (Object client : clients.values()) set(client, "clockSynchronized", false);
+        dispatchThenChange(() -> server.sendAllGameInfo(TcpServer.SEND_ALL), () -> { });
+        int[] initialBytes = new int[sockets.size()];
+        for (int i = 0; i < sockets.size(); i++) {
+            assertEquals(32, readJson(sockets.get(i)).getJSONArray(TcpServer.JSON_PLAYERS).length());
+            initialBytes[i] = sockets.get(i).bytes.size();
+        }
+        Method settings = TcpServer.class.getDeclaredMethod("sendPlayerSettingsUpdate", int.class,
+                boolean.class);
+        settings.setAccessible(true);
+        for (int update = 0; update < 16; update++) {
+            dispatchThenChange(() -> server.sendAllGameInfo(TcpServer.SEND_ALL), () -> { });
+            dispatchThenChange(() -> settings.invoke(server, TcpServer.SEND_ALL, false), () -> { });
+        }
+        for (int i = 0; i < sockets.size(); i++)
+            assertEquals("Lobby churn queued bulk frames ahead of a calibrating phone's clock replies",
+                    initialBytes[i], sockets.get(i).bytes.size());
+
+        // The next snapshot after readiness must contain the newest state,
+        // rather than replaying every intermediate lobby update.
+        Globals.getInstance().mTeamPlayerNameMap.put((byte) 32, "Latest name");
+        for (Object client : clients.values()) set(client, "clockSynchronized", true);
+        dispatchThenChange(() -> server.sendAllGameInfo(TcpServer.SEND_ALL), () -> { });
+        for (int i = 0; i < sockets.size(); i++) {
+            DataInputStream frames = new DataInputStream(new ByteArrayInputStream(sockets.get(i).bytes.toByteArray()));
+            frames.readUTF();
+            JSONObject latest = readJsonFrame(frames.readUTF());
+            assertTrue(latest.toString().contains("Latest name"));
+            assertEquals(0, frames.available());
+        }
+    }
+
+    @Test
+    public void simultaneousClockAcknowledgementsPublishOneCurrentRoster() throws Exception {
+        for (int id = 2; id <= 32; id++) addClient(id, new MemorySocket());
+        for (Object client : clients.values()) {
+            set(client, "clockSynchronized", false);
+            set(client, "clockSamples", GameClock.SAMPLES_PER_SYNC);
+        }
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            try {
+                Object pending = null;
+                for (int id = 1; id <= 32; id++) {
+                    parseClock(id, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+                    Object callback = get(server, "mClockRosterUpdate");
+                    assertTrue(callback != null);
+                    if (pending != null)
+                        assertSame("Each ACK scheduled another all-phone roster", pending, callback);
+                    pending = callback;
+                }
+            } catch (Exception failure) { throw new AssertionError(failure); }
+        });
+        long deadline = SystemClock.elapsedRealtime() + 2000;
+        while (sockets.get(31).bytes.size() == 0 && SystemClock.elapsedRealtime() < deadline)
+            Thread.sleep(10);
+        awaitBalancedModeTasks();
+        assertTrue(server.arePlayerClocksSynchronized());
+        for (MemorySocket socket : sockets) {
+            DataInputStream frames = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray()));
+            JSONArray players = readJsonFrame(frames.readUTF()).getJSONArray(TcpServer.JSON_PLAYERS);
+            assertEquals(32, players.length());
+            for (int i = 0; i < players.length(); i++)
+                assertTrue(players.getJSONObject(i).getBoolean(TcpServer.JSON_CLOCK_READY));
+            assertEquals("Intermediate clock states were replayed to the phone", 0, frames.available());
+        }
+    }
+
+    @Test
+    public void lobbyGpsWaitsForCalibrationThenSendsAFullCurrentSnapshot() throws Exception {
+        Globals globals = Globals.getInstance();
+        int originalMode = globals.mGPSMode;
+        try {
+            globals.mUseGPS = true;
+            for (int mode : new int[]{Globals.GPS_TEAMMATE, Globals.GPS_ALL}) {
+                globals.mGPSMode = mode;
+                sockets.get(0).bytes.reset();
+                set(clients.get(1), "clockSynchronized", false);
+                Method gps = TcpServer.class.getDeclaredMethod("sendGPSUpdates", List.class,
+                        List.class, boolean.class);
+                gps.setAccessible(true);
+                dispatchThenChange(() -> gps.invoke(server, java.util.Collections.emptyList(),
+                        java.util.Collections.emptyList(), true), () -> { });
+                assertEquals("Bulk GPS was queued before the clock replies", 0, sockets.get(0).bytes.size());
+
+                set(clients.get(1), "clockSynchronized", true);
+                // Even an empty incremental tick must flush the full current map,
+                // clearing markers from before calibration or a reconnect.
+                dispatchThenChange(() -> gps.invoke(server, java.util.Collections.emptyList(),
+                        java.util.Collections.emptyList(), false), () -> { });
+                JSONObject current = readJson(sockets.get(0));
+                assertTrue(current.getBoolean(TcpServer.JSON_GPSFULLUPDATE));
+                assertEquals(0, current.getJSONArray(TcpServer.JSON_GPSUPDATE).length());
+            }
+        } finally { globals.mGPSMode = originalMode; }
+    }
+
+    @Test
+    public void lastClockAckRetainsItsRecoverySnapshotWhenSendSlotsAreFull() throws Exception {
+        set(clients.get(1), "clockSynchronized", false);
+        set(clients.get(1), "clockSamples", GameClock.SAMPLES_PER_SYNC);
+        Semaphore slots = (Semaphore) get(server, "mClientTaskSlots");
+        android.os.Handler handler = (android.os.Handler) get(server, "mShutdownHandler");
+        slots.acquire(TcpServer.MAX_PENDING_CLIENT_TASKS);
+        Runnable pending;
+        try {
+            parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+            pending = (Runnable) get(server, "mClockRosterUpdate");
+            assertTrue(pending != null);
+            handler.removeCallbacks(pending);
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(pending);
+            assertSame("Sender backlog discarded the only post-calibration snapshot",
+                    pending, get(server, "mClockRosterUpdate"));
+            assertEquals(0, sockets.get(0).bytes.size());
+        } finally { slots.release(TcpServer.MAX_PENDING_CLIENT_TASKS); }
+        handler.removeCallbacks(pending);
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(pending);
+        awaitBalancedModeTasks();
+        assertTrue(get(server, "mClockRosterUpdate") == null);
+        assertTrue(readJson(sockets.get(0)).getJSONArray(TcpServer.JSON_PLAYERS)
+                .getJSONObject(0).getBoolean(TcpServer.JSON_CLOCK_READY));
+    }
+
+    @Test
+    public void clockSendTimestampExcludesWaitingForAnEarlierWriter() throws Exception {
+        Object client = clients.get(1);
+        Thread probe = new Thread(() -> {
+            try { parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 123456)); }
+            catch (Throwable failure) { failures.add(failure); }
+        });
+        workers.add(probe);
+        long releasedAt;
+        synchronized (client) {
+            probe.start();
+            long deadline = SystemClock.elapsedRealtime() + 1000;
+            while (probe.getState() != Thread.State.BLOCKED && SystemClock.elapsedRealtime() < deadline)
+                Thread.sleep(1);
+            assertEquals("Clock reply never reached the contended writer", Thread.State.BLOCKED, probe.getState());
+            Thread.sleep(100);
+            releasedAt = SystemClock.elapsedRealtime();
+        }
+        probe.join(1000);
+        assertFalse(probe.isAlive());
+        assertTrue(failures.isEmpty());
+        JSONObject reply = readJson(sockets.get(0));
+        assertTrue(reply.getLong(TcpServer.JSON_CLOCK_RECEIVE) < releasedAt);
+        assertTrue("Writer backlog was counted as network delay",
+                reply.getLong(TcpServer.JSON_CLOCK_SEND) >= releasedAt);
+    }
+
+    @Test
     public void unregisteredOrMalformedClockRequestDoesNotGetAResponse() throws Exception {
         parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, -1));
         parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, "123"));

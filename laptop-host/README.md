@@ -174,6 +174,12 @@ the round; they receive no start command and do not affect scoring, teams, or
 Boss health. Change participation before starting, with no extra Ready button
 needed on the phones.
 
+During clock calibration, each phone receives its initial lobby settings once.
+Repeated roster, settings and GPS snapshots wait until that phone acknowledges
+its clock samples, then it receives the current state. Clock-ready broadcasts
+are grouped for 75 ms so a large lobby finishing together does not flood the
+phones with complete roster copies. Active-round updates keep their normal order.
+
 The laptop starts in **Event Mode**: the operator starts and ends rounds, edits
 players, and controls the event. **End game** ends the round directly. Phone
 start commands and name/rule edits cannot override the operator. Use
@@ -588,9 +594,11 @@ protocol suite):
 javac --release 17 --add-modules jdk.httpserver -d laptop-host/out \
   shared/src/main/java/com/simplecoil/protocol/*.java \
   laptop-host/src/main/java/com/simplecoil/laptophost/*.java \
-  laptop-host/src/test/java/com/simplecoil/laptophost/LaptopHostProtocolSmokeTest.java
+  laptop-host/src/test/java/com/simplecoil/laptophost/*.java
 java --add-modules jdk.httpserver -cp laptop-host/out \
   com.simplecoil.laptophost.LaptopHostProtocolSmokeTest --reports-only
+java --add-modules jdk.httpserver -cp laptop-host/out \
+  com.simplecoil.laptophost.LargeLobbyClockSyncTest
 node --test laptop-host/src/test/js/round-report-page.test.cjs
 ```
 
@@ -598,5 +606,10 @@ Report smoke tests use temporary report directories, not the operator's archive.
 The JavaScript checks exercise the actual embedded review code with a minimal
 DOM harness, including SVG lanes/events, filters, partial-data notices, and safe
 names. They complement rather than replace a browser or physical-gun check.
+The large-lobby check uses 16, 24 and 32 TCP peers with concurrent gun-readiness,
+settings and GPS updates, delayed metadata processing and a blocked writer. It
+requires joining plus twelve accepted clock samples and current lobby state in
+under five seconds. It preserves the native 80 ms sample limit; physical Wi-Fi
+and blaster behavior still need a device check.
 Set `SIMPLECOIL_TIMELINE_SVG` to a local output filename when running the Node
 check to save its standalone SVG fixture for visual inspection.

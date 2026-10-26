@@ -126,6 +126,7 @@ public class TcpClient extends Service {
     private final GameClock mGameClock = new GameClock();
     private boolean mClockSynchronized;
     private boolean mRelayClockConnection;
+    private boolean mClockGpsFixSent;
     private boolean mClockRequestQueued;
     private long mPendingClockRequest = -1;
     private long mLastClockSync;
@@ -399,6 +400,7 @@ public class TcpClient extends Service {
         mGameClock.reset();
         mClockSynchronized = false;
         mRelayClockConnection = false;
+        mClockGpsFixSent = false;
         mClockRequestQueued = false;
         mPendingClockRequest = -1;
         mLastClockSync = 0;
@@ -474,16 +476,28 @@ public class TcpClient extends Service {
                 try {
                     JSONObject request = new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, sentAt);
                     Globals.LocalGpsFix fix = Globals.getInstance().mLocalGpsFix;
-                    if (Globals.getInstance().mUseGPS
-                            && (!mClockSynchronized || Globals.getInstance().mGpsOffset == null) && fix != null
-                            && Globals.isFreshGpsFix(fix.elapsedMs, sentAt)) {
+                    final boolean includeGpsFix;
+                    synchronized (TcpClient.this) {
+                        // Seed this connection once, including reconnects with a known
+                        // origin. Repeating the same fix in all twelve probes makes
+                        // every clock reply wait for the host's shared GPS-state lock.
+                        includeGpsFix = !mClockGpsFixSent && Globals.getInstance().mUseGPS
+                                && fix != null && Globals.isFreshGpsFix(fix.elapsedMs, sentAt);
+                    }
+                    if (includeGpsFix) {
                         GpsWire.putPosition(request, null, fix.latitude, fix.longitude);
                         request.put(TcpServer.JSON_GPS_FIX_AGE, sentAt - fix.elapsedMs);
                     }
                     long gpsTime = Globals.getInstance().mGpsGameTime.utcTimeAtElapsed(sentAt, sentAt);
                     if (GpsGameTime.isValidUtcTime(gpsTime))
                         request.put(TcpServer.JSON_GPS_CLOCK, gpsTime);
-                    writeMessage(writer, TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + request);
+                    if (writeMessage(writer, TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON + request)
+                            && includeGpsFix) {
+                        synchronized (TcpClient.this) {
+                            if (isCurrentSession(generation) && writer == out)
+                                mClockGpsFixSent = true;
+                        }
+                    }
                 } catch (JSONException e) {
                     Log.w(TAG, "Unable to request clock synchronization", e);
                 }

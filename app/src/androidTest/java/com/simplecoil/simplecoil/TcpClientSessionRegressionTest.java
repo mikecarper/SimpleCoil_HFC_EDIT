@@ -50,6 +50,7 @@ public class TcpClientSessionRegressionTest {
     private byte originalPairedGrenade;
     private com.simplecoil.protocol.GpsOffset originalGpsOffset;
     private Globals.LocalGpsFix originalLocalGpsFix;
+    private boolean originalUseGps;
     private java.util.Map<Byte, Globals.GPSData> originalLocations;
     private java.util.Map<Field, Object> seatTestGlobals;
 
@@ -63,6 +64,7 @@ public class TcpClientSessionRegressionTest {
         originalPairedGrenade = globals.mPairedGrenadeID;
         originalGpsOffset = globals.mGpsOffset;
         originalLocalGpsFix = globals.mLocalGpsFix;
+        originalUseGps = globals.mUseGPS;
         Globals.getmGPSDataSemaphore();
         try {
             originalLocations = new java.util.HashMap<>(globals.mGPSData);
@@ -93,6 +95,7 @@ public class TcpClientSessionRegressionTest {
             globals.mPairedGrenadeID = originalPairedGrenade;
             globals.mGpsOffset = originalGpsOffset;
             globals.mLocalGpsFix = originalLocalGpsFix;
+            globals.mUseGPS = originalUseGps;
             Globals.getmGPSDataSemaphore();
             try {
                 globals.mGPSData.clear();
@@ -355,6 +358,82 @@ public class TcpClientSessionRegressionTest {
         assertNotNull(pending);
         assertEquals(NetMsg.NETMSG_SERVERUNREACHABLE, pending.getAction());
         assertNull(client.consumePendingTerminalEvent());
+    }
+
+    @Test
+    public void clockBurstSeedsGpsOnceAndReconnectSeedsAgainWithinFiveSeconds() throws Exception {
+        Globals globals = Globals.getInstance();
+        globals.mUseGPS = true;
+        globals.mLocalGpsFix = new Globals.LocalGpsFix(47.62, -122.10, SystemClock.elapsedRealtime());
+        connect(false);
+        assertClockBurstHasOneGpsSeed();
+        assertNull("The fake host must leave the origin missing throughout the first burst", globals.mGpsOffset);
+
+        // A reconnect must still seed its first request when the previous
+        // connection already learned an origin, then omit the eleven repeats.
+        globals.mGpsOffset = com.simplecoil.protocol.GpsOffset.create(47.62, -122.10);
+        globals.mLocalGpsFix = new Globals.LocalGpsFix(47.62, -122.10, SystemClock.elapsedRealtime());
+        reconnectAfterWriterFailure();
+        assertTrue(readClientJson().getBoolean(TcpServer.JSON_REJOIN));
+        expectPlayerConfiguration(globals.mPairedGrenadeID, globals.mPlayerID);
+        assertClockBurstHasOneGpsSeed();
+    }
+
+    private void assertClockBurstHasOneGpsSeed() throws Exception {
+        long started = SystemClock.elapsedRealtime();
+        for (int sample = 0; sample < GameClock.SAMPLES_PER_SYNC; sample++) {
+            JSONObject request = readClientJson();
+            assertTrue(request.has(TcpServer.JSON_CLOCK_REQUEST));
+            assertEquals("GPS fix was repeated within the clock burst", sample == 0,
+                    request.has(TcpServer.JSON_GPSLATITUDE));
+            assertEquals(sample == 0, request.has(TcpServer.JSON_GPSLONGITUDE));
+            assertEquals(sample == 0, request.has(TcpServer.JSON_GPS_FIX_AGE));
+            if (sample == 0) {
+                assertEquals(47.62, request.getDouble(TcpServer.JSON_GPSLATITUDE), 0);
+                assertEquals(-122.10, request.getDouble(TcpServer.JSON_GPSLONGITUDE), 0);
+            }
+            long receivedAt = SystemClock.elapsedRealtime();
+            send(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST,
+                            request.getLong(TcpServer.JSON_CLOCK_REQUEST))
+                    .put(TcpServer.JSON_CLOCK_RECEIVE, receivedAt)
+                    .put(TcpServer.JSON_CLOCK_SEND, SystemClock.elapsedRealtime()));
+        }
+        assertTrue(readClientJson().getBoolean(TcpServer.JSON_CLOCK_READY));
+        assertTrue(client.isClockSynchronized());
+        assertTrue("Twelve low-delay clock exchanges took five seconds",
+                SystemClock.elapsedRealtime() - started < 5000);
+    }
+
+    @Test
+    public void staleAndDuplicateClockRepliesCannotAdvanceCalibration() throws Exception {
+        Field field = TcpClient.class.getDeclaredField("mGameClock");
+        field.setAccessible(true);
+        GameClock clock = (GameClock) field.get(client);
+        Field pending = TcpClient.class.getDeclaredField("mPendingClockRequest");
+        pending.setAccessible(true);
+        Field generation = TcpClient.class.getDeclaredField("mSessionGeneration");
+        generation.setAccessible(true);
+        long currentGeneration = generation.getLong(client);
+        Method receive = TcpClient.class.getDeclaredMethod("receiveClockSync", JSONObject.class,
+                long.class, long.class);
+        receive.setAccessible(true);
+        pending.setLong(client, 1000);
+        JSONObject reply = new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 999)
+                .put(TcpServer.JSON_CLOCK_RECEIVE, 2010).put(TcpServer.JSON_CLOCK_SEND, 2010);
+        receive.invoke(client, reply, 1020L, currentGeneration);
+        assertEquals(0, clock.samples());
+        assertEquals(1000, pending.getLong(client));
+        reply.put(TcpServer.JSON_CLOCK_REQUEST, 1000);
+        receive.invoke(client, reply, 1020L, currentGeneration + 1);
+        assertEquals("An obsolete session advanced the current clock", 0, clock.samples());
+        assertEquals(1000, pending.getLong(client));
+        receive.invoke(client, reply, 1020L, currentGeneration);
+        assertEquals(1, clock.samples());
+        assertEquals(-1, pending.getLong(client));
+        receive.invoke(client, reply, 1030L, currentGeneration);
+        assertEquals("A duplicate clock reply counted as a second sample", 1, clock.samples());
+        assertFalse(client.isClockSynchronized());
     }
 
     @Test
@@ -728,6 +807,10 @@ public class TcpClientSessionRegressionTest {
     }
 
     private void connect() throws Exception {
+        connect(true);
+    }
+
+    private void connect(boolean synchronize) throws Exception {
         InetAddress loopback = InetAddress.getByAddress(new byte[]{127, 0, 0, 1});
         listener = new ServerSocket();
         listener.setReuseAddress(true);
@@ -739,7 +822,9 @@ public class TcpClientSessionRegressionTest {
         peer.setSoTimeout(3000);
         received = new DataInputStream(peer.getInputStream());
         assertTrue(received.readUTF().startsWith(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON));
-        expectGrenadePairing(Globals.getInstance().mPairedGrenadeID);
+        expectPlayerConfiguration(Globals.getInstance().mPairedGrenadeID, Globals.getInstance().mPlayerID);
+        if (synchronize)
+            synchronizeClock();
     }
 
     private void expectGrenadePairing(int expected) throws Exception {

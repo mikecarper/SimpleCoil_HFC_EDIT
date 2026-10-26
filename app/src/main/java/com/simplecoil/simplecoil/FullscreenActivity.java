@@ -1119,6 +1119,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private String mLobbyNetworkAddress;
     private long mLobbyNetworkLostAt = -1;
     private String mLobbyRosterSignature;
+    private String mLobbyWeaponAssignment;
     private LastGameStats mLastGameStats;
     private boolean mLastGameStatsLoaded;
     private String mRoundAnalyticsToken;
@@ -5645,6 +5646,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             editor.apply();
         }
         displayCurrentTeam();
+    }
+
+    private void setTeamFromLobby(boolean firstRoster) {
+        Globals globals = Globals.getInstance();
+        String assignment = globals.mPlayerID + "/" + globals.mGameMode + "/"
+                + globals.calcNetworkTeam(globals.mPlayerID) + "/" + globals.mTournamentMode
+                + "/" + globals.mBossMode + "/" + globals.mCaptureTheFlag + "/" + globals.mInfectionMode;
+        if (!firstRoster && assignment.equals(mLobbyWeaponAssignment)) {
+            // Balanced assignment presence can change the pending-team UI
+            // without changing the ID or its computed network team.
+            displayCurrentTeam();
+            return;
+        }
+        // Other players' joins and clock-ready updates do not change this
+        // blaster's assignment. Keep explicit setup/recovery setTeam() calls
+        // independent, but do not replay gun commands for every roster refresh.
+        setTeam();
+        mLobbyWeaponAssignment = assignment;
     }
 
     private void applyServerAssignedPlayerID(byte assignedPlayerID) {
@@ -11017,13 +11036,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (sharedPreferences != null) sharedPreferences.edit().putString(PREF_PLAYER_NAME, Globals.getInstance().mPlayerName).apply();
                 mLastEventLockStatus = null;
                 if (mReady) {
+                    boolean firstRoster = !mLobbyJoined;
                     if (!mLobbyJoined && !mIsServer && mTcpClient != null)
                         mTcpClient.sendLobbyReady();
                     mLobbyJoined = true;
                     mLobbyNotice = null;
                     endUDPScanning();
                     updateNetworkRosterDisplay();
-                    setTeam();
+                    setTeamFromLobby(firstRoster);
                     updateTeamAssignmentScanButton();
                     updatePowerupScanButton();
                     if (!mIsServer && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) {

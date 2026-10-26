@@ -84,6 +84,7 @@ public class TcpServer extends Service {
     // initial twelve-exchange burst. Do not hold every socket in a 10 ms polling
     // loop for the former five-second round-trip timeout after a single probe.
     private static final long CLOCK_SYNC_BURST_WINDOW_MS = 1000;
+    private static final long CLOCK_ROSTER_UPDATE_DELAY_MS = 100;
     // Every network snapshot is generated on a separate task so the caller
     // never blocks on a slow socket. Bound queued tasks to prevent a chatty
     // client from exhausting the dedicated host's threads while writes stall.
@@ -281,6 +282,9 @@ public class TcpServer extends Service {
     private Thread mCancellationThread;
     private Runnable mCancellationTimeout;
     private final Handler mShutdownHandler = new Handler(Looper.getMainLooper());
+    // Clock ACKs arrive together. Publish their latest state once per short
+    // window instead of sending a full lobby to every phone for each ACK.
+    private Runnable mClockRosterUpdate;
     private long mNextGameStartAllowedAt;
     private boolean mRoundCooldownRecorded;
     private final Powerups.Authority mPowerupAuthority = new Powerups.Authority();
@@ -1902,12 +1906,62 @@ public class TcpServer extends Service {
         runClientTask(() -> sendGameInfo(id, recipients));
     }
 
+    private void scheduleClockRosterUpdate() {
+        synchronized (mServerStateLock) {
+            if (!isClientTaskActive() || mClockRosterUpdate != null)
+                return;
+            mClockRosterUpdate = new Runnable() {
+                @Override public void run() {
+                    synchronized (mServerStateLock) {
+                        if (mClockRosterUpdate != this)
+                            return;
+                        if (!isClientTaskActive()) {
+                            mClockRosterUpdate = null;
+                            return;
+                        }
+                        final List<ClientRecipient> recipients = getClientRecipients();
+                        if (recipients.isEmpty()
+                                || runClientTask(() -> sendGameInfo(SEND_ALL, recipients))) {
+                            mClockRosterUpdate = null;
+                        } else {
+                            // This is the recovery snapshot for deferred edits.
+                            // A full sender backlog must not discard the last ACK.
+                            mShutdownHandler.postDelayed(this, CLOCK_ROSTER_UPDATE_DELAY_MS);
+                        }
+                    }
+                }
+            };
+            mShutdownHandler.postDelayed(mClockRosterUpdate, CLOCK_ROSTER_UPDATE_DELAY_MS);
+        }
+    }
+
+    private boolean deferLobbySnapshot(ClientData client) {
+        return client.initialGameInfoSent && isCalibratingLobbyPlayer(client);
+    }
+
+    private boolean isCalibratingLobbyPlayer(ClientData client) {
+        return !mStartAnnounced && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                && !client.clockSynchronized;
+    }
+
+    private boolean hasCalibratingLobbyPlayers() {
+        for (ClientRecipient recipient : getClientRecipients())
+            if (recipient.isConnectedPlayer() && isCalibratingLobbyPlayer(recipient.client))
+                return true;
+        return false;
+    }
+
     // Called with the client lock held, like start/end and registration. Build
     // snapshots in dispatch order: preparing a lobby snapshot before waiting for
     // the lock could send GAME_STATE_NONE after a queued start was announced, or
     // roll back a later score/roster update. Keep the original recipient identities
     // so a new connection cannot inherit work queued for a previous player.
     private void sendGameInfo(int id, List<ClientRecipient> recipients) {
+        boolean hasRecipient = false;
+        for (ClientRecipient recipient : recipients)
+            hasRecipient |= recipient.isCurrent() && !deferLobbySnapshot(recipient.client);
+        if (!hasRecipient)
+            return;
         try {
             JSONArray players = new JSONArray();
             Map<Byte, LobbyPlayer> lobbyPlayers = getLobbyPlayersSnapshot();
@@ -2047,8 +2101,10 @@ public class TcpServer extends Service {
             for (ClientRecipient recipient : recipients) {
                 if (!isClientTaskActive())
                     return;
-                if (recipient.isCurrent()) {
-                    recipient.client.sendTCPMessage(recipient.playerID == id ? idMessage : allMessage, false);
+                if (recipient.isCurrent() && !deferLobbySnapshot(recipient.client)) {
+                    if (recipient.client.sendTCPMessage(
+                            recipient.playerID == id ? idMessage : allMessage, false))
+                        recipient.client.initialGameInfoSent = true;
                     synchronized (mServerStateLock) {
                         if (recipient.client.analyticsCapable && mStartAnnounced) {
                             RoundAnalytics stats = analyticsLocked(recipient.client);
@@ -2123,43 +2179,55 @@ public class TcpServer extends Service {
     }
 
     /**
-     * Team GPS sends each phone its teammates and its team's short-lived confirmed-hit enemy
-     * reveal. The periodic full snapshot plus targeted visibility refreshes remove an enemy
-     * marker as soon as a reveal expires or either involved player dies.
+     * Team GPS restricts each phone to its teammates and confirmed-hit enemy reveals.
+     * Full snapshots also recover updates deferred during initial clock calibration.
      */
-    private void sendTeamGPSData(final List<GPSUpdate> changedUpdates,
-                                 final List<GPSUpdate> fullSnapshot,
-                                 final boolean fullUpdate) {
+    private void sendGPSUpdates(final List<GPSUpdate> changedUpdates,
+                                final List<GPSUpdate> fullSnapshot,
+                                final boolean fullUpdate) {
+        final List<ClientRecipient> recipients = getClientRecipients();
         runClientTask(() -> {
             if (!Globals.getInstance().mUseGPS
-                    || Globals.getInstance().mGPSMode != Globals.GPS_TEAMMATE)
+                    || Globals.getInstance().mGPSMode == Globals.GPS_DISABLED)
                 return;
+            boolean teamOnly = Globals.getInstance().mGPSMode == Globals.GPS_TEAMMATE
+                    && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA;
             Map<Integer, String> messages = new HashMap<>();
-            for (ClientRecipient recipient : getClientRecipients()) {
+            for (ClientRecipient recipient : recipients) {
                 if (!recipient.isCurrent() || recipient.playerID <= 0
                         || !Globals.isValidPlayerID(recipient.playerID))
                     continue;
+                if (isCalibratingLobbyPlayer(recipient.client)) {
+                    // The origin is already in clock replies. Keep bulk map
+                    // updates off this stream until calibration completes,
+                    // then send a full current map rather than lost deltas.
+                    synchronized (mServerStateLock) {
+                        mGPSVisibilityRefreshPlayers.add(recipient.playerID);
+                    }
+                    continue;
+                }
                 final Set<Byte> revealedEnemyIDs;
                 final boolean recipientFullUpdate;
                 synchronized (mServerStateLock) {
                     Map<Byte, Long> reveals = mEnemyGPSRevealUntil.get(recipient.playerID);
-                    revealedEnemyIDs = reveals == null ? new HashSet<>()
+                    revealedEnemyIDs = !teamOnly || reveals == null ? new HashSet<>()
                             : new HashSet<>(reveals.keySet());
-                    recipientFullUpdate = fullUpdate
-                            || mGPSVisibilityRefreshPlayers.remove(recipient.playerID);
+                    boolean visibilityRefresh = mGPSVisibilityRefreshPlayers.remove(recipient.playerID);
+                    recipientFullUpdate = fullUpdate || visibilityRefresh;
                 }
+                int recipientTeam = teamOnly ? recipient.team : SEND_ALL;
                 String message;
                 // The ordinary teammate-only case is identical for a team, so retain the
                 // compact one-frame-per-team behavior. A temporary enemy reveal is team-wide.
                 if (revealedEnemyIDs.isEmpty() && !recipientFullUpdate
-                        && messages.containsKey(recipient.team)) {
-                    message = messages.get(recipient.team);
+                        && messages.containsKey(recipientTeam)) {
+                    message = messages.get(recipientTeam);
                 } else {
                     List<GPSUpdate> updates = recipientFullUpdate ? fullSnapshot : changedUpdates;
-                    message = createGPSMessage(updates, recipientFullUpdate, recipient.team,
+                    message = createGPSMessage(updates, recipientFullUpdate, recipientTeam,
                             revealedEnemyIDs);
                     if (revealedEnemyIDs.isEmpty() && !recipientFullUpdate)
-                        messages.put(recipient.team, message);
+                        messages.put(recipientTeam, message);
                 }
                 if (message != null)
                     recipient.client.sendTCPMessage(message, false);
@@ -2326,14 +2394,14 @@ public class TcpServer extends Service {
                         Globals.getInstance().mGPSDataSemaphore.release();
                     }
 
-                    // JSON construction and network dispatch happen on the GPS worker.  A
-                    // normal all-player update retains the existing broadcast path; team mode
-                    // emits one compact frame per team instead.
+                    // Build and dispatch off the UI thread. Both visibility modes
+                    // defer bulk data while a lobby phone calibrates its clock.
                     if (gpsMode != Globals.GPS_DISABLED && (!updates.isEmpty() || fullUpdate
                             || hasPendingGPSVisibilityRefresh())) {
                         if (gpsMode == Globals.GPS_TEAMMATE
-                                && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA) {
-                            sendTeamGPSData(updates, fullSnapshot, fullUpdate);
+                                && Globals.getInstance().mGameMode != Globals.GAME_MODE_FFA
+                                || hasCalibratingLobbyPlayers() || hasPendingGPSVisibilityRefresh()) {
+                            sendGPSUpdates(updates, fullSnapshot, fullUpdate);
                         } else {
                             String message = createGPSMessage(fullUpdate ? fullSnapshot : updates,
                                     fullUpdate, SEND_ALL, null);
@@ -2584,8 +2652,23 @@ public class TcpServer extends Service {
 
     private void sendPlayerSettingsUpdate(int playerID, boolean applyAll) {
         String message = createPlayerSettingsMessage(playerID, applyAll);
-        if (message != null)
+        if (message == null)
+            return;
+        if (!hasCalibratingLobbyPlayers()) {
             sendTCPMessageAll(message);
+            return;
+        }
+        final List<ClientRecipient> recipients = getClientRecipients();
+        runClientTask(() -> {
+            for (ClientRecipient recipient : recipients) {
+                if (!isClientTaskActive())
+                    return;
+                // The initial and post-calibration rosters already carry the
+                // latest settings. Do not queue a full profile table per join.
+                if (recipient.isCurrent() && !isCalibratingLobbyPlayer(recipient.client))
+                    recipient.client.sendTCPMessage(message);
+            }
+        });
     }
 
     private String createPlayerSettingsMessage(int playerID, boolean applyAll) {
@@ -3356,6 +3439,7 @@ public class TcpServer extends Service {
         private volatile DataOutputStream out = null;
         private volatile boolean connectionFailed;
         private volatile boolean clockSynchronized;
+        private boolean initialGameInfoSent;
         private volatile boolean lobbyReady = true;
         private volatile boolean lobbyBenched;
         private InetAddress lobbyAddress;
@@ -3385,6 +3469,7 @@ public class TcpServer extends Service {
             clientID = cID;
             noReadCount = 0;
             clockSynchronized = false;
+            initialGameInfoSent = false;
             clockSamples = 0;
             lastClockRequestAt = -1;
             idleTick = 0;
@@ -3409,6 +3494,13 @@ public class TcpServer extends Service {
         }
 
         public synchronized boolean sendTCPMessage(final String message) { return sendTCPMessage(message, false); }
+
+        private synchronized boolean sendClockReply(JSONObject reply) throws JSONException {
+            // Exclude time waiting behind an earlier writer from the network
+            // round trip, just as the laptop host does at its writer.
+            reply.put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime());
+            return sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply);
+        }
 
         public synchronized boolean sendTCPMessage(final String message, boolean queueFailed) {
             if (out == null) {
@@ -3853,7 +3945,7 @@ public class TcpServer extends Service {
                                 SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime());
                         if (GpsGameTime.isValidUtcTime(gpsTime))
                             reply.put(JSON_GPS_CLOCK, gpsTime);
-                        if (client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply))
+                        if (client.sendClockReply(reply))
                             client.clockSamples = Math.min(GameClock.SAMPLES_PER_SYNC,
                                     client.clockSamples + 1);
                     } else if (Boolean.TRUE.equals(player.get(JSON_CLOCK_READY))) {
@@ -3861,7 +3953,7 @@ public class TcpServer extends Service {
                             boolean changed = !client.clockSynchronized;
                             client.clockSynchronized = true;
                             if (changed && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)
-                                sendAllGameInfo(SEND_ALL);
+                                scheduleClockRosterUpdate();
                         } else
                             Log.w(TAG, "Ignoring clock-ready acknowledgement before sampling completed");
                     }
@@ -4389,6 +4481,9 @@ public class TcpServer extends Service {
                     requestFullGPSUpdate(); // Force a full GPS update when someone leaves
                     client.close();
                     mClientData.remove(clientID);
+                    synchronized (mServerStateLock) {
+                        mGPSVisibilityRefreshPlayers.remove(client.mPlayerID);
+                    }
                     if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
                             && !mStartAnnounced
                             && Globals.getInstance().mBalancedRandom) {
@@ -4458,6 +4553,10 @@ public class TcpServer extends Service {
             keepListening = false;
             mTcpServerReady = false;
             cancelBalancedCheckInTimeoutLocked();
+            if (mClockRosterUpdate != null) {
+                mShutdownHandler.removeCallbacks(mClockRosterUpdate);
+                mClockRosterUpdate = null;
+            }
             if (mCancellationTimeout != null) {
                 mShutdownHandler.removeCallbacks(mCancellationTimeout);
                 mCancellationTimeout = null;

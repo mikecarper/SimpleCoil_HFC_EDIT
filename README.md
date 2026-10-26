@@ -330,6 +330,11 @@ does not turn an old fix into a new one. Expired fixes are removed from the map.
 
 - Lobby join immediately begins a 12-exchange clock-calibration burst before a
   start is accepted.
+- During initial calibration, the host sends the first lobby snapshot and
+  defers repeated roster/settings updates until that phone is synchronized.
+  Clock-ready broadcasts are grouped briefly so 16-32 phones finishing together
+  do not flood each other's clock replies. Each connection seeds GPS once in
+  its clock probes; regular position updates continue separately.
 - Native Wi-Fi discards exchanges above 80 ms round-trip delay; relay sockets
   allow up to 800 ms. Both use the lowest-delay valid sample, bounding network
   timing uncertainty to 40 ms per native phone or 400 ms per relayed phone.

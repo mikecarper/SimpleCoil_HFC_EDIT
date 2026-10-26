@@ -96,6 +96,7 @@ public final class LaptopHost {
     // selects the lowest-delay measurement and rejects RTTs above 80 ms, which
     // bounds its network timing uncertainty to less than 50 ms.
     private static final int CLOCK_SAMPLES_REQUIRED = 12;
+    private static final long CLOCK_ROSTER_COALESCE_MS = 75;
     private static final int ROSTER_UTF_BUDGET = 60_000;
 
     private static final int MAX_PLAYERS = 32;
@@ -318,6 +319,8 @@ public final class LaptopHost {
     private long gpsUtcAtReference = -1;
     private long gpsElapsedAtReference = -1;
     private int gpsTick;
+    // Guarded by stateLock. Readiness often arrives from a whole lobby at once.
+    private ScheduledFuture<?> clockRosterBroadcast;
 
     private LaptopHost(HostConfig config) {
         this.config = config;
@@ -959,9 +962,12 @@ public final class LaptopHost {
             client.sendClockReply(reply);
         } else if (Boolean.TRUE.equals(json.get("clockready"))
                 && client.clockSamples >= CLOCK_SAMPLES_REQUIRED) {
-            boolean changed = !client.clockReady;
-            client.clockReady = true;
-            if (changed) broadcastRoster();
+            synchronized (stateLock) {
+                if (playerForClientLocked(client) == null || client.clockReady) return;
+                client.clockReady = true;
+                if (client.rosterPending) sendRoster(client);
+                scheduleClockRosterBroadcastLocked();
+            }
         }
     }
 
@@ -2314,9 +2320,18 @@ public final class LaptopHost {
             final Set<Integer> revealedEnemies;
             final boolean recipientFullUpdate;
             synchronized (stateLock) {
+                if (roundState == RoundState.LOBBY && !client.clockReady
+                        && !(client.socket instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket)) {
+                    // Clock replies share the native phone's ordered TCP stream.
+                    // Retain a full refresh instead of filling its calibration
+                    // queue with periodic GPS snapshots. Relay GPS is also used
+                    // for nearby discovery and keeps its existing delivery.
+                    gpsVisibilityRefreshPlayers.add(client.playerID);
+                    continue;
+                }
                 Map<Integer, Long> reveals = enemyGpsRevealUntil.get(client.playerID);
                 revealedEnemies = reveals == null ? Collections.emptySet() : new HashSet<>(reveals.keySet());
-                recipientFullUpdate = fullUpdate || gpsVisibilityRefreshPlayers.remove(client.playerID);
+                recipientFullUpdate = gpsVisibilityRefreshPlayers.remove(client.playerID) || fullUpdate;
             }
             List<Position> source = recipientFullUpdate ? fullSnapshot : changedPositions;
             List<Object> updates = new ArrayList<>();
@@ -2346,13 +2361,52 @@ public final class LaptopHost {
 
     private void broadcastRoster() {
         for (ClientConnection client : connectedClients())
-            for (String frame : rosterFrames(client.playerID)) client.send(frame);
+            sendRoster(client);
+    }
+
+    private void sendRoster(ClientConnection client) {
+        synchronized (stateLock) {
+            if (stopping || playerForClientLocked(client) == null) return;
+            // The first snapshot establishes game settings, assignment and host
+            // identity. Rebuilding it for every join or gun/clock-ready change
+            // fills old phones' receive queues ahead of their clock replies.
+            // One current snapshot after calibration includes every deferred edit.
+            if (roundState == RoundState.LOBBY && client.initialRosterSent && !client.clockReady) {
+                client.rosterPending = true;
+                return;
+            }
+            for (String frame : rosterFrames(client.playerID))
+                if (!client.send(frame)) return;
+            client.initialRosterSent = true;
+            client.rosterPending = false;
+        }
+    }
+
+    /** Caller holds stateLock. Build the snapshot when dispatched, never in advance. */
+    private void scheduleClockRosterBroadcastLocked() {
+        if (stopping || clockRosterBroadcast != null) return;
+        try {
+            clockRosterBroadcast = scheduler.schedule(() -> {
+                synchronized (stateLock) {
+                    clockRosterBroadcast = null;
+                    if (stopping) return;
+                }
+                broadcastRoster();
+            }, CLOCK_ROSTER_COALESCE_MS, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException stopped) {
+            // Shutdown already owns the connections; no delayed task may reopen them.
+        }
     }
 
     private void broadcastSettings() {
         String frame = settingsFrame();
-        for (ClientConnection client : connectedClients())
-            client.send(frame);
+        for (ClientConnection client : connectedClients()) {
+            synchronized (stateLock) {
+                if (roundState == RoundState.LOBBY && !client.clockReady && client.initialRosterSent)
+                    client.rosterPending = true;
+                else client.send(frame);
+            }
+        }
     }
 
     private void broadcastGrenadePairings() {
@@ -2965,6 +3019,8 @@ public final class LaptopHost {
         private volatile boolean left;
         private volatile int playerID;
         private volatile boolean clockReady;
+        // Guarded by stateLock. A deferred roster also carries current settings.
+        private boolean initialRosterSent, rosterPending;
         private volatile boolean lobbyReady = true;
         private volatile boolean lobbyBenched;
         private volatile int clockSamples;

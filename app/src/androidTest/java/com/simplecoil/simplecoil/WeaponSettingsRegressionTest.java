@@ -60,7 +60,8 @@ public class WeaponSettingsRegressionTest {
         String[] savedFields = {"mAllowSingleShotMode", "mAllowBurst3ShotMode", "mAllowAutoShotMode",
                 "mCurrentFiringMode", "mGameState", "mUseGPS", "mPlayerID", "mPlayerName",
                 "mGameMode", "mGameLimit", "mTimeLimit", "mLivesLimit", "mScoreLimit",
-                "mOverrideLives", "mFullReload", "mBossMode", "mTournamentMode"};
+                "mOverrideLives", "mFullReload", "mBossMode", "mTournamentMode",
+                "mBalancedRandom", "mBalancedTeams", "mInfectionMode"};
         for (String name : savedFields) {
             Field field = Globals.class.getDeclaredField(name);
             originalGlobals.put(field, field.get(globals));
@@ -208,6 +209,84 @@ public class WeaponSettingsRegressionTest {
                     Globals.getInstance().mCurrentFiringMode);
             assertEquals(0xff, lastShotConfig()[5] & 0xff);
             assertEquals(0xc8, lastShotConfig()[6] & 0xff);
+        });
+    }
+
+    @Test public void rosterRefreshesDoNotReplayPrimaryOrSecondaryGunAssignments() {
+        scenario.onActivity(current -> {
+            ((android.os.Handler) get("mLobbyHandler")).removeCallbacksAndMessages(null);
+            Globals globals = Globals.getInstance();
+            enableBossRole();
+            globals.mTournamentMode = true;
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            set("mUseNetwork", true);
+            set("mReady", true);
+            set("mIsServer", false);
+            set("mPhoneHostingEnabled", false);
+            set("mLobbyJoined", false);
+            set("mMatchSession", new MatchSessionLock(null, null));
+            set("mCommandCharacteristic", characteristic(GattAttributes.RECOIL_COMMAND_UUID));
+            RecordingBluetoothService second = new RecordingBluetoothService();
+            set("mSecondaryBluetoothLeService", second);
+            set("mSecondaryCommandCharacteristic", characteristic(GattAttributes.RECOIL_COMMAND_UUID));
+            BroadcastReceiver receiver = (BroadcastReceiver) get("mUDPUpdateReceiver");
+            Intent roster = new Intent(NetMsg.NETMSG_LISTPLAYERS);
+            receiver.onReceive(current, roster);
+            assertEquals(1, bluetooth.commands.size());
+            assertEquals(1, second.commands.size());
+            for (int player = 0; player < 24; player++)
+                receiver.onReceive(current, roster);
+            assertEquals("Other players' roster updates reprogrammed the primary gun",
+                    1, bluetooth.commands.size());
+            assertEquals("Other players' roster updates reprogrammed the secondary gun",
+                    1, second.commands.size());
+
+            globals.mPlayerID = 2;
+            receiver.onReceive(current, roster);
+            assertEquals(2, bluetooth.commands.size());
+            assertEquals(2, bluetooth.commands.get(1)[4]);
+            assertEquals(1, second.commands.size());
+            globals.mGameMode = Globals.GAME_MODE_4TEAMS;
+            receiver.onReceive(current, roster);
+            assertEquals("A mode change did not refresh the gun assignment", 3, bluetooth.commands.size());
+            globals.mBossMode = false;
+            receiver.onReceive(current, roster);
+            assertEquals("A role change did not refresh the gun assignment", 4, bluetooth.commands.size());
+
+            enableBossRole();
+            receiver.onReceive(current, roster);
+            assertEquals(5, bluetooth.commands.size());
+            assertEquals(2, second.commands.size());
+            set("mLobbyJoined", false);
+            receiver.onReceive(current, roster);
+            assertEquals("The first roster after reconnect must restore the gun assignment",
+                    6, bluetooth.commands.size());
+            assertEquals(3, second.commands.size());
+            invoke("setTeam", new Class<?>[0]);
+            assertEquals("Explicit gun setup/recovery was suppressed", 7, bluetooth.commands.size());
+            assertEquals(4, second.commands.size());
+
+            globals.mBossMode = false;
+            globals.mInfectionMode = false;
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            globals.mBalancedRandom = false;
+            globals.mBalancedTeams = java.util.Collections.emptyMap();
+            receiver.onReceive(current, roster);
+            int assignedCommands = bluetooth.commands.size();
+            globals.mBalancedRandom = true;
+            receiver.onReceive(current, roster);
+            assertEquals("A pending team display change reprogrammed the gun",
+                    assignedCommands, bluetooth.commands.size());
+            assertEquals(0, get("mNetworkTeam"));
+            assertEquals(current.getString(R.string.balanced_team_pending),
+                    ((TextView) get("mTeamLabelTV")).getText().toString());
+            globals.mBalancedTeams = java.util.Collections.singletonMap((byte) 1, 1);
+            receiver.onReceive(current, roster);
+            assertEquals("A natural-team assignment reprogrammed the gun",
+                    assignedCommands, bluetooth.commands.size());
+            assertEquals(1, get("mNetworkTeam"));
+            assertEquals(current.getString(R.string.team_number_label, 1),
+                    ((TextView) get("mTeamLabelTV")).getText().toString());
         });
     }
 

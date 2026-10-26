@@ -432,6 +432,10 @@ public final class LaptopHostProtocolSmokeTest {
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "GPS Blue");
                  FakePhone second = new FakePhone("127.0.0.2", 17, "GPS Red")) {
                 require(first.lastRoster.contains("\"gpsoffset\":null"), "missing fix created an origin");
+                // Native GPS snapshots wait behind the initial clock barrier;
+                // clock probes still bootstrap and share the origin directly.
+                first.synchronizeClock();
+                second.synchronizeClock();
                 String reply = first.probeClock(",\"gpslatitude\":0,\"gpslongitude\":0");
                 require(reply.contains("\"gpsoffset\":null"), "Null Island created a lobby origin");
                 require(!get("/api/state").contains("\"latitude\":"),
@@ -482,8 +486,6 @@ public final class LaptopHostProtocolSmokeTest {
                 first.probeClock("");
                 require(closeTo(jsonNumber(get("/api/state"), "latitude"), 47.6),
                         "zero offsets were confused with Null Island");
-                first.synchronizeClock();
-                second.synchronizeClock();
                 require(post("/api/start").contains("\"ok\":true"), "GPS test round could not start");
                 String start = first.readUntil(frame -> frame.contains("\"gamestart\""));
                 String token = jsonString(start, "roundtoken");
