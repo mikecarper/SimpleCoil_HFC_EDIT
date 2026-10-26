@@ -17,6 +17,10 @@ final class GameClock {
     // leaving 200 ms toward the game's one-second goal for local scheduling.
     // This bounds the network contribution, not total UI or hardware latency.
     static final long MAX_RELAY_SAMPLE_DELAY_MS = 800;
+    // Keep a committed offset through short transport interruptions. Normal
+    // background batches renew it every 30 seconds; an old estimate must earn
+    // a full calibration again rather than accumulate unbounded clock drift.
+    static final long MAX_RETAINED_AGE_MS = 5 * 60 * 1000;
     static final long MAX_TIMESTAMP = Long.MAX_VALUE / 4;
     private long offset;
     private long bestRoundTrip = Long.MAX_VALUE;
@@ -25,6 +29,7 @@ final class GameClock {
     private int samples;
     private boolean hasEstimate;
     private boolean sampling;
+    private long calibratedAt = -1;
 
     GameClock() {
         beginSampling();
@@ -34,6 +39,7 @@ final class GameClock {
         offset = 0;
         hasEstimate = false;
         bestRoundTrip = Long.MAX_VALUE;
+        calibratedAt = -1;
         beginSampling();
     }
 
@@ -54,12 +60,8 @@ final class GameClock {
 
     private boolean record(long clientSend, long hostReceive, long hostSend, long clientReceive,
                            long maximumDelay) {
-        if (!validTimestamp(clientSend) || !validTimestamp(hostReceive)
-                || !validTimestamp(hostSend) || !validTimestamp(clientReceive)
-                || clientReceive < clientSend || hostSend < hostReceive)
-            return false;
-        long roundTrip = (clientReceive - clientSend) - (hostSend - hostReceive);
-        if (roundTrip < 0 || roundTrip > maximumDelay)
+        long roundTrip = sampleDelay(clientSend, hostReceive, hostSend, clientReceive, maximumDelay);
+        if (roundTrip < 0)
             return false;
         long measuredOffset = ((hostReceive - clientSend) + (hostSend - clientReceive)) / 2;
         if (sampling) {
@@ -84,6 +86,7 @@ final class GameClock {
                 offset = candidateOffset;
                 bestRoundTrip = candidateRoundTrip;
                 sampling = false;
+                calibratedAt = clientReceive;
             }
         } else if (roundTrip < bestRoundTrip) {
             // During a live countdown use only a strictly better one-shot
@@ -93,6 +96,42 @@ final class GameClock {
             bestRoundTrip = roundTrip;
         }
         return true;
+    }
+
+    boolean hasRecentCalibration(long now) {
+        return calibratedAt >= 0 && now >= calibratedAt && now - calibratedAt <= MAX_RETAINED_AGE_MS;
+    }
+
+    static boolean usableSample(long clientSend, long hostReceive, long hostSend,
+                                long clientReceive, boolean relay) {
+        return sampleDelay(clientSend, hostReceive, hostSend, clientReceive,
+                relay ? MAX_RELAY_SAMPLE_DELAY_MS : MAX_SAMPLE_DELAY_MS) >= 0;
+    }
+
+    /** Caller must also verify that this is the same host clock epoch. */
+    boolean resume(long clientSend, long hostReceive, long hostSend, long clientReceive, boolean relay) {
+        long maximumDelay = relay ? MAX_RELAY_SAMPLE_DELAY_MS : MAX_SAMPLE_DELAY_MS;
+        if (!hasRecentCalibration(clientReceive)
+                || sampleDelay(clientSend, hostReceive, hostSend, clientReceive, maximumDelay) < 0)
+            return false;
+        long measuredOffset = ((hostReceive - clientSend) + (hostSend - clientReceive)) / 2;
+        if (Math.abs(measuredOffset - offset) > maximumDelay)
+            return false;
+        // Revalidation does not replace the good estimate with one noisier
+        // sample or renew its age. The next complete background batch does.
+        sampling = false;
+        samples = SAMPLES_PER_SYNC;
+        return true;
+    }
+
+    private static long sampleDelay(long clientSend, long hostReceive, long hostSend,
+                                    long clientReceive, long maximumDelay) {
+        if (!validTimestamp(clientSend) || !validTimestamp(hostReceive)
+                || !validTimestamp(hostSend) || !validTimestamp(clientReceive)
+                || clientReceive < clientSend || hostSend < hostReceive)
+            return -1;
+        long roundTrip = (clientReceive - clientSend) - (hostSend - hostReceive);
+        return roundTrip < 0 || roundTrip > maximumDelay ? -1 : roundTrip;
     }
 
     int samples() { return samples; }

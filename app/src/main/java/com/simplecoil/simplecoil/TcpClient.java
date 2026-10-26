@@ -126,6 +126,8 @@ public class TcpClient extends Service {
     private Intent mPendingTerminalEvent;
     private final GameClock mGameClock = new GameClock();
     private boolean mClockSynchronized;
+    private String mClockEpoch;
+    private boolean mClockResumePending;
     private boolean mRelayClockConnection;
     private boolean mClockGpsFixSent;
     private boolean mClockRequestQueued;
@@ -399,10 +401,19 @@ public class TcpClient extends Service {
     }
 
     private void resetClockSyncLocked() {
+        resetClockSyncLocked(false);
+    }
+
+    private void resetClockSyncLocked(boolean retainOffset) {
+        mClockResumePending = retainOffset && mClockEpoch != null
+                && mGameClock.hasRecentCalibration(SystemClock.elapsedRealtime());
         mLobbyRegistered = false;
         mLobbyHostAddress = null;
         mLastServerTrafficAt = 0;
-        mGameClock.reset();
+        if (!mClockResumePending) {
+            mGameClock.reset();
+            mClockEpoch = null;
+        }
         mClockSynchronized = false;
         mRelayClockConnection = false;
         mClockGpsFixSent = false;
@@ -453,7 +464,7 @@ public class TcpClient extends Service {
         long requestTimeout = mRelayClockConnection ? RELAY_CLOCK_REQUEST_TIMEOUT_MS : CLOCK_REQUEST_TIMEOUT_MS;
         if (mPendingClockRequest >= 0 && now - mPendingClockRequest < requestTimeout)
             return;
-        if (mGameClock.samples() >= GameClock.SAMPLES_PER_SYNC) {
+        if (!mClockResumePending && mGameClock.samples() >= GameClock.SAMPLES_PER_SYNC) {
             boolean countdownActive = hasActiveStartCountdownLocked(now);
             long refreshInterval = countdownActive ? COUNTDOWN_CLOCK_REFRESH_MS : CLOCK_REFRESH_MS;
             if (now - mLastClockSync < refreshInterval)
@@ -517,15 +528,36 @@ public class TcpClient extends Service {
         long sentAt = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_REQUEST);
         long hostReceived = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_RECEIVE);
         long hostSent = TcpJson.getLong(reply, TcpServer.JSON_CLOCK_SEND);
+        Object epochValue = reply.opt(TcpServer.JSON_CLOCK_EPOCH);
+        String epoch = epochValue instanceof String && !((String) epochValue).isEmpty()
+                && ((String) epochValue).length() <= 64 ? (String) epochValue : null;
         boolean ready;
         boolean announceReady = false;
         synchronized (this) {
             if (!isCurrentSession(generation) || sentAt != mPendingClockRequest || sentAt < 0)
                 return;
             mPendingClockRequest = -1;
-            boolean accepted = mRelayClockConnection
+            boolean resumed = false;
+            if (mClockResumePending && mClockEpoch.equals(epoch)) {
+                // A delayed reply cannot validate the retained offset. Leave
+                // it available for the next low-latency verification probe.
+                if (!GameClock.usableSample(sentAt, hostReceived, hostSent, receivedAt, mRelayClockConnection))
+                    return;
+                resumed = mGameClock.resume(sentAt, hostReceived, hostSent, receivedAt, mRelayClockConnection);
+            }
+            boolean epochChanged = mClockEpoch == null ? epoch != null && mGameClock.samples() > 0
+                    : !mClockEpoch.equals(epoch);
+            if (mClockResumePending || epochChanged) {
+                if (!resumed) {
+                    mGameClock.reset();
+                    mClockSynchronized = false;
+                }
+                mClockResumePending = false;
+            }
+            mClockEpoch = epoch;
+            boolean accepted = resumed || (mRelayClockConnection
                     ? mGameClock.recordRelay(sentAt, hostReceived, hostSent, receivedAt)
-                    : mGameClock.record(sentAt, hostReceived, hostSent, receivedAt);
+                    : mGameClock.record(sentAt, hostReceived, hostSent, receivedAt));
             if (!accepted) {
                 // A follow-up probe can be rejected for excessive delay.  Keep
                 // the last good estimate, but do not immediately retry in a
@@ -541,8 +573,11 @@ public class TcpClient extends Service {
                 mClockSynchronized = true;
                 mLastClockSync = receivedAt;
                 if (announceReady) {
+                    JSONObject acknowledgment = new JSONObject().put(TcpServer.JSON_CLOCK_READY, true);
+                    if (mClockEpoch != null)
+                        acknowledgment.put(TcpServer.JSON_CLOCK_EPOCH, mClockEpoch);
                     sendPriorityTCPMessage(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
-                            + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+                            + acknowledgment);
                 }
             }
         }
@@ -825,8 +860,12 @@ public class TcpClient extends Service {
                     // Publish the writer and enqueue registration as one operation,
                     // before gameplay threads can enqueue events for this connection.
                     out = connectionOut;
-                    resetClockSyncLocked();
-                    mRelayClockConnection = s instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket;
+                    boolean relay = s instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket;
+                    // An automatic reconnect is still the same selected host.
+                    // Retain its monotonic offset, but gate starts until one
+                    // reply verifies the host epoch, delay and clock agreement.
+                    resetClockSyncLocked(rejoin && relay == mRelayClockConnection);
+                    mRelayClockConnection = relay;
                     sendPlayerInfo(rejoin);
                 }
                 wasConnected = true;
@@ -893,7 +932,7 @@ public class TcpClient extends Service {
                         int readWait = mIsDedicatedServer ? TcpServer.TCP_DEDICATED_READ_WAIT_MS : TcpServer.TCP_READ_WAIT_MS;
                         boolean sampling;
                         synchronized (this) {
-                            sampling = mGameClock.samples() < GameClock.SAMPLES_PER_SYNC
+                            sampling = mClockResumePending || mGameClock.samples() < GameClock.SAMPLES_PER_SYNC
                                     || mPendingClockRequest >= 0;
                         }
                         sleep(sampling ? TcpServer.CLOCK_READ_WAIT_MS : readWait);

@@ -577,6 +577,15 @@ to 80 ms round trip; relay sockets allow up to 800 ms. Choosing the least-delaye
 valid sample bounds network timing uncertainty to 40 ms per native phone or
 400 ms per relayed phone, before UI scheduling and hardware latency.
 
+The offset continues against each phone's monotonic clock while its game screen
+is in the background. Connected phones refresh it every 30 seconds without
+discarding the current estimate. An automatic reconnect to the same host may
+resume a calibration under five minutes old after one low-delay probe validates
+the saved offset and the host's clock epoch. A host restart, transport change,
+stale estimate, or clock disagreement requires a fresh 12-probe calibration.
+Explicit Leave clears the offset. The optional `clockepoch` field keeps this
+compatible with existing protocol-31 phones, which still use the full batch.
+
 Phones see only their own team by default; the laptop's local game-master map
 still sees every player. A valid IR hit temporarily reveals the involved enemy
 to each participating player's whole team for up to ten seconds. The host ends

@@ -181,6 +181,7 @@ public class TcpServer extends Service {
     static final String JSON_CLOCK_RECEIVE = "clockreceive";
     static final String JSON_CLOCK_SEND = "clocksend";
     static final String JSON_CLOCK_READY = "clockready";
+    static final String JSON_CLOCK_EPOCH = "clockepoch";
     // Optional GPS UTC calibration. The host still owns the start deadline;
     // this only gives clients with fresh GPS fixes a lower-jitter conversion.
     static final String JSON_GPS_CLOCK = "gpsclock";
@@ -212,6 +213,9 @@ public class TcpServer extends Service {
 
     private volatile boolean keepListening = false;
     private final Object mServerStateLock = new Object();
+    // A retained offset is valid only for this host's monotonic clock instance.
+    // Keep it across rounds and socket reconnects; a new service gets a new ID.
+    private final String mClockEpoch = UUID.randomUUID().toString();
     private boolean mDestroyed;
     // True only after this instance has bound its listening socket and reset the
     // shared lobby state for the current server session.
@@ -3543,8 +3547,8 @@ public class TcpServer extends Service {
         private volatile boolean lobbyReady = true;
         private volatile boolean lobbyBenched;
         private InetAddress lobbyAddress;
-        // A ready acknowledgement is meaningful only after this connection has
-        // received the exchanges used to calculate its clock offset.
+        // A ready acknowledgement needs the full initial calibration, or a
+        // fresh probe confirming a retained offset for this clock epoch.
         private int clockSamples;
         private long lastClockRequestAt = -1;
         private long idleTick;
@@ -3599,7 +3603,8 @@ public class TcpServer extends Service {
         private synchronized boolean sendClockReply(JSONObject reply) throws JSONException {
             // Exclude time waiting behind an earlier writer from the network
             // round trip, just as the laptop host does at its writer.
-            reply.put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime());
+            reply.put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime())
+                    .put(JSON_CLOCK_EPOCH, mClockEpoch);
             return sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply);
         }
 
@@ -4050,7 +4055,9 @@ public class TcpServer extends Service {
                             client.clockSamples = Math.min(GameClock.SAMPLES_PER_SYNC,
                                     client.clockSamples + 1);
                     } else if (Boolean.TRUE.equals(player.get(JSON_CLOCK_READY))) {
-                        if (client.clockSamples >= GameClock.SAMPLES_PER_SYNC) {
+                        boolean retainedOffset = client.clockSamples > 0
+                                && mClockEpoch.equals(player.opt(JSON_CLOCK_EPOCH));
+                        if (client.clockSamples >= GameClock.SAMPLES_PER_SYNC || retainedOffset) {
                             boolean changed = !client.clockSynchronized;
                             client.clockSynchronized = true;
                             if (changed && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE)

@@ -92,6 +92,7 @@ public final class LaptopHost {
     private static final String TCP_MESSAGE_PREFIX = TCP_PREFIX + "MESG";
     private static final String JSON_GPS_CLOCK = "gpsclock";
     private static final String JSON_GPS_START_TIME = "gpsstarttime";
+    private static final String JSON_CLOCK_EPOCH = "clockepoch";
     // Must match the Android client's GameClock.SAMPLES_PER_SYNC. The client
     // selects the lowest-delay measurement and rejects RTTs above 80 ms, which
     // bounds its network timing uncertainty to less than 50 ms.
@@ -146,6 +147,8 @@ public final class LaptopHost {
 
     private final HostConfig config;
     private final long clockOriginNanos = System.nanoTime();
+    // A cached offset is valid only for this monotonic clock's host lifetime.
+    private final String clockEpoch = UUID.randomUUID().toString();
     private final Object stateLock = new Object();
     private final Map<Integer, Player> players = new LinkedHashMap<>();
     // Operator edits belong to a person, never to a reusable blaster/player ID.
@@ -952,6 +955,7 @@ public final class LaptopHost {
             reply.put("clocksync", sentAt);
             reply.put("clockreceive", received);
             reply.put("clocksend", elapsedMillis());
+            reply.put(JSON_CLOCK_EPOCH, clockEpoch);
             synchronized (stateLock) {
                 if (json.containsKey(JSON_GPS_CLOCK))
                     recordGpsClockLocked(longValue(json.get(JSON_GPS_CLOCK), -1), received);
@@ -962,7 +966,11 @@ public final class LaptopHost {
             }
             client.sendClockReply(reply);
         } else if (Boolean.TRUE.equals(json.get("clockready"))
-                && client.clockSamples >= CLOCK_SAMPLES_REQUIRED) {
+                && (client.clockSamples >= CLOCK_SAMPLES_REQUIRED
+                // A client may resume its own recent, RTT-validated estimate
+                // after one fresh probe proves the same host clock is alive.
+                // Legacy ACKs and mismatched epochs still require the full batch.
+                || client.clockSamples > 0 && clockEpoch.equals(json.get(JSON_CLOCK_EPOCH)))) {
             synchronized (stateLock) {
                 if (playerForClientLocked(client) == null || client.clockReady) return;
                 client.clockReady = true;

@@ -9,6 +9,7 @@ import android.os.SystemClock;
 
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.lifecycle.Lifecycle;
 
 import org.junit.After;
 import org.junit.Before;
@@ -197,6 +198,62 @@ public class FullscreenServiceLifecycleRegressionTest {
     }
 
     @Test
+    public void pausingAndStoppingAJoinedScreenKeepsItsClockEstimateAndNetworkBindings() {
+        assertBackgroundSessionRetained(false);
+    }
+
+    @Test
+    public void pausingAndStoppingThePhoneHostKeepsItsNetworkBindings() {
+        assertBackgroundSessionRetained(true);
+    }
+
+    private void assertBackgroundSessionRetained(boolean hosting) {
+        final ServiceConnection[] callbacks = new ServiceConnection[3];
+        final GameClock[] clock = new GameClock[1];
+        scenario.onActivity(current -> {
+            ((android.os.Handler) get("mLobbyHandler")).removeCallbacksAndMessages(null);
+            set("mUseNetwork", true);
+            set("mReady", true);
+            set("mLobbyJoined", true);
+            set("mIsServer", hosting);
+            for (int service = SERVICE_UDP; service <= SERVICE_TCP_SERVER; service++)
+                callbacks[service] = beginBinding(service);
+            try {
+                Field estimate = TcpClient.class.getDeclaredField("mGameClock");
+                estimate.setAccessible(true);
+                clock[0] = (GameClock) estimate.get(tcpClient);
+                for (int sample = 0; sample < GameClock.SAMPLES_PER_SYNC; sample++)
+                    assertTrue(clock[0].record(1000 + sample, 6010 + sample,
+                            6010 + sample, 1020 + sample));
+                Field synchronizedClock = TcpClient.class.getDeclaredField("mClockSynchronized");
+                synchronizedClock.setAccessible(true);
+                synchronizedClock.setBoolean(tcpClient, true);
+            } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
+        });
+
+        scenario.moveToState(Lifecycle.State.STARTED);
+        scenario.moveToState(Lifecycle.State.CREATED);
+
+        scenario.onActivity(current -> {
+            assertFalse((boolean) get("mActivityResumed"));
+            assertTrue((boolean) get("mReady"));
+            assertTrue((boolean) get("mLobbyJoined"));
+            assertEquals(hosting, get("mIsServer"));
+            for (int service = SERVICE_UDP; service <= SERVICE_TCP_SERVER; service++) {
+                assertTrue((boolean) get(boundField(service)));
+                assertSame(callbacks[service], get(connectionField(service)));
+                assertSame(serviceFor(service), get(serviceField(service)));
+            }
+            assertEquals("Backgrounding stopped the TCP clock worker", 0, tcpClient.stops);
+            assertEquals("Backgrounding stopped the phone host", 0, tcpServer.stops);
+            assertEquals("Backgrounding stopped UDP lobby maintenance", 0, udp.stops);
+            assertTrue(tcpClient.isClockSynchronized());
+            assertEquals(GameClock.SAMPLES_PER_SYNC, clock[0].samples());
+            assertEquals(2000, clock[0].toLocalTime(7000));
+        });
+    }
+
+    @Test
     public void peerHostNameChangePublishesTheLobbySnapshot() {
         scenario.onActivity(current -> {
             set("mReady", true);
@@ -369,6 +426,10 @@ public class FullscreenServiceLifecycleRegressionTest {
     }
 
     private static final class RecordingUDPService extends UDPListenerService {
+        int stops;
+
+        @Override void stopListen() { stops++; }
+
         @Override
         public void startGameInviteListener() {
             // Lifecycle tests use a detached service double, not a real UDP socket.
@@ -377,6 +438,9 @@ public class FullscreenServiceLifecycleRegressionTest {
 
     private static final class RecordingTcpClient extends TcpClient {
         int playerNameChangeCount;
+        int stops;
+
+        @Override public void stopTcpClient() { stops++; }
 
         @Override
         public void sendPlayerNameChange() {
@@ -386,6 +450,9 @@ public class FullscreenServiceLifecycleRegressionTest {
 
     private static final class RecordingTcpServer extends TcpServer {
         final List<Integer> gameInfoRequests = new ArrayList<>();
+        int stops;
+
+        @Override public void stopTcpServer() { stops++; }
 
         @Override
         public void sendAllGameInfo(int id) {

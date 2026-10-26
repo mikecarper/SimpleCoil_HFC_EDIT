@@ -120,6 +120,65 @@ public class GameClockTest {
         assertEquals(-4000, clock.toLocalTime(1000));
     }
 
+    @Test public void recentCalibrationCanResumeWithoutReplacingItsOffset() {
+        GameClock clock = calibratedClock();
+        assertTrue(clock.hasRecentCalibration(4000));
+        clock.beginSampling();
+        assertTrue(clock.record(3000, 8030, 8030, 3040));
+        assertTrue(clock.resume(4000, 9030, 9030, 4040, false));
+        assertEquals(GameClock.SAMPLES_PER_SYNC, clock.samples());
+        assertEquals("One reconnect probe replaced the stable offset", 2000, clock.toLocalTime(7000));
+    }
+
+    @Test public void provisionalOrExpiredOffsetMustCalibrateAgain() {
+        GameClock clock = new GameClock();
+        assertTrue(clock.record(1000, 6010, 6010, 1020));
+        assertFalse(clock.resume(2000, 7010, 7010, 2020, false));
+        clock = calibratedClock();
+        long sent = 1020 + GameClock.MAX_RETAINED_AGE_MS;
+        assertFalse(clock.resume(sent, sent + 5010, sent + 5010, sent + 20, false));
+        assertFalse(clock.hasRecentCalibration(1000));
+    }
+
+    @Test public void repeatedRevalidationDoesNotExtendTheOriginalCalibrationAge() {
+        GameClock clock = calibratedClock();
+        assertTrue(clock.resume(2000, 7010, 7010, 2020, false));
+        assertTrue(clock.resume(3000, 8010, 8010, 3020, false));
+        assertFalse(clock.hasRecentCalibration(1021 + GameClock.MAX_RETAINED_AGE_MS));
+        clock.beginSampling();
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC; i++)
+            assertTrue(clock.record(4000, 9010, 9010, 4020));
+        assertTrue(clock.hasRecentCalibration(4020 + GameClock.MAX_RETAINED_AGE_MS));
+    }
+
+    @Test public void driftOrExcessiveDelayCannotValidateRetainedCalibration() {
+        GameClock clock = calibratedClock();
+        assertFalse(clock.resume(2000, 8000, 8000, 2020, false));
+        assertFalse(clock.resume(2000, 7041, 7041, 2081, false));
+        assertFalse(clock.resume(2000, 7010, 7000, 2020, false));
+        assertFalse(clock.resume(2000, Long.MAX_VALUE, Long.MAX_VALUE, 2020, false));
+        assertEquals(2000, clock.toLocalTime(7000));
+        assertTrue(clock.resume(2000, 7010, 7010, 2020, false));
+        clock.reset();
+        assertFalse(clock.hasRecentCalibration(3000));
+        assertFalse(clock.resume(3000, 8010, 8010, 3020, false));
+    }
+
+    @Test public void relayRevalidationKeepsItsOwnDelayBound() {
+        GameClock clock = calibratedClock();
+        assertFalse(clock.resume(2000, 7300, 7300, 2600, false));
+        assertTrue(clock.resume(2000, 7300, 7300, 2600, true));
+        assertFalse(clock.resume(3000, 8401, 8401, 3801, true));
+        assertEquals(2000, clock.toLocalTime(7000));
+    }
+
+    private static GameClock calibratedClock() {
+        GameClock clock = new GameClock();
+        for (int i = 0; i < GameClock.SAMPLES_PER_SYNC; i++)
+            assertTrue(clock.record(1000, 6010, 6010, 1020));
+        return clock;
+    }
+
     @Test(expected = IllegalArgumentException.class) public void resetDiscardsPreviousHost() {
         GameClock clock = new GameClock();
         clock.record(1000, 6010, 6010, 1020);

@@ -330,6 +330,14 @@ does not turn an old fix into a new one. Expired fixes are removed from the map.
 
 - Lobby join immediately begins a 12-exchange clock-calibration burst before a
   start is accepted.
+- The host offset runs against the phone's monotonic clock, independently of
+  the game screen and changes to the phone's date/time. Background refreshes
+  run every 30 seconds while connected and keep the committed offset usable
+  until a complete new batch arrives. Automatic reconnects can reuse a recent
+  offset after one low-delay probe confirms the same host clock epoch and
+  agrees with the saved estimate. A different host epoch, transport, stale
+  estimate (over five minutes), or clock disagreement requires all 12 samples.
+  Explicit Leave clears the saved offset.
 - Normal round completion returns to the same lobby without closing the host
   connection or discarding clock calibration. Final scores and personal reports
   arrive before the end event; the next round uses a fresh token and scores.

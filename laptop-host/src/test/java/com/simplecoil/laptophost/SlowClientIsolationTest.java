@@ -36,6 +36,11 @@ public final class SlowClientIsolationTest {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && "--clock-epoch-only".equals(args[0])) {
+            verifyClockEpochResume();
+            System.out.println("Clock epoch resume tests passed.");
+            return;
+        }
         verifyHeartbeatAndStateIsolation();
         verifyQueueBound("x", 128);
         verifyQueueBound("x".repeat(60_000), 4);
@@ -44,6 +49,7 @@ public final class SlowClientIsolationTest {
         verifyRetainedLobbyAssignments();
         verifyFinalFrameDeadline();
         verifyClockSendTimestamp();
+        verifyClockEpochResume();
         verifyShutdownClosesUnregisteredWriter();
         System.out.println("Slow-client isolation tests passed.");
     }
@@ -232,6 +238,79 @@ public final class SlowClientIsolationTest {
             ExecutorService workers = (ExecutorService) field(fixture.host, "clientExecutor");
             check(workers.awaitTermination(1, TimeUnit.SECONDS), "Shutdown left a blocked output worker running");
         }
+    }
+
+    private static void verifyClockEpochResume() throws Exception {
+        String oldEpoch;
+        try (Fixture fixture = new Fixture()) {
+            Phone cached = fixture.phone(1, true);
+            String epoch = (String) field(fixture.host, "clockEpoch");
+            check(UUID.fromString(epoch).toString().equals(epoch), "Host clock epoch is not a UUID");
+            acknowledgeClock(fixture, cached, Map.of("clockready", true, "clockepoch", epoch));
+            check(!clockReady(cached), "A cached epoch acknowledged an unprobed connection");
+            call(fixture.host, "handleClockSync", CLIENT, cached.client, Map.class, Map.of("clocksync", -1));
+            acknowledgeClock(fixture, cached, Map.of("clockready", true, "clockepoch", epoch));
+            check(!clockReady(cached), "An invalid clock probe satisfied the resume barrier");
+            check(epoch.equals(clockProbe(fixture, cached, 101).get("clockepoch")),
+                    "Clock reply omitted the stable host epoch");
+            acknowledgeClock(fixture, cached, Map.of("clockready", true));
+            check(!clockReady(cached), "A legacy ACK skipped the twelve-probe barrier");
+            acknowledgeClock(fixture, cached, Map.of("clockready", true, "clockepoch", UUID.randomUUID().toString()));
+            check(!clockReady(cached), "A stale epoch resumed the cached clock");
+            acknowledgeClock(fixture, cached, Map.of("clockready", true, "clockepoch", 101));
+            check(!clockReady(cached), "A non-string epoch resumed the cached clock");
+            acknowledgeClock(fixture, cached, Map.of("clockready", "true", "clockepoch", epoch));
+            check(!clockReady(cached), "String true acknowledged a cached clock");
+            acknowledgeClock(fixture, cached, Map.of("clockready", true, "clockepoch", epoch));
+            check(clockReady(cached) && (Integer) field(cached.client, "clockSamples") == 1,
+                    "A matching epoch did not resume after exactly one fresh clock probe");
+            synchronized (field(fixture.host, "stateLock")) { call(fixture.host, "resetForNewLobbyLocked"); }
+            check(epoch.equals(clockProbe(fixture, cached, 102).get("clockepoch")),
+                    "Next-lobby preparation changed the host clock epoch");
+
+            Phone legacy = fixture.phone(2, true), stale = fixture.phone(17, true);
+            String wrongEpoch = UUID.randomUUID().toString();
+            for (int sample = 1; sample <= 12; sample++) {
+                check(epoch.equals(clockProbe(fixture, legacy, 200 + sample).get("clockepoch"))
+                                && epoch.equals(clockProbe(fixture, stale, 300 + sample).get("clockepoch")),
+                        "Connections on the same host received different clock epochs");
+                acknowledgeClock(fixture, legacy, Map.of("clockready", true));
+                acknowledgeClock(fixture, stale, Map.of("clockready", true, "clockepoch", wrongEpoch));
+                check(clockReady(legacy) == (sample == 12) && clockReady(stale) == (sample == 12),
+                        "Missing/stale epochs did not preserve the full legacy sampling barrier");
+            }
+            oldEpoch = epoch;
+        }
+        try (Fixture restarted = new Fixture()) {
+            Phone phone = restarted.phone(1, true);
+            String epoch = (String) clockProbe(restarted, phone, 401).get("clockepoch");
+            check(!oldEpoch.equals(epoch), "A new host instance reused its predecessor's clock epoch");
+            acknowledgeClock(restarted, phone, Map.of("clockready", true, "clockepoch", oldEpoch));
+            check(!clockReady(phone), "A previous host lifetime resumed against the restarted host");
+            acknowledgeClock(restarted, phone, Map.of("clockready", true, "clockepoch", epoch));
+            check(clockReady(phone), "The restarted host did not accept its own epoch after a probe");
+        }
+    }
+
+    private static void acknowledgeClock(Fixture fixture, Phone phone, Map<String, Object> value) throws Exception {
+        call(fixture.host, "handleClockSync", CLIENT, phone.client, Map.class, value);
+    }
+
+    private static boolean clockReady(Phone phone) throws Exception {
+        return Boolean.TRUE.equals(field(phone.client, "clockReady"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> clockProbe(Fixture fixture, Phone phone, long sentAt) throws Exception {
+        call(fixture.host, "handleClockSync", CLIENT, phone.client, Map.class, Map.of("clocksync", sentAt));
+        await(() -> outboundEmpty(phone.client), 1_000, "Clock epoch probe did not flush");
+        for (String frame : phone.socket.output.frames()) {
+            if (!frame.startsWith(JSON)) continue;
+            Map<String, Object> reply = (Map<String, Object>) LaptopHost.Json.parse(frame.substring(JSON.length()));
+            if (reply.get("clocksync") instanceof Number
+                    && ((Number) reply.get("clocksync")).longValue() == sentAt) return reply;
+        }
+        throw new AssertionError("Clock probe did not produce a reply");
     }
 
     private static final class Fixture implements AutoCloseable {

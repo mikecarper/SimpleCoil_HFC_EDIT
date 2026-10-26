@@ -56,6 +56,65 @@ public class PhoneClockSyncLoadTest {
     }
 
     @Test
+    public void retainedClockEpochNeedsAFreshProbeBeforeReady() throws Exception {
+        try (Fixture fixture = new Fixture(1, Globals.GPS_ALL)) {
+            String epoch = (String) get(fixture.server, "mClockEpoch");
+            java.util.UUID.fromString(epoch);
+            fixture.parse(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true)
+                    .put(TcpServer.JSON_CLOCK_EPOCH, epoch));
+            assertFalse("An epoch alone bypassed clock sampling",
+                    fixture.server.arePlayerClocksSynchronized());
+
+            JSONObject reply = fixture.clockReply(1, 1000);
+            assertEquals(epoch, reply.getString(TcpServer.JSON_CLOCK_EPOCH));
+            fixture.parse(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, "true")
+                    .put(TcpServer.JSON_CLOCK_EPOCH, epoch));
+            assertFalse(fixture.server.arePlayerClocksSynchronized());
+            fixture.parse(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true)
+                    .put(TcpServer.JSON_CLOCK_EPOCH, 123));
+            assertFalse("A non-string epoch acknowledged a retained clock",
+                    fixture.server.arePlayerClocksSynchronized());
+            fixture.parse(1, new JSONObject().put(TcpServer.JSON_CLOCK_READY, true)
+                    .put(TcpServer.JSON_CLOCK_EPOCH, epoch));
+            assertTrue("A fresh same-host probe did not restore clock readiness",
+                    fixture.server.arePlayerClocksSynchronized());
+            assertEquals(1, get(fixture.clients.get(1), "clockSamples"));
+        }
+    }
+
+    @Test
+    public void missingOrStaleClockEpochStillNeedsFullCalibration() throws Exception {
+        for (String epoch : new String[] {null, "previous-host-epoch"}) {
+            try (Fixture fixture = new Fixture(1, Globals.GPS_ALL)) {
+                fixture.clockReply(1, 1000);
+                JSONObject ready = new JSONObject().put(TcpServer.JSON_CLOCK_READY, true);
+                if (epoch != null) ready.put(TcpServer.JSON_CLOCK_EPOCH, epoch);
+                fixture.parse(1, ready);
+                assertFalse("An absent or old epoch bypassed full clock calibration",
+                        fixture.server.arePlayerClocksSynchronized());
+                for (int sample = 1; sample < GameClock.SAMPLES_PER_SYNC; sample++)
+                    fixture.clockReply(1, 1000 + sample);
+                fixture.parse(1, ready);
+                assertTrue("Legacy full calibration no longer satisfies clock readiness",
+                        fixture.server.arePlayerClocksSynchronized());
+            }
+        }
+    }
+
+    @Test
+    public void clockEpochIsStableAcrossClientsAndReconnectsButChangesForNewHost() throws Exception {
+        try (Fixture fixture = new Fixture(2, Globals.GPS_ALL)) {
+            String epoch = fixture.clockReply(1, 1000).getString(TcpServer.JSON_CLOCK_EPOCH);
+            assertEquals(epoch, fixture.clockReply(2, 1000).getString(TcpServer.JSON_CLOCK_EPOCH));
+            fixture.reconnect(1);
+            fixture.server.clearScheduledStart();
+            assertEquals(epoch, fixture.clockReply(1, 2000).getString(TcpServer.JSON_CLOCK_EPOCH));
+            assertNotEquals("A replacement host reused the previous clock identity", epoch,
+                    get(new RecordingServer(), "mClockEpoch"));
+        }
+    }
+
+    @Test
     public void ordinaryRoundEndKeepsSocketsAndClocksForTheNextRound() throws Exception {
         ExecutorService workers = Executors.newFixedThreadPool(2);
         WallClock clock = new WallClock();
@@ -458,6 +517,37 @@ public class PhoneClockSyncLoadTest {
             constructor.setAccessible(true);
             polling = new Thread((Runnable) constructor.newInstance(server), "Phone clock load polling");
             set(server, "mClientThread", polling);polling.start();
+        }
+        void parse(int id, JSONObject value) throws Exception {
+            Class<?> threadType = Class.forName(TcpServer.class.getName() + "$ClientThread");
+            Constructor<?> constructor = threadType.getDeclaredConstructor(TcpServer.class);
+            constructor.setAccessible(true);
+            Method parse = threadType.getDeclaredMethod("parsePlayerInfo", String.class,
+                    clients.get(id).getClass());
+            parse.setAccessible(true);
+            parse.invoke(constructor.newInstance(server), value.toString(), clients.get(id));
+        }
+        JSONObject clockReply(int id, long sent) throws Exception {
+            parse(id, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, sent));
+            JSONObject frame;
+            do { frame = phones.get(id - 1).read(); }
+            while (!frame.has(TcpServer.JSON_CLOCK_REQUEST));
+            assertEquals(sent, frame.getLong(TcpServer.JSON_CLOCK_REQUEST));
+            return frame;
+        }
+        void reconnect(int id) throws Exception {
+            Object client = clients.get(id);
+            Method close = client.getClass().getDeclaredMethod("close");close.setAccessible(true);
+            close.invoke(client);
+            phones.get(id - 1).close();
+            try (ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
+                Socket peer = new Socket(listener.getInetAddress(), listener.getLocalPort());
+                peer.setTcpNoDelay(true);peer.setSoTimeout(6_000);
+                Method initialize = client.getClass().getDeclaredMethod("initialize", Socket.class, int.class);
+                initialize.setAccessible(true);
+                assertTrue((boolean) initialize.invoke(client, listener.accept(), id));
+                phones.set(id - 1, new Phone(peer, id));
+            }
         }
         @Override public void close() throws Exception {
             try {
