@@ -4,25 +4,28 @@ SimpleCoil is an Android companion app for supported Bluetooth LE laser-tag
 hardware. This fork is based on [Dees-Troy/SimpleCoil](https://github.com/Dees-Troy/SimpleCoil)
 and retains the project's Apache-2.0 license.
 
-## Latest release (1.54)
+## Latest release (1.55)
 
-[Download version 1.54](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.54)
+[Download version 1.55](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.55)
 for faster large-lobby joins and clock sync, retained connections between rounds,
 gun and reload recovery, scanning of existing QR posters, and host countdown
 cancellation. This release also fixes disconnected-player ownership, stale
 laptop cancellation dialogs, and update checks interrupted by Internet loss.
 Version 1.54 keeps lobby updates consistent with a start message that is still
 being delivered, so a late lobby update cannot return a starting phone to idle.
+Version 1.55 lets Event Mode phones scan their team QR to enter a running match
+while organizer settings stay locked. Free-for-all QR entry also accepts any
+team poster and assigns an available player slot without creating a team.
 Release builds check GitHub on launch and install future updates while idle.
 
 Update every phone and use the matching laptop host from this release's source
-download. Versions 1.54, 1.53 and 1.52 use network protocol 31; version 1.51 uses
+download. Versions 1.52 through 1.55 use network protocol 31; version 1.51 uses
 protocol 30 and cannot join the same game. Android 5.0 or newer is required.
 
-Version 1.54 updates signed 1.53 and 1.52 APKs in place and preserves settings and
+Version 1.55 updates signed 1.54, 1.53 and 1.52 APKs in place and preserves settings and
 player history. These use the configured release signing key, which differs
 from the debug key used for the published 1.51 APK. Android cannot install
-1.54 in place over 1.51. Reinstalling removes the old app's local settings
+1.55 in place over 1.51. Reinstalling removes the old app's local settings
 and player history, so save any information you need before switching.
 
 ## Platform support
@@ -206,6 +209,13 @@ it cannot change teams or recover exhausted limited lives by leaving. Infected
 players return through the zombie team's base. Boss scaling stays fixed at
 the original countdown roster, and joining cannot create a second boss.
 
+There is no extra waiting period after GO. Once the gun is paired and Wi-Fi is
+connected, the phone enters as soon as QR admission and clock calibration
+finish. It keeps the running match's original timer instead of starting a new
+countdown. Event Mode permits this QR entry while organizer settings remain
+locked. In free-for-all, any TEAM 1-4 poster admits an individual player into
+an available slot.
+
 Departed slots can be reused in a full 32-player game. Per-seat generations
 reject the former occupant's delayed state, hits and leave packets. Team totals
 retain departed players' contributions. TCP stays open for infrequent roster
@@ -215,7 +225,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.54 on every phone for this build.
+messages cannot end a new round. Install 1.55 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
 remains the primary connection. If it fails, Bluetooth Classic links can forward

@@ -177,6 +177,96 @@ public class TcpServerIdentityOwnershipTest {
         }
     }
 
+    @Test public void aNewPhoneCanJoinARunningFreeForAllThroughAStandardTeamQr() throws Exception {
+        assertRunningQrJoin(Globals.GAME_MODE_FFA, 4, 2, 0);
+    }
+
+    @Test public void aNewPhoneCanJoinAndCalibrateInARunningTwoTeamMatchWithinFiveSeconds() throws Exception {
+        assertRunningQrJoin(Globals.GAME_MODE_2TEAMS, 2, 17, 2);
+    }
+
+    private static void assertRunningQrJoin(int gameMode, int qrTeam, int expectedID, int expectedTeam)
+            throws Exception {
+        try (Fixture fixture = new Fixture(true, gameMode)) {
+            long originalStart = (long) get(fixture.server, "mScheduledStart");
+            long originalDuration = 60_000;
+            long roundID = 7;
+            set(fixture.server, "mRoundSequence", roundID);
+            set(fixture.server, "mScheduledDuration", originalDuration);
+            Globals.getInstance().mGameLimit = Globals.GAME_LIMIT_TIME;
+            Globals.getInstance().mTimeLimit = 1;
+            long began = System.nanoTime();
+            fixture.send(registration(BOB, false).put(TcpServer.JSON_PLAYERID, 17).put(LiveJoin.TEAM, qrTeam));
+            fixture.releaseRoster();
+            List<String> frames = fixture.readUntilRoster();
+            JSONObject assigned = null;
+            JSONObject game = null;
+            for (String frame : frames) {
+                if (!frame.startsWith(JSON)) continue;
+                JSONObject value = new JSONObject(frame.substring(JSON.length()));
+                if (value.has(LiveJoin.ASSIGNED)) assigned = value;
+                if (value.has(TcpServer.JSON_PLAYERS)) game = value;
+            }
+            assertNotNull("The running host rejected the standard QR admission", assigned);
+            assertEquals(expectedID, assigned.getInt(LiveJoin.ASSIGNED));
+            assertEquals(TOKEN, assigned.getString(TcpServer.JSON_ROUND_TOKEN));
+            assertNotNull(game);
+            RoundRoster round = RoundRoster.decode(game.getString(LiveJoin.ROSTER));
+            assertEquals(expectedTeam, round.person(BOB).team);
+            assertEquals(expectedID, round.person(BOB).id);
+            assertEquals(gameMode == Globals.GAME_MODE_FFA ? 0 : 1, round.person(ALICE).team);
+            assertEquals(Globals.GAME_STATE_RUNNING, game.getInt(TcpServer.JSON_GAMESTATE));
+            assertEquals(roundID, game.getLong(TcpServer.JSON_ROUND_ID));
+            assertEquals(originalStart, game.getLong(TcpServer.JSON_GAMESTART));
+            assertEquals(originalDuration, game.getLong(TcpServer.JSON_GAMEDURATION));
+            assertEquals(1, game.getJSONObject(TcpServer.JSON_LIMITS).getInt(TcpServer.JSON_TIMELIMIT));
+            for (int sample = 0; sample < GameClock.SAMPLES_PER_SYNC; sample++) {
+                long request = 2000 + sample;
+                fixture.send(new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, request));
+                readClockReply(fixture.input, request);
+            }
+            fixture.send(new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+            await(() -> {
+                try { return (boolean) get(fixture.candidate, "clockSynchronized"); }
+                catch (Exception failure) { throw new AssertionError(failure); }
+            });
+            fixture.server.sendAllGameInfo(expectedID);
+            game = null;
+            for (String frame : fixture.readUntilRoster()) {
+                if (!frame.startsWith(JSON)) continue;
+                JSONObject value = new JSONObject(frame.substring(JSON.length()));
+                if (value.has(TcpServer.JSON_PLAYERS)) game = value;
+            }
+            assertNotNull(game);
+            boolean clockReady = false;
+            org.json.JSONArray players = game.getJSONArray(TcpServer.JSON_PLAYERS);
+            for (int index = 0; index < players.length(); index++) {
+                JSONObject player = players.getJSONObject(index);
+                if (player.getInt(TcpServer.JSON_PLAYERID) == expectedID)
+                    clockReady = player.getBoolean(TcpServer.JSON_CLOCK_READY);
+            }
+            assertTrue("The admitted player was not clock-ready in the published roster", clockReady);
+            assertEquals(roundID, game.getLong(TcpServer.JSON_ROUND_ID));
+            assertEquals(originalStart, game.getLong(TcpServer.JSON_GAMESTART));
+            assertEquals(originalDuration, game.getLong(TcpServer.JSON_GAMEDURATION));
+            assertEquals(1, game.getJSONObject(TcpServer.JSON_LIMITS).getInt(TcpServer.JSON_TIMELIMIT));
+            RoundRoster calibrated = RoundRoster.decode(game.getString(LiveJoin.ROSTER));
+            assertEquals(expectedID, calibrated.person(BOB).id);
+            assertEquals(expectedTeam, calibrated.person(BOB).team);
+            long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began);
+            System.out.println("Running QR join mode=" + gameMode + " registered and clock-ready in " + elapsed + "ms");
+            assertTrue("Loopback admission and full clock calibration took " + elapsed + "ms", elapsed < 5_000);
+            assertEquals("Late admission restarted the original match timer", originalStart,
+                    (long) get(fixture.server, "mScheduledStart"));
+            assertSame(fixture.candidate, fixture.clients.get(16));
+            assertNotNull(get(fixture.old, "clientSocket"));
+            DataOutputStream existing = new DataOutputStream(fixture.oldPhone.getOutputStream());
+            existing.writeUTF(JSON + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 4242));existing.flush();
+            assertEquals(4242, readClockReply(new DataInputStream(fixture.oldPhone.getInputStream()), 4242)
+                    .getLong(TcpServer.JSON_CLOCK_REQUEST));
+        }
+    }
+
     private static void assertFreshSeat(Fixture fixture, String identity, List<String> frames) throws Exception {
         assertFalse("A prior person's reliable event reached a new occupant", frames.contains(EVENT));
         assertFalse("The prior person's ClientData stayed attached to the reused seat", fixture.clients.containsKey(15));
@@ -219,17 +309,22 @@ public class TcpServerIdentityOwnershipTest {
         boolean held;
 
         Fixture(boolean active) throws Exception {
+            this(active, Globals.GAME_MODE_2TEAMS);
+        }
+
+        Fixture(boolean active, int gameMode) throws Exception {
             previousGlobals = get(Globals.class, "mInstance");set(Globals.class, "mInstance", null);
             Globals globals = Globals.getInstance();
             globals.mPlayerID = 0;
             globals.mGameState = active ? Globals.GAME_STATE_RUNNING : Globals.GAME_STATE_NONE;
-            globals.mGameMode = Globals.GAME_MODE_2TEAMS;globals.mGameLimit = Globals.GAME_LIMIT_NONE;
+            globals.mGameMode = gameMode;globals.mGameLimit = Globals.GAME_LIMIT_NONE;
             globals.mUseGPS = false;globals.mBalancedRandom = false;globals.mBossMode = false;
             globals.mInfectionMode = false;globals.mTournamentMode = false;
             server.setDedicated(true);set(server, "keepListening", true);set(server, "mClientData", clients);
             if (active) {
                 RoundRoster round = new RoundRoster(TOKEN);
-                round.restore(new RoundRoster.Member(ALICE, 1, 1, 0));globals.mRoundRoster = round;
+                round.restore(new RoundRoster.Member(ALICE, 1, gameMode == Globals.GAME_MODE_FFA ? 0 : 1, 0));
+                globals.mRoundRoster = round;
                 set(server, "mStartAnnounced", true);set(server, "mRoundToken", TOKEN);
                 set(server, "mScheduledStart", Math.max(0, SystemClock.elapsedRealtime() - 1));
             }

@@ -1212,7 +1212,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         findViewById(R.id.lobby_rebalance_button).setOnClickListener(v -> rebalanceLobbyTeams());
         findViewById(R.id.lobby_more_button).setOnClickListener(v -> showLobbyAdvanced());
         findViewById(R.id.lobby_primary_button).setOnClickListener(v -> {
-            if (mUseNetwork && Globals.getInstance().mLobbyRoundActive) {
+            if (mUseNetwork && (Globals.getInstance().mLobbyRoundActive
+                    || Globals.getInstance().mWaitingForLobbyRoundEnd)) {
                 if (!mCommunicating) toggleLobbyPairing();
                 else openTeamAssignmentQrScanner();
             } else if (mUseNetwork && ((!mIsServer && Globals.getInstance().mLocalLobbyBenched)
@@ -1932,7 +1933,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         int label;
         int hint;
         boolean enabled = false;
-        if (mUseNetwork && globals.mLobbyRoundActive) {
+        if (mUseNetwork && (globals.mLobbyRoundActive || globals.mWaitingForLobbyRoundEnd)) {
             label = mCommunicating ? R.string.lobby_join_by_qr : R.string.lobby_gun_action;
             hint = R.string.lobby_join_by_qr_hint;
             enabled = !mLobbyTakeoverPending && globals.mRequestedJoinTeam == 0;
@@ -1972,10 +1973,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         for (int id : new int[]{R.id.lobby_name_button, R.id.lobby_wifi_button, R.id.lobby_more_button})
             findViewById(id).setEnabled(!restricted);
         if (restricted) {
-            for (int id : new int[]{R.id.lobby_team_button, R.id.lobby_scan_button, R.id.lobby_mode_button,
-                    R.id.lobby_rules_button, R.id.lobby_host_button}) findViewById(id).setEnabled(false);
-            if (mCommunicating) findViewById(R.id.lobby_primary_button).setEnabled(false);
-            lobbyText(R.id.lobby_next_step, getString(R.string.event_controlled));
+            applyRestrictedLobbyControls();
+            lobbyText(R.id.lobby_next_step, getString(isEventModeLateTeamQrJoinAvailable()
+                    ? R.string.lobby_join_by_qr_hint : R.string.event_controlled));
         }
         if (mMatchSession.active()) {
             findViewById(R.id.lobby_host_button).setEnabled(false);
@@ -1983,6 +1983,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if (label == R.string.lobby_start) findViewById(R.id.lobby_primary_button).setEnabled(false);
             lobbyText(R.id.lobby_next_step, getString(R.string.match_reconnecting));
         }
+    }
+
+    private void applyRestrictedLobbyControls() {
+        for (int id : new int[]{R.id.lobby_team_button, R.id.lobby_mode_button,
+                R.id.lobby_rules_button, R.id.lobby_host_button}) findViewById(id).setEnabled(false);
+        boolean lateJoin = isEventModeLateTeamQrJoinAvailable();
+        findViewById(R.id.lobby_scan_button).setEnabled(lateJoin);
+        // A disconnected gun retains its pairing action. A connected gun may
+        // only use the host-validated team QR join, never start a local round.
+        if (mCommunicating) findViewById(R.id.lobby_primary_button).setEnabled(lateJoin);
     }
 
     private String lobbyGameModeLabel() {
@@ -5916,6 +5926,16 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         updateTeamAssignmentScanButton();
     }
 
+    /** Event restrictions still permit a host-validated join from an idle phone. */
+    private boolean isEventModeLateTeamQrJoinAvailable() {
+        Globals globals = Globals.getInstance();
+        return mUseNetwork && mCommunicating && mCommandCharacteristic != null
+                && networkServicesReady() && !hasCommittedRound() && !mLobbyTakeoverPending
+                && globals.mRequestedJoinTeam == 0
+                && globals.mGameState == Globals.GAME_STATE_NONE
+                && (globals.mLobbyRoundActive || globals.mWaitingForLobbyRoundEnd);
+    }
+
     /** A team QR is a lobby selection, never an in-round identity change. */
     private boolean isTeamAssignmentScanAvailable() {
         Globals globals = Globals.getInstance();
@@ -6044,7 +6064,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     /** Assign the team encoded by an existing printed respawn QR checkpoint. */
     private boolean assignTeamFromQrCode(String contents) {
-        if (!isTeamAssignmentScanAvailable()) {
+        if (!isTeamAssignmentScanAvailable()
+                || eventControlsRestricted() && !isEventModeLateTeamQrJoinAvailable()) {
             hideQrScanner();
             return false;
         }
@@ -7202,7 +7223,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void openTeamAssignmentQrScanner() {
-        if (eventControlsRestricted()) return;
+        if (eventControlsRestricted() && !isEventModeLateTeamQrJoinAvailable()) return;
         if (!isTeamAssignmentScanAvailable() || isFinishing() || isDestroyed())
             return;
         if (!mActivityResumed) {

@@ -68,7 +68,7 @@ public final class RoundRoster {
         }
     }
 
-    /** team is authoritative: returning players cannot switch sides by leaving. */
+    /** Team is authoritative; in FFA any standard team QR admits an unteamed player. */
     public synchronized Member join(String identity, int team, int teamCount,
                                     boolean boss, boolean infection, int lives) {
         return join(identity, team, teamCount, boss, infection, lives, false, false);
@@ -77,7 +77,11 @@ public final class RoundRoster {
     public synchronized Member join(String identity, int team, int teamCount,
                                     boolean boss, boolean infection, int lives,
                                     boolean balanced, boolean resumeActive) {
-        if (!validIdentity(identity) || team < 1 || team > teamCount) return null;
+        boolean freeForAll = teamCount == 0;
+        if (!validIdentity(identity) || team < 1 || team > (freeForAll ? 4 : teamCount)
+                || teamCount != 0 && teamCount != 2 && teamCount != 4
+                || freeForAll && (boss || infection || balanced)) return null;
+        if (freeForAll) team = 0;
         Member previous = people.get(identity);
         if (previous != null && (previous.active && !resumeActive || (lives > 0 && previous.deaths >= lives)
                 || (infection ? previous.infected ? 1 : 2 : previous.team) != team)) return null;
@@ -87,7 +91,7 @@ public final class RoundRoster {
             Member occupant = seats[id];
             if (occupant != null && occupant.active && !(resumeActive && occupant == previous)
                     || generations[id] >= 255) continue;
-            boolean eligible = balanced || (infection ? id != 1 || previous != null && previous.id == 1
+            boolean eligible = freeForAll || balanced || (infection ? id != 1 || previous != null && previous.id == 1
                     : boss ? (team == 1 ? id == 1 : id > 1)
                     : (id - 1) / (CAPACITY / teamCount) + 1 == team);
             if (eligible && (selected == 0 || previous != null && previous.id == id)) selected = id;
