@@ -79,10 +79,16 @@ public final class LaptopHostProtocolSmokeTest {
         if (args.length == 1 && "--countdown-only".equals(args[0])) {
             verifyNormalStartCountdown(false);
             verifyNormalStartCountdown(true);
+            verifyHostCountdownCancellation();
             verifyBalancedQr();
             verifyBalancedNoQr();
             verifyBalancedTeamRetention();
             System.out.println("Game-start countdown protocol smoke tests passed");
+            return;
+        }
+        if (args.length == 1 && "--cancel-countdown-only".equals(args[0])) {
+            verifyHostCountdownCancellation();
+            System.out.println("Host-only countdown cancellation protocol smoke test passed");
             return;
         }
         if (args.length == 1 && "--persistent-lobby-only".equals(args[0])) {
@@ -388,6 +394,7 @@ public final class LaptopHostProtocolSmokeTest {
         if (args.length == 1 && "--core-only".equals(args[0])) return;
         verifyNormalStartCountdown(false);
         verifyNormalStartCountdown(true);
+        verifyHostCountdownCancellation();
         System.out.println("LaptopHost normal start countdown smoke tests passed.");
         verifyPersistentLobbyRounds();
         verifyGpsOffsets();
@@ -664,6 +671,86 @@ public final class LaptopHostProtocolSmokeTest {
                         && received.get(last - 1).contains("\"roundreport\"")
                         && received.get(last - 1).contains("\"roundtoken\":\"" + token + "\""),
                 "final scoreboard, personal report and ENDGAME were not one ordered batch");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void verifyHostCountdownCancellation() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--no-browser",
+                "--tcp-port", String.valueOf(TCP_PORT), "--udp-port", String.valueOf(UDP_PORT),
+                "--dashboard-port", String.valueOf(DASHBOARD_PORT), "--tile-port", String.valueOf(TILE_PORT)});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method start = LaptopHost.class.getDeclaredMethod("start");
+        java.lang.reflect.Method stop = LaptopHost.class.getDeclaredMethod("stop");
+        java.lang.reflect.Method elapsed = LaptopHost.class.getDeclaredMethod("elapsedMillis");
+        start.setAccessible(true);stop.setAccessible(true);elapsed.setAccessible(true);
+        try {
+            start.invoke(host);waitForHost();
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "Countdown blue");
+                 FakePhone second = new FakePhone("127.0.0.2", 17, "Countdown red")) {
+                first.synchronizeClock();second.synchronizeClock();
+                java.util.Map<Integer, Object> connections = (java.util.Map<Integer, Object>)
+                        getHostField(host, "activeClients");
+                Object blue = connections.get(1), red = connections.get(17);
+                require(post("/api/start").contains("\"ok\":true"), "countdown cancel fixture could not start");
+                String firstStart = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                require(second.readUntil(frame -> frame.contains("\"gamestart\"")) != null,
+                        "the second phone missed countdown");
+                String token = jsonString(firstStart, "roundtoken");
+                require(get("/api/state").contains("\"state\":\"countdown\""),
+                        "fixture had already reached actual play");
+                // A participant still needs another player's approval, even before GO.
+                first.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + token + "\"}");
+                require(second.readUntil(frame -> frame.contains("\"endvotes\":1")) != null,
+                        "a countdown participant's vote was not retained");
+                require(!first.receivesFor(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME"), 100),
+                        "one participant cancelled the countdown without the host");
+                String result = post("/api/end");
+                require(result.contains("Countdown cancelled"),
+                        "the host still needed two players to cancel a countdown: " + result);
+                require(first.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME")) != null
+                                && second.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME")) != null,
+                        "host-only cancellation did not reach both phones");
+                String cancelled = get("/api/state");
+                require(cancelled.contains("\"state\":\"finished\"")
+                                && cancelled.contains("\"clockReady\":2")
+                                && cancelled.contains("\"canStart\":true")
+                                && cancelled.contains("\"latestReport\":null"),
+                        "cancelled countdown lost readiness, added a report, or delayed restart");
+                require(connections.get(1) == blue && connections.get(17) == red
+                                && !(Boolean) getHostField(blue, "closed") && !(Boolean) getHostField(red, "closed"),
+                        "countdown cancellation discarded the retained TCP lobby");
+
+                require(post("/api/start").contains("\"ok\":true"), "cancelled countdown could not restart immediately");
+                String next = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                String nextToken = jsonString(next, "roundtoken");
+                require(nextToken != null && !nextToken.equals(token), "restart reused the cancelled round token");
+                require(second.readUntil(frame -> frame.contains("\"gamestart\"")) != null,
+                        "retained second phone missed restart");
+                // Leave the enum stale at COUNTDOWN while the actual monotonic GO
+                // deadline has passed. The API must advance state before deciding.
+                synchronized (getHostField(host, "stateLock")) {
+                    setHostField(host, "roundStartAt", (Long) elapsed.invoke(host));
+                }
+                result = post("/api/end");
+                require(result.contains("Waiting for two players"),
+                        "host-only cancellation remained available at or after GO: " + result);
+                require(get("/api/state").contains("\"state\":\"running\""),
+                        "the boundary request ended a live round without approval");
+                require(!first.receivesFor(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME"), 100),
+                        "host-only pre-start authority crossed the actual GO deadline");
+                first.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + nextToken + "\"}");
+                require(second.readUntil(frame -> frame.contains("\"endvotes\":1")) != null,
+                        "live-round approval no longer worked after a cancelled countdown");
+                second.send(JSON_PREFIX + "{\"endvote\":true,\"roundtoken\":\"" + nextToken + "\"}");
+                require(first.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ENDGAME")) != null,
+                        "two approvals no longer ended the live round");
+            }
+        } finally { stop.invoke(host); }
     }
 
     private static void verifyNormalStartCountdown(boolean explicitOverride) throws Exception {

@@ -368,6 +368,9 @@
     <string name="dialog_out_of_lives">Out of lives!</string>
 
     <string name="end_game_dialog_title">End Game?</string>
+    <string name="cancel_game_countdown">Cancel countdown</string>
+    <string name="cancel_game_countdown_message">Cancel the countdown for everyone and return to the lobby?</string>
+    <string name="cancel_game_countdown_expired">The countdown can no longer be canceled. Ending play requires two player approvals.</string>
     <string name="end_game_dialog_message">Are you sure you want to stop playing?</string>
     <string name="game_controls_button">End / Leave game</string>
     <string name="end_game_vote_message">End the round for everyone? At least two different players must agree. Approvals: %1$d/2. Your approval stays until you withdraw it, leave, or the round ends.</string>

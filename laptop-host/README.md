@@ -192,8 +192,14 @@ workflow. Use protocol-31 phones with this host and update the laptop and every
 phone together; the previous protocol is not compatible. This build also
 includes the Event Mode, kiosk, battery, and player-transfer controls from 1.51.
 
-With `--no-event-mode`, the map's **End game** button asks participating players
-to approve an early end. Two different players must agree; the non-playing
+During the initial countdown, **Cancel countdown** lets the laptop host return
+everyone to the lobby without player approvals, in either event mode. The
+connections and clock sync stay ready for an immediate restart, and a canceled
+countdown does not replace the previous round's report.
+
+With `--no-event-mode`, after the scheduled start time the map's **End game**
+button asks participating players to approve an early end. Two different
+players must agree; the non-playing
 laptop operator and sitting-out phones do not count. The button shows the
 approval count. Players can withdraw approval or confirm **Leave game** on
 their phone at any time; leaving does not end the shared round. Timer and

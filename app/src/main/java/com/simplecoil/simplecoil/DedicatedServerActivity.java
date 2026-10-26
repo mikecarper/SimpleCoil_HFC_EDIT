@@ -1090,6 +1090,8 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             }
         }
         mEndGameButton.setEnabled(true);
+        mEndGameButton.setText(SystemClock.elapsedRealtime() < mRoundStartAt
+                ? R.string.cancel_game_countdown : R.string.end_game_button);
         updateGameMasterRespawnButton();
         if (mRoundEndAt > 0) {
             startGameCountdown();
@@ -1108,6 +1110,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
                     if (mSpawnTimer != this || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING)
                         return;
                     mSpawnTimer = null;
+                    mEndGameButton.setText(R.string.end_game_button);
                     mGameStatusTV.setText(R.string.dedicated_game_running);
                     if (mRoundEndAt == 0) {
                         mGameTimer.setBase(mRoundStartAt);
@@ -1122,11 +1125,36 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
     private void requestEndGame() {
         if (isFinishing() || isDestroyed())
             return;
-        new AlertDialog.Builder(this).setTitle(R.string.end_game_dialog_title)
-                .setMessage(R.string.end_game_vote_host)
-                .setPositiveButton(R.string.yes, (dialog, which) -> {
-                    if (mTcpServer != null) mTcpServer.requestEndGameVote();
-                }).setNegativeButton(R.string.cancel, null).show();
+        final TcpServer server = mTcpServer;
+        final Intent start = server == null ? null : server.getScheduledGameStart();
+        final String roundToken = start == null ? null : start.getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+        final boolean cancelCountdown = server != null && server.canCancelGameBeforeStart(roundToken);
+        new AlertDialog.Builder(this)
+                .setTitle(cancelCountdown ? R.string.cancel_game_countdown : R.string.end_game_dialog_title)
+                .setMessage(cancelCountdown ? R.string.cancel_game_countdown_message : R.string.end_game_vote_host)
+                .setPositiveButton(cancelCountdown ? R.string.cancel_game_countdown : R.string.yes,
+                        (dialog, which) -> {
+                            if (mTcpServer != server || server == null) return;
+                            if (cancelCountdown) {
+                                if (!server.cancelGameBeforeStart(roundToken)) {
+                                    Toast.makeText(this, R.string.cancel_game_countdown_expired,
+                                            Toast.LENGTH_SHORT).show();
+                                    return;
+                                }
+                                if (mSpawnTimer != null) {
+                                    mSpawnTimer.cancel();
+                                    mSpawnTimer = null;
+                                }
+                                if (mGameCountdownTimer != null) {
+                                    mGameCountdownTimer.cancel();
+                                    mGameCountdownTimer = null;
+                                }
+                                mGameTimer.stop();
+                                mEndGameButton.setEnabled(false);
+                            } else {
+                                server.requestEndGameVote();
+                            }
+                        }).setNegativeButton(cancelCountdown ? R.string.no : R.string.cancel, null).show();
     }
 
     private void endGame() {
@@ -1153,6 +1181,7 @@ public class DedicatedServerActivity extends AppCompatActivity implements PopupM
             mUDPListenerService.allowJoin(true);
         }
         mEndGameButton.setEnabled(false);
+        mEndGameButton.setText(R.string.end_game_button);
         Globals.getInstance().mGameState = Globals.GAME_STATE_NONE;
         Globals.getInstance().clearBalancedRoundState();
         updateRebalanceButton();

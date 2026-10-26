@@ -2775,13 +2775,27 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private boolean requestPeerOrderedRoundEnd() {
+        return requestPeerOrderedRoundEnd(null);
+    }
+
+    private boolean canHostCancelCountdown(String roundToken) {
+        return mUseNetwork && mIsServer && mStartGameTimer && mTcpServer != null
+                && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                && roundToken != null && roundToken.equals(mActivePeerRoundToken)
+                && mTcpServer.canCancelGameBeforeStart(roundToken);
+    }
+
+    private boolean requestPeerOrderedRoundEnd(String countdownToken) {
+        boolean cancelCountdown = countdownToken != null;
+        if (cancelCountdown && !canHostCancelCountdown(countdownToken)) return false;
         if (mPeerOrderedEndPending) return true;
-        if (!mIsServer || mTcpServer == null || mStartGameTimer
+        if (!mIsServer || mTcpServer == null || mStartGameTimer && !cancelCountdown
                 || Globals.getInstance().mGameState == Globals.GAME_STATE_NONE) return false;
         Globals globals = Globals.getInstance();
         int team = globals.calcNetworkTeam(globals.mPlayerID);
-        GameOutcome.Result outcome = completedRoundOutcome();
-        if (!mTcpServer.requestOrderedRoundEnd()) return false;
+        GameOutcome.Result outcome = cancelCountdown ? GameOutcome.Result.UNKNOWN : completedRoundOutcome();
+        if (!(cancelCountdown ? mTcpServer.cancelGameBeforeStart(countdownToken)
+                : mTcpServer.requestOrderedRoundEnd())) return false;
         // The worker retires the shared roster and balanced assignments before
         // its completion broadcast. Preserve the player's actual round team
         // and outcome before that asynchronous cleanup can change them.
@@ -2789,6 +2803,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mPeerOrderedEndOutcome = outcome;
         mPeerOrderedEndPending = true;
         freezeRoundGameplayForReport();
+        if (cancelCountdown) {
+            resetGameStartCountdownSpeech();
+            updateInGameEndControl();
+        }
         final long generation = mGameControlGeneration;
         mLobbyHandler.postDelayed(() -> {
             if (!mPeerOrderedEndPending || mPeerOrderedEndDelivered
@@ -5123,15 +5141,29 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void confirmEndGame() {
         if (Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                || roundEndReportPending()
                 || (mGameExitDialog != null && mGameExitDialog.isShowing())) return;
         final long generation = mGameControlGeneration;
         final String roundToken = mActivePeerRoundToken;
         final boolean network = mUseNetwork;
+        final boolean cancelCountdown = canHostCancelCountdown(roundToken);
         final boolean voted = (Globals.getInstance().mEndGameVotes
                 & EndGameVotes.playerBit(Globals.getInstance().mPlayerID)) != 0;
         AlertDialog.Builder builder = new AlertDialog.Builder(this)
                 .setTitle(R.string.end_game_dialog_title);
-        if (network) {
+        if (cancelCountdown) {
+            builder.setTitle(R.string.cancel_game_countdown)
+                    .setMessage(R.string.cancel_game_countdown_message)
+                    .setPositiveButton(R.string.cancel_game_countdown, (dialog, which) -> {
+                        if (generation == mGameControlGeneration
+                                && !requestPeerOrderedRoundEnd(roundToken))
+                            Toast.makeText(this, R.string.cancel_game_countdown_expired,
+                                    Toast.LENGTH_SHORT).show();
+                    })
+                    .setNeutralButton(R.string.quit_game_button, (dialog, which) -> {
+                        if (generation == mGameControlGeneration) confirmQuitGame();
+                    });
+        } else if (network) {
             builder.setMessage(getString(R.string.end_game_vote_message,
                     Long.bitCount(Globals.getInstance().mEndGameVotes)))
                     .setPositiveButton(voted ? R.string.end_game_vote_withdraw : R.string.end_game_vote_agree,
@@ -5148,7 +5180,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         if (generation == mGameControlGeneration) endGame();
                     });
         }
-        builder.setNegativeButton(R.string.cancel, null);
+        builder.setNegativeButton(cancelCountdown ? R.string.no : R.string.cancel, null);
         showGameControlDialog(builder);
     }
 
@@ -5217,9 +5249,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void updateInGameEndControl() {
         if (mEndNetworkGameButton == null) return;
         Globals globals = Globals.getInstance();
-        mEndNetworkGameButton.setText(globals.mEndGameVoteRequested
+        mEndNetworkGameButton.setText(canHostCancelCountdown(mActivePeerRoundToken)
+                ? getString(R.string.cancel_game_countdown) : globals.mEndGameVoteRequested
                 ? getString(R.string.end_game_vote_progress, Long.bitCount(globals.mEndGameVotes))
                 : getString(R.string.game_controls_button));
+        mEndNetworkGameButton.setEnabled(!roundEndReportPending());
         mEndNetworkGameButton.setVisibility(View.VISIBLE);
     }
 

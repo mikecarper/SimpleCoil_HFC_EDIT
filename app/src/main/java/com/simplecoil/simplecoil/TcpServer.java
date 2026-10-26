@@ -262,6 +262,7 @@ public class TcpServer extends Service {
     // Guarded by mServerStateLock from scheduling through cleanup completion.
     private boolean mEndingGame;
     private volatile boolean mStartingGame;
+    private Thread mStartingGameTask;
     // Retained until round cleanup, including the gap before the UI receives STARTGAME.
     private volatile boolean mStartAnnounced;
     private final Random mBalanceRandom = new Random();
@@ -633,8 +634,10 @@ public class TcpServer extends Service {
                         // release this reservation so a later round can start.
                         if (endsRound)
                             mEndingGame = false;
-                        if (startsRound && mPendingStartDelivery == null)
-                            mStartingGame = false;
+                        if (startsRound && mStartingGameTask == Thread.currentThread()) {
+                            mStartingGameTask = null;
+                            if (mPendingStartDelivery == null) mStartingGame = false;
+                        }
                         if (cancelsServer && mCancellationThread == Thread.currentThread()) {
                             if (mCancellationTimeout != null)
                                 mShutdownHandler.removeCallbacks(mCancellationTimeout);
@@ -646,6 +649,7 @@ public class TcpServer extends Service {
                 }
             }, "SimpleCoil TCP send");
             mClientTasks.add(task);
+            if (startsRound) mStartingGameTask = task;
             if (cancelsServer) {
                 mCancellationThread = task;
                 // A stalled writer or held client lock must not keep shutdown
@@ -1806,6 +1810,32 @@ public class TcpServer extends Service {
         requestOrderedRoundEnd();
     }
 
+    /** The local host can abandon this initial countdown without a player vote. */
+    public boolean canCancelGameBeforeStart(String roundToken) {
+        synchronized (mServerStateLock) {
+            return canCancelGameBeforeStartLocked(roundToken);
+        }
+    }
+
+    private boolean canCancelGameBeforeStartLocked(String roundToken) {
+        if (!keepListening || mDestroyed || mEndingGame || mRoundEndDelivered
+                || mCancellationThread != null || !isValidRoundToken(roundToken)
+                || !roundToken.equals(mRoundToken)) return false;
+        long startAt = mStartAnnounced ? mScheduledStart
+                : mStartingGame && mPendingStartDelivery != null ? mPendingStartDelivery.startAt : -1;
+        return startAt >= 0 && SystemClock.elapsedRealtime() < startAt;
+    }
+
+    public boolean cancelGameBeforeStart(String roundToken) {
+        synchronized (mServerStateLock) {
+            if (!canCancelGameBeforeStartLocked(roundToken)) return false;
+            // Reserve END under this same lock. Crossing the deadline while its
+            // worker waits for roster access cannot turn an accepted cancel
+            // into a running round or allow a late START confirmation.
+            return requestOrderedRoundEnd();
+        }
+    }
+
     /** Lets a phone host wait for the ordered report/ENDGAME delivery task. */
     public boolean requestOrderedRoundEnd() {
         synchronized (mServerStateLock) {
@@ -1863,6 +1893,9 @@ public class TcpServer extends Service {
                 cancelBalancedCheckInTimeoutLocked();
                 if (isClientTaskActive()) {
                     mRoundEndDelivered = true;
+                    mPendingStartDelivery = null;
+                    mStartingGame = false;
+                    mStartingGameTask = null;
                     mStartAnnounced = false;
                     mScheduledStart = -1;
                     mScheduledDuration = 0;
@@ -3475,8 +3508,9 @@ public class TcpServer extends Service {
 
     private void freezeRoundReports() {
         synchronized (mServerStateLock) {
+            long endedAt = mAnalyticsEndAt >= 0 ? mAnalyticsEndAt : SystemClock.elapsedRealtime();
             if (!isValidRoundToken(mRoundToken) || mScheduledStart < 0
-                    || SystemClock.elapsedRealtime() < mScheduledStart) return;
+                    || endedAt < mScheduledStart) return;
             if (!mIsDedicated) localAnalyticsLocked();
             if (mClientData != null) for (ClientData client : mClientData.values()) {
                 analyticsLocked(client);
@@ -3489,8 +3523,7 @@ public class TcpServer extends Service {
                     && mRoundToken.equals(mCompletedRoundReports.values().iterator().next().roundToken)) return;
             mCompletedRoundReports.clear();
             long duration = Math.min(7L * 24 * 60 * 60 * 1000,
-                    Math.max(0, (mAnalyticsEndAt >= 0 ? mAnalyticsEndAt : SystemClock.elapsedRealtime())
-                            - mScheduledStart));
+                    Math.max(0, endedAt - mScheduledStart));
             boolean allCapable = true;
             for (RoundAnalytics stats : mRoundAnalytics.values()) allCapable &= stats.capable;
             for (RoundAnalytics stats : mRoundAnalytics.values()) {
@@ -4998,6 +5031,7 @@ public class TcpServer extends Service {
             keepListening = false;
             mPendingStartDelivery = null;
             mStartingGame = false;
+            mStartingGameTask = null;
             mTcpServerReady = false;
             cancelBalancedCheckInTimeoutLocked();
             if (mClockRosterUpdate != null) {

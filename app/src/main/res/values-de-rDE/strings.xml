@@ -331,6 +331,9 @@
     <string name="dialog_game_time_expired">Zeit Limit erreicht!</string>
     <string name="dialog_out_of_lives">Keine Leben mehr!</string>
     <string name="end_game_dialog_title">Spiel Beenden ?</string>
+    <string name="cancel_game_countdown">Start abbrechen</string>
+    <string name="cancel_game_countdown_message">Den Countdown fuer alle abbrechen und zur Lobby zurueckkehren?</string>
+    <string name="cancel_game_countdown_expired">Der Countdown kann nicht mehr abgebrochen werden. Zum Beenden muessen zwei Spieler zustimmen.</string>
     <string name="game_controls_button">Beenden / Verlassen</string>
     <string name="end_game_vote_message">Die Runde fuer alle beenden? Zwei verschiedene Spieler muessen zustimmen. Stimmen: %1$d/2. Ihre Stimme gilt, bis Sie sie zuruecknehmen, gehen oder die Runde endet.</string>
     <string name="end_game_vote_agree">Beenden zustimmen</string>

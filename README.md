@@ -169,8 +169,15 @@ registered or queued, its line falls back to system speech. See
 
 ### Ending, leaving, or joining a round (1.27)
 
-During countdown, play, or respawn, **End / Leave game** offers two separate
-actions. **Agree to end** asks for an early end; the round ends only after two
+During the initial countdown, the phone or dedicated host can select
+**Cancel countdown** to return everyone to the lobby without player approvals.
+The lobby connections and clock sync remain ready for an immediate restart,
+and the canceled countdown does not replace the previous round's result. This
+host action expires at the scheduled start time and does not apply to respawns.
+
+For other players during countdown, and during play or respawn, **End / Leave
+game** offers two separate actions. **Agree to end** asks for an early end;
+the round ends only after two
 different participating players approve. Duplicate taps and sitting-out phones
 do not count. Approval lasts for the current round and can be withdrawn while
 waiting for a second player. Leaving also removes that player's approval.
