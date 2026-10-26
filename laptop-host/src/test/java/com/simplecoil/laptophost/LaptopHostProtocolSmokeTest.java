@@ -1977,8 +1977,35 @@ public final class LaptopHostProtocolSmokeTest {
                         "host did not publish the respawn rule");
                 require(get("/api/state").contains("\"respawnQrEnabled\":" + qrEnabled),
                         "dashboard did not expose the selected respawn rule");
+                long defaultWait = qrEnabled ? 180 : 10;
+                requireRespawnTime(second.lastRoster, 1, defaultWait);
+                requireRespawnTime(second.lastRoster, 17, defaultWait);
                 first.synchronizeClock();
                 second.synchronizeClock();
+                // Editing another rule must not restore the old three-minute
+                // default, and an explicit custom wait must remain authoritative.
+                java.util.Map<String, Object> controls = parseHostObject(get("/api/players"));
+                @SuppressWarnings("unchecked")
+                List<java.util.Map<String, Object>> playerRows =
+                        (List<java.util.Map<String, Object>>) controls.get("players");
+                java.util.Map<String, Object> blue = playerRows.stream()
+                        .filter(row -> hostJsonNumber(row, "id") == 1).findFirst().orElseThrow();
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, Object> settings = new java.util.LinkedHashMap<>(
+                        (java.util.Map<String, Object>) blue.get("settings"));
+                settings.remove("playerID");settings.put("spawntime", 17);
+                String edit = LaptopHost.Json.stringify(java.util.Map.of("id", 1,
+                        "identity", blue.get("identity"), "settings", settings));
+                HttpResponse<String> edited = WIFI_HTTP.send(HttpRequest.newBuilder(URI.create(
+                                "http://127.0.0.1:" + DASHBOARD_PORT + "/api/players"))
+                        .timeout(Duration.ofSeconds(2)).header("X-SimpleCoil-Control", "1")
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(edit)).build(), HttpResponse.BodyHandlers.ofString());
+                require(edited.statusCode() == 200, "host rejected an explicit custom respawn time");
+                String customRoster = first.readUntil(frame -> frame.contains("\"players\"")
+                        && frame.contains("\"hostcustomrules\":true"));
+                requireRespawnTime(customRoster, 1, 17);
+                requireRespawnTime(customRoster, 17, defaultWait);
                 long readyDeadline = System.nanoTime() + 3_000_000_000L;
                 while (!get("/api/state").contains("\"canStart\":true")
                         && System.nanoTime() < readyDeadline)
@@ -2020,6 +2047,18 @@ public final class LaptopHostProtocolSmokeTest {
             if (!host.waitFor(3, java.util.concurrent.TimeUnit.SECONDS))
                 host.destroyForcibly();
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void requireRespawnTime(String frame, int playerID, long seconds) throws Exception {
+        require(frame != null && frame.startsWith(JSON_PREFIX), "missing respawn settings frame");
+        java.util.Map<String, Object> roster = parseHostObject(frame.substring(JSON_PREFIX.length()));
+        List<java.util.Map<String, Object>> settings =
+                (List<java.util.Map<String, Object>>) roster.get("playersettings");
+        java.util.Map<String, Object> player = settings.stream()
+                .filter(row -> hostJsonNumber(row, "playerID") == playerID).findFirst().orElseThrow();
+        require(hostJsonNumber(player, "spawntime") == seconds,
+                "player " + playerID + " respawn setting was not " + seconds + " seconds");
     }
 
     private static void verifyBossMode() throws Exception {

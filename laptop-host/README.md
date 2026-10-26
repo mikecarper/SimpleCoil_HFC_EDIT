@@ -158,7 +158,7 @@ For Infection, run `./laptop-host/run.sh --infection`. Player 1 is the original
 zombie. Killed survivors scan the Team 1 respawn QR to join the zombie team;
 recruited zombies use the same QR after later deaths. Players can also wait
 the three-minute respawn timer; with `--timer-respawn`, no camera opens and
-killed survivors convert when the timer completes. Hits drain the original
+killed survivors convert after the ten-second timer. Hits drain the original
 zombie's ammunition until that player earns two kills. After the second kill,
 the original zombie can die and scan Team 1 or wait the timer to return. That player's reload
 takes 20% of normal only until the original zombie's first death, then returns
@@ -540,10 +540,11 @@ compatibility with old scripts.
 
 ## Respawn mode
 
-Default team respawns take three minutes. A saved custom host profile can
-set a different wait in the updated phone app. Add `--timer-respawn` to keep the camera
-closed and disable early checkpoint respawns; `--qr-respawn` restores the
-default QR-or-timer choice. The host publishes this rule to every phone.
+Default QR team respawns allow a checkpoint scan or a three-minute fallback.
+Add `--timer-respawn` for ten-second team respawns with the camera closed;
+`--qr-respawn` restores the default QR-or-timer choice. A saved custom host
+profile keeps its explicitly configured wait in either mode. The host
+publishes this rule to every phone.
 Game Master respawn remains available in either mode. CTF objectives and
 optional power-up/team-check-in QRs are independent of respawn scanning.
 

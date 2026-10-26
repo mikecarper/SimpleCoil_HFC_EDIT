@@ -539,7 +539,7 @@ Infection starts Player 1 as the original zombie and everyone else as a
 survivor. A killed survivor can run to the zombie base and scan the existing
 Team 1 respawn QR before returning as a zombie, or wait the three-minute timer.
 In timer-only respawn mode there is no scanner; conversion to a zombie happens
-when the timer expires. Recruited zombies can be killed and use the same respawn
+after 10 seconds. Recruited zombies can be killed and use the same respawn
 rule. Until the original zombie earns two kills,
 incoming damage removes ammunition instead of health. After the second kill,
 the original zombie can be killed normally and uses the same respawn rule to
@@ -623,9 +623,9 @@ display security, and options.
 The host selects **Match options > Respawn mode** in the lobby:
 
 - **Timer only (no respawn QR)**: team players return automatically after
-  **3:00**. The camera stays closed and there are no "scan your base" reminders.
+  **10 seconds**. The camera stays closed and there are no "scan your base" reminders.
 - **QR checkpoint or timer** (default): scan the team's base to return early,
-  or wait the same **3:00** timer.
+  or wait the **3:00** timer.
 
 This is a match-wide setting; joined players cannot override the host. Solo
 practice and free-for-all use the configured respawn duration, **10 seconds**

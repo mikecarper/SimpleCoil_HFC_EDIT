@@ -156,10 +156,16 @@ public class Globals {
 
     public static long respawnWaitSeconds(boolean networked, boolean startingGame,
                                          int gameMode, long configuredSeconds, boolean hostCustomRules) {
+        return respawnWaitSeconds(networked, startingGame, gameMode, configuredSeconds, hostCustomRules, true);
+    }
+
+    public static long respawnWaitSeconds(boolean networked, boolean startingGame,
+                                         int gameMode, long configuredSeconds, boolean hostCustomRules,
+                                         boolean qrRespawnEnabled) {
         if (startingGame) return GameStartCountdown.DURATION_SECONDS;
         if (networked && !hostCustomRules
                 && (gameMode == GAME_MODE_2TEAMS || gameMode == GAME_MODE_4TEAMS))
-            return TEAM_QR_RESPAWN_WAIT_SECONDS;
+            return qrRespawnEnabled ? TEAM_QR_RESPAWN_WAIT_SECONDS : RESPAWN_TIME_SECONDS;
         return Math.max(MIN_RESPAWN_TIME_SECONDS, Math.min(MAX_RESPAWN_TIME_SECONDS, configuredSeconds));
     }
 

@@ -25,10 +25,20 @@ public class GlobalsTest {
         assertFalse(Globals.isFreshGpsFix(0, 10_000));
     }
 
-    @Test public void teamRespawnsKeepThreeMinuteWaitWithoutAQrScanner() {
+    @Test public void teamQrRespawnsKeepThreeMinuteCheckpointWait() {
         for (int mode : new int[]{Globals.GAME_MODE_2TEAMS, Globals.GAME_MODE_4TEAMS}) {
-            assertEquals(180L, Globals.respawnWaitSeconds(true, false, mode, 10));
-            assertEquals(180L, Globals.respawnWaitSeconds(true, false, mode, 90));
+            assertEquals(180L, Globals.respawnWaitSeconds(true, false, mode, 10, false, true));
+            assertEquals(180L, Globals.respawnWaitSeconds(true, false, mode, 90, false, true));
+        }
+    }
+
+    @Test public void timerOnlyTeamRespawnsUseTenSeconds() {
+        for (int mode : new int[]{Globals.GAME_MODE_2TEAMS, Globals.GAME_MODE_4TEAMS}) {
+            for (long configured : new long[]{1, 10, 90, Long.MIN_VALUE, Long.MAX_VALUE}) {
+                assertEquals(10L, Globals.respawnWaitSeconds(true, false, mode, configured, false, false));
+                assertEquals(GameStartCountdown.DURATION_SECONDS,
+                        Globals.respawnWaitSeconds(true, true, mode, configured, false, false));
+            }
         }
     }
 
@@ -58,6 +68,7 @@ public class GlobalsTest {
         assertEquals(GameStartCountdown.DURATION_SECONDS,
                 Globals.respawnWaitSeconds(true, true, Globals.GAME_MODE_2TEAMS, 42, true));
         assertEquals(180L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_2TEAMS, 42, false));
+        assertEquals(42L, Globals.respawnWaitSeconds(true, false, Globals.GAME_MODE_2TEAMS, 42, true, false));
     }
 
     @Test public void defaultGameLengthIsFiveMinutes() {

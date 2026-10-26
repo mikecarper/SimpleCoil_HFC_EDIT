@@ -2949,7 +2949,7 @@ public final class LaptopHost {
     }
 
     private Settings defaultSettings(int playerID) {
-        Settings settings = config.tournament ? Settings.tournament() : new Settings();
+        Settings settings = config.tournament ? Settings.tournament(config.respawnQrEnabled) : new Settings();
         if (config.boss)
             settings.applyBoss(playerID == 1, Math.max(0, playingClientsLocked().size() - 1));
         return settings;
@@ -3878,11 +3878,11 @@ public final class LaptopHost {
         boolean allowAuto = true;
         int firingMode;
 
-        static Settings tournament() {
+        static Settings tournament(boolean respawnQrEnabled) {
             Settings settings = new Settings();
-            // The phone's default team timer is three minutes. Keep the
-            // displayed profile consistent when custom host rules are enabled.
-            settings.spawnTime = 180;
+            // Keep the published default consistent when one player's edited
+            // profile enables custom host rules for the whole lobby.
+            settings.spawnTime = respawnQrEnabled ? 180 : 10;
             settings.allowBurst = false;
             settings.allowAuto = false;
             return settings;
@@ -5198,7 +5198,7 @@ public final class LaptopHost {
                     + "  --lives-limit 0..100        0 means unlimited\n"
                     + "  --powerup-qr 2..8           Enable QR power-ups (default: off)\n"
                     + "  --reports PATH             Save completed-round JSON reports here\n"
-                    + "  --timer-respawn            Three-minute team respawns without QR scanning\n"
+                    + "  --timer-respawn            Ten-second team respawns without QR scanning\n"
                     + "  --qr-respawn               QR checkpoint or timer respawns (default)\n"
                     + "  --gps all|team              Phone GPS visibility (default: team)\n"
                     + "  --start-delay 1..1000       Normal countdown seconds (default: "

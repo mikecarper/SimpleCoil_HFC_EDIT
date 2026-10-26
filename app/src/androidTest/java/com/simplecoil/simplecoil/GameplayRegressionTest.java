@@ -4925,10 +4925,11 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void initialCountdownUsesHostDeadlineInsteadOfPersonalRespawnTime() {
+    public void timerOnlyInitialCountdownUsesHostDeadlineInsteadOfPersonalRespawnTime() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);
             Globals.getInstance().mRespawnTime = 90;
+            Globals.getInstance().mRespawnQrEnabled = false;
             long deadline = SystemClock.elapsedRealtime() + 4000;
             receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
             assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
@@ -4970,29 +4971,35 @@ public class GameplayRegressionTest {
     public void laterTeamRespawnUsesCheckpointWaitAndCannotResetRoundTimer() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);
+            Globals.getInstance().mRespawnQrEnabled = true;
+            assertTrue(((String) invokeResult(activity, "lobbyMatchSummary")).contains(
+                    activity.getString(R.string.respawn_summary_qr, 3, 0)));
             long deadline = SystemClock.elapsedRealtime() - 1000;
             receiveNetwork(activity, synchronizedStart(deadline, deadline + 60000));
             assertEquals(Globals.GAME_STATE_RUNNING, Globals.getInstance().mGameState);
             Object roundTimer = get(activity, "mGameCountdownTimer");
             invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Hit");
             assertEquals(Globals.GAME_STATE_ELIMINATED, Globals.getInstance().mGameState);
-            assertTrue(((TextView) get(activity, "mSpawnInTV")).getText().toString().contains("03:00"));
+            assertEquals(activity.getString(R.string.respawn_qr_wait_label, 3, 0, 1),
+                    ((TextView) get(activity, "mSpawnInTV")).getText().toString());
             assertSame(roundTimer, get(activity, "mGameCountdownTimer"));
         });
     }
 
     @Test
-    public void timerOnlyTeamRespawnKeepsThreeMinutesWithoutCameraOrQrReminders() {
+    public void timerOnlyTeamRespawnUsesTenSecondsWithoutCameraOrQrReminders() {
         scenario.onActivity(activity -> {
             prepareDedicatedJoin(activity);
             Globals globals = Globals.getInstance();
             globals.mRespawnQrEnabled = false;
+            assertTrue(((String) invokeResult(activity, "lobbyMatchSummary")).contains(
+                    activity.getString(R.string.respawn_summary_timer, 0, 10)));
             long deadline = SystemClock.elapsedRealtime() - 1000;
             receiveNetwork(activity, synchronizedStart(deadline, deadline + 600000));
             Object roundTimer = get(activity, "mGameCountdownTimer");
             invoke(activity, "startSpawn", new Class<?>[]{String.class}, "Hit");
             assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
-            assertEquals(activity.getString(R.string.respawn_timer_wait_label, 3, 0),
+            assertEquals(activity.getString(R.string.respawn_timer_wait_label, 0, 10),
                     ((TextView) get(activity, "mSpawnInTV")).getText().toString());
             assertEquals(false, get(activity, "mRespawnQrScannerActive"));
             assertEquals(false, get(activity, "mRespawnQrVoiceReminderActive"));
@@ -5000,6 +5007,11 @@ public class GameplayRegressionTest {
             assertSame(roundTimer, get(activity, "mGameCountdownTimer"));
             CountDownTimer timer = (CountDownTimer) get(activity, "mSpawnTimer");
             assertNotNull(timer);
+            timer.cancel();
+            timer.onTick(9000);
+            assertEquals(activity.getString(R.string.respawn_timer_wait_label, 0, 9),
+                    ((TextView) get(activity, "mSpawnInTV")).getText().toString());
+            assertEquals(Globals.GAME_STATE_ELIMINATED, globals.mGameState);
             timer.onFinish();
             assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
             assertNull(get(activity, "mSpawnTimer"));

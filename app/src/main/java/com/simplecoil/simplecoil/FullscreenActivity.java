@@ -2136,7 +2136,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         String objective = getString(g.mInfectionMode ? R.string.lobby_goal_infection
                 : g.mCaptureTheFlag ? R.string.lobby_goal_ctf
                 : g.mBossMode ? R.string.lobby_goal_boss : R.string.lobby_goal_kills);
-        long respawnSeconds = Globals.respawnWaitSeconds(mUseNetwork, false, g.mGameMode, g.mRespawnTime, g.mHostCustomRules);
+        long respawnSeconds = Globals.respawnWaitSeconds(mUseNetwork, false, g.mGameMode,
+                g.mRespawnTime, g.mHostCustomRules, g.mRespawnQrEnabled);
         boolean teamCheckpoints = mUseNetwork && g.mGameMode != Globals.GAME_MODE_FFA && g.mRespawnQrEnabled;
         String respawn = getString(teamCheckpoints ? R.string.respawn_summary_qr
                 : R.string.respawn_summary_timer, respawnSeconds / 60, respawnSeconds % 60);
@@ -7430,7 +7431,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         final long spawnDelay = gameStartCountdown
                 ? gameStartRemaining()
                 : Globals.respawnWaitSeconds(mUseNetwork, mStartGameTimer,
-                        Globals.getInstance().mGameMode, Globals.getInstance().mRespawnTime, Globals.getInstance().mHostCustomRules) * 1000;
+                        Globals.getInstance().mGameMode, Globals.getInstance().mRespawnTime,
+                        Globals.getInstance().mHostCustomRules, Globals.getInstance().mRespawnQrEnabled) * 1000;
         final boolean notifyDedicatedHost = !mStartGameTimer && isDedicatedServerConnection();
         updateSpawnCountdown(spawnDelay, gameStartCountdown, teamQrRespawn);
         mSpawnInTV.setVisibility(View.VISIBLE);
