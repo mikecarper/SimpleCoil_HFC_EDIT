@@ -5676,6 +5676,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (Globals.getInstance().mTournamentMode)
             Globals.getInstance().applyTournamentRules();
         applyBossWeaponRole();
+        setPrimaryWeaponTeam();
+        setSecondWeaponTeam();
+        if (sharedPreferences != null) {
+            SharedPreferences.Editor editor = sharedPreferences.edit();
+            editor.putInt(PREF_PLAYER_ID, Globals.getInstance().mPlayerID);
+            editor.putInt(PREF_GAME_MODE, Globals.getInstance().mGameMode);
+            editor.apply();
+        }
+        displayCurrentTeam();
+    }
+
+    private void setPrimaryWeaponTeam() {
         if (!TEST_NETWORK && mBluetoothLeService != null && mCommandCharacteristic != null) {
             Log.d(TAG, "setting player ID to " + Globals.getInstance().mPlayerID);
             byte[] command = new byte[20];
@@ -5691,14 +5703,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             // until a disconnected blaster is available to receive it.
             Log.d(TAG, "Saving player ID until the blaster command is available");
         }
-        setSecondWeaponTeam();
-        if (sharedPreferences != null) {
-            SharedPreferences.Editor editor = sharedPreferences.edit();
-            editor.putInt(PREF_PLAYER_ID, Globals.getInstance().mPlayerID);
-            editor.putInt(PREF_GAME_MODE, Globals.getInstance().mGameMode);
-            editor.apply();
-        }
-        displayCurrentTeam();
     }
 
     private void setTeamFromLobby(boolean firstRoster) {
@@ -5741,25 +5745,42 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         if (secondary) {
             if (playerID != Globals.getInstance().mPlayerID
                     && SystemClock.elapsedRealtime() - mSecondaryTeamCommandAt > 2000)
-                setSecondWeaponTeam();
+                repairGunAssignment(true);
             return;
         }
-        if (playerID <= 0 || !Globals.isValidPlayerID(playerID)) return;
+        if (playerID < 0 || !Globals.isValidPlayerID(playerID)) return;
         boolean changed = mLastTeam != playerID;
-        mLastTeam = playerID;
+        if (playerID > 0) mLastTeam = playerID;
         if (networkOwnsPlayerID()) {
             // The gun can still report its old ID while a host assignment is
             // being programmed. Telemetry must never move the admitted player
             // into another person's seat or change the reconnect identity.
             if (playerID != Globals.getInstance().mPlayerID
                     && SystemClock.elapsedRealtime() - mPrimaryTeamCommandAt > 2000)
-                setTeam();
+                repairGunAssignment(false);
             return;
         }
+        if (playerID == 0) return;
         if (changed || Globals.getInstance().mPlayerID != playerID) {
             Log.d(TAG, "Player ID changed to " + playerID);
             Globals.getInstance().mPlayerID = playerID;
             displayCurrentTeam();
+        }
+    }
+
+    private void repairGunAssignment(boolean secondary) {
+        if (secondary) setSecondWeaponTeam();
+        else setPrimaryWeaponTeam();
+        // Recoil applies an ID change most reliably through a reload cycle.
+        // Repair only the affected gun, retaining the admitted network seat.
+        if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING || mStartGameTimer
+                || roundEndReportPending() || hasPowerup(Powerups.EMP) || hasPendingEmpReplay())
+            return;
+        if (secondary) {
+            if (mSecondaryReloading == RELOADING_STATE_NONE)
+                startSecondaryReload(RELOADING_STATE_STARTED);
+        } else if (mReloading == RELOADING_STATE_NONE) {
+            startReload();
         }
     }
 
@@ -9239,6 +9260,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         public void onReceive(Context context, Intent intent) {
             if (!mGattReceiverRegistered || isFinishing() || isDestroyed() || intent == null)
                 return;
+            if (intent.hasExtra(BluetoothLeService.EXTRA_CONNECTION_ID)) {
+                BluetoothLeService service = intent.getIntExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, 0) == 1
+                        ? mSecondaryBluetoothLeService : mBluetoothLeService;
+                if (service == null || !service.isCurrentConnectionEvent(intent))
+                    return;
+            }
             if (intent.getIntExtra(BluetoothLeService.EXTRA_WEAPON_SLOT, 0) == 1) {
                 handleSecondaryGattUpdate(intent);
                 return;
@@ -9410,6 +9437,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             public void run(){
                 if (!mConnected)
                     return;
+                // The service timestamps valid telemetry at the radio callback,
+                // including while this screen is busy or in the background.
+                if (mBluetoothLeService != null && mBluetoothLeService.monitorsConnectionHealth()) {
+                    mConnectionTest = false;
+                    connectionTestHandler.postDelayed(this, CONNECTION_TEST_INTERVAL_MILLISECONDS);
+                    return;
+                }
                 if (!mConnectionTest) {
                     Log.d(TAG, "Connection test reports disconnect!");
                     handleDisconnect();

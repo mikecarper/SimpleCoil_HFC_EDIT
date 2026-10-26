@@ -190,7 +190,7 @@ public class BluetoothConnectionRegressionTest {
         assertTrue(service.isConnected());
         callback.onConnectionStateChange(original.gatt, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_DISCONNECTED);
         assertFalse(service.isConnected());
-        assertSame(original.gatt, serviceField("mBluetoothGatt").get(service));
+        assertNull(serviceField("mBluetoothGatt").get(service));
         service.close();
         serviceField("mConnectionState").setInt(service, 2);
         assertFalse("A retired handle cannot be connected", service.isConnected());

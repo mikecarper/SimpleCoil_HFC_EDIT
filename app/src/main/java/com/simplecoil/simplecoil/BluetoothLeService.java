@@ -49,6 +49,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Queue;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Service for managing connection and data communication with a GATT server hosted on a
@@ -84,6 +85,8 @@ public class BluetoothLeService extends Service {
     private BluetoothAdapter mBluetoothAdapter;
     private String mBluetoothDeviceAddress;
     private volatile BluetoothGatt mBluetoothGatt;
+    private static final AtomicLong CONNECTION_IDS = new AtomicLong();
+    private long mConnectionId;
     private int mConnectionState = STATE_DISCONNECTED;
     private boolean mConnectionForeground;
     private PowerManager.WakeLock mConnectionWakeLock;
@@ -161,6 +164,8 @@ public class BluetoothLeService extends Service {
             "com.example.bluetooth.le.EXTRA_WEAPON_SLOT";
     public final static String EXTRA_COMPLETED_AT =
             "com.example.bluetooth.le.EXTRA_COMPLETED_AT";
+    public final static String EXTRA_CONNECTION_ID =
+            "com.example.bluetooth.le.EXTRA_CONNECTION_ID";
 
     /** A separate service component supplies its own GATT handle and operation queue. */
     protected int weaponSlot() {
@@ -176,6 +181,9 @@ public class BluetoothLeService extends Service {
     static final int MAX_QUEUED_GATT_OPERATIONS = 64;
     static final int MAX_COMPLETED_WRITE_RESULTS = 64;
     static final long GATT_OPERATION_TIMEOUT_MS = 5_000L;
+    static final long GATT_CONNECT_TIMEOUT_MS = 10_000L;
+    static final long GATT_SETUP_TIMEOUT_MS = 5_000L;
+    static final long GATT_TELEMETRY_TIMEOUT_MS = 5_000L;
 
     private boolean mActionAvailable = true;
     private final Queue<CharacteristicWrite> mCharacteristicWriteQueue = new LinkedList<>();
@@ -186,6 +194,11 @@ public class BluetoothLeService extends Service {
     private BluetoothGattCharacteristic mActiveCharacteristicRead;
     private final Handler mGattOperationHandler = new Handler(Looper.getMainLooper());
     private Runnable mGattOperationTimeout;
+    private Runnable mConnectionHealthTimeout;
+    private long mConnectionHealthDeadline;
+    private boolean mTelemetryExpected;
+    private boolean mTelemetryReceived;
+    private BluetoothGattCharacteristic mTelemetryNotificationCharacteristic;
     private final Queue<CompletedWriteResult> mCompletedWriteResults = new LinkedList<>();
 
     // Android 5.1 uses mutable characteristic objects. Keep each operation's payload
@@ -195,16 +208,23 @@ public class BluetoothLeService extends Service {
         final byte[] value;
         final int writeType;
         final BluetoothGatt gatt;
+        final long connectionId;
 
         CharacteristicWrite(BluetoothGattCharacteristic characteristic, byte[] value) {
             this(characteristic, value, null);
         }
 
         CharacteristicWrite(BluetoothGattCharacteristic characteristic, byte[] value, BluetoothGatt gatt) {
+            this(characteristic, value, gatt, 0);
+        }
+
+        CharacteristicWrite(BluetoothGattCharacteristic characteristic, byte[] value,
+                            BluetoothGatt gatt, long connectionId) {
             this.characteristic = characteristic;
             this.value = value.clone();
             writeType = characteristic.getWriteType();
             this.gatt = gatt;
+            this.connectionId = connectionId;
         }
 
         void prepare() {
@@ -268,6 +288,7 @@ public class BluetoothLeService extends Service {
         intent.putExtra(EXTRA_DATA, write.value.clone());
         intent.putExtra(EXTRA_STATUS, result.status);
         intent.putExtra(EXTRA_COMPLETED_AT, result.completedAt);
+        intent.putExtra(EXTRA_CONNECTION_ID, write.connectionId);
         return intent;
     }
 
@@ -326,6 +347,50 @@ public class BluetoothLeService extends Service {
         mGattOperationTimeout = null;
     }
 
+    private void cancelConnectionHealthTimeout() {
+        if (mConnectionHealthTimeout != null)
+            mGattOperationHandler.removeCallbacks(mConnectionHealthTimeout);
+        mConnectionHealthTimeout = null;
+        mConnectionHealthDeadline = 0;
+    }
+
+    private void startConnectionHealthTimeout(final BluetoothGatt gatt, long waitMs) {
+        cancelConnectionHealthTimeout();
+        final long connectionId = mConnectionId;
+        mConnectionHealthDeadline = SystemClock.elapsedRealtime() + waitMs;
+        mConnectionHealthTimeout = new Runnable() {
+            @Override public void run() {
+                synchronized (BluetoothLeService.this) {
+                    if (mConnectionHealthTimeout != this || !isCurrentGatt(gatt)
+                            || connectionId != mConnectionId) return;
+                    long remaining = mConnectionHealthDeadline - SystemClock.elapsedRealtime();
+                    if (remaining > 0) {
+                        mGattOperationHandler.postDelayed(this, remaining);
+                        return;
+                    }
+                    retireGattConnection(gatt, "Connection setup or telemetry timed out");
+                }
+            }
+        };
+        mGattOperationHandler.postDelayed(mConnectionHealthTimeout, waitMs);
+    }
+
+    private void retireGattConnection(BluetoothGatt gatt, String reason) {
+        if (!isCurrentGatt(gatt)) return;
+        Log.w(TAG, reason + "; reconnecting the affected gun");
+        List<CharacteristicWrite> failed = pendingCharacteristicWrites();
+        close();
+        for (CharacteristicWrite write : failed)
+            broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
+        broadcastUpdate(ACTION_GATT_DISCONNECTED);
+    }
+
+    private boolean isTelemetryEnable(DescriptorWrite write) {
+        return mTelemetryExpected && write.descriptor.getCharacteristic() == mTelemetryNotificationCharacteristic
+                && GattAttributes.CLIENT_CHARACTERISTIC_CONFIG.equals(write.descriptor.getUuid().toString())
+                && Arrays.equals(write.value, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+    }
+
     private void startGattOperationTimeout(final BluetoothGatt gatt, final Object operation) {
         cancelGattOperationTimeout();
         mGattOperationTimeout = new Runnable() {
@@ -378,6 +443,8 @@ public class BluetoothLeService extends Service {
         cancelGattOperationTimeout();
         mActiveDescriptorWrite = null;
         mActionAvailable = true;
+        if (isTelemetryEnable(write))
+            retireGattConnection(gatt, "Telemetry notification descriptor was rejected");
         return false;
     }
 
@@ -405,6 +472,7 @@ public class BluetoothLeService extends Service {
         }
         try {
             while (true) {
+                if (!isCurrentGatt(gatt)) return;
                 if (!mCharacteristicWriteQueue.isEmpty()) {
                     CharacteristicWrite write = mCharacteristicWriteQueue.remove();
                     if (startCharacteristicWrite(gatt, write))
@@ -431,7 +499,9 @@ public class BluetoothLeService extends Service {
             }
         } catch (SecurityException e) {
             Log.w(TAG, "Bluetooth permission was revoked while processing queued operations", e);
-            failPendingGattOperations();
+            if (mActiveDescriptorWrite != null && isTelemetryEnable(mActiveDescriptorWrite))
+                retireGattConnection(gatt, "Queued telemetry descriptor permission was revoked");
+            else failPendingGattOperations();
         }
     }
 
@@ -448,24 +518,28 @@ public class BluetoothLeService extends Service {
                     return;
                 }
                 String intentAction;
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                if (newState != BluetoothProfile.STATE_DISCONNECTED && status != BluetoothGatt.GATT_SUCCESS) {
+                    retireGattConnection(gatt, "GATT connection failed with status " + status);
+                } else if (newState == BluetoothProfile.STATE_CONNECTED) {
                     intentAction = ACTION_GATT_CONNECTED;
                     mConnectionState = STATE_CONNECTED;
+                    startConnectionHealthTimeout(gatt, GATT_SETUP_TIMEOUT_MS);
                     broadcastUpdate(intentAction);
                     Log.i(TAG, "Connected to GATT server.");
                     // Attempts to discover services after successful connection.
                     try {
-                        Log.i(TAG, "Attempting to start service discovery:" +
-                                gatt.discoverServices());
+                        if (!gatt.discoverServices())
+                            retireGattConnection(gatt, "Service discovery was rejected");
                     } catch (SecurityException e) {
                         Log.w(TAG, "Bluetooth permission was revoked before service discovery", e);
+                        retireGattConnection(gatt, "Service discovery permission was revoked");
                     }
 
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     intentAction = ACTION_GATT_DISCONNECTED;
-                    mConnectionState = STATE_DISCONNECTED;
-                    clearPendingGattOperations();
-                    mCompletedWriteResults.clear();
+                    // Even a disconnected framework handle can deliver late
+                    // callbacks. Retain its event ID, but never revive it.
+                    close();
                     Log.i(TAG, "Disconnected from GATT server: " + status);
                     broadcastUpdate(intentAction);
                 }
@@ -477,9 +551,23 @@ public class BluetoothLeService extends Service {
             synchronized (BluetoothLeService.this) {
                 if (!isCurrentGatt(gatt)) return;
                 if (status == BluetoothGatt.GATT_SUCCESS) {
+                    boolean found = false;
+                    try {
+                        for (BluetoothGattService service : gatt.getServices()) {
+                            if (GattAttributes.RECOIL_MAIN_SERVICE.equals(service.getUuid().toString())
+                                    && service.getCharacteristic(UUID_RECOIL_TELEMETRY) != null
+                                    && service.getCharacteristic(UUID.fromString(GattAttributes.RECOIL_COMMAND_UUID)) != null)
+                                found = true;
+                        }
+                    } catch (SecurityException e) { Log.w(TAG, "Cannot inspect gun services", e); }
+                    if (!found) {
+                        retireGattConnection(gatt, "Required gun services are missing");
+                        return;
+                    }
+                    startConnectionHealthTimeout(gatt, GATT_SETUP_TIMEOUT_MS);
                     broadcastUpdate(ACTION_GATT_SERVICES_DISCOVERED);
                 } else {
-                    Log.w(TAG, "onServicesDiscovered received: " + status);
+                    retireGattConnection(gatt, "Service discovery failed with status " + status);
                 }
             }
         }
@@ -531,6 +619,11 @@ public class BluetoothLeService extends Service {
             byte[] snapshot = value == null ? null : value.clone();
             synchronized (BluetoothLeService.this) {
                 if (!isCurrentGatt(gatt)) return;
+                if (mTelemetryExpected && characteristic == mTelemetryNotificationCharacteristic
+                        && snapshot != null && snapshot.length == 20) {
+                    mTelemetryReceived = true;
+                    mConnectionHealthDeadline = SystemClock.elapsedRealtime() + GATT_TELEMETRY_TIMEOUT_MS;
+                }
                 broadcastUpdate(characteristic, snapshot);
             }
         }
@@ -544,7 +637,16 @@ public class BluetoothLeService extends Service {
                         || mActiveDescriptorWrite.descriptor != descriptor)
                     return;
                 cancelGattOperationTimeout();
+                DescriptorWrite completed = mActiveDescriptorWrite;
                 mActiveDescriptorWrite = null;
+                if (isTelemetryEnable(completed)) {
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        retireGattConnection(gatt, "Telemetry notification descriptor failed");
+                        return;
+                    }
+                    if (!mTelemetryReceived)
+                        startConnectionHealthTimeout(gatt, GATT_TELEMETRY_TIMEOUT_MS);
+                }
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "descriptor write success!");
                 } else {
@@ -559,6 +661,7 @@ public class BluetoothLeService extends Service {
     private void broadcastUpdate(final String action) {
         final Intent intent = new Intent(action);
         intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
+        intent.putExtra(EXTRA_CONNECTION_ID, mConnectionId);
         sendBroadcast(intent);
     }
 
@@ -574,6 +677,7 @@ public class BluetoothLeService extends Service {
             logFireTiming("telemetry", characteristic.getUuid(), data, BluetoothGatt.GATT_SUCCESS);
             final Intent intent = new Intent(TELEMETRY_DATA_AVAILABLE);
             intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
+            intent.putExtra(EXTRA_CONNECTION_ID, mConnectionId);
             intent.putExtra(EXTRA_DATA, data.clone());
             sendBroadcast(intent);
         } else if (UUID_RECOIL_ID.equals((characteristic.getUuid()))) {
@@ -586,6 +690,7 @@ public class BluetoothLeService extends Service {
             // This gets the blaster type, 1 for rifle and 2 for pistol
             final Intent intent = new Intent(ID_DATA_AVAILABLE);
             intent.putExtra(EXTRA_WEAPON_SLOT, weaponSlot());
+            intent.putExtra(EXTRA_CONNECTION_ID, mConnectionId);
             intent.putExtra(EXTRA_DATA, data[10]);
             sendBroadcast(intent);
         } else {
@@ -656,6 +761,22 @@ public class BluetoothLeService extends Service {
         return mBluetoothGatt != null && mConnectionState == STATE_CONNECTED;
     }
 
+    /** Reject delayed broadcasts from an older handle or a destroyed service instance. */
+    public synchronized boolean isCurrentConnectionEvent(Intent event) {
+        if (!event.hasExtra(EXTRA_CONNECTION_ID)) return true;
+        if (event.getLongExtra(EXTRA_CONNECTION_ID, -1) != mConnectionId) return false;
+        if (ACTION_GATT_DISCONNECTED.equals(event.getAction())) return true;
+        if (CHARACTERISTIC_WRITE_FINISHED.equals(event.getAction())
+                && event.getIntExtra(EXTRA_STATUS, BluetoothGatt.GATT_FAILURE) != BluetoothGatt.GATT_SUCCESS)
+            return true;
+        return isConnected();
+    }
+
+    /** The activity must not judge radio health by delayed UI broadcasts. */
+    public synchronized boolean monitorsConnectionHealth() {
+        return mBluetoothGatt != null && mConnectionHealthTimeout != null;
+    }
+
     /**
      * Connects to the GATT server hosted on the Bluetooth LE device.
      *
@@ -678,19 +799,8 @@ public class BluetoothLeService extends Service {
             // Resuming an activity must not reconnect an already healthy GATT
             // session or restart a connection/discovery still in flight.
             if (mConnectionState == STATE_CONNECTED || mConnectionState == STATE_CONNECTING) return true;
-            Log.d(TAG, "Trying to use an existing mBluetoothGatt for connection.");
-            try {
-                if (mBluetoothGatt.connect()) {
-                    mCompletedWriteResults.clear();
-                    mConnectionState = STATE_CONNECTING;
-                    keepConnectionActive();
-                    return true;
-                }
-                return false;
-            } catch (SecurityException e) {
-                Log.w(TAG, "Bluetooth permission was revoked while reconnecting", e);
-                return false;
-            }
+            // A disconnected handle can still dispatch old callbacks. Publish
+            // a fresh handle and identity for the next connection attempt.
         }
 
         final BluetoothDevice device;
@@ -722,9 +832,11 @@ public class BluetoothLeService extends Service {
         // the old queue as well before publishing the new handle.
         close();
         mBluetoothGatt = gatt;
+        mConnectionId = CONNECTION_IDS.incrementAndGet();
         Log.d(TAG, "Trying to create a new connection.");
         mBluetoothDeviceAddress = address;
         mConnectionState = STATE_CONNECTING;
+        startConnectionHealthTimeout(gatt, GATT_CONNECT_TIMEOUT_MS);
         keepConnectionActive();
         return true;
     }
@@ -757,6 +869,9 @@ public class BluetoothLeService extends Service {
         mBluetoothGatt = null;
         mBluetoothDeviceAddress = null;
         mConnectionState = STATE_DISCONNECTED;
+        cancelConnectionHealthTimeout();
+        mTelemetryExpected = mTelemetryReceived = false;
+        mTelemetryNotificationCharacteristic = null;
         releaseConnectionPriority();
         clearPendingGattOperations();
         mCompletedWriteResults.clear();
@@ -813,7 +928,7 @@ public class BluetoothLeService extends Service {
         // Command IDs wrap. A new identical submission must not find an old ACK
         // while it is queued or in flight on this same connection.
         forgetCompletedWriteResult(characteristic, value);
-        CharacteristicWrite write = new CharacteristicWrite(characteristic, value, mBluetoothGatt);
+        CharacteristicWrite write = new CharacteristicWrite(characteristic, value, mBluetoothGatt, mConnectionId);
         if (mBluetoothAdapter == null || mBluetoothGatt == null) {
             Log.w(TAG, "BluetoothAdapter not initialized");
             broadcastWriteFinished(write, BluetoothGatt.GATT_FAILURE);
@@ -849,6 +964,8 @@ public class BluetoothLeService extends Service {
         if (!mActionAvailable) {
             if (!hasGattQueueCapacity()) {
                 Log.w(TAG, "Dropping descriptor write because the GATT operation queue is full");
+                if (isTelemetryEnable(new DescriptorWrite(descriptor)))
+                    retireGattConnection(mBluetoothGatt, "Telemetry descriptor queue is full");
                 return;
             }
             Log.d(TAG, "Writing not available yet, queuing...");
@@ -863,7 +980,9 @@ public class BluetoothLeService extends Service {
             }
         } catch (SecurityException e) {
             Log.w(TAG, "Bluetooth permission was revoked while writing a descriptor", e);
-            clearPendingGattOperations();
+            if (isTelemetryEnable(new DescriptorWrite(descriptor)))
+                retireGattConnection(mBluetoothGatt, "Telemetry descriptor permission was revoked");
+            else clearPendingGattOperations();
         }
     }
 
@@ -879,14 +998,25 @@ public class BluetoothLeService extends Service {
             Log.w(TAG, "BluetoothAdapter not initialized");
             return;
         }
+        final BluetoothGatt gatt = mBluetoothGatt;
+        boolean telemetry = UUID_RECOIL_TELEMETRY.equals(characteristic.getUuid());
+        if (telemetry) {
+            mTelemetryExpected = enabled;
+            mTelemetryReceived = false;
+            mTelemetryNotificationCharacteristic = enabled ? characteristic : null;
+            if (enabled) startConnectionHealthTimeout(gatt, GATT_SETUP_TIMEOUT_MS);
+            else cancelConnectionHealthTimeout();
+        }
         try {
             if (!mBluetoothGatt.setCharacteristicNotification(characteristic, enabled)) {
                 Log.w(TAG, "Failed to change characteristic notification state");
+                if (telemetry && enabled) retireGattConnection(gatt, "Telemetry notifications were rejected");
                 return;
             }
         } catch (SecurityException e) {
             Log.w(TAG, "Bluetooth permission was revoked while changing notifications", e);
-            failPendingGattOperations();
+            if (telemetry && enabled) retireGattConnection(gatt, "Telemetry notification permission was revoked");
+            else failPendingGattOperations();
             return;
         }
 
@@ -895,6 +1025,7 @@ public class BluetoothLeService extends Service {
                     UUID.fromString(GattAttributes.CLIENT_CHARACTERISTIC_CONFIG));
             if (descriptor == null) {
                 Log.w(TAG, "Telemetry characteristic has no client configuration descriptor");
+                if (enabled) retireGattConnection(gatt, "Telemetry notification descriptor is missing");
                 return;
             }
             if (enabled) {

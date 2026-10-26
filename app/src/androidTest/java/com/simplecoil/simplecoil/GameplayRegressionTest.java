@@ -5362,6 +5362,83 @@ public class GameplayRegressionTest {
         assertInvalidTelemetryPlayerIdIgnored(255);
     }
 
+    @Test
+    public void lostGunIdentityRepairsAndReloadsOnlyTheAffectedGunWithoutChangingThePlayer() {
+        for (boolean secondary : new boolean[]{false, true}) {
+            for (int reportedID : new int[]{0, 17})
+                assertGunIdentityRecovery(secondary, reportedID, false);
+        }
+    }
+
+    @Test
+    public void lostGunIdentityDuringEmpCannotStartARecoveryReload() {
+        for (boolean secondary : new boolean[]{false, true})
+            assertGunIdentityRecovery(secondary, 0, true);
+    }
+
+    private void assertGunIdentityRecovery(boolean secondary, int reportedID, boolean emp) {
+        scenario.onActivity(activity -> {
+            try (PowerupDualGunFixture guns = new PowerupDualGunFixture(activity)) {
+                Globals globals = Globals.getInstance();
+                globals.mPlayerID = Globals.BOSS_PLAYER_ID;
+                globals.mGameState = Globals.GAME_STATE_RUNNING;
+                set(activity, "mReady", true);
+                set(activity, "mIsServer", false);
+                set(activity, "mReloading", 0);
+                set(activity, "mSecondaryReloading", 0);
+                set(activity, "mPendingReloadCommand", null);
+                set(activity, "mSecondaryPendingReloadCommand", null);
+                set(activity, "mLastShotCount", (byte) 30);
+                set(activity, "mSecondaryLastShotCount", (byte) 30);
+                set(activity, "mHealth", 20);
+                set(activity, "mScore", 7);
+                set(activity, "mTeamScore", 9);
+                set(activity, "mHasLivesLimit", true);
+                set(activity, "mEliminationCount", 3);
+                set(activity, secondary ? "mSecondaryTeamCommandAt" : "mPrimaryTeamCommandAt",
+                        SystemClock.elapsedRealtime() - 2500L);
+                String name = globals.mPlayerName;
+                long[] powers = (long[]) get(activity, "mPowerupUntil");
+                long previousEmp = powers[Powerups.EMP];
+                powers[Powerups.EMP] = emp ? SystemClock.elapsedRealtime() + 5000L : 0L;
+                try {
+                    bluetooth.writes.clear();
+                    byte[] packet = telemetryPacket(0, 0, 0, 0);
+                    packet[FullscreenActivity.RECOIL_OFFSET_TEAM] = (byte) reportedID;
+                    invoke(activity, "processTelemetryData", new Class<?>[]{byte[].class, boolean.class},
+                            packet, secondary);
+                    List<byte[]> repaired = secondary ? guns.second.writes : bluetooth.writes;
+                    List<byte[]> healthy = secondary ? bluetooth.writes : guns.second.writes;
+                    assertEquals(emp ? 1 : 2, repaired.size());
+                    assertEquals(0x80, repaired.get(0)[2] & 255);
+                    assertEquals(Globals.BOSS_PLAYER_ID, repaired.get(0)[4]);
+                    if (!emp) {
+                        assertEquals(2, repaired.get(1)[2] & 255);
+                        assertEquals(Globals.BOSS_PLAYER_ID, repaired.get(1)[4]);
+                    }
+                    assertTrue("Identity recovery wrote to the healthy gun", healthy.isEmpty());
+                    assertEquals(emp ? 0 : 1,
+                            get(activity, secondary ? "mSecondaryReloading" : "mReloading"));
+                    assertEquals(0, get(activity, secondary ? "mReloading" : "mSecondaryReloading"));
+
+                    invoke(activity, "processTelemetryData", new Class<?>[]{byte[].class, boolean.class},
+                            packet, secondary);
+                    assertEquals("Repeated status bypassed the ID repair backoff", emp ? 1 : 2, repaired.size());
+                    assertTrue(healthy.isEmpty());
+                    assertEquals(Globals.BOSS_PLAYER_ID, globals.mPlayerID);
+                    assertEquals(name, globals.mPlayerName);
+                    assertEquals(20, get(activity, "mHealth"));
+                    assertEquals(7, get(activity, "mScore"));
+                    assertEquals(9, get(activity, "mTeamScore"));
+                    assertEquals(3, get(activity, "mEliminationCount"));
+                    assertEquals(Globals.GAME_STATE_RUNNING, globals.mGameState);
+                } finally {
+                    powers[Powerups.EMP] = previousEmp;
+                }
+            }
+        });
+    }
+
     private void assertInvalidTelemetryPlayerIdIgnored(int playerID) {
         scenario.onActivity(activity -> {
             byte[] packet = telemetryPacket(0, 0, 0, 0);

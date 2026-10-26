@@ -297,13 +297,15 @@ public class BluetoothQueueRegressionTest {
         first[2] = 99;
         denyNotifications = true;
         service.setCharacteristicNotification(telemetry, true);
-        assertEquals(2, service.broadcasts.size());
+        assertEquals(3, service.broadcasts.size());
         assertWriteResult(0, new byte[]{16, 0, 2}, BluetoothGatt.GATT_FAILURE);
         assertWriteResult(1, new byte[]{32, 0, 4}, BluetoothGatt.GATT_FAILURE);
+        assertEquals(BluetoothLeService.ACTION_GATT_DISCONNECTED, service.broadcasts.get(2).getAction());
+        assertNull(serviceField("mBluetoothGatt").get(service));
         assertTrue(isAvailable());
         completeWrite();
-        assertEquals(2, service.broadcasts.size());
-        assertEquals(Arrays.asList("writeCharacteristic"), operations);
+        assertEquals(3, service.broadcasts.size());
+        assertEquals(Arrays.asList("writeCharacteristic", "unregisterClient"), operations);
     }
 
     @Test

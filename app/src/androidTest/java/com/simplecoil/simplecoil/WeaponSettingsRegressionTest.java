@@ -304,6 +304,20 @@ public class WeaponSettingsRegressionTest {
         });
     }
 
+    @Test public void unconfiguredGunGetsItsHostAssignmentWithoutStealingASeat() {
+        scenario.onActivity(current -> {
+            prepareHostAssignedGun();
+            set("mReady", true);
+            reportedGunSeat(0);
+            assertHostAssignmentRetained();
+            assertEquals(1, bluetooth.commands.size());
+            reportedGunSeat(0);
+            assertHostAssignmentRetained();
+            assertEquals("Repeated reset status flooded the gun's command queue", 1, bluetooth.commands.size());
+            assertEquals(Globals.GAME_STATE_NONE, Globals.getInstance().mGameState);
+        });
+    }
+
     @Test public void staleGunSeatCannotReplaceAssignmentDuringTcpReconnect() {
         scenario.onActivity(current -> {
             Object previous = get("mTcpClient");
