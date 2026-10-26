@@ -100,12 +100,10 @@ import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentManager;
 import androidx.fragment.app.FragmentTransaction;
 
-import com.google.zxing.BarcodeFormat;
 import com.google.zxing.ResultPoint;
 import com.journeyapps.barcodescanner.BarcodeCallback;
 import com.journeyapps.barcodescanner.BarcodeResult;
 import com.journeyapps.barcodescanner.DecoratedBarcodeView;
-import com.journeyapps.barcodescanner.DefaultDecoderFactory;
 import com.simplecoil.protocol.GameStartCountdown;
 import com.simplecoil.protocol.Powerups;
 import com.simplecoil.protocol.RoundStatistics;
@@ -3170,7 +3168,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mQrScannerCancelButton = findViewById(R.id.qr_scanner_cancel_button);
         if (mRespawnQrScanner != null)
             mRespawnQrScanner.getBarcodeView().setDecoderFactory(
-                    new DefaultDecoderFactory(Collections.singletonList(BarcodeFormat.QR_CODE)));
+                    new GameQrDecoderFactory());
         if (mQrScannerCancelButton != null)
             mQrScannerCancelButton.setOnClickListener(v -> hideQrScanner());
         mPowerupQrScannerWindow = findViewById(R.id.powerup_qr_scanner_window);
@@ -3180,7 +3178,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mPowerupQrPrompt = findViewById(R.id.powerup_qr_prompt);
         if (mPowerupQrScanner != null) {
             mPowerupQrScanner.getBarcodeView().setDecoderFactory(
-                    new DefaultDecoderFactory(Collections.singletonList(BarcodeFormat.QR_CODE)));
+                    new GameQrDecoderFactory());
             if (mPowerupQrScanner.getStatusView() != null)
                 mPowerupQrScanner.getStatusView().setVisibility(View.GONE);
         }

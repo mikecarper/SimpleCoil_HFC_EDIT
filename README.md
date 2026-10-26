@@ -717,6 +717,9 @@ The print pack starts with Team 1 and omits the app-download cover.
 The release print pack contains no gun-specific pairing codes.
 Team codes do not contain a host address or Wi-Fi
 credentials; connect to the game network first.
+Existing printed codes remain valid. The in-game scanner accepts the older
+team signs and the current print pack, including QR patterns where corner
+markers appear but an ordinary scan cannot finish reading the code.
 
 To regenerate the PDF, use a virtual environment with `reportlab` and `qrcode`
 installed, then run:
