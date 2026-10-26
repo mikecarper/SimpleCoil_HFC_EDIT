@@ -31,6 +31,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
+import java.util.Queue;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -75,8 +76,10 @@ public class PhoneHostSlowSocketTest {
             fixture.server.sendTCPMessageAll(JSON + "{}");
             assertTrue("The controlled socket never entered its blocked write",
                     fixture.blocked.entered.await(2, TimeUnit.SECONDS));
-            assertEquals("The stalled writer did not reproduce the shared-lock convoy", 0,
-                    ((Semaphore) get(fixture.server, "mClientDataSemaphore")).availablePermits());
+            Semaphore clientAccess = (Semaphore) get(fixture.server, "mClientDataSemaphore");
+            assertTrue("A native writer retained the shared client semaphore",
+                    clientAccess.tryAcquire(200, TimeUnit.MILLISECONDS));
+            clientAccess.release();
 
             long started = millis();
             healthy.send(new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 1234));
@@ -88,15 +91,108 @@ public class PhoneHostSlowSocketTest {
                             + "a healthy clock request and native TCP admission could not proceed");
             assertEquals(1234, clock.get(1, TimeUnit.SECONDS).getLong(TcpServer.JSON_CLOCK_REQUEST));
             assertTrue("The healthy clock/admission exceeded five seconds", millis() - started < 5_000);
-            assertTrue("The stalled connection was not closed to release its writer", fixture.blocked.closed);
+            long elapsed = millis() - started;
+            driveUntil(() -> fixture.blocked.closed, 2_000,
+                    "The native write watchdog did not close its own stalled connection");
             assertFalse("A healthy connection was closed with the stalled phone", healthy.socket.isClosed());
             assertFalse("The joining phone was closed with the stalled phone", newcomer.socket.isClosed());
             assertTrue("The phone host stopped instead of isolating the slow phone", fixture.server.isTcpServerReady());
             System.out.println("Phone host slow socket: clock and admission recovered in "
-                    + (millis() - started) + " ms");
+                    + elapsed + " ms");
         } finally {
             reader.shutdownNow();
             assertTrue("The healthy reader survived cleanup", reader.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test public void sixStalledPhonesCannotDelayHealthyClockOrNativeAdmission() throws Exception {
+        ExecutorService reader = Executors.newSingleThreadExecutor();
+        try (Fixture fixture = new Fixture()) {
+            for (int id = 1; id <= 6; id++) fixture.connect(id);
+            Phone healthy = fixture.connect(7);
+            driveUntil(() -> fixture.registeredThrough(7) && fixture.settled(), 4_000,
+                    "Initial seven-phone registrations did not settle");
+            List<ControlledOutput> stalled = new ArrayList<>();
+            for (int id = 1; id <= 6; id++) stalled.add(fixture.blockWritesTo(id));
+            fixture.server.sendTCPMessageAll(JSON + "{}");
+            assertTrue("The controlled native write did not start",
+                    stalled.get(0).entered.await(2, TimeUnit.SECONDS));
+            long started = millis();
+            healthy.send(new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 1234));
+            Future<JSONObject> clock = reader.submit(() -> healthy.readClockReply(1234));
+            Phone newcomer = fixture.connect(8);
+            driveUntil(() -> clock.isDone() && fixture.registered(8), 2_000,
+                    "Six stalled phones delayed a healthy clock reply or native admission");
+            assertEquals(1234, clock.get(1, TimeUnit.SECONDS).getLong(TcpServer.JSON_CLOCK_REQUEST));
+            long elapsed = millis() - started;
+            assertTrue("The healthy clock and admission exceeded the five-second target", elapsed < 5_000);
+            assertFalse(healthy.socket.isClosed());assertFalse(newcomer.socket.isClosed());
+            for (ControlledOutput blocked : stalled)
+                assertTrue("The blocked phones were still serialized behind a shared writer",
+                        blocked.entered.await(100, TimeUnit.MILLISECONDS));
+            assertTrue(fixture.server.isTcpServerReady());
+            assertTrue(((Set<?>) get(fixture.server, "mClientWriters")).size() <= TcpServer.MAX_CLIENT_WRITERS);
+            System.out.println("Six stalled phones: healthy clock and native admission completed in "
+                    + elapsed + " ms (audit baseline 7216 ms)");
+        } finally {
+            reader.shutdownNow();
+            assertTrue(reader.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test public void eachClientWritesFramesInEnqueueOrder() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            Phone phone = fixture.connect(1);
+            driveUntil(() -> fixture.registered(1) && fixture.settled(), 3_000,
+                    "Phone did not finish registration");
+            Object client = fixture.client(1);
+            Method send = client.getClass().getDeclaredMethod("sendTCPMessage", String.class, boolean.class);
+            send.setAccessible(true);
+            for (int i = 0; i < 64; i++) assertTrue((boolean) send.invoke(client, "ordered-" + i, false));
+            int received = 0;
+            while (received < 64) {
+                String frame = phone.input.readUTF();
+                if (!frame.startsWith("ordered-")) continue;
+                assertEquals("ordered-" + received, frame);
+                received++;
+            }
+            driveUntil(fixture::settled, 2_000, "The ordered queue did not drain");
+        }
+    }
+
+    @Test public void frameAndByteBacklogsAreBoundedAndRetireOnlyTheirOwnPhone() throws Exception {
+        for (boolean largeFrames : new boolean[] {false, true}) {
+            try (Fixture fixture = new Fixture()) {
+                fixture.connect(1);
+                Phone healthy = fixture.connect(2);
+                driveUntil(() -> fixture.registeredThrough(2) && fixture.settled(), 3_000,
+                        "Phones did not finish registration");
+                Object client = fixture.client(1);
+                ControlledOutput blocked = fixture.blockWritesTo(1);
+                Method send = client.getClass().getDeclaredMethod("sendTCPMessage", String.class, boolean.class);
+                send.setAccessible(true);
+                assertTrue((boolean) send.invoke(client, "in-flight", false));
+                assertTrue(blocked.entered.await(1, TimeUnit.SECONDS));
+                char[] chars = new char[largeFrames ? 65500 : 32];
+                java.util.Arrays.fill(chars, 'a');
+                String message = new String(chars);
+                int accepted = 0;
+                while ((boolean) send.invoke(client, message, true)) {
+                    accepted++;
+                    assertTrue("The outbound queue grew without a bound", accepted <= TcpServer.MAX_PENDING_CLIENT_WRITES);
+                }
+                if (largeFrames) assertTrue("The byte cap did not bound large frames", accepted <= 16);
+                else assertEquals(TcpServer.MAX_PENDING_CLIENT_WRITES, accepted);
+                synchronized (client) {
+                    assertTrue(((Queue<?>) get(client, "outbound")).isEmpty());
+                    assertEquals(0, get(client, "outboundBytes"));
+                    assertTrue(((Queue<?>) get(client, "messageQueue")).size() <= TcpServer.MAX_QUEUED_CLIENT_EVENTS);
+                }
+                assertTrue("Backpressure did not cancel the captured native write", blocked.closed);
+                healthy.send(new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 2345));
+                assertEquals(2345, healthy.readClockReply(2345).getLong(TcpServer.JSON_CLOCK_REQUEST));
+                assertTrue(fixture.server.isTcpServerReady());
+            }
         }
     }
 
@@ -104,6 +200,7 @@ public class PhoneHostSlowSocketTest {
         final RecordingServer server = new RecordingServer();
         final List<Phone> phones = new ArrayList<>();
         final ControlledOutput blocked = new ControlledOutput();
+        final List<ControlledOutput> blockedWrites = new ArrayList<>();
         final Object previousGlobals;
 
         Fixture() throws Exception {
@@ -160,15 +257,35 @@ public class PhoneHostSlowSocketTest {
             } catch (Exception failure) { throw new AssertionError(failure); }
         }
 
+        boolean registeredThrough(int maximum) {
+            for (int id = 1; id <= maximum; id++) if (!registered(id)) return false;
+            return true;
+        }
+
+        Object client(int id) throws Exception {
+            for (Object candidate : clients().values())
+                if (((byte) get(candidate, "mPlayerID") & 255) == id) return candidate;
+            throw new AssertionError("No client for player " + id);
+        }
+
         boolean settled() {
             try {
                 synchronized (get(server, "mServerStateLock")) {
-                    return ((Set<?>) get(server, "mClientTasks")).isEmpty();
+                    if (!((Set<?>) get(server, "mClientTasks")).isEmpty()) return false;
                 }
+                for (Object client : clients().values()) {
+                    synchronized (client) {
+                        if ((boolean) get(client, "writing") || !((Queue<?>) get(client, "outbound")).isEmpty())
+                            return false;
+                    }
+                }
+                return true;
             } catch (Exception failure) { throw new AssertionError(failure); }
         }
 
-        void blockWritesTo(int id) throws Exception {
+        ControlledOutput blockWritesTo(int id) throws Exception {
+            ControlledOutput blocked = blockedWrites.isEmpty() ? this.blocked : new ControlledOutput();
+            blockedWrites.add(blocked);
             Semaphore access = (Semaphore) get(server, "mClientDataSemaphore");
             assertTrue("Could not install the controlled writer", access.tryAcquire(2, TimeUnit.SECONDS));
             try {
@@ -180,12 +297,14 @@ public class PhoneHostSlowSocketTest {
                 set(client, "clientSocket", new CloseControlledSocket(nativeSocket, blocked));
                 set(client, "out", new DataOutputStream(new BufferedOutputStream(blocked)));
             } finally { access.release(); }
+            return blocked;
         }
 
         @Override public void close() throws Exception {
             // Release first, even if the assertion failed before a watchdog existed.
             // Socket writes need not react to a thread interruption.
             blocked.close();
+            for (ControlledOutput output : blockedWrites) output.close();
             List<Thread> workers = new ArrayList<>();
             try {
                 synchronized (get(server, "mServerStateLock")) {
@@ -194,6 +313,7 @@ public class PhoneHostSlowSocketTest {
                     if (accept != null) workers.add(accept);
                     if (poll != null) workers.add(poll);
                     for (Object task : (Set<?>) get(server, "mClientTasks")) workers.add((Thread) task);
+                    for (Object task : (Set<?>) get(server, "mClientWriters")) workers.add((Thread) task);
                 }
                 server.onDestroy();
                 for (Phone phone : phones) phone.socket.close();
@@ -201,6 +321,8 @@ public class PhoneHostSlowSocketTest {
                     worker.join(2_000);
                     assertFalse("Phone-host worker survived cleanup: " + worker.getName(), worker.isAlive());
                 }
+                assertEquals("A writer permit leaked", TcpServer.MAX_CLIENT_WRITERS,
+                        ((Semaphore) get(server, "mClientWriterSlots")).availablePermits());
                 ScheduledThreadPoolExecutor watchdog = (ScheduledThreadPoolExecutor) get(server, "mWriteWatchdog");
                 assertTrue("Write watchdog survived service destruction", watchdog.awaitTermination(2, TimeUnit.SECONDS));
             } finally {

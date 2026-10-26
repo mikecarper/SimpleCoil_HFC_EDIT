@@ -1223,7 +1223,7 @@ public final class LaptopHostProtocolSmokeTest {
                     .filter(value -> "RUNNING".equals(value.toString())).findFirst().orElseThrow();
             setHostField(host, "roundState", running);
             Class<?> settingsClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Settings");
-            java.lang.reflect.Method settingsMethod = settingsClass.getDeclaredMethod("tournament");
+            java.lang.reflect.Method settingsMethod = settingsClass.getDeclaredMethod("tournament", boolean.class);
             settingsMethod.setAccessible(true);
             Class<?> playerClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Player");
             java.lang.reflect.Constructor<?> playerConstructor = playerClass.getDeclaredConstructor(
@@ -1235,7 +1235,7 @@ public final class LaptopHostProtocolSmokeTest {
             java.lang.reflect.Method putPlayer = java.util.Map.class.getMethod("put", Object.class, Object.class);
             for (int id = 1; id <= 32; id++) {
                 Object player = playerConstructor.newInstance(id, String.format(java.util.Locale.ROOT, "%020d", id),
-                        InetAddress.getByName("127.0.0." + id), settingsMethod.invoke(null));
+                        InetAddress.getByName("127.0.0." + id), settingsMethod.invoke(null, true));
                 setHostField(player, "connected", true);
                 setHostField(player, "identity", roster.seat(id).identity);
                 setHostField(player, "kills", maxScore);
@@ -1550,10 +1550,10 @@ public final class LaptopHostProtocolSmokeTest {
         Class<?> reviewClass = Class.forName("com.simplecoil.laptophost.LaptopHost$RoundReview");
         Class<?> playerClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Player");
         Class<?> settingsClass = Class.forName("com.simplecoil.laptophost.LaptopHost$Settings");
-        java.lang.reflect.Method settings = settingsClass.getDeclaredMethod("tournament"); settings.setAccessible(true);
+        java.lang.reflect.Method settings = settingsClass.getDeclaredMethod("tournament", boolean.class); settings.setAccessible(true);
         java.lang.reflect.Constructor<?> playerCtor = playerClass.getDeclaredConstructor(int.class, String.class,
                 InetAddress.class, settingsClass); playerCtor.setAccessible(true);
-        Object player = playerCtor.newInstance(1, "Player", InetAddress.getLoopbackAddress(), settings.invoke(null));
+        Object player = playerCtor.newInstance(1, "Player", InetAddress.getLoopbackAddress(), settings.invoke(null, true));
         java.lang.reflect.Constructor<?> reviewCtor = reviewClass.getDeclaredConstructor(String.class, long.class,
                 long.class, String.class); reviewCtor.setAccessible(true);
         Object review = reviewCtor.newInstance(UUID.randomUUID().toString(), 1L, 1000L, "teams");
@@ -1568,10 +1568,10 @@ public final class LaptopHostProtocolSmokeTest {
         enroll.invoke(review, player, 1); started.invoke(review);
         for (int n = 0; n < 2005; n++) shots.invoke(review, 1000L + n * 1000L, player, 1);
         for (int n = 0; n < 10005; n++) event.invoke(review, 1000L + n, "hit", player, null, 1, "Observed hit");
-        Object returning = playerCtor.newInstance(9, "Player returns", InetAddress.getLoopbackAddress(), settings.invoke(null));
+        Object returning = playerCtor.newInstance(9, "Player returns", InetAddress.getLoopbackAddress(), settings.invoke(null, true));
         setHostField(returning, "identity", getHostField(player, "identity"));
         enroll.invoke(review, returning, 1);
-        Object seatReplacement = playerCtor.newInstance(1, "Different player", InetAddress.getLoopbackAddress(), settings.invoke(null));
+        Object seatReplacement = playerCtor.newInstance(1, "Different player", InetAddress.getLoopbackAddress(), settings.invoke(null, true));
         enroll.invoke(review, seatReplacement, 1);
         Object result = freeze.invoke(review, 3_000_000L, "bounds");
         String json = (String) getHostField(result, "json");

@@ -95,6 +95,11 @@ public class TcpServer extends Service {
     // client from exhausting the dedicated host's threads while writes stall.
     static final int MAX_PENDING_CLIENT_TASKS = 32;
     private static final long CLIENT_WRITE_TIMEOUT_MS = 1000;
+    static final int MAX_PENDING_CLIENT_WRITES = MAX_QUEUED_CLIENT_EVENTS + 32;
+    static final int MAX_PENDING_CLIENT_WRITE_BYTES = 1024 * 1024;
+    // Unregistered sockets share the same hard bound as registered writers.
+    static final int MAX_CLIENT_WRITERS = Globals.MAX_PLAYER_ID + 8;
+    private static final long CLIENT_WRITER_IDLE_MS = 1000;
 
     private static ScheduledThreadPoolExecutor createWriteWatchdog() {
         ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, action -> {
@@ -117,9 +122,8 @@ public class TcpServer extends Service {
         boolean complete() { return state.compareAndSet(PENDING, COMPLETED); }
         @Override public void run() {
             if (state.compareAndSet(PENDING, EXPIRED)) {
-                // A blocked writer holds its ClientData monitor and the shared
-                // client semaphore. Close only the captured socket, taking
-                // neither lock, so every other phone can keep making progress.
+                // A native write can ignore interruption. Close only its captured
+                // socket without acquiring the client or roster locks.
                 closeSocket(socket);
             }
         }
@@ -257,9 +261,9 @@ public class TcpServer extends Service {
     private boolean mTcpServerReady;
     // Guarded by mServerStateLock from scheduling through cleanup completion.
     private boolean mEndingGame;
-    private boolean mStartingGame;
+    private volatile boolean mStartingGame;
     // Retained until round cleanup, including the gap before the UI receives STARTGAME.
-    private boolean mStartAnnounced;
+    private volatile boolean mStartAnnounced;
     private final Random mBalanceRandom = new Random();
     private static final long BALANCED_QR_CHECK_IN_TIMEOUT_MS = 90_000L;
     private volatile long mBalancedCheckInDeadline = -1;
@@ -314,6 +318,11 @@ public class TcpServer extends Service {
     private volatile Thread mClientThread = null;
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
     private final Semaphore mClientTaskSlots = new Semaphore(MAX_PENDING_CLIENT_TASKS);
+    private final Semaphore mClientWriterSlots = new Semaphore(MAX_CLIENT_WRITERS);
+    private final Set<Thread> mClientWriters = java.util.Collections.newSetFromMap(
+            new ConcurrentHashMap<Thread, Boolean>());
+    private final Set<Socket> mClientSockets = java.util.Collections.newSetFromMap(
+            new ConcurrentHashMap<Socket, Boolean>());
     private final ScheduledThreadPoolExecutor mWriteWatchdog = createWriteWatchdog();
     // Guarded by mServerStateLock, including registration before Thread.start().
     private final Set<Thread> mClientTasks = new HashSet<>();
@@ -328,6 +337,7 @@ public class TcpServer extends Service {
     private long mNextGameStartAllowedAt;
     private boolean mRoundCooldownRecorded;
     private boolean mRoundEndDelivered;
+    private StartDelivery mPendingStartDelivery;
     private final Powerups.Authority mPowerupAuthority = new Powerups.Authority();
     private final Random mPowerupRandom = new Random();
     private String mPowerupAuthorityToken;
@@ -472,18 +482,20 @@ public class TcpServer extends Service {
         final ClientData client;
         final byte playerID;
         final int team;
+        final String identity;
 
         ClientRecipient(int connectionID, ClientData client) {
             this.connectionID = connectionID;
             this.client = client;
             playerID = client.mPlayerID;
+            identity = client.playerIdentity;
             team = Globals.getInstance().calcNetworkTeam(playerID);
         }
 
         boolean isCurrent() {
             Map<Integer, ClientData> clients = mClientData;
             return clients != null && clients.get(connectionID) == client
-                    && client.mPlayerID == playerID;
+                    && client.mPlayerID == playerID && identity.equals(client.playerIdentity);
         }
 
         boolean canStartGame() {
@@ -587,13 +599,23 @@ public class TcpServer extends Service {
                         Log.e(TAG, "TCP client task failed", e);
                 } finally {
                     if (cancelsServer && acquired) {
+                        mClientDataSemaphore.release();
+                        acquired = false;
+                        awaitClientWrites(CANCEL_FLUSH_TIMEOUT_MS);
+                        boolean interruptedBeforeCleanup = Thread.interrupted();
+                        try {
+                            acquired = mClientDataSemaphore.tryAcquire(CANCEL_FLUSH_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException cancelled) {
+                            interruptedBeforeCleanup = true;
+                        }
+                        if (interruptedBeforeCleanup) Thread.currentThread().interrupt();
                         // Cleanup needs exclusive roster access. If cancellation
                         // timed out before it acquired that access, the timeout
                         // has already closed the session and this task must exit
                         // instead of waiting forever behind the stalled owner.
                         boolean interrupted = Thread.interrupted();
                         try {
-                            clearCancelledSessionState();
+                            if (acquired) clearCancelledSessionState();
                         } catch (RuntimeException e) {
                             Log.e(TAG, "Failed to clear cancelled TCP session", e);
                         } finally {
@@ -611,7 +633,7 @@ public class TcpServer extends Service {
                         // release this reservation so a later round can start.
                         if (endsRound)
                             mEndingGame = false;
-                        if (startsRound)
+                        if (startsRound && mPendingStartDelivery == null)
                             mStartingGame = false;
                         if (cancelsServer && mCancellationThread == Thread.currentThread()) {
                             if (mCancellationTimeout != null)
@@ -633,6 +655,26 @@ public class TcpServer extends Service {
             }
             task.start();
             return true;
+        }
+    }
+
+    private void awaitClientWrites(long timeoutMs) {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        Map<Integer, ClientData> clients = mClientData;
+        if (clients == null) return;
+        for (ClientData client : new ArrayList<>(clients.values())) {
+            synchronized (client) {
+                while (client.writing || !client.outbound.isEmpty()) {
+                    long remaining = end - System.nanoTime();
+                    if (remaining <= 0) return;
+                    try {
+                        TimeUnit.NANOSECONDS.timedWait(client, remaining);
+                    } catch (InterruptedException cancelled) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -863,40 +905,73 @@ public class TcpServer extends Service {
                 Globals.getInstance().mLobbyPlayers = java.util.Collections.unmodifiableMap(
                         getLobbyPlayersSnapshot());
                 Globals.getInstance().removeBenchedPlayersFromGameRoster();
-                boolean delivered = false;
-                for (ClientRecipient recipient : recipients) {
-                    synchronized (mServerStateLock) {
-                        if (!isClientTaskActive() || mEndingGame
-                                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
-                                || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
-                            return;
+                StartDelivery delivery = new StartDelivery(roundID, roundToken, startAt, duration);
+                synchronized (mServerStateLock) { mPendingStartDelivery = delivery; }
+                try {
+                    for (ClientRecipient recipient : recipients) {
+                        synchronized (mServerStateLock) {
+                            if (!isClientTaskActive() || mEndingGame
+                                    || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
+                                    || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
+                                return;
+                        }
+                        if (recipient.canStartGame()) {
+                            if (bossSettingsMessage != null
+                                    && !recipient.client.sendTCPMessage(bossSettingsMessage))
+                                continue;
+                            delivery.expect();
+                            recipient.client.sendStartMessage(message, delivery);
+                        } else if (recipient.isConnectedPlayer() && recipient.client.lobbyBenched) {
+                            recipient.client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
+                                    + "{\"" + JSON_LOBBY_WAIT + "\":true}");
+                        }
                     }
-                    if (recipient.canStartGame()) {
-                        if (bossSettingsMessage != null
-                                && !recipient.client.sendTCPMessage(bossSettingsMessage))
-                            continue;
-                        delivered = recipient.client.sendTCPMessage(message) || delivered;
-                    } else if (recipient.isConnectedPlayer() && recipient.client.lobbyBenched) {
-                        recipient.client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
-                                + "{\"" + JSON_LOBBY_WAIT + "\":true}");
-                    }
+                } finally {
+                    delivery.finishEnqueue();
                 }
-                if (!delivered)
-                    return;
-                synchronized (mServerStateLock) {
-                    if (!isClientTaskActive() || mEndingGame
-                            || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
-                            || SystemClock.elapsedRealtime() < mNextGameStartAllowedAt)
-                        return;
+            }, RoundTask.START);
+        }
+    }
+
+    /** START is confirmed by a real flush, while a slow peer cannot delay a healthy one. */
+    private final class StartDelivery {
+        final long roundID, startAt, duration;
+        final String token;
+        int pending = 1;
+        boolean enqueued, flushed, confirmed;
+
+        StartDelivery(long roundID, String token, long startAt, long duration) {
+            this.roundID = roundID;this.token = token;this.startAt = startAt;this.duration = duration;
+        }
+
+        void expect() { synchronized (mServerStateLock) { pending++; } }
+        void finishEnqueue() {
+            synchronized (mServerStateLock) { enqueued = true; }
+            complete(false);
+        }
+        void complete(boolean success) {
+            synchronized (mServerStateLock) {
+                flushed |= success;
+                pending--;
+                if (mPendingStartDelivery != this) return;
+                if (enqueued && flushed && !confirmed && keepListening && !mDestroyed
+                        && mCancellationThread == null && !mEndingGame
+                        && roundID == mRoundSequence && token.equals(mRoundToken)
+                        && Globals.getInstance().mGameState == Globals.GAME_STATE_NONE
+                        && SystemClock.elapsedRealtime() >= mNextGameStartAllowedAt) {
+                    confirmed = true;
                     mScheduledStart = startAt;
                     mScheduledDuration = duration;
                     mRoundCooldownRecorded = false;
                     mStartAnnounced = true;
                     cancelBalancedCheckInTimeoutLocked();
                     sendBroadcast(getScheduledGameStart());
-                    // Keep the control channel open for roster changes and QR joins.
                 }
-            }, RoundTask.START);
+                if (pending == 0) {
+                    mPendingStartDelivery = null;
+                    mStartingGame = false;
+                }
+            }
         }
     }
 
@@ -3012,7 +3087,7 @@ public class TcpServer extends Service {
                 return;
             if ((mServerThread != null && mServerThread.isAlive())
                     || (mClientThread != null && mClientThread.isAlive())
-                    || !mClientTasks.isEmpty()) {
+                    || !mClientTasks.isEmpty() || !mClientWriters.isEmpty()) {
                 Log.d(TAG, "Server is still starting, listening, or shutting down");
                 return;
             }
@@ -3120,9 +3195,11 @@ public class TcpServer extends Service {
                     mClientDataSemaphore.acquire();
                     try {
                         synchronized (mServerStateLock) {
-                            if (!keepListening || mDestroyed) {
+                            if (!keepListening || mDestroyed || mCancellationThread != null) {
                                 client.close();
-                                break;
+                                if (!keepListening || mDestroyed) break;
+                                pendingSocket = null;
+                                continue;
                             }
                             clientID++;
                             mClientData.put(clientID, client);
@@ -3568,7 +3645,7 @@ public class TcpServer extends Service {
     }
 
     private class ClientData {
-        private String playerIdentity = java.util.UUID.randomUUID().toString();
+        private volatile String playerIdentity = java.util.UUID.randomUUID().toString();
         private volatile Socket clientSocket = null;
         private int clientID = -1;
         private volatile byte mPlayerID = 0;
@@ -3607,7 +3684,11 @@ public class TcpServer extends Service {
         }
 
         public synchronized boolean initialize(Socket s, int cID) {
+            connectionGeneration++;
+            connectionFailed = false;
+            closeAfterWrites = false;
             clientSocket = s;
+            mClientSockets.add(s);
             clientID = cID;
             noReadCount = 0;
             clockSynchronized = false;
@@ -3635,91 +3716,270 @@ public class TcpServer extends Service {
             }
         }
 
-        public synchronized boolean sendTCPMessage(final String message) { return sendTCPMessage(message, false); }
+        private final Queue<OutboundMessage> outbound = new LinkedList<>();
+        private int outboundBytes;
+        private Thread writeWorker;
+        private boolean writing;
+        private boolean closeAfterWrites;
+        private long connectionGeneration;
 
-        private synchronized boolean sendClockReply(JSONObject reply) throws JSONException {
-            // Exclude time waiting behind an earlier writer from the network
-            // round trip, just as the laptop host does at its writer.
-            reply.put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime())
-                    .put(JSON_CLOCK_EPOCH, mClockEpoch);
-            return sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply);
+        private final class OutboundMessage {
+            final String message;
+            final String reliableToken;
+            final boolean clockReply;
+            final boolean terminal;
+            final StartDelivery startDelivery;
+            final AtomicInteger completed = new AtomicInteger();
+            final int bytes;
+            final Socket socket;
+            final DataOutputStream output;
+            final long generation;
+            final byte playerID;
+            final String identity;
+
+            OutboundMessage(String message, String reliableToken, boolean clockReply,
+                            boolean terminal, int bytes, StartDelivery startDelivery) {
+                this.message = message;
+                this.reliableToken = reliableToken;
+                this.clockReply = clockReply;
+                this.terminal = terminal;
+                this.startDelivery = startDelivery;
+                this.bytes = bytes;
+                socket = clientSocket;
+                output = out;
+                generation = connectionGeneration;
+                playerID = mPlayerID;
+                identity = playerIdentity;
+            }
+
+            void finish(boolean success, boolean defer) {
+                if (startDelivery == null || !completed.compareAndSet(0, 1)) return;
+                if (defer) mShutdownHandler.post(() -> startDelivery.complete(success));
+                else startDelivery.complete(success);
+            }
         }
 
-        public synchronized boolean sendTCPMessage(final String message, boolean queueFailed) {
-            if (out == null) {
-                if (queueFailed)
-                    queueMessage(message);
-                return false;
+        private void sendStartMessage(String message, StartDelivery delivery) {
+            if (!enqueue(message, false, false, false, null, delivery))
+                mShutdownHandler.post(() -> delivery.complete(false));
+        }
+
+        public boolean sendTCPMessage(final String message) { return sendTCPMessage(message, false); }
+
+        private boolean sendClockReply(JSONObject reply) {
+            return enqueue(reply.toString(), false, true, false, null);
+        }
+
+        public boolean sendTCPMessage(final String message, boolean queueFailed) {
+            return enqueue(message, queueFailed, false, false, null);
+        }
+
+        private void sendTCPMessageAndClose(String message) {
+            enqueue(message, false, false, true, null);
+        }
+
+        /** Only enqueue under shared roster locks; native writes belong to this client's worker. */
+        private boolean enqueue(String message, boolean reliable, boolean clockReply,
+                                boolean terminal, String retainedToken) {
+            return enqueue(message, reliable, clockReply, terminal, retainedToken, null);
+        }
+
+        private boolean enqueue(String message, boolean reliable, boolean clockReply,
+                                boolean terminal, String retainedToken, StartDelivery startDelivery) {
+            Socket retired = null;
+            boolean accepted = false;
+            synchronized (this) {
+                String token = retainedToken;
+                if (reliable) token = queueMessage(message);
+                if (out == null || clientSocket == null || closeAfterWrites || !keepListening)
+                    return false;
+                int bytes = modifiedUtfBytes(message);
+                if (clockReply && bytes >= 0) bytes += 128; // Writer adds the epoch and current timestamp.
+                if (bytes < 0 || outbound.size() >= MAX_PENDING_CLIENT_WRITES
+                        || bytes > MAX_PENDING_CLIENT_WRITE_BYTES - outboundBytes) {
+                    Log.w(TAG, "Retiring slow TCP client with a full outbound queue: " + clientID);
+                    retired = detachLocked(true);
+                } else {
+                    OutboundMessage pending = new OutboundMessage(message, token, clockReply, terminal, bytes, startDelivery);
+                    outbound.offer(pending);
+                    outboundBytes += bytes;
+                    closeAfterWrites = terminal;
+                    if (writeWorker != null || startWriterLocked()) {
+                        accepted = true;
+                        notifyAll();
+                    } else {
+                        retired = detachLocked(true);
+                        // The queued frame owns completion even though no worker could start.
+                        accepted = startDelivery != null;
+                    }
+                }
             }
-            SocketWriteDeadline deadline = new SocketWriteDeadline(clientSocket);
-            final ScheduledFuture<?> timeout;
+            closeSocket(retired);
+            return accepted;
+        }
+
+        private boolean startWriterLocked() {
+            if (!mClientWriterSlots.tryAcquire()) return false;
+            Thread worker = new Thread(this::writeMessages, "SimpleCoil TCP writer " + clientID);
+            worker.setDaemon(true);
+            writeWorker = worker;
+            mClientWriters.add(worker);
             try {
-                timeout = mWriteWatchdog.schedule(deadline, CLIENT_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            } catch (RejectedExecutionException stopped) {
-                if (queueFailed) queueMessage(message);
-                return false;
-            }
-            try {
-                out.writeUTF(message);
-                out.flush();
-                // If expiry won the race with a successful flush, retire this
-                // stream before another write can use the same native socket.
-                if (!deadline.complete())
-                    throw new SocketTimeoutException("TCP client write exceeded its deadline");
-                if (BuildConfig.DEBUG && !message.equals(TcpServer.TCP_SERVER_PING))
-                    Log.i(TAG, "sent(" + clientID + "): " + message);
+                worker.start();
                 return true;
-            } catch (IOException e) {
-                //Log.e(TAG, "IO Error:", e);
-                e.printStackTrace();
-                if (queueFailed)
-                    queueMessage(message);
-                // The failed write may have emitted only part of its frame.
-                // Keep pending events, but never append to that damaged stream.
-                close();
-                connectionFailed = true;
+            } catch (RuntimeException failure) {
+                writeWorker = null;
+                mClientWriters.remove(worker);
+                mClientWriterSlots.release();
+                Log.w(TAG, "Could not start TCP client writer", failure);
                 return false;
-            } finally {
-                deadline.complete();
-                timeout.cancel(false);
             }
         }
 
-        private void queueMessage(String message) {
-            if (messageQueue == null)
-                messageQueue = new LinkedList<>();
-            while (messageQueue.size() >= MAX_QUEUED_CLIENT_EVENTS)
-                messageQueue.poll();
-            messageQueue.offer(message);
+        private boolean isCurrentLocked(OutboundMessage message) {
+            Map<Integer, ClientData> clients = mClientData;
+            return keepListening && clientSocket == message.socket && out == message.output
+                    && connectionGeneration == message.generation
+                    && (message.playerID == 0 || mPlayerID == message.playerID
+                    && playerIdentity.equals(message.identity))
+                    && (closeAfterWrites || clients != null && clients.get(clientID) == this);
         }
 
-        public synchronized void close() {
-            connectionFailed = false;
-            if (clientSocket == null) return;
-            try { clientSocket.close(); } catch (IOException e) {/*do nothing*/}
-            try { if (in != null) in.close(); } catch (IOException e) {/*do nothing*/}
-            try { if (is != null) is.close(); } catch (IOException e) {/*do nothing*/}
-            try { if (out != null) out.close(); } catch (IOException e) {/*do nothing*/}
-            try { if (os != null) os.close(); } catch (IOException e) {/*do nothing*/}
+        private void writeMessages() {
+            try {
+                while (true) {
+                    OutboundMessage pending;
+                    synchronized (this) {
+                        if (outbound.isEmpty() && clientSocket != null && keepListening) {
+                            writing = false;
+                            notifyAll();
+                            wait(CLIENT_WRITER_IDLE_MS);
+                        }
+                        pending = outbound.poll();
+                        if (pending == null) return;
+                        outboundBytes -= pending.bytes;
+                        if (!isCurrentLocked(pending)) {
+                            pending.finish(false, true);
+                            continue;
+                        }
+                        writing = true;
+                    }
+                    String message = pending.message;
+                    SocketWriteDeadline deadline = new SocketWriteDeadline(pending.socket);
+                    ScheduledFuture<?> timeout = null;
+                    try {
+                        if (pending.clockReply) {
+                            JSONObject reply = new JSONObject(message)
+                                    .put(JSON_CLOCK_SEND, SystemClock.elapsedRealtime())
+                                    .put(JSON_CLOCK_EPOCH, mClockEpoch);
+                            message = TCPMESSAGE_PREFIX + TCPPREFIX_JSON + reply;
+                        }
+                        timeout = mWriteWatchdog.schedule(deadline, CLIENT_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                        // Never hold a client monitor, roster semaphore, or host-state lock here.
+                        pending.output.writeUTF(message);
+                        pending.output.flush();
+                        if (!deadline.complete()) throw new SocketTimeoutException("TCP client write exceeded its deadline");
+                        Socket retired = null;
+                        boolean delivered;
+                        synchronized (this) {
+                            delivered = isCurrentLocked(pending);
+                            if (delivered) {
+                                if (pending.reliableToken != null) removeQueuedMessage(pending.reliableToken);
+                                if (pending.terminal) retired = detachLocked(true);
+                            }
+                            writing = false;
+                            notifyAll();
+                        }
+                        closeSocket(retired);
+                        pending.finish(delivered, false);
+                        if (BuildConfig.DEBUG && !message.equals(TCP_SERVER_PING))
+                            Log.i(TAG, "sent(" + clientID + "): " + message);
+                    } catch (IOException | JSONException | RuntimeException failure) {
+                        Socket retired = null;
+                        synchronized (this) {
+                            // An old stream failing after rejoin must never retire its replacement.
+                            if (clientSocket == pending.socket && connectionGeneration == pending.generation)
+                                retired = detachLocked(true);
+                            writing = false;
+                            notifyAll();
+                        }
+                        closeSocket(retired);
+                        pending.finish(false, false);
+                        Log.w(TAG, "TCP client write failed: " + clientID, failure);
+                    } finally {
+                        deadline.complete();
+                        if (timeout != null) timeout.cancel(false);
+                    }
+                }
+            } catch (InterruptedException cancelled) {
+                Thread.currentThread().interrupt();
+            } finally {
+                mClientWriters.remove(Thread.currentThread());
+                mClientWriterSlots.release();
+                Socket retired = null;
+                synchronized (this) {
+                    if (writeWorker == Thread.currentThread()) {
+                        writeWorker = null;
+                        writing = false;
+                        // Enqueue can race the idle worker's exit. Transfer its pending work.
+                        if (!outbound.isEmpty() && clientSocket != null && keepListening
+                                && !startWriterLocked()) retired = detachLocked(true);
+                        notifyAll();
+                    }
+                }
+                closeSocket(retired);
+            }
+        }
+
+        private String queueMessage(String message) {
+            if (messageQueue == null) messageQueue = new LinkedList<>();
+            while (messageQueue.size() >= MAX_QUEUED_CLIENT_EVENTS) messageQueue.poll();
+            // Identity distinguishes repeated equal events when old bounded entries were evicted.
+            String token = new String(message);
+            messageQueue.offer(token);
+            return token;
+        }
+
+        private void removeQueuedMessage(String token) {
+            if (messageQueue == null) return;
+            Iterator<String> events = messageQueue.iterator();
+            while (events.hasNext()) {
+                if (events.next() == token) { events.remove();return; }
+            }
+        }
+
+        private Socket detachLocked(boolean failed) {
+            Socket socket = clientSocket;
+            if (socket != null) mClientSockets.remove(socket);
+            connectionGeneration++;
             clientSocket = null;
             in = null;
             is = null;
             out = null;
             os = null;
+            for (OutboundMessage pending : outbound) pending.finish(false, true);
+            outbound.clear();
+            outboundBytes = 0;
+            closeAfterWrites = false;
+            connectionFailed = failed;
+            notifyAll();
+            return socket;
         }
 
-        public synchronized void rejoin(Socket s) {
+        public void close() {
+            Socket retired;
+            synchronized (this) { retired = detachLocked(false); }
+            // Closing the native socket cancels an in-flight write. Closing its
+            // BufferedOutputStream would flush under the caller's roster lock.
+            closeSocket(retired);
+        }
+
+        public void rejoin(Socket socket) {
             close();
-            if (!initialize(s, clientID))
-                return;
-            while (!messageQueue.isEmpty()) {
-                if (BuildConfig.DEBUG)
-                    Log.d(TAG, "sending queued event to " + clientID);
-                // Only dequeue after a successful write and flush. A replacement
-                // connection can fail too; preserve the remainder for another rejoin.
-                if (!sendTCPMessage(messageQueue.peek()))
-                    break;
-                messageQueue.remove();
+            synchronized (this) {
+                if (!initialize(socket, clientID)) return;
+                for (String message : new ArrayList<>(messageQueue))
+                    enqueue(message, false, false, false, message);
             }
         }
     }
@@ -3956,7 +4216,7 @@ public class TcpServer extends Service {
                                             Log.d(TAG, "unknown tcp message received");
                                         }
                                     } else if (message.startsWith(NetMsg.MESSAGE_PREFIX)) {
-                                        entry.getValue().sendTCPMessage(NetMsg.NETMSG_VERSIONERROR);
+                                        entry.getValue().sendTCPMessageAndClose(NetMsg.NETMSG_VERSIONERROR);
                                         break;
                                     }
                                 }
@@ -4251,7 +4511,7 @@ public class TcpServer extends Service {
                 return;
             }
             if (player.has(JSON_PLAYERSETTINGS)) {
-                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE || mStartAnnounced
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE || mStartAnnounced || mStartingGame
                         || Globals.getInstance().mTournamentMode || !Globals.getInstance().mAllowPlayerSettings || Globals.getInstance().mOnlyServerSettings
                         || client.mPlayerID <= 0 || !Globals.isValidPlayerID(client.mPlayerID)) {
                     Log.e(TAG, "Player " + client.mPlayerID + "not allowed to send player settings");
@@ -4283,6 +4543,8 @@ public class TcpServer extends Service {
                     try {
                         // The host can revoke permission while this request waits for the lock.
                         if (Globals.getInstance().mTournamentMode || !Globals.getInstance().mAllowPlayerSettings || Globals.getInstance().mOnlyServerSettings
+                                || mStartingGame || mStartAnnounced
+                                || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE
                                 || playerID != client.mPlayerID) {
                             Log.w(TAG, "Ignoring player settings after permission or identity changed");
                         } else {
@@ -4318,7 +4580,7 @@ public class TcpServer extends Service {
                 return;
             }
             if (player.has(JSON_PLAYERNAMECHANGE)) {
-                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE || mStartAnnounced)
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE || mStartAnnounced || mStartingGame)
                     return;
                 int id;
                 String playerName;
@@ -4397,6 +4659,18 @@ public class TcpServer extends Service {
             }
             if (client.clientSocket == null)
                 return;
+            synchronized (mServerStateLock) {
+                if (mStartingGame && !mStartAnnounced) {
+                    // New sockets retry once the frozen START has committed.
+                    // Transferring an existing player's socket here would lose
+                    // its non-replayable START frame on the retired generation.
+                    if (client.mPlayerID == 0) {
+                        client.close();
+                        mClientData.remove(client.clientID);
+                    }
+                    return;
+                }
+            }
             String identity = player.optString(LiveJoin.IDENTITY, client.playerIdentity);
             if (!RoundRoster.validIdentity(identity)) return;
             int requestedTeam = player.optInt(LiveJoin.TEAM, 0);
@@ -4440,16 +4714,14 @@ public class TcpServer extends Service {
                     member = null;
                 }
                 if (member == null) {
-                    client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
+                    client.sendTCPMessageAndClose(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
                             + "{\"" + LiveJoin.REJECTED + "\":true}");
-                    client.close();
                     mClientData.remove(client.clientID);
                     return;
                 }
             } else if (requestedTeam != 0) {
-                client.sendTCPMessage(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
+                client.sendTCPMessageAndClose(TCPMESSAGE_PREFIX + TCPPREFIX_JSON
                         + "{\"" + LiveJoin.REJECTED + "\":true}");
-                client.close();
                 mClientData.remove(client.clientID);
                 return;
             }
@@ -4477,7 +4749,21 @@ public class TcpServer extends Service {
                         return;
                     }
                     Log.d(TAG, "rejoining " + client.clientID + " to " + entry.getValue().clientID);
-                    entry.getValue().rejoin(client.clientSocket);
+                    synchronized (mServerStateLock) {
+                        Socket replacement;
+                        synchronized (client) {
+                            // An unregistered connection may already be writing a ping.
+                            // Its old watchdog must never own a transferred socket.
+                            if (client.writing || client.clientSocket == null || !keepListening) {
+                                client.close();
+                                mClientData.remove(client.clientID);
+                                return;
+                            }
+                            replacement = client.clientSocket;
+                            client.detachLocked(false);
+                        }
+                        entry.getValue().rejoin(replacement);
+                    }
                     mClientData.remove(client.clientID);
                     client = entry.getValue();
                     break;
@@ -4485,11 +4771,10 @@ public class TcpServer extends Service {
             }
             if (client.clientSocket == null)
                 return; // A replacement socket can fail while its streams are opened.
-            // Once a roster-sensitive start is queued, only an already-registered
-            // player may reconnect. A fresh ID would invalidate the frozen
-            // assignments/Boss scaling or receive a partial round snapshot.
-            if (requestedTeam == 0 && (Globals.getInstance().mBalancedRandom || Globals.getInstance().mBossMode)
-                    && client.mPlayerID == 0
+            // Until an actual START flush commits this round, the frozen roster
+            // is final in every mode. A fresh ID cannot join an apparent idle
+            // lobby after the START frames have already been queued.
+            if (requestedTeam == 0 && client.mPlayerID == 0
                     && mStartingGame && !mStartAnnounced) {
                 client.close();
                 mClientData.remove(client.clientID);
@@ -4711,6 +4996,8 @@ public class TcpServer extends Service {
             if (cancellationOwner != null && mCancellationThread != cancellationOwner)
                 return;
             keepListening = false;
+            mPendingStartDelivery = null;
+            mStartingGame = false;
             mTcpServerReady = false;
             cancelBalancedCheckInTimeoutLocked();
             if (mClockRosterUpdate != null) {
@@ -4725,7 +5012,10 @@ public class TcpServer extends Service {
             listener = mListenSocket;
             worker = mServerThread;
             clients = mClientThread;
-            tasks = mClientTasks.toArray(new Thread[0]);
+            List<Thread> pendingTasks = new ArrayList<>(mClientTasks);
+            pendingTasks.addAll(mClientWriters);
+            tasks = pendingTasks.toArray(new Thread[0]);
+            sockets.addAll(mClientSockets);
             if (mClientData != null) {
                 for (ClientData client : mClientData.values())
                     sockets.add(client.clientSocket);
@@ -4748,6 +5038,17 @@ public class TcpServer extends Service {
         // of its next socket read. Cancelling the listener alone cannot wake it.
         if (clients != null && clients != Thread.currentThread())
             clients.interrupt();
+    }
+
+    private static int modifiedUtfBytes(String message) {
+        if (message == null) return -1;
+        int bytes = 2;
+        for (int i = 0; i < message.length(); i++) {
+            char value = message.charAt(i);
+            bytes += value >= 1 && value <= 127 ? 1 : value <= 2047 ? 2 : 3;
+            if (bytes - 2 > 65535) return -1;
+        }
+        return bytes;
     }
 
     private static void closeListener(ServerSocket socket) {

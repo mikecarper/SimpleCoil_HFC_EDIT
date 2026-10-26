@@ -502,8 +502,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static int mLives = 0;
 
     private static class LastHitData {
-        int playerID;
+        int playerID = Globals.INVALID_PLAYER_ID;
         byte shotID;
+
+        void remember(int playerID, byte shotID) {
+            this.playerID = playerID > 0 ? playerID : Globals.INVALID_PLAYER_ID;
+            this.shotID = shotID;
+        }
     }
 
     private static final class WeaponCandidate {
@@ -518,6 +523,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private final LastHitData mLastHitData1 = new LastHitData();
     private final LastHitData mLastHitData2 = new LastHitData();
+    private final LastHitData mSecondaryLastHitData1 = new LastHitData();
+    private final LastHitData mSecondaryLastHitData2 = new LastHitData();
 
     private final GunBattery mGunBattery = new GunBattery(SystemClock::elapsedRealtime);
     private final GunBattery mSecondGunBattery = new GunBattery(SystemClock::elapsedRealtime);
@@ -4889,10 +4896,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
      * round must not suppress a real hit in the next one.
      */
     private void resetRoundTelemetryState() {
-        mLastHitData1.playerID = Globals.INVALID_PLAYER_ID;
-        mLastHitData1.shotID = 0;
-        mLastHitData2.playerID = Globals.INVALID_PLAYER_ID;
-        mLastHitData2.shotID = 0;
+        mLastHitData1.remember(0, (byte) 0);
+        mLastHitData2.remember(0, (byte) 0);
+        mSecondaryLastHitData1.remember(0, (byte) 0);
+        mSecondaryLastHitData2.remember(0, (byte) 0);
+        mDualGunHitDeduper.reset();
         mLastHitMessage = 0;
         Arrays.fill(mLastAlreadyDeadFeedbackAt, 0);
         mLastShotFired = 0;
@@ -4999,7 +5007,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             Globals.getInstance().mEndGameVotes = 0;
             Globals.getInstance().mEndGameVoteRequested = false;
         }
-        mDualGunHitDeduper.reset();
         mKillStreakVoice.resetStreak();
         clearCombatFeedback();
         setGameVolumeToMaximum();
@@ -10477,10 +10484,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             byte shotsRemaining = data[RECOIL_OFFSET_SHOTS_REMAINING];
             //byte status = data[RECOIL_OFFSET_STATUS];
             //int buttons = data[RECOIL_OFFSET_BUTTONS];
-            int hit_by_player1 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY1]);
+            LastHitData lastHitData1 = secondary ? mSecondaryLastHitData1 : mLastHitData1;
+            LastHitData lastHitData2 = secondary ? mSecondaryLastHitData2 : mLastHitData2;
+            int receivedHitBy1 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY1]);
             // Often, hit_by_player2 is the same player ID as player1
-            int hit_by_player2 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY2]);
-            if (isLocalBoss() && mSecondaryCommunicating) {
+            int receivedHitBy2 = validatedHitSource(data[RECOIL_OFFSET_HIT_BY2]);
+            byte receivedShot1 = (byte) (data[RECOIL_OFFSET_HIT_BY1_SHOTID]
+                    & (receivedHitBy1 == Globals.GRENADE_PLAYER_ID ? 0xff : 0x07));
+            byte receivedShot2 = (byte) (data[RECOIL_OFFSET_HIT_BY2_SHOTID]
+                    & (receivedHitBy2 == Globals.GRENADE_PLAYER_ID ? 0xff : 0x07));
+            int hit_by_player1 = receivedHitBy1;
+            int hit_by_player2 = receivedHitBy2;
+            // Remember primary hits before gun 2's first packet, too. That
+            // first packet must not count the same physical hit a second time.
+            if (isLocalBoss()) {
                 long seenAt = SystemClock.elapsedRealtime();
                 int slot = secondary ? 1 : 0;
                 int source1 = hit_by_player1 == Globals.GRENADE_PLAYER_ID
@@ -10652,12 +10669,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 // Only the right-most 3 bits make up a normal shot ID. Grenades
                 // instead use the complete byte for a grenade ID and command, so
                 // retain all of it when filtering repeated telemetry packets.
-                byte shot_id1 = hit_by_player1 == Globals.GRENADE_PLAYER_ID
-                        ? data[RECOIL_OFFSET_HIT_BY1_SHOTID]
-                        : (byte)(data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0x07);
-                byte shot_id2 = hit_by_player2 == Globals.GRENADE_PLAYER_ID
-                        ? data[RECOIL_OFFSET_HIT_BY2_SHOTID]
-                        : (byte)(data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0x07);
+                byte shot_id1 = receivedShot1;
+                byte shot_id2 = receivedShot2;
                 //Log.e(TAG, "Hit by " + hit_by_player1);
                 /*if (hit_by_player2 != 0) {
                     Log.e(TAG, "hitdata: " + Integer.toHexString(hit_by_player1) + " " + Integer.toHexString(data[RECOIL_OFFSET_HIT_BY1_SHOTID] & 0xFF) + " " + Integer.toHexString(hit_by_player2) + " " + Integer.toHexString(data[RECOIL_OFFSET_HIT_BY2_SHOTID] & 0xFF));
@@ -10680,7 +10693,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 if (!roundEndReportPending() && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
                     if (hit_by_player1 != 0 && (hit_by_player1 == Globals.GRENADE_PLAYER_ID
                             || !isBenchedHit(hitByPlayer1ID))) {
-                    if ((mLastHitData1.playerID == hit_by_player1 && mLastHitData1.shotID == shot_id1) || (mLastHitData2.playerID == hit_by_player1 && mLastHitData2.shotID == shot_id1)) {
+                    if ((lastHitData1.playerID == hit_by_player1 && lastHitData1.shotID == shot_id1) || (lastHitData2.playerID == hit_by_player1 && lastHitData2.shotID == shot_id1)) {
                         //Log.e(TAG, "Hit by 1 is using same shot ID from a previous hit, filter!" + hit_by_player1 + " " + data[RECOIL_OFFSET_HIT_BY1_SHOTID]);
                     } else {
                         if (playerWasAlreadyEliminated) {
@@ -10726,7 +10739,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     }
                     }
                     boolean duplicateInPacket = hit_by_player2 == hit_by_player1 && shot_id2 == shot_id1;
-                    if (duplicateInPacket || (mLastHitData1.playerID == hit_by_player2 && mLastHitData1.shotID == shot_id2) || (mLastHitData2.playerID == hit_by_player2 && mLastHitData2.shotID == shot_id2)) {
+                    if (duplicateInPacket || (lastHitData1.playerID == hit_by_player2 && lastHitData1.shotID == shot_id2) || (lastHitData2.playerID == hit_by_player2 && lastHitData2.shotID == shot_id2)) {
                         //Log.e(TAG, "Hit by 2 is using same shot ID from a previous hit, filter!");
                     } else if (hit_by_player2 != 0
                             && (hit_by_player2 == Globals.GRENADE_PLAYER_ID
@@ -10770,18 +10783,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             healthRemoved += secondHitDamage;
                         }
                     }
-                    if (hit_by_player1 > 0) {
-                        mLastHitData1.playerID = hit_by_player1;
-                        mLastHitData1.shotID = shot_id1;
-                    } else {
-                        mLastHitData1.playerID = Globals.INVALID_PLAYER_ID;
-                    }
-                    if (hit_by_player2 > 0) {
-                        mLastHitData2.playerID = hit_by_player2;
-                        mLastHitData2.shotID = shot_id2;
-                    } else {
-                        mLastHitData2.playerID = Globals.INVALID_PLAYER_ID;
-                    }
+                    lastHitData1.remember(receivedHitBy1, receivedShot1);
+                    lastHitData2.remember(receivedHitBy2, receivedShot2);
                     //TODO hit conformation for the other player vibration toogle
                     if (healthRemoved != 0) {
                         if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING) {
@@ -10800,8 +10803,11 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     }
                 }
             } else {
-                mLastHitData1.playerID = Globals.INVALID_PLAYER_ID;
-                mLastHitData2.playerID = Globals.INVALID_PLAYER_ID;
+                // An idle packet only clears its own gun. Preserve raw hits
+                // suppressed by the cross-gun filter so a cached packet cannot
+                // become fresh damage when that filter's short window expires.
+                lastHitData1.remember(receivedHitBy1, receivedShot1);
+                lastHitData2.remember(receivedHitBy2, receivedShot2);
             }
             // Before joining, the gun can supply a local player selection.
             // Once joined, its telemetry only confirms the host's assigned ID.

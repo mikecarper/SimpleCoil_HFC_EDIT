@@ -210,6 +210,7 @@ public class TcpServerDispatchRegressionTest {
             sender.join(2000);
             assertFalse("Roster sender did not finish", sender.isAlive());
         }
+        awaitOutboundWrites();
         for (MemorySocket socket : sockets) {
             assertFalse("An oversized name broke another player's TCP connection", socket.closed);
             String frame = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray())).readUTF();
@@ -583,6 +584,7 @@ public class TcpServerDispatchRegressionTest {
             task.join(1000);
             assertFalse(task.isAlive());
         }
+        awaitOutboundWrites();
         DataInputStream messages = new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray()));
         assertStartFrame(messages.readUTF());
         assertEquals("A player received multiple starts for one round", 0, messages.available());
@@ -891,6 +893,7 @@ public class TcpServerDispatchRegressionTest {
             task.join(2000);
             assertFalse("Bounded TCP sender did not finish", task.isAlive());
         }
+        awaitOutboundWrites();
         assertTrue(captureClientTasks().isEmpty());
     }
 
@@ -905,6 +908,7 @@ public class TcpServerDispatchRegressionTest {
         } finally { clientsLock.release(); }
         worker.join(1000);
         assertFalse(worker.isAlive());
+        awaitOutboundWrites();
         assertStartFrame(new DataInputStream(new ByteArrayInputStream(sockets.get(0).bytes.toByteArray())).readUTF());
         assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
         assertEquals(1, clientsLock.availablePermits());
@@ -924,6 +928,7 @@ public class TcpServerDispatchRegressionTest {
         } finally { clientsLock.release(); }
         worker.join(1000);
         assertFalse(worker.isAlive());
+        awaitOutboundWrites();
         assertEquals(0, sockets.get(0).bytes.size());
         assertEquals(0, enemy.bytes.size());
         assertEquals("team", new DataInputStream(new ByteArrayInputStream(teammate.bytes.toByteArray())).readUTF());
@@ -1068,6 +1073,15 @@ public class TcpServerDispatchRegressionTest {
                 () -> set(clients.get(2), "mPlayerID", (byte) 2));
         assertEquals("Newly registered player received a pre-registration snapshot", 0, joining.bytes.size());
         assertTrue(sockets.get(0).bytes.size() > 0);
+    }
+
+    @Test
+    public void queuedPlayerEventCannotFollowADifferentIdentityOnTheSameRegisteredSocket() throws Exception {
+        dispatchThenChange(() -> sendPlayer(true), () ->
+                set(clients.get(1), "playerIdentity", java.util.UUID.randomUUID().toString()));
+        assertEquals("A previous person's event followed the same socket and player ID", 0,
+                sockets.get(0).bytes.size());
+        assertTrue(queuedMessages(1).isEmpty());
     }
 
     @Test
@@ -1445,7 +1459,10 @@ public class TcpServerDispatchRegressionTest {
     private void awaitBalancedModeTasks() throws Exception {
         for (int pass = 0; pass < 10; pass++) {
             List<Thread> tasks = captureClientTasks();
-            if (tasks.isEmpty()) return;
+            if (tasks.isEmpty()) {
+                awaitOutboundWrites();
+                return;
+            }
             for (Thread task : tasks) {
                 task.join(2000);
                 assertFalse("Balanced mode task did not finish", task.isAlive());
@@ -1571,6 +1588,21 @@ public class TcpServerDispatchRegressionTest {
         assertTrue(sockets.get(0).closed);
     }
 
+    @Test
+    public void aFailedStartRecipientDoesNotPreventAHealthyPlayersStartConfirmation() throws Exception {
+        MemorySocket healthy = new MemorySocket();
+        addClient(2, healthy);
+        set(clients.get(1), "out", new DataOutputStream(new OutputStream() {
+            @Override public void write(int value) throws IOException { throw new IOException("Disconnected"); }
+        }));
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
+        assertTrue("Failed start recipient kept its damaged socket", sockets.get(0).closed);
+        assertFalse("A failed recipient closed a healthy player's socket", healthy.closed);
+        assertStartFrame(new DataInputStream(new ByteArrayInputStream(healthy.bytes.toByteArray())).readUTF());
+        assertTrue("A successfully flushed start never reached the host UI",
+                server.events.contains(NetMsg.NETMSG_STARTGAME));
+    }
+
     private void assertLaterJoinerDoesNotReceive(CheckedAction send, int playerID) throws Exception {
         MemorySocket newcomer = new MemorySocket();
         dispatchThenChange(send, () -> addClient(playerID, newcomer));
@@ -1599,6 +1631,7 @@ public class TcpServerDispatchRegressionTest {
         } finally { clientsLock.release(); }
         worker.join(1000);
         assertFalse("Sender did not finish after the membership change", worker.isAlive());
+        awaitOutboundWrites();
         assertEquals(1, clientsLock.availablePermits());
     }
 
@@ -1646,6 +1679,7 @@ public class TcpServerDispatchRegressionTest {
         } finally { clientsLock.release(); }
         worker.join(1000);
         assertFalse(worker.isAlive());
+        awaitOutboundWrites();
         assertTrue(sockets.get(0).bytes.size() > 0);
         assertEquals(1, clientsLock.availablePermits());
     }
@@ -1889,26 +1923,31 @@ public class TcpServerDispatchRegressionTest {
 
     @Test
     public void clockSendTimestampExcludesWaitingForAnEarlierWriter() throws Exception {
-        Object client = clients.get(1);
+        GateSocket socket = new GateSocket();
+        addClient(1, socket);
+        server.sendTCPMessageAll("earlier frame");
+        assertTrue("Earlier frame did not enter the controlled writer",
+                socket.writing.await(1, TimeUnit.SECONDS));
         Thread probe = new Thread(() -> {
             try { parseClock(1, new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, 123456)); }
             catch (Throwable failure) { failures.add(failure); }
         });
         workers.add(probe);
-        long releasedAt;
-        synchronized (client) {
+        long releasedAt = -1;
+        try {
             probe.start();
-            long deadline = SystemClock.elapsedRealtime() + 1000;
-            while (probe.getState() != Thread.State.BLOCKED && SystemClock.elapsedRealtime() < deadline)
-                Thread.sleep(1);
-            assertEquals("Clock reply never reached the contended writer", Thread.State.BLOCKED, probe.getState());
+            probe.join(500);
+            assertFalse("Queuing a clock reply waited for an earlier socket write", probe.isAlive());
             Thread.sleep(100);
             releasedAt = SystemClock.elapsedRealtime();
+        } finally {
+            socket.released.countDown();
         }
-        probe.join(1000);
-        assertFalse(probe.isAlive());
+        awaitOutboundWrites();
         assertTrue(failures.isEmpty());
-        JSONObject reply = readJson(sockets.get(0));
+        DataInputStream frames = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray()));
+        assertEquals("earlier frame", frames.readUTF());
+        JSONObject reply = readJsonFrame(frames.readUTF());
         assertTrue(reply.getLong(TcpServer.JSON_CLOCK_RECEIVE) < releasedAt);
         assertTrue("Writer backlog was counted as network delay",
                 reply.getLong(TcpServer.JSON_CLOCK_SEND) >= releasedAt);
@@ -2063,6 +2102,7 @@ public class TcpServerDispatchRegressionTest {
             task.join(2000);
             assertFalse("Queued start/roster task did not finish", task.isAlive());
         }
+        awaitOutboundWrites();
         for (MemorySocket socket : sockets) {
             DataInputStream frames = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray()));
             int prefixLength = TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length();
@@ -2465,6 +2505,7 @@ public class TcpServerDispatchRegressionTest {
     }
 
     private JSONObject readJson(MemorySocket socket) throws Exception {
+        awaitOutboundWrites();
         String message = new DataInputStream(new ByteArrayInputStream(socket.bytes.toByteArray())).readUTF();
         return readJsonFrame(message);
     }
@@ -2553,7 +2594,26 @@ public class TcpServerDispatchRegressionTest {
         Object client = clients.get(playerID);
         Field queue = client.getClass().getDeclaredField("messageQueue");
         queue.setAccessible(true);
-        return (Queue<?>) queue.get(client);
+        synchronized (client) {
+            return new java.util.LinkedList<>((Queue<?>) queue.get(client));
+        }
+    }
+
+    /** Sender task completion only means its frames were accepted by each FIFO. */
+    private void awaitOutboundWrites() throws Exception {
+        long deadline = SystemClock.elapsedRealtime() + 3_000;
+        for (Object client : new ArrayList<>(clients.values())) {
+            while (true) {
+                Thread writer;
+                synchronized (client) { writer = (Thread) get(client, "writeWorker"); }
+                if (writer == null) break;
+                if (!workers.contains(writer)) workers.add(writer);
+                writer.setUncaughtExceptionHandler((thread, failure) -> failures.add(failure));
+                long remaining = deadline - SystemClock.elapsedRealtime();
+                assertTrue("Per-client outbound writer did not drain", remaining > 0);
+                writer.join(Math.min(remaining, 100));
+            }
+        }
     }
 
     private static void set(Object target, String name, Object value) throws Exception {
@@ -2604,6 +2664,38 @@ public class TcpServerDispatchRegressionTest {
         @Override public InputStream getInputStream() { return new ByteArrayInputStream(new byte[0]); }
         @Override public OutputStream getOutputStream() { return bytes; }
         @Override public void close() { closed = true; }
+    }
+
+    /** Holds one frame while allowing its socket to remain usable for the next frame. */
+    private static final class GateSocket extends MemorySocket {
+        final CountDownLatch writing = new CountDownLatch(1);
+        final CountDownLatch released = new CountDownLatch(1);
+        private boolean first = true;
+
+        @Override public OutputStream getOutputStream() {
+            return new OutputStream() {
+                @Override public void write(int value) throws IOException {
+                    write(new byte[] {(byte) value}, 0, 1);
+                }
+                @Override public void write(byte[] values, int offset, int length) throws IOException {
+                    if (first) {
+                        first = false;
+                        writing.countDown();
+                        try {
+                            if (!released.await(2, TimeUnit.SECONDS))
+                                throw new IOException("Controlled frame was not released");
+                        } catch (InterruptedException cancelled) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("Controlled writer was interrupted", cancelled);
+                        }
+                    }
+                    if (closed) throw new IOException("Controlled socket is closed");
+                    bytes.write(values, offset, length);
+                }
+            };
+        }
+
+        @Override public void close() { super.close();released.countDown(); }
     }
 
     private static final class BlockingSocket extends MemorySocket {
