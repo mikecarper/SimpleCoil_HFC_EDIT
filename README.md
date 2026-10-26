@@ -125,6 +125,12 @@ its own recovery. Returning to an already connected gun does not reconnect it
 or trigger an extra reload. Reload confirmations received while the app is
 paused are recovered on resume, retaining the original completion time so the
 configured reload wait is not restarted.
+During play, a failed reload stage retries twice, 250 ms apart, using fresh
+command IDs. Retrying the refill does not repeat the reload wait or change the
+other gun. The periodic game update also recovers missed confirmations and
+resumes an ordinary reload whose wait finished while temporarily blocked.
+Elimination, EMP, round completion and disconnect cancel obsolete retries;
+exhausted retries leave another manual reload available.
 
 ### Recorded announcements
 

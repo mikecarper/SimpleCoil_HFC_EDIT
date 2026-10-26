@@ -440,6 +440,10 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private int mSecondaryEmptyTriggerCount;
     private byte[] mSecondaryPendingReloadCommand;
     private CountDownTimer mSecondaryReloadTimer;
+    private boolean mSecondaryOrdinaryReload;
+    private boolean mSecondaryReloadWaitFinished;
+    private int mSecondaryReloadWriteRetries;
+    private Runnable mSecondaryReloadWriteRetry;
     private final ArrayList<WeaponCandidate> mSecondaryWeaponCandidates = new ArrayList<>();
     private boolean mScanningSecondary;
     private boolean mSecondaryScanPendingPermission;
@@ -664,6 +668,12 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private static final int ORIGINAL_ZOMBIE_PROTECTED_KILLS = 2;
     private int mReloading = RELOADING_STATE_ELIMINATED;
     private byte[] mPendingReloadCommand;
+    private boolean mOrdinaryReload;
+    private boolean mReloadWaitFinished;
+    private int mReloadWriteRetries;
+    private Runnable mReloadWriteRetry;
+    private static final int RELOAD_WRITE_MAX_RETRIES = 2;
+    private static final long RELOAD_WRITE_RETRY_MS = 250;
 
     private int mCurrentShotMode = Globals.SHOT_MODE_SINGLE;
     private boolean mBossWeaponInitialized = false;
@@ -967,6 +977,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void resetSecondaryBluetoothServices() {
+        clearReloadRecovery(true);
         if (mSecondaryReconnectRunnable != null) {
             mWeaponPairingHandler.removeCallbacks(mSecondaryReconnectRunnable);
             mSecondaryReconnectRunnable = null;
@@ -1143,6 +1154,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         @Override public void run() {
             if (!keepGunSessionRunning())
                 return;
+            recoverCompletedReloadWrites();
             if (!mActivityResumed) {
                 if (mReady || mMatchSession.active()
                         || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) updateSharedLobby();
@@ -1151,7 +1163,6 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 return;
             }
             updateSharedLobby();
-            finishUnblockedRoundStartReloads();
             if (Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
                     && Globals.getInstance().mPowerupQrRequired != 0) {
                 updatePowerupScanButton();
@@ -6145,6 +6156,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             startSecondaryReload(reloadStatus);
         if (!superseding && mReloading != RELOADING_STATE_NONE)
             return;
+        clearReloadRecovery(false);
+        mOrdinaryReload = reloadStatus == RELOADING_STATE_STARTED;
         // Elimination must supersede even a refill whose acknowledgement is in flight.
         if (superseding) {
             stopReloadVoiceReminder();
@@ -6192,6 +6205,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 || (roundStart && mPendingReloadCommand != null))
             return;
         mReloading = RELOADING_STATE_FINISHING;
+        cancelReloadWriteRetry(false);
         mEmptyTriggerCount = 0;
         updateSecondGunControls();
         Log.d(TAG, "Finishing reload");
@@ -6216,7 +6230,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void prepareRoundStartReloads() {
         if (!isInitialRoundCountdown() || gameStartRemaining() == 0)
             return;
-        finishUnblockedRoundStartReloads();
+        finishUnblockedReloads();
         long now = SystemClock.elapsedRealtime();
         if (mReloading == RELOADING_STATE_ELIMINATED && mPendingReloadCommand == null
                 && mCountdownPrimaryReloadAttempts < COUNTDOWN_RELOAD_MAX_ATTEMPTS
@@ -6238,13 +6252,125 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         startReload(RELOADING_STATE_ROUND_START, false);
     }
 
-    /** A retained EMP may temporarily block the refill after its disable ACK. */
-    private void finishUnblockedRoundStartReloads() {
+    /** A transient block must not strand a reload whose configured wait finished. */
+    private void finishUnblockedReloads() {
         if (mReloading == RELOADING_STATE_ROUND_START && mPendingReloadCommand == null)
+            finishReload();
+        else if (mReloading == RELOADING_STATE_STARTED && mReloadWaitFinished
+                && mReloadTimer == null && mPendingReloadCommand == null)
             finishReload();
         if (isLocalBoss() && mSecondaryReloading == RELOADING_STATE_ROUND_START
                 && mSecondaryPendingReloadCommand == null)
             finishSecondaryReload();
+        else if (isLocalBoss() && mSecondaryReloading == RELOADING_STATE_STARTED
+                && mSecondaryReloadWaitFinished && mSecondaryReloadTimer == null
+                && mSecondaryPendingReloadCommand == null)
+            finishSecondaryReload();
+    }
+
+    private void cancelReloadWriteRetry(boolean secondary) {
+        Runnable retry = secondary ? mSecondaryReloadWriteRetry : mReloadWriteRetry;
+        if (retry != null) mWeaponPairingHandler.removeCallbacks(retry);
+        if (secondary) {
+            mSecondaryReloadWriteRetry = null;
+            mSecondaryReloadWriteRetries = 0;
+        } else {
+            mReloadWriteRetry = null;
+            mReloadWriteRetries = 0;
+        }
+    }
+
+    private void clearReloadRecovery(boolean secondary) {
+        cancelReloadWriteRetry(secondary);
+        if (secondary) {
+            mSecondaryOrdinaryReload = false;
+            mSecondaryReloadWaitFinished = false;
+        } else {
+            mOrdinaryReload = false;
+            mReloadWaitFinished = false;
+        }
+    }
+
+    /** Retry this failed stage, preserving the normal wait and the other gun. */
+    private boolean retryReloadWrite(boolean secondary, byte[] failed) {
+        BluetoothLeService service = secondary ? mSecondaryBluetoothLeService : mBluetoothLeService;
+        BluetoothGattCharacteristic characteristic = secondary
+                ? mSecondaryCommandCharacteristic : mCommandCharacteristic;
+        int state = secondary ? mSecondaryReloading : mReloading;
+        boolean ordinary = secondary ? mSecondaryOrdinaryReload : mOrdinaryReload;
+        if (!ordinary || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                || roundEndReportPending() || hasPowerup(Powerups.EMP) || hasPendingEmpReplay()
+                || service == null || characteristic == null || !service.isConnected()
+                || (state != RELOADING_STATE_STARTED && state != RELOADING_STATE_FINISHING))
+            return false;
+        if ((secondary ? mSecondaryReloadWriteRetry : mReloadWriteRetry) != null)
+            return true;
+        int retries = secondary ? mSecondaryReloadWriteRetries : mReloadWriteRetries;
+        if (retries >= RELOAD_WRITE_MAX_RETRIES)
+            return false;
+        if (secondary) mSecondaryReloadWriteRetries++;
+        else mReloadWriteRetries++;
+        Runnable retry = new Runnable() {
+            @Override public void run() {
+                if ((secondary ? mSecondaryReloadWriteRetry : mReloadWriteRetry) != this)
+                    return;
+                byte[] pending = secondary ? mSecondaryPendingReloadCommand : mPendingReloadCommand;
+                if (!Arrays.equals(pending, failed)
+                        || service != (secondary ? mSecondaryBluetoothLeService : mBluetoothLeService)
+                        || characteristic != (secondary ? mSecondaryCommandCharacteristic : mCommandCharacteristic)
+                        || state != (secondary ? mSecondaryReloading : mReloading)) {
+                    if (secondary) mSecondaryReloadWriteRetry = null;
+                    else mReloadWriteRetry = null;
+                    return;
+                }
+                // Host events can arrive just before their UI broadcast. Wait
+                // for that event instead of enabling a gun ahead of an EMP/end.
+                if (roundEndReportPending() || hasPendingEmpReplay()) {
+                    mWeaponPairingHandler.postDelayed(this, RELOAD_WRITE_RETRY_MS);
+                    return;
+                }
+                if (secondary) mSecondaryReloadWriteRetry = null;
+                else mReloadWriteRetry = null;
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING
+                        || hasPowerup(Powerups.EMP) || !service.isConnected()
+                        || isFinishing() || isDestroyed()) {
+                    abandonReloadWrite(secondary);
+                    return;
+                }
+                byte[] command = failed.clone();
+                // A fresh ID also avoids a gun treating a retry as a duplicate.
+                command[0] = secondary ? mSecondaryCommandID : mCommandID;
+                if (command[0] == failed[0]) command[0] += COMMAND_ID_INCREMENT;
+                if (secondary) {
+                    mSecondaryCommandID = (byte) (command[0] + COMMAND_ID_INCREMENT);
+                    mSecondaryPendingReloadCommand = command.clone();
+                } else {
+                    mCommandID = (byte) (command[0] + COMMAND_ID_INCREMENT);
+                    mPendingReloadCommand = command.clone();
+                }
+                characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+                service.writeCharacteristic(characteristic, command);
+            }
+        };
+        if (secondary) mSecondaryReloadWriteRetry = retry;
+        else mReloadWriteRetry = retry;
+        mWeaponPairingHandler.postDelayed(retry, RELOAD_WRITE_RETRY_MS);
+        return true;
+    }
+
+    private void abandonReloadWrite(boolean secondary) {
+        clearReloadRecovery(secondary);
+        int state = Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
+                ? RELOADING_STATE_NONE : RELOADING_STATE_ELIMINATED;
+        if (secondary) {
+            mSecondaryPendingReloadCommand = null;
+            mSecondaryReloading = state;
+        } else {
+            mPendingReloadCommand = null;
+            mReloading = state;
+            if (state == RELOADING_STATE_NONE) hideReloadProgress();
+        }
+        updateSecondGunControls();
     }
 
     /** Before its second kill, damage to Infection's original zombie drains ammunition. */
@@ -6611,6 +6737,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         BluetoothGattCharacteristic characteristic = secondary ? mSecondaryCommandCharacteristic : mCommandCharacteristic;
         if (roundEndReportPending() || service == null || characteristic == null || hasPowerup(Powerups.EMP)
                 || Globals.getInstance().mGameState != Globals.GAME_STATE_RUNNING) return;
+        boolean ordinaryRefill = secondary
+                ? mSecondaryOrdinaryReload && mSecondaryReloading == RELOADING_STATE_FINISHING
+                : mOrdinaryReload && mReloading == RELOADING_STATE_FINISHING;
+        clearReloadRecovery(secondary);
+        // Expiring the larger magazine replaces an ordinary refill with a
+        // capped one. That replacement still belongs to the player's reload.
+        if (secondary) mSecondaryOrdinaryReload = ordinaryRefill;
+        else mOrdinaryReload = ordinaryRefill;
         byte[] command = new byte[20];
         command[0] = secondary ? mSecondaryCommandID : mCommandID;
         if (secondary) mSecondaryCommandID += COMMAND_ID_INCREMENT;
@@ -7344,7 +7478,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         } else {
             mEmptyTriggerCount = 0;
             mSecondaryEmptyTriggerCount = 0;
-            finishUnblockedRoundStartReloads();
+            finishUnblockedReloads();
             // Successful countdown preparation needs no write at GO. A failed
             // gun can recover, but do not replace an outstanding disable/refill.
             if (mReloading == RELOADING_STATE_ELIMINATED && mPendingReloadCommand == null)
@@ -7759,7 +7893,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             if (completed != null)
                 mGattUpdateReceiver.onReceive(this, completed);
         }
-        finishUnblockedRoundStartReloads();
+        finishUnblockedReloads();
     }
 
     private boolean hasPendingEmpReplay() {
@@ -8696,6 +8830,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void resetBluetoothServices() {
+        clearReloadRecovery(false);
         cancelWeaponSyncTriggerHint();
         stopReloadVoiceReminder();
         stopConnectionTest();
@@ -8894,6 +9029,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             }
         } else if (BluetoothLeService.ACTION_GATT_DISCONNECTED.equals(action)) {
             mSecondaryConnected = false;
+            clearReloadRecovery(true);
             mSecondaryCommunicating = false;
             resetBatteryLevel(true);
             mSecondaryTelemetryCharacteristic = null;
@@ -8962,13 +9098,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 || mSecondaryPendingReloadCommand == null
                 || !Arrays.equals(mSecondaryPendingReloadCommand, completed))
             return;
-        mSecondaryPendingReloadCommand = null;
         if (intent.getIntExtra(BluetoothLeService.EXTRA_STATUS, BluetoothGatt.GATT_FAILURE)
                 != BluetoothGatt.GATT_SUCCESS) {
-            mSecondaryReloading = Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
-                    ? RELOADING_STATE_NONE : RELOADING_STATE_ELIMINATED;
+            if (retryReloadWrite(true, completed)) return;
+            abandonReloadWrite(true);
             return;
         }
+        mSecondaryPendingReloadCommand = null;
+        cancelReloadWriteRetry(true);
         if (mSecondaryReloading == RELOADING_STATE_ROUND_START) {
             finishSecondaryReload();
         } else if (mSecondaryReloading == RELOADING_STATE_STARTED) {
@@ -8981,6 +9118,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     if (mSecondaryReloadTimer != this)
                         return;
                     mSecondaryReloadTimer = null;
+                    mSecondaryReloadWaitFinished = true;
                     finishSecondaryReload();
                 }
             };
@@ -8992,6 +9130,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 return;
             }
             mSecondaryReloading = RELOADING_STATE_NONE;
+            clearReloadRecovery(true);
             mSecondaryLastShotCount = completed[6];
             publishPeerRuntimeState();
             if (!Globals.getInstance().mReloadOnEmpty)
@@ -9018,6 +9157,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         boolean superseding = reloadStatus == RELOADING_STATE_ELIMINATED || roundStart;
         if (!superseding && mSecondaryReloading != RELOADING_STATE_NONE)
             return;
+        clearReloadRecovery(true);
+        mSecondaryOrdinaryReload = reloadStatus == RELOADING_STATE_STARTED;
         if (superseding) {
             if (mSecondaryReloadTimer != null) {
                 mSecondaryReloadTimer.cancel();
@@ -9057,6 +9198,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 || (roundStart && mSecondaryPendingReloadCommand != null))
             return;
         mSecondaryReloading = RELOADING_STATE_FINISHING;
+        cancelReloadWriteRetry(true);
         mSecondaryEmptyTriggerCount = 0;
         byte[] command = new byte[20];
         command[0] = mSecondaryCommandID;
@@ -9180,16 +9322,15 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         || mPendingReloadCommand == null
                         || !Arrays.equals(mPendingReloadCommand, completedCommand))
                     return;
-                mPendingReloadCommand = null;
                 if (intent.getIntExtra(BluetoothLeService.EXTRA_STATUS, BluetoothGatt.GATT_FAILURE)
                         != BluetoothGatt.GATT_SUCCESS) {
-                    Log.w(TAG, "Reload command failed; allow another reload attempt");
-                    mReloading = Globals.getInstance().mGameState == Globals.GAME_STATE_RUNNING
-                            ? RELOADING_STATE_NONE : RELOADING_STATE_ELIMINATED;
-                    if (mReloading == RELOADING_STATE_NONE)
-                        hideReloadProgress();
+                    if (retryReloadWrite(false, completedCommand)) return;
+                    Log.w(TAG, "Reload command failed after recovery; allow another reload attempt");
+                    abandonReloadWrite(false);
                     return;
                 }
+                mPendingReloadCommand = null;
+                cancelReloadWriteRetry(false);
                 if (mReloading == RELOADING_STATE_ROUND_START) {
                     finishReload();
                 } else if (mReloading == RELOADING_STATE_STARTED) {
@@ -9203,6 +9344,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                             if (mReloadTimer != this)
                                 return;
                             mReloadTimer = null;
+                            mReloadWaitFinished = true;
                             finishReload();
                         }
                     };
@@ -9215,6 +9357,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         return;
                     }
                     mReloading = RELOADING_STATE_NONE;
+                    clearReloadRecovery(false);
                     setShotsRemaining(completedCommand[6]);
                     hideReloadProgress();
                     if (!Globals.getInstance().mReloadOnEmpty)

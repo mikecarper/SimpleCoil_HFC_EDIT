@@ -4187,17 +4187,44 @@ public class GameplayRegressionTest {
     }
 
     @Test
-    public void failedRefillDoesNotInventAmmoAndAllowsRetry() {
+    public void failedRefillRetriesTwiceWithoutInventingAmmoThenAllowsAManualReload() {
         scenario.onActivity(activity -> {
-            set(activity, "mLastShotCount", (byte) 0);
-            invoke(activity, "startReload");
-            invoke(activity, "finishReload");
-            completeWrite(activity, GattAttributes.RECOIL_COMMAND_UUID,
-                    bluetooth.writes.get(1), BluetoothGatt.GATT_FAILURE);
-            assertEquals((byte) 0, get(activity, "mLastShotCount"));
-            assertEquals(0, get(activity, "mReloading"));
-            invoke(activity, "startReload");
-            assertEquals(3, bluetooth.writes.size());
+            boolean previouslyConnected = bluetooth.simulateConnected;
+            bluetooth.simulateConnected = true;
+            try {
+                set(activity, "mLastShotCount", (byte) 0);
+                invoke(activity, "startReload");
+                invoke(activity, "finishReload");
+                byte[] failed = bluetooth.writes.get(1);
+                completeWrite(activity, GattAttributes.RECOIL_COMMAND_UUID,
+                        failed, BluetoothGatt.GATT_FAILURE);
+                for (int retry = 1; retry <= 2; retry++) {
+                    assertEquals("A pending retry released the reload state", 2, get(activity, "mReloading"));
+                    assertEquals((byte) 0, get(activity, "mLastShotCount"));
+                    assertEquals("Retry ignored its backoff", retry + 1, bluetooth.writes.size());
+                    Runnable pending = (Runnable) get(activity, "mReloadWriteRetry");
+                    assertNotNull(pending);
+                    ((android.os.Handler) get(activity, "mWeaponPairingHandler")).removeCallbacks(pending);
+                    pending.run();
+                    byte[] repeated = bluetooth.writes.get(bluetooth.writes.size() - 1);
+                    assertEquals(4, repeated[2]);
+                    assertEquals(failed[6], repeated[6]);
+                    assertTrue("A retry reused the failed command ID", failed[0] != repeated[0]);
+                    assertEquals(retry + 2, bluetooth.writes.size());
+                    completeWrite(activity, GattAttributes.RECOIL_COMMAND_UUID,
+                            repeated, BluetoothGatt.GATT_FAILURE);
+                    failed = repeated;
+                }
+                assertEquals((byte) 0, get(activity, "mLastShotCount"));
+                assertEquals(0, get(activity, "mReloading"));
+                assertNull(get(activity, "mReloadWriteRetry"));
+                assertNull(get(activity, "mPendingReloadCommand"));
+                invoke(activity, "startReload");
+                assertEquals(5, bluetooth.writes.size());
+                assertEquals(2, bluetooth.writes.get(4)[2]);
+            } finally {
+                bluetooth.simulateConnected = previouslyConnected;
+            }
         });
     }
 
