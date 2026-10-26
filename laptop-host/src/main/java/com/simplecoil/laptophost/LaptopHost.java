@@ -901,7 +901,8 @@ public final class LaptopHost {
                 if (playerForClientLocked(client) == null
                         || !(json.get("lobbyready") instanceof Boolean))
                     return;
-                if (roundState == RoundState.LOBBY) client.lobbyReady = (Boolean) json.get("lobbyready");
+                if (!isRoundActiveLocked())
+                    client.lobbyReady = (Boolean) json.get("lobbyready");
                 relayCapabilities(players.get(client.playerID), json);
             }
             broadcastRoster();
@@ -1319,7 +1320,7 @@ public final class LaptopHost {
             Player player = playerForClientLocked(client);
             if (player == null)
                 return;
-            if (roundState != RoundState.LOBBY)
+            if (isRoundActiveLocked())
                 return;
             if (!config.onlyServerSettings && !config.tournament) {
                 Settings candidate = Settings.fromClientJson(json);
@@ -1341,7 +1342,7 @@ public final class LaptopHost {
             return;
         synchronized (stateLock) {
             Player player = playerForClientLocked(client);
-            if (player == null || roundState != RoundState.LOBBY)
+            if (player == null || isRoundActiveLocked())
                 return;
             if (!eventMode) player.name = hostPlayerNames.getOrDefault(player.identity, name);
         }
@@ -1419,8 +1420,8 @@ public final class LaptopHost {
             else profile.name = name;
             if (client.playerID != 0 && client.playerID != requestedID)
                 return;
-            // The first returning phone starts the next lobby even if the
-            // previous round's socket workers have not finished closing yet.
+            // A new arrival opens the next lobby without disturbing the
+            // connected players or their already-calibrated host clocks.
             if (roundState == RoundState.FINISHED)
                 resetForNewLobbyLocked();
             removeExpiredAssignmentsLocked(elapsedMillis());
@@ -1738,6 +1739,8 @@ public final class LaptopHost {
             if (cooldown > 0)
                 return StartResult.error("Next game can start in "
                         + ((cooldown + 999) / 1_000) + " seconds.", false);
+            if (roundState == RoundState.FINISHED)
+                resetForNewLobbyLocked();
             if (roundState != RoundState.LOBBY)
                 return StartResult.error("A game is already running.", false);
             recipients = playingClientsLocked();
@@ -1854,11 +1857,13 @@ public final class LaptopHost {
             if (validGpsUtcTime(gpsStartTime))
                 start.put(JSON_GPS_START_TIME, gpsStartTime);
             startFrame = jsonFrame(start);
+            // Queue the announcement before releasing round state. An immediate
+            // end must follow this start on every retained connection.
+            for (ClientConnection client : recipients)
+                client.send(startFrame);
+            for (ClientConnection client : connectedClientsLocked())
+                if (client.lobbyBenched) client.send(jsonFrame(mapOf("lobbywait", true)));
         }
-        for (ClientConnection client : recipients)
-            client.send(startFrame);
-        for (ClientConnection client : connectedClients())
-            if (client.lobbyBenched) client.send(jsonFrame(mapOf("lobbywait", true)));
         // Refresh the lobby immediately after the start frame so a phone joining
         // near the edge sees dedicated-host state and the shared deadline.
         broadcastRoster();
@@ -1914,11 +1919,12 @@ public final class LaptopHost {
     private StartResult rebalanceTeams() {
         synchronized (stateLock) {
             updateRoundStateLocked();
-            if (roundState != RoundState.LOBBY || !config.balanced || !hostPlayerTeams.isEmpty()
+            if (isRoundActiveLocked() || !config.balanced || !hostPlayerTeams.isEmpty()
                     || config.gameMode != GameMode.TWO_TEAMS)
                 return StartResult.error("Teams can only be rebalanced in a Balanced Random lobby.", false);
             if (playingClientsLocked().size() < 2)
                 return StartResult.error("At least two phones must join first.", false);
+            if (roundState == RoundState.FINISHED) resetForNewLobbyLocked();
             balancedTeams = computeBalancedTeamsLocked();
             retainedBalancedTeams.clear();
             rememberBalancedTeamsLocked();
@@ -2063,26 +2069,29 @@ public final class LaptopHost {
             nextRoundStartAllowedAt = Math.max(nextRoundStartAllowedAt,
                     com.simplecoil.protocol.RoundRestart.allowedAt(elapsedMillis(), roundStartAt));
             recipients = connectedClientsLocked();
+            enemyGpsRevealUntil.clear();
+            gpsVisibilityRefreshPlayers.addAll(activeClients.keySet());
             savePlayerDirectoryLocked();
             if (report != null) for (ClientConnection client : recipients) {
                 Player player = players.get(client.playerID);
                 if (player != null && report.personal.containsKey(player.identity))
                     personalFrames.put(client, report.personal.get(player.identity));
             }
+            for (ClientConnection client : recipients) {
+                // Keep the final batch contiguous, and queue it before another
+                // Start can prepare the retained lobby. ENDGAME ends the round;
+                // heartbeats, clock refreshes and the next round reuse this TCP
+                // relationship and its already-calibrated clock.
+                synchronized (client.outboundLock) {
+                    client.send(finalPlayerData);
+                    Map<String, Object> personal = personalFrames.get(client);
+                    if (personal != null) client.send(jsonFrame(mapOf("roundreport", personal)));
+                    client.send(messageFrame(MSG_END_GAME));
+                }
+            }
         }
         if (report != null) persistReport(report);
         System.out.println("Game finished: " + reason);
-        for (ClientConnection client : recipients) {
-            // Hold the outbound queue lock across the final ordered batch so a late
-            // live-score broadcast cannot overwrite the frozen scoreboard
-            // between it, the personal report, and ENDGAME.
-            synchronized (client.outboundLock) {
-                client.send(finalPlayerData);
-                Map<String, Object> personal = personalFrames.get(client);
-                if (personal != null) client.send(jsonFrame(mapOf("roundreport", personal)));
-                client.sendAndClose(messageFrame(MSG_END_GAME));
-            }
-        }
     }
 
     private boolean grantRespawn(int playerID) {
@@ -2760,15 +2769,29 @@ public final class LaptopHost {
     private void resetForNewLobbyLocked() {
         savePlayerDirectoryLocked();
         powerupAuthority.resetRound();
-        gpsOffset = null;
-        players.clear();
-        activeClients.clear();
+        // A new round is not a new host session. Retain live participants,
+        // profiles, pairings, the GPS origin and per-connection clock readiness.
+        // Offline final-score rows remain in the saved report, not the next lobby.
+        players.values().removeIf(player -> !player.connected || player.connection == null
+                || player.connection.closed);
+        activeClients.entrySet().removeIf(entry -> players.get(entry.getKey()) == null
+                || players.get(entry.getKey()).connection != entry.getValue());
+        for (Player player : players.values()) {
+            PlayerDirectory.Profile profile = playerDirectory.profiles.get(player.identity);
+            player.priorKills = Math.min(100_000, Math.max(addScore(player.priorKills, player.kills),
+                    profile == null ? 0 : profile.totalKills));
+            player.priorDeaths = Math.min(100_000, Math.max(addScore(player.priorDeaths, player.deaths),
+                    profile == null ? 0 : profile.totalDeaths));
+            player.awaitingRespawn = false;
+            player.eliminated = false;
+        }
         pendingAssignments.clear();
-        grenadeOwners.clear();
+        grenadeOwners.entrySet().removeIf(entry -> !players.containsKey(entry.getValue()));
         lasers.clear();
         grenadeBursts.clear();
         enemyGpsRevealUntil.clear();
         gpsVisibilityRefreshPlayers.clear();
+        gpsVisibilityRefreshPlayers.addAll(activeClients.keySet());
         balancedTeams = Collections.emptyMap();
         balancedCheckedIn.clear();
         balancedCheckInDeadline = 0;
@@ -2791,6 +2814,9 @@ public final class LaptopHost {
             observedCombatType[playerID] = 0;
             observedCombatTarget[playerID] = 0;
         }
+        // Retained sockets do not re-register between games. Reapply the saved
+        // identity assignments here instead of relying on a new join to do it.
+        invalidateTeamAssignmentsLocked();
     }
 
     private void disconnect(ClientConnection client) {
@@ -4129,7 +4155,7 @@ public final class LaptopHost {
             }
             boolean lobbyEdit = request.containsKey("benched") || request.containsKey("team")
                     || request.containsKey("settings") || request.containsKey("resetSettings");
-            if (lobbyEdit && roundState != RoundState.LOBBY) {
+            if (lobbyEdit && isRoundActiveLocked()) {
                 sendJson(exchange, 409, mapOf("ok", false, "message", "Teams, participation, and gameplay settings can only change in the lobby."));
                 return;
             }
@@ -4192,7 +4218,7 @@ public final class LaptopHost {
             updateRoundStateLocked();
             Player target = players.get(targetID);
             PlayerDirectory.Profile profile = playerDirectory.profiles.get(request.get("identity"));
-            if (roundState != RoundState.LOBBY || profile == null || target == null || !target.connected
+            if (isRoundActiveLocked() || profile == null || target == null || !target.connected
                     || !target.identity.equals(request.get("targetIdentity")) || target.identity.equals(profile.id)) {
                 sendJson(exchange, 409, mapOf("ok", false, "message", "Transfers require a different connected phone in the lobby. Refresh the roster and try again."));
                 return;
@@ -4203,6 +4229,12 @@ public final class LaptopHost {
             if ((config.boss || config.captureTheFlag || config.infection) && desiredTeam != teamFor(target.id)) {
                 sendJson(exchange, 409, mapOf("ok", false, "message", "In this game mode, connect the replacement phone using the same team or Boss role first."));
                 return;
+            }
+            if (roundState == RoundState.FINISHED) {
+                // Save the completed identities before rebinding a retained
+                // socket. Its former player's scores cannot follow the new person.
+                resetForNewLobbyLocked();
+                target.kills = target.deaths = target.shots = target.hits = 0;
             }
             if (source != null) {
                 previous = source.connection;
@@ -4538,7 +4570,7 @@ public final class LaptopHost {
         boolean changed = false;
         synchronized (stateLock) {
             ClientConnection client = activeClients.get(playerID);
-            if (roundState == RoundState.LOBBY && client != null && !client.closed) {
+            if (!isRoundActiveLocked() && client != null && !client.closed) {
                 client.lobbyBenched = Boolean.parseBoolean(value);
                 Player player = players.get(playerID);
                 if (player != null) hostPlayerParticipation.put(player.identity, client.lobbyBenched);
@@ -4591,7 +4623,7 @@ public final class LaptopHost {
             state.put("clockReady", clockReadyCountLocked());
             state.put("balancedQr", balancedQrEnabledLocked());
             state.put("balancedRandom", config.balanced && hostPlayerTeams.isEmpty());
-            state.put("canRebalance", roundState == RoundState.LOBBY && config.balanced && hostPlayerTeams.isEmpty()
+            state.put("canRebalance", !isRoundActiveLocked() && config.balanced && hostPlayerTeams.isEmpty()
                     && config.gameMode == GameMode.TWO_TEAMS && playing.size() >= 2);
             state.put("assignedCount", balancedTeams.size());
             state.put("checkedInCount", balancedCheckedIn.size());
@@ -4602,7 +4634,9 @@ public final class LaptopHost {
             state.put("remainingMs", roundEndAt > 0 && isRoundActiveLocked()
                     ? Math.max(0, roundEndAt - now) : 0);
             state.put("cooldownMs", Math.max(0, nextRoundStartAllowedAt - now));
-            state.put("canStart", !hotspot.isBusy() && roundState == RoundState.LOBBY && playing.size() >= 2
+            state.put("canStart", !hotspot.isBusy()
+                    && (roundState == RoundState.LOBBY || roundState == RoundState.FINISHED)
+                    && playing.size() >= 2
                     && now >= nextRoundStartAllowedAt
                     && (!config.boss || hasPlayingLeaderLocked())
                     && (!config.infection || hasPlayingLeaderLocked())

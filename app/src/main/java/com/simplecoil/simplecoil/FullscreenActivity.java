@@ -2213,7 +2213,9 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             Intent event = mTcpClient.consumePendingTerminalEvent();
             if (event != null) {
                 mUDPUpdateReceiver.onReceive(this, event);
-                return;
+                if (!event.getBooleanExtra(TcpClient.EXTRA_ROUND_END, false)
+                        || !canRetainLobbyAfterRound())
+                    return;
             }
             if (mUseNetwork && mReady && networkServicesReady()) {
                 event = mIsServer ? mTcpServer.getScheduledGameStart()
@@ -2770,7 +2772,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         return mPeerOrderedEndPending || mClientRoundEndPending;
     }
 
-    /** Stop play now, retaining TCP only long enough to receive the final report. */
+    /** Stop play while the retained lobby connection receives the final report. */
     private void freezeRoundGameplayForReport() {
         if (mSpawnTimer != null) {
             mSpawnTimer.cancel();
@@ -5381,6 +5383,13 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     private void endGame() { endGame(false); }
 
+    private boolean canRetainLobbyAfterRound() {
+        if (!mUseNetwork || !mReady)
+            return false;
+        return mIsServer ? mTcpServer != null && mTcpServer.isTcpServerReady()
+                : mTcpClient != null && mTcpClient.hasClientSession(Globals.getInstance().mServerIP);
+    }
+
     /** Read the immutable matching report before any service clears its round. */
     private RoundReport completedRoundReport() {
         String token = mActivePeerRoundToken;
@@ -5399,6 +5408,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 && !mStartGameTimer && !mPeerOrderedEndDelivered) {
             if (requestPeerOrderedRoundEnd()) return;
         }
+        final boolean retainLobby = !leaveOnly && canRetainLobbyAfterRound();
         // A local timer, score result or exit cannot authorize a participant
         // to start a side game. Only the host/validated shared end unlocks it.
         if (!leaveOnly && (!mUseNetwork || mIsServer)) releaseMatch();
@@ -5497,9 +5507,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mJoinedFromGameInvite = false;
         clearCombatFeedback();
         resetTeamRespawnQrState();
-        // A peer host owns a TCP listener only while it is serving this lobby or
-        // round. Ending locally must retire that listener too; otherwise the
-        // invisible listener can block a later attempt to host a new game.
+        // An explicit departure retires this lobby relationship. A completed
+        // round returns to the same listener and calibrated TCP connections.
         boolean ownsPeerHost = mIsServer || mPeerHostCreationPending || mPeerUdpServerStarting;
         if (mIsServer && mTcpServer != null)
             mTcpServer.clearScheduledStart();
@@ -5516,6 +5525,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mPeerOrderedEndOutcome = null;
         resetClientRoundReportWait();
         resetGameStartCountdownSpeech();
+        if (retainLobby && !mIsServer && mTcpClient != null)
+            mTcpClient.finishRoundToLobby(mActivePeerRoundToken);
         mActivePeerRoundToken = null;
         if (Globals.getInstance().mTournamentMode)
             Globals.getInstance().applyTournamentRules();
@@ -5524,19 +5535,30 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mStartGameButton.setVisibility(View.VISIBLE);
         mPlayerSettingsButton.setVisibility(View.VISIBLE);
         if (mUseNetwork) {
-            if (mUDPListenerService != null)
-                mUDPListenerService.stopListen();
-            if (ownsPeerHost && mTcpServer != null) {
-                if (leaveOnly) mTcpServer.stopTcpServer();
-                else mTcpServer.cancelServer(true);
+            if (retainLobby) {
+                if (mUDPListenerService != null)
+                    mUDPListenerService.finishRoundToLobby(mIsServer);
+                mResumePeerHostSince = -1;
+                mLobbyTarget = Globals.getInstance().mServerIP;
+                mLobbyConnectionDeadline = SystemClock.elapsedRealtime() + SharedLobby.CONNECTION_TIMEOUT_MS;
+                mLobbyJoined = mIsServer || mTcpClient.hasLobbyConnection();
+                if (mIsServer)
+                    mTcpServer.sendAllGameInfo(TcpServer.SEND_ALL);
+            } else {
+                if (mUDPListenerService != null)
+                    mUDPListenerService.stopListen();
+                if (ownsPeerHost && mTcpServer != null) {
+                    if (leaveOnly) mTcpServer.stopTcpServer();
+                    else mTcpServer.cancelServer(true);
+                }
+                if (mTcpClient != null)
+                    mTcpClient.stopTcpClient();
+                mReady = false;
+                mIsServer = false;
+                setReady(false, !leaveOnly);
             }
-            if (mTcpClient != null)
-                mTcpClient.stopTcpClient();
             mPeerHostCreationPending = false;
             mPeerUdpServerStarting = false;
-            mReady = false;
-            mIsServer = false;
-            setReady(false, !leaveOnly);
         }
         if (leaveOnly && mMatchSession.active()) saveMatchSession();
         hideWeaponDisconnect();
@@ -5560,8 +5582,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         cancelRespawnShieldBoost();
         mStartGameButton.setVisibility(View.VISIBLE);
         mPlayerSettingsButton.setVisibility(View.VISIBLE);
-        mTeamMinusButton.setVisibility(View.VISIBLE);
-        mTeamPlusButton.setVisibility(View.VISIBLE);
+        mTeamMinusButton.setVisibility(retainLobby ? View.INVISIBLE : View.VISIBLE);
+        mTeamPlusButton.setVisibility(retainLobby ? View.INVISIBLE : View.VISIBLE);
         mEndGameButton.setVisibility(View.GONE);
         mEndNetworkGameButton.setVisibility(View.GONE);
         mEndNetworkGameButton.setText(R.string.end_game_button);
@@ -5584,7 +5606,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mUseNetworkingButton.setVisibility(View.VISIBLE);
         mFiringModeButton.setVisibility(View.VISIBLE);
         mGameLimitButton.setVisibility(View.VISIBLE);
-        setNetworkMenu(NETWORK_TYPE_ENABLED);
+        setNetworkMenu(retainLobby ? mIsServer ? NETWORK_TYPE_SERVING : NETWORK_TYPE_JOINED
+                : NETWORK_TYPE_ENABLED);
         if (completedRound)
             announceRoundEnd(roundOutcome);
         renderLobby();
@@ -10697,7 +10720,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return; // Already handled, or belongs to an earlier session/service.
             }
             final String action = intent.getAction();
-            if (tcpTerminal && !mIsServer && (NetMsg.NETMSG_ENDGAME.equals(action)
+            final boolean tcpRoundEnd = intent.getBooleanExtra(TcpClient.EXTRA_ROUND_END, false);
+            if ((tcpTerminal || tcpRoundEnd) && !mIsServer && (NetMsg.NETMSG_ENDGAME.equals(action)
                     || NetMsg.NETMSG_SERVERCANCEL.equals(action) || NetMsg.NETMSG_VERSIONERROR.equals(action)))
                 mClientRoundEndDelivered = true;
             if (NetMsg.NETMSG_POWERUP.equals(action)) {
@@ -11158,7 +11182,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                 Toast.makeText(getApplicationContext(), R.string.clock_sync_waiting, Toast.LENGTH_SHORT).show();
             } else if (NetMsg.NETMSG_ENDGAME.equals(action)) {
                 releaseMatch();
-                boolean clientTerminalEnd = !mIsServer && (tcpTerminal
+                boolean clientTerminalEnd = !mIsServer && (tcpTerminal || tcpRoundEnd
                         || mTcpClient == null || !mTcpClient.hasLobbyConnection());
                 if (clientTerminalEnd) {
                     mClientRoundEndDelivered = true;
@@ -11171,7 +11195,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         && intent.getBooleanExtra(TcpServer.EXTRA_ROUND_REPORTS_DELIVERED, false);
                 clearRoundSitOut();
                 mLobbyNotice = null;
-                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
+                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE || canRetainLobbyAfterRound())
                     endGame();
                 else if (mReady) {
                     mReady = false;

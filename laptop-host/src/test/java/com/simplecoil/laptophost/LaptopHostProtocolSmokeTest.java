@@ -85,6 +85,11 @@ public final class LaptopHostProtocolSmokeTest {
             System.out.println("Game-start countdown protocol smoke tests passed");
             return;
         }
+        if (args.length == 1 && "--persistent-lobby-only".equals(args[0])) {
+            verifyPersistentLobbyRounds();
+            System.out.println("Persistent-lobby two-round protocol smoke test passed");
+            return;
+        }
         if (args.length == 1 && "--gps-only".equals(args[0])) {
             verifyGpsOffsets();
             System.out.println("GPS offset protocol smoke test passed");
@@ -187,8 +192,7 @@ public final class LaptopHostProtocolSmokeTest {
                 require(first.lastRoster.contains("\"hostkind\":\"L\"")
                                 && first.lastRoster.contains("\"hostage\":"),
                         "TCP roster did not identify the laptop when UDP beacons are missed");
-                require(first.readUntil(frame -> frame.startsWith(JSON_PREFIX + "{\"players\"")
-                                && frame.contains("\"powerupqrrequired\":4")) != null,
+                require(first.lastRoster.contains("\"powerupqrrequired\":4"),
                         "laptop host did not advertise the power-up QR requirement");
                 first.synchronizeClock();
                 blueTeammate.synchronizeClock();
@@ -357,10 +361,12 @@ public final class LaptopHostProtocolSmokeTest {
                 String finishedState = get("/api/state");
                 require(finishedState.contains("\"cooldownMs\":0"),
                         "round stopped under 60 seconds incorrectly required a cooldown");
-                require(!post("/api/start").contains("Next game can start in"),
-                        "host delayed an early-stop restart by 30 seconds");
+                require(finishedState.contains("\"canStart\":true"),
+                        "host did not offer an immediate retained-lobby restart");
                 completedToken = activeToken;
             }
+            require(waitForDashboard(state -> state.contains("\"playerCount\":0")) != null,
+                    "explicitly closed first-round phones remained connected");
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue Next Round");
                  FakePhone second = new FakePhone("127.0.0.2", 17, "Red Next Round")) {
                 first.synchronizeClock();
@@ -383,6 +389,7 @@ public final class LaptopHostProtocolSmokeTest {
         verifyNormalStartCountdown(false);
         verifyNormalStartCountdown(true);
         System.out.println("LaptopHost normal start countdown smoke tests passed.");
+        verifyPersistentLobbyRounds();
         verifyGpsOffsets();
         System.out.println("LaptopHost GPS offset smoke test passed.");
         verifyBalancedQr();
@@ -542,6 +549,121 @@ public final class LaptopHostProtocolSmokeTest {
 
     private static boolean closeTo(double actual, double expected) {
         return Math.abs(actual - expected) < 1e-8;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void verifyPersistentLobbyRounds() throws Exception {
+        Class<?> configClass = Class.forName("com.simplecoil.laptophost.LaptopHost$HostConfig");
+        java.lang.reflect.Method parse = configClass.getDeclaredMethod("parse", String[].class);
+        parse.setAccessible(true);
+        Object config = parse.invoke(null, (Object) new String[]{"--no-event-mode", "--no-browser",
+                "--start-delay", "1", "--tcp-port", String.valueOf(TCP_PORT),
+                "--udp-port", String.valueOf(UDP_PORT), "--dashboard-port", String.valueOf(DASHBOARD_PORT),
+                "--tile-port", String.valueOf(TILE_PORT)});
+        java.lang.reflect.Constructor<LaptopHost> constructor = LaptopHost.class.getDeclaredConstructor(configClass);
+        constructor.setAccessible(true);
+        LaptopHost host = constructor.newInstance(config);
+        java.lang.reflect.Method start = LaptopHost.class.getDeclaredMethod("start");
+        java.lang.reflect.Method stop = LaptopHost.class.getDeclaredMethod("stop");
+        java.lang.reflect.Method end = LaptopHost.class.getDeclaredMethod("endRound", String.class);
+        java.lang.reflect.Method elapsed = LaptopHost.class.getDeclaredMethod("elapsedMillis");
+        start.setAccessible(true);stop.setAccessible(true);end.setAccessible(true);elapsed.setAccessible(true);
+        try {
+            start.invoke(host);waitForHost();
+            try (FakePhone first = new FakePhone("127.0.0.3", 1, "Persistent blue");
+                 FakePhone second = new FakePhone("127.0.0.2", 17, "Persistent red")) {
+                first.synchronizeClock();second.synchronizeClock();
+                first.probeClock(",\"gpslatitude\":47.6,\"gpslongitude\":-122.1");
+                Object origin = getHostField(host, "gpsOffset");
+                java.util.Map<Integer, Object> connections = (java.util.Map<Integer, Object>)
+                        getHostField(host, "activeClients");
+                Object blueConnection = connections.get(1), redConnection = connections.get(17);
+                String previousToken = null, firstReport = null;
+                for (int round = 1; round <= 2; round++) {
+                    require(post("/api/start").contains("\"ok\":true"),
+                            "retained lobby could not start round " + round);
+                    String announcement = first.readUntil(frame -> frame.contains("\"gamestart\""));
+                    String token = jsonString(announcement, "roundtoken");
+                    require(token != null && !token.equals(previousToken), "next round reused its old token");
+                    require(second.readUntil(frame -> frame.contains("\"roundtoken\":\"" + token + "\"")) != null,
+                            "second retained phone missed the next start");
+                    require(waitForDashboard(state -> state.contains("\"state\":\"running\"")) != null,
+                            "retained round never reached actual play");
+                    String clean = get("/api/state");
+                    require(jsonNumber(currentPlayerState(clean, 1), "kills") == 0
+                                    && jsonNumber(currentPlayerState(clean, 17), "deaths") == 0,
+                            "a new round inherited completed-round scores");
+                    second.send(MESSAGE_PREFIX + "ELIMINATED1");
+                    require(first.readUntil(frame -> frame.equals(MESSAGE_PREFIX + "ELIMINATED17")) != null,
+                            "next round did not accept an elimination on the same connection");
+                    if (round == 1)
+                        // Exercise the normal cooldown without waiting a minute
+                        // for this isolated protocol fixture's first round.
+                        setHostField(host, "roundStartAt", (Long) elapsed.invoke(host) - 61_000);
+                    end.invoke(host, "persistent round " + round);
+                    requireFinalRoundBatch(first, token);requireFinalRoundBatch(second, token);
+                    String finished = get("/api/state");
+                    require(finished.contains("\"state\":\"finished\"")
+                                    && finished.contains("\"playerCount\":2")
+                                    && finished.contains("\"clockReady\":2"),
+                            "round completion discarded lobby participants or clock readiness");
+                    require(connections.get(1) == blueConnection && connections.get(17) == redConnection
+                                    && !(Boolean) getHostField(blueConnection, "closed")
+                                    && !(Boolean) getHostField(redConnection, "closed"),
+                            "round completion replaced or closed a TCP connection");
+                    require((Integer) getHostField(blueConnection, "clockSamples") == 12
+                                    && (Integer) getHostField(redConnection, "clockSamples") == 12,
+                            "retained lobby requested a new calibration batch");
+                    require(getHostField(host, "gpsOffset") == origin, "round completion changed the GPS origin");
+                    if (round == 1) {
+                        firstReport = get("/api/report?roundtoken=" + token);
+                        require(post("/api/start").contains("Next game can start in"),
+                                "persistent connection bypassed the normal round cooldown");
+                        setHostField(host, "nextRoundStartAllowedAt", 0L);
+                        first.send(JSON_PREFIX + "{\"lobbyready\":false}");
+                        require(waitForDashboard(state -> currentPlayerState(state, 1)
+                                .contains("\"gunReady\":false")) != null,
+                                "between-round gun readiness was ignored");
+                        require(post("/api/start").contains("connect a gun"),
+                                "next game ignored a disconnected gun");
+                        first.send(JSON_PREFIX + "{\"lobbyready\":true}");
+                        require(waitForDashboard(state -> state.contains("\"canStart\":true")) != null,
+                                "ready retained lobby could not start without recalibration");
+                    } else {
+                        require(firstReport.equals(get("/api/report?roundtoken=" + previousToken)),
+                                "starting the next game changed the previous frozen report");
+                    }
+                    previousToken = token;
+                }
+                java.util.Map<Integer, Object> players = (java.util.Map<Integer, Object>) getHostField(host, "players");
+                Object directory = getHostField(host, "playerDirectory");
+                java.util.Map<String, Object> profiles = (java.util.Map<String, Object>) getHostField(directory, "profiles");
+                require((Integer) getHostField(profiles.get(getHostField(players.get(1), "identity")), "totalKills") == 2
+                                && (Integer) getHostField(profiles.get(getHostField(players.get(17), "identity")), "totalDeaths") == 2,
+                        "retained rounds lost or double-counted player history");
+                first.send(MESSAGE_PREFIX + "QUIT");
+                require(waitForDashboard(state -> state.contains("\"playerCount\":1")) != null,
+                        "explicit Quit failed to disconnect a retained phone");
+                stop.invoke(host);
+                boolean disconnected = false;
+                try { while (true) second.input.readUTF(); }
+                catch (java.io.EOFException expected) { disconnected = true; }
+                require(disconnected, "explicit host stop retained the control socket");
+            }
+        } finally { stop.invoke(host); }
+    }
+
+    private static void requireFinalRoundBatch(FakePhone phone, String token) throws IOException {
+        List<String> received = new ArrayList<>();
+        require(phone.readUntil(frame -> {
+            received.add(frame);
+            return frame.equals(MESSAGE_PREFIX + "ENDGAME");
+        }) != null, "round completion frame was not delivered");
+        int last = received.size() - 1;
+        require(last >= 2 && received.get(last - 2).contains("\"playerdata\"")
+                        && received.get(last - 1).contains("\"roundreport\"")
+                        && received.get(last - 1).contains("\"roundtoken\":\"" + token + "\""),
+                "final scoreboard, personal report and ENDGAME were not one ordered batch");
     }
 
     private static void verifyNormalStartCountdown(boolean explicitOverride) throws Exception {
@@ -1532,10 +1654,12 @@ public final class LaptopHostProtocolSmokeTest {
             require(post("/api/rebalance").contains("\"ok\":false"),
                     "rebalance moved players during countdown");
             endRound.invoke(host, "retention regression");
-            require(waitForDashboard(value -> value.contains("\"playerCount\":0")) != null,
-                    "round-end connections did not close");
+            require(get("/api/state").contains("\"playerCount\":4"),
+                    "round end disconnected retained lobby players");
             for (FakePhone phone : phones) phone.close();
             phones.clear();
+            require(waitForDashboard(value -> value.contains("\"playerCount\":0")) != null,
+                    "explicitly closed phones remained connected");
             // Keep the production cooldown intact; advance this isolated test
             // fixture instead of making the suite wait thirty seconds.
             setHostField(host, "nextRoundStartAllowedAt", 0L);
@@ -1849,7 +1973,7 @@ public final class LaptopHostProtocolSmokeTest {
             waitForHost();
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
                  FakePhone second = new FakePhone("127.0.0.2", 17, "Red")) {
-                require(first.readUntil(frame -> frame.contains("\"respawnqrenabled\":" + qrEnabled)) != null,
+                require(first.lastRoster.contains("\"respawnqrenabled\":" + qrEnabled),
                         "host did not publish the respawn rule");
                 require(get("/api/state").contains("\"respawnQrEnabled\":" + qrEnabled),
                         "dashboard did not expose the selected respawn rule");
@@ -1910,9 +2034,9 @@ public final class LaptopHostProtocolSmokeTest {
             waitForHost();
             try (FakePhone boss = new FakePhone("127.0.0.3", 1, "Boss");
                  FakePhone hunter = new FakePhone("127.0.0.2", 2, "Hunter")) {
-                String roster = boss.readUntil(frame -> frame.contains("\"bossmode\":true")
-                        && frame.contains("\"playerID\":2"));
-                require(roster != null, "Boss Mode was not advertised to the phones");
+                String roster = hunter.lastRoster;
+                require(roster.contains("\"bossmode\":true") && roster.contains("\"playerID\":2"),
+                        "Boss Mode was not advertised to the phones");
                 require(roster.contains("\"playerID\":1,\"health\":6,\"reloadshots\":120")
                                 && roster.contains("\"shotmodeburst3\":true,\"shotmodeauto\":true,\"firingmode\":1"),
                         "boss did not receive scaled health, 120 rounds, unlocked fire modes, and a wide cone");
@@ -1952,9 +2076,9 @@ public final class LaptopHostProtocolSmokeTest {
             waitForHost();
             try (FakePhone first = new FakePhone("127.0.0.3", 1, "Blue");
                  FakePhone second = new FakePhone("127.0.0.2", 17, "Red")) {
-                String roster = first.readUntil(frame -> frame.contains("\"capturetheflag\":true")
-                        && frame.contains("\"tournamentmode\":true"));
-                require(roster != null, "Capture the Flag mode was not advertised to phones");
+                require(first.lastRoster.contains("\"capturetheflag\":true")
+                                && first.lastRoster.contains("\"tournamentmode\":true"),
+                        "Capture the Flag mode was not advertised to phones");
             }
         } finally {
             host.destroy();
@@ -1977,9 +2101,9 @@ public final class LaptopHostProtocolSmokeTest {
             try (FakePhone zombie = new FakePhone("127.0.0.3", 1, "Zombie");
                  FakePhone survivor = new FakePhone("127.0.0.2", 2, "Survivor");
                  FakePhone lastSurvivor = new FakePhone("127.0.0.4", 3, "Last Survivor")) {
-                String roster = zombie.readUntil(frame -> frame.contains("\"infectionmode\":true")
-                        && frame.contains("\"tournamentmode\":true"));
-                require(roster != null, "Infection mode was not advertised to phones");
+                require(zombie.lastRoster.contains("\"infectionmode\":true")
+                                && zombie.lastRoster.contains("\"tournamentmode\":true"),
+                        "Infection mode was not advertised to phones");
                 zombie.synchronizeClock();
                 survivor.synchronizeClock();
                 lastSurvivor.synchronizeClock();

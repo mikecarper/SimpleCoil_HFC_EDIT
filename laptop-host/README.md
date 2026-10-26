@@ -67,8 +67,12 @@ clearly reports any omitted batches. Totals keep updating after this limit.
 Older phones, telemetry gaps, and disconnections mark the data as incomplete;
 unobserved hits or streaks are not invented.
 
-Reports are frozen before phones leave the round, and remain available when
-phones auto-join the next lobby or a new round starts. A cancelled countdown
+Reports are frozen before phones leave the round, and remain available in the
+retained lobby or when a new round starts. Normal game-over keeps each phone's
+connection, clock calibration, identity, gun readiness and participation. The
+next Start resets round scores and authority without another join or clock burst;
+the usual cooldown and gun-readiness checks still apply. Explicit Quit or host
+shutdown closes the connection. A cancelled countdown
 does not replace the latest completed round. Stable player identities preserve
 statistics across reconnections and keep a new occupant of the same player ID
 separate from its former occupant. The host sends the frozen final scoreboard,

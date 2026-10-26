@@ -287,6 +287,7 @@ public class TcpServer extends Service {
     private Runnable mClockRosterUpdate;
     private long mNextGameStartAllowedAt;
     private boolean mRoundCooldownRecorded;
+    private boolean mRoundEndDelivered;
     private final Powerups.Authority mPowerupAuthority = new Powerups.Authority();
     private final Random mPowerupRandom = new Random();
     private String mPowerupAuthorityToken;
@@ -764,6 +765,7 @@ public class TcpServer extends Service {
                     roundID = ++mRoundSequence;
                     roundToken = createRoundToken();
                     mRoundToken = roundToken;
+                    mRoundEndDelivered = false;
                     mEndVotes = 0;
                     Globals.getInstance().mEndGameVotes = 0;
                     Globals.getInstance().mEndGameVoteRequested = false;
@@ -775,6 +777,13 @@ public class TcpServer extends Service {
                         Globals.getInstance().mBossHunterCount = mBossHunterCount;
                     }
                 }
+                // These connections survive ordinary round completion. Their
+                // final scores stay readable until this next round commits.
+                mDepartedScores.clear();
+                if (mClientData != null) for (ClientData client : mClientData.values()) {
+                    client.points = client.eliminated = client.shots = client.hits = 0;
+                    client.awaitingRespawn = false;
+                }
                 // Send the final Boss profile immediately before STARTGAME on each
                 // player's TCP stream. TCP ordering guarantees that the health update
                 // is applied before that phone enters the synchronized countdown.
@@ -782,6 +791,10 @@ public class TcpServer extends Service {
                         ? createPlayerSettingsMessage(SEND_ALL, false) : null;
                 if (bossMode && bossSettingsMessage == null)
                     return;
+                // Lobby connections retain the old round until statistics are
+                // saved. Converted survivors must not start the next round as
+                // zombies just because the lobby itself was kept alive.
+                Globals.getInstance().resetInfectedPlayers();
                 RoundRoster roundRoster = new RoundRoster(roundToken);
                 for (ClientRecipient recipient : recipients) {
                     if (recipient.canStartGame()) roundRoster.restore(new RoundRoster.Member(
@@ -1299,7 +1312,8 @@ public class TcpServer extends Service {
 
     private boolean hasRoundStarted() {
         synchronized (mServerStateLock) {
-            return mScheduledStart < 0 || SystemClock.elapsedRealtime() >= mScheduledStart;
+            return !mRoundEndDelivered
+                    && (mScheduledStart < 0 || SystemClock.elapsedRealtime() >= mScheduledStart);
         }
     }
 
@@ -1679,15 +1693,16 @@ public class TcpServer extends Service {
     /** Lets a phone host wait for the ordered report/ENDGAME delivery task. */
     public boolean requestOrderedRoundEnd() {
         synchronized (mServerStateLock) {
+            if (mRoundEndDelivered && !mStartAnnounced && mScheduledStart < 0)
+                return false;
             recordRoundCooldownLocked();
         }
         return runClientTask(() -> {
-            // Keep registration excluded until every shared roster has been
-            // cleared, not just until the old client sockets have been closed.
+            // Keep registration excluded until final scores and reports have
+            // preceded ENDGAME on every retained lobby connection.
             if (mClientData != null) {
                 sendPlayerData(SEND_ALL);
                 freezeRoundReports();
-                // We want to send the end-game message before removing clients.
                 String message = TCPMESSAGE_PREFIX + TCPPREFIX_MESG + NetMsg.NETMSG_ENDGAME;
                 for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
                     if (!isClientTaskActive())
@@ -1695,6 +1710,7 @@ public class TcpServer extends Service {
                     RoundReport report;
                     synchronized (mServerStateLock) {
                         report = mCompletedRoundReports.get(entry.getValue().playerIdentity);
+                        if (report != null && !report.roundToken.equals(mRoundToken)) report = null;
                     }
                     if (report != null) {
                         try {
@@ -1703,16 +1719,24 @@ public class TcpServer extends Service {
                         } catch (JSONException invalid) { Log.w(TAG, "Unable to encode round report", invalid); }
                     }
                     entry.getValue().sendTCPMessage(message);
-                    entry.getValue().close();
+                    // The phone records the same frozen report in its history.
+                    // Keep this connection's next-round skill baseline current
+                    // without requiring another registration or clock burst.
+                    if (report != null && !report.roundToken.equals(entry.getValue().historyRoundApplied)) {
+                        entry.getValue().priorKills = Math.min(PlayerHistory.MAX_TOTAL,
+                                entry.getValue().priorKills + report.kills);
+                        entry.getValue().priorDeaths = Math.min(PlayerHistory.MAX_TOTAL,
+                                entry.getValue().priorDeaths + report.deaths);
+                        entry.getValue().historyRoundApplied = report.roundToken;
+                    }
                 }
                 if (!isClientTaskActive())
                     return;
-                mClientData.clear();
                 mDepartedScores.clear();
             }
             if (!isClientTaskActive())
                 return;
-            clearSharedRosterState();
+            restoreConnectedLobbyRoster();
             synchronized (mServerStateLock) {
                 // A playing phone still needs its actual assigned round team
                 // when consuming the completion broadcast. Its activity clears
@@ -1722,17 +1746,87 @@ public class TcpServer extends Service {
                 mBalancedPreparationGeneration++;
                 cancelBalancedCheckInTimeoutLocked();
                 if (isClientTaskActive()) {
+                    mRoundEndDelivered = true;
                     mStartAnnounced = false;
                     mScheduledStart = -1;
                     mScheduledDuration = 0;
                     mRoundToken = null;
                     mBossHunterCount = -1;
                     Globals.getInstance().mBossHunterCount = -1;
+                    mEndVotes = 0;
+                    Globals.getInstance().mEndGameVotes = 0;
+                    Globals.getInstance().mEndGameVoteRequested = false;
+                    mEnemyGPSRevealUntil.clear();
+                    mGPSVisibilityRefreshPlayers.clear();
+                    mPowerupAuthority.resetRound();
+                    mPowerupAuthorityToken = null;
+                    mUnacknowledgedLocalPowerups.clear();
+                    java.util.Arrays.fill(mPowerupIdentities, null);
+                    mRoundAnalytics.clear();
+                    mAnalyticsToken = null;
+                    mAnalyticsComplete = false;
+                    mAnalyticsEndAt = -1;
                     sendBroadcast(new Intent(NetMsg.NETMSG_ENDGAME)
                             .putExtra(EXTRA_ROUND_REPORTS_DELIVERED, true));
                 }
             }
         }, RoundTask.END);
+    }
+
+    /** Round participation ends; live lobby sockets and their clocks do not. */
+    private void restoreConnectedLobbyRoster() {
+        Map<Byte, InetAddress> connected = new HashMap<>();
+        Map<Byte, InetAddress> previousAddresses = getTeamIPMapSnapshot();
+        Set<Byte> disconnected = new HashSet<>();
+        for (ClientRecipient recipient : getClientRecipients()) {
+            if (recipient.playerID <= 0 || !Globals.isValidPlayerID(recipient.playerID))
+                continue;
+            if (recipient.isConnectedPlayer() && !recipient.client.connectionFailed) {
+                InetAddress address = recipient.client.lobbyAddress;
+                if (address == null) address = recipient.client.clientSocket.getInetAddress();
+                if (address == null) address = previousAddresses.get(recipient.playerID);
+                connected.put(recipient.playerID, address);
+            } else {
+                disconnected.add(recipient.playerID);
+                recipient.client.close();
+                mClientData.remove(recipient.connectionID, recipient.client);
+            }
+        }
+        disconnected.removeAll(connected.keySet());
+        Globals globals = Globals.getInstance();
+        if (!isClientTaskActive()) return;
+        Globals.getmGPSDataSemaphore();
+        try {
+            if (!keepListening || Thread.currentThread().isInterrupted()) return;
+            for (byte id : disconnected) globals.mGPSData.remove(id);
+        } finally { globals.mGPSDataSemaphore.release(); }
+        if (!isClientTaskActive()) return;
+        Globals.getmTeamPlayerNameSemaphore();
+        try {
+            if (!keepListening || Thread.currentThread().isInterrupted()) return;
+            for (byte id : disconnected) globals.mTeamPlayerNameMap.remove(id);
+        } finally { globals.mTeamPlayerNameSemaphore.release(); }
+        if (!isClientTaskActive()) return;
+        Globals.getmTeamIPMapSemaphore();
+        try {
+            if (!keepListening || Thread.currentThread().isInterrupted()) return;
+            for (byte id : disconnected) globals.mTeamIPMap.remove(id);
+            globals.mTeamIPMap.putAll(connected);
+        } finally { globals.mTeamIPMapSemaphore.release(); }
+        if (!isClientTaskActive()) return;
+        Globals.getmIPTeamMapSemaphore();
+        try {
+            if (!keepListening || Thread.currentThread().isInterrupted()) return;
+            Iterator<Map.Entry<InetAddress, Byte>> endpoints = globals.mIPTeamMap.entrySet().iterator();
+            while (endpoints.hasNext()) {
+                Map.Entry<InetAddress, Byte> endpoint = endpoints.next();
+                if (disconnected.contains(endpoint.getValue())
+                        || connected.containsKey(endpoint.getValue())) endpoints.remove();
+            }
+            for (Map.Entry<Byte, InetAddress> endpoint : connected.entrySet())
+                globals.mIPTeamMap.put(endpoint.getValue(), endpoint.getKey());
+        } finally { globals.mIPTeamMapSemaphore.release(); }
+        requestFullGPSUpdate();
     }
 
     private void recordRoundCooldownLocked() {
@@ -1963,6 +2057,10 @@ public class TcpServer extends Service {
         if (!hasRecipient)
             return;
         try {
+            final boolean completedRound;
+            synchronized (mServerStateLock) { completedRound = mRoundEndDelivered; }
+            int publishedGameState = completedRound ? Globals.GAME_STATE_NONE
+                    : Globals.getInstance().mGameState;
             JSONArray players = new JSONArray();
             Map<Byte, LobbyPlayer> lobbyPlayers = getLobbyPlayersSnapshot();
             Map<Byte, InetAddress> teamIPMap = getTeamIPMapSnapshot();
@@ -2017,8 +2115,8 @@ public class TcpServer extends Service {
             String relayConfig = relayConfiguration();
             if (relayConfig != null) game.put(com.simplecoil.protocol.RelayConfig.WIRE, relayConfig);
             GpsWire.putOrigin(game, Globals.getInstance().mGpsOffset);
-            game.put(JSON_LOBBY_PLAYING, mStartAnnounced
-                    || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE);
+            game.put(JSON_LOBBY_PLAYING, !completedRound && (mStartAnnounced
+                    || publishedGameState != Globals.GAME_STATE_NONE));
             game.put(JSON_HOST_KIND, (mIsDedicated ? SharedLobby.Kind.DEDICATED_PHONE
                     : mManualPhoneHost ? SharedLobby.Kind.MANUAL_PHONE : SharedLobby.Kind.AUTO_PHONE).wire);
             game.put(JSON_HOST_AGE, mLobbyHostStartedAt < 0 ? 0 : Math.max(0,
@@ -2037,14 +2135,14 @@ public class TcpServer extends Service {
             game.put(JSON_GAMEMODE, Globals.getInstance().mGameMode);
             game.put(JSON_BALANCED_MODE, Globals.getInstance().mBalancedRandom);
             game.put(JSON_BALANCED_QR, Globals.getInstance().mBalancedRequireQr);
-            game.put(JSON_BALANCED_PREPARED, Globals.getInstance().mBalancedGamePrepared);
+            game.put(JSON_BALANCED_PREPARED, !completedRound && Globals.getInstance().mBalancedGamePrepared);
             game.put(JSON_POWERUP_QR_REQUIRED, Globals.getInstance().mPowerupQrRequired);
             game.put(JSON_RESPAWN_QR_ENABLED, Globals.getInstance().mRespawnQrEnabled);
             game.put(JSON_GRENADE_DAMAGE, Globals.getInstance().mGrenadeDamage);
             if (mIsDedicated) {
                 game.put(JSON_DEDICATED, true);
-                game.put(JSON_GAMESTATE, Globals.getInstance().mGameState);
-                if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE && (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0)
+                game.put(JSON_GAMESTATE, publishedGameState);
+                if (publishedGameState != Globals.GAME_STATE_NONE && (Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0)
                     game.put(JSON_TIMEREMAINING, Globals.getInstance().mServerGameTimeRemaining);
             }
             if (Globals.getInstance().mUseGPS)
@@ -2092,7 +2190,7 @@ public class TcpServer extends Service {
                     }
                     playerGameUpdate.put(JSON_TEAMPOINTS, teamPoints);
                 }
-                if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0 && Globals.getInstance().mGameState != Globals.GAME_STATE_NONE) {
+                if ((Globals.getInstance().mGameLimit & Globals.GAME_LIMIT_TIME) != 0 && publishedGameState != Globals.GAME_STATE_NONE) {
                     playerGameUpdate.put(JSON_TIMEREMAINING, Globals.getInstance().mServerGameTimeRemaining);
                 }
                 game.put(JSON_PLAYERGAMEUPDATE, playerGameUpdate);
@@ -2886,6 +2984,7 @@ public class TcpServer extends Service {
                 mScheduledStart = -1;
                 mScheduledDuration = 0;
                 mRoundToken = null;
+                mRoundEndDelivered = false;
                 mBossHunterCount = -1;
                 Globals.getInstance().mBossHunterCount = -1;
             }
@@ -2902,6 +3001,7 @@ public class TcpServer extends Service {
             mIsDedicated = false;
             mStartAnnounced = true;
             mRoundToken = token;
+            mRoundEndDelivered = false;
             mRoundSequence = roundID;
             mScheduledStart = startAt;
             mScheduledDuration = endAt > 0 ? Math.max(1, endAt - startAt) : 0;
@@ -3455,6 +3555,7 @@ public class TcpServer extends Service {
         private volatile int hits = 0;
         private volatile int priorKills;
         private volatile int priorDeaths;
+        private String historyRoundApplied;
         // Dedicated-host state: only a server-observed death may be revived.
         private volatile boolean awaitingRespawn;
         private volatile boolean analyticsCapable;

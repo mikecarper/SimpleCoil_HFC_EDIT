@@ -98,6 +98,7 @@ public class TcpClient extends Service {
     static final int MAX_SCOREBOARD_VALUE = Globals.MAX_SCOREBOARD_VALUE;
     static final String EXTRA_TERMINAL_EVENT_ID = "com.simplecoil.simplecoil.TCP_TERMINAL_EVENT_ID";
     static final String EXTRA_START_EVENT_ID = "com.simplecoil.simplecoil.TCP_START_EVENT_ID";
+    static final String EXTRA_ROUND_END = "com.simplecoil.simplecoil.TCP_ROUND_END";
     private static final AtomicLong terminalEventIds = new AtomicLong();
 
     private volatile boolean keepListening = false;
@@ -131,6 +132,10 @@ public class TcpClient extends Service {
     private long mPendingClockRequest = -1;
     private long mLastClockSync;
     private long mLastStartRound;
+    // Numeric round order belongs to one connection. The completed token also
+    // survives automatic reconnects, where a restarted host may begin at ID 1.
+    private long mLastCompletedRound;
+    private String mLastCompletedRoundToken;
     private JSONObject mPendingStartInfo;
     private Intent mPendingStartIntent;
     private Intent mPendingGameStartEvent;
@@ -405,6 +410,7 @@ public class TcpClient extends Service {
         mPendingClockRequest = -1;
         mLastClockSync = 0;
         mLastStartRound = 0;
+        mLastCompletedRound = 0;
         mPendingStartInfo = null;
         mPendingStartIntent = null;
         mPendingGameStartEvent = null;
@@ -575,12 +581,14 @@ public class TcpClient extends Service {
             if (!isCurrentSession(generation))
                 return;
             long roundID = TcpJson.getLong(startInfo, TcpServer.JSON_ROUND_ID);
+            if (startInfo.optString(TcpServer.JSON_ROUND_TOKEN).equals(mLastCompletedRoundToken))
+                return;
             // Clock sync can delay publication of a start. Keep the newest plan
             // during that delay; otherwise a late packet for an older round can
             // replace a newer pending plan and start the wrong game.
             long pendingRoundID = mPendingStartInfo == null ? 0
                     : TcpJson.getLong(mPendingStartInfo, TcpServer.JSON_ROUND_ID);
-            if (roundID < mLastStartRound || (roundID == mLastStartRound
+            if (roundID <= mLastCompletedRound || roundID < mLastStartRound || (roundID == mLastStartRound
                     && NetMsg.NETMSG_STARTGAME.equals(intent.getAction()))
                     || roundID < pendingRoundID)
                 return;
@@ -617,15 +625,15 @@ public class TcpClient extends Service {
         mLastStartRound = roundID;
         if (duration > 0 && startAt + duration <= now) {
             // A start plan may reach a paused client after its timed round has
-            // already expired. An active TCP session must retire normally; the
-            // parser is also used before a worker has been started, where
-            // finishServerSession intentionally ignores inactive sessions.
-            // In that latter case still tell the UI not to start a fresh
-            // countdown from a finished round.
+            // already expired. Finish that round without discarding the host's
+            // calibrated lobby connection. Parser-only callers still receive
+            // an end event instead of starting a fresh countdown.
             if (keepListening)
-                finishServerSession(NetMsg.NETMSG_ENDGAME);
-            else
+                finishRoundFromHost(roundToken);
+            else {
+                finishRoundToLobbyLocked(roundToken, roundID);
                 broadcastIfCurrentSession(generation, new Intent(NetMsg.NETMSG_ENDGAME));
+            }
             return;
         }
         mActiveHostStartAt = hostStartAt;
@@ -720,6 +728,8 @@ public class TcpClient extends Service {
             messageQueue = new ConcurrentLinkedQueue<>();
             mPersistentDrainRequested = false;
             mPendingTerminalEvent = null;
+            mLastCompletedRound = 0;
+            mLastCompletedRoundToken = null;
             mIsDedicatedServer = false;
             resetClockSyncLocked();
             mSessionGeneration++;
@@ -863,8 +873,7 @@ public class TcpClient extends Service {
                                 } else if (message.equals(NetMsg.NETMSG_RESPAWNGRANTED)) {
                                     sendBroadcast(new Intent(NetMsg.NETMSG_RESPAWNGRANTED));
                                 } else if (message.equals(NetMsg.NETMSG_ENDGAME)) {
-                                    finishServerSession(NetMsg.NETMSG_ENDGAME);
-                                    break;
+                                    finishRoundFromHost(null);
                                 } else if (message.equals(NetMsg.NETMSG_STARTGAME)) {
                                     Log.w(TAG, "Ignoring a start without a synchronized deadline");
                                 } else if (message.equals(NetMsg.NETMSG_CLOCKSYNCWAITING)) {
@@ -971,6 +980,62 @@ public class TcpClient extends Service {
         sendBroadcast(new Intent(notification));
     }
 
+    /** Retire gameplay only; the same host and clock remain valid for the next round. */
+    public synchronized void finishRoundToLobby(String roundToken) {
+        if (roundToken == null || roundToken.equals(mLastCompletedRoundToken))
+            return;
+        if (!roundToken.equals(mStatisticsRoundToken)
+                && !roundToken.equals(mActiveStartToken)
+                && (mPendingStartInfo == null
+                || !roundToken.equals(mPendingStartInfo.optString(TcpServer.JSON_ROUND_TOKEN))))
+            return;
+        long completed = mLastStartRound;
+        if (mPendingStartInfo != null)
+            completed = Math.max(completed, mPendingStartInfo.optLong(TcpServer.JSON_ROUND_ID));
+        finishRoundToLobbyLocked(roundToken, completed);
+    }
+
+    private void finishRoundToLobbyLocked(String roundToken, long completed) {
+        mLastCompletedRound = Math.max(mLastCompletedRound, completed);
+        if (roundToken == null) roundToken = mStatisticsRoundToken;
+        if (roundToken != null) mLastCompletedRoundToken = roundToken;
+        mPendingStartInfo = null;
+        mPendingStartIntent = null;
+        mPendingGameStartEvent = null;
+        clearActiveStartLocked();
+        mPowerupCache.resetRound();
+        mPowerupRoundToken = null;
+        mPendingPowerupFrame = null;
+        mPendingLivePowerups.clear();
+        mSeenLivePowerups.clear();
+        mUnacknowledgedPowerups.clear();
+        mPendingTelemetryResume = null;
+        messageQueue = new ConcurrentLinkedQueue<>();
+        mPersistentDrainRequested = false;
+    }
+
+    private void finishRoundFromHost(String roundToken) {
+        final Intent notification;
+        synchronized (this) {
+            if (mDestroyed || !keepListening) return;
+            if (roundToken == null) roundToken = mStatisticsRoundToken;
+            long completed = mLastStartRound;
+            if (mPendingStartInfo != null) {
+                completed = Math.max(completed, mPendingStartInfo.optLong(TcpServer.JSON_ROUND_ID));
+                if (roundToken == null)
+                    roundToken = mPendingStartInfo.optString(TcpServer.JSON_ROUND_TOKEN, null);
+            }
+            finishRoundToLobbyLocked(roundToken, completed);
+            mLobbyHostPlaying = false;
+            notification = new Intent(NetMsg.NETMSG_ENDGAME)
+                    .putExtra(EXTRA_ROUND_END, true)
+                    .putExtra(EXTRA_TERMINAL_EVENT_ID, terminalEventIds.incrementAndGet());
+            if (roundToken != null) notification.putExtra(NetMsg.INTENT_ROUND_TOKEN, roundToken);
+            mPendingTerminalEvent = notification;
+        }
+        sendBroadcast(new Intent(notification));
+    }
+
     public Intent consumePendingTerminalEvent() {
         return consumePendingTerminalEvent(0);
     }
@@ -1070,7 +1135,8 @@ public class TcpClient extends Service {
         }
         synchronized (this) {
             RoundRoster roster = Globals.getInstance().mRoundRoster;
-            if (!isCurrentSession(generation) || roster == null || !token.equals(roster.token)) return;
+            if (!isCurrentSession(generation) || token.equals(mLastCompletedRoundToken)
+                    || roster == null || !token.equals(roster.token)) return;
             if (!token.equals(mPowerupRoundToken)) {
                 mPowerupCache.resetRound();
                 Arrays.fill(mPowerupSeatIdentities, null);
@@ -1418,6 +1484,7 @@ public class TcpClient extends Service {
         RoundRoster.Member member = roster == null ? null : roster.seat(globals.mPlayerID);
         if (mDestroyed || globals.mGameState != Globals.GAME_STATE_RUNNING
                 || member == null || !member.active || !roster.token.equals(mStatisticsRoundToken)
+                || roster.token.equals(mLastCompletedRoundToken)
                 || mStatisticsStartAt >= 0 && SystemClock.elapsedRealtime() < mStatisticsStartAt)
             return null;
         if (!roster.token.equals(mTelemetryToken)) {
@@ -1692,6 +1759,12 @@ public class TcpClient extends Service {
                 return;
             }
             JSONObject startInfo = game.has(TcpServer.JSON_GAMESTART) ? readStartInfo(game) : null;
+            synchronized (this) {
+                if (startInfo != null
+                        && (TcpJson.getLong(startInfo, TcpServer.JSON_ROUND_ID) <= mLastCompletedRound
+                        || startInfo.optString(TcpServer.JSON_ROUND_TOKEN).equals(mLastCompletedRoundToken)))
+                    return;
+            }
             if (startInfo != null && !game.has(TcpServer.JSON_PLAYERS)) {
                 if (Globals.getInstance().mLocalLobbyBenched) return;
                 if (roundRoster != null) Globals.getInstance().installRoundRoster(roundRoster);

@@ -461,8 +461,15 @@ public class TcpClientSessionRegressionTest {
     }
 
     @Test
-    public void roundEndStopsWithoutAnActivityReceiver() throws Exception {
-        assertTerminalMessage(control(NetMsg.NETMSG_ENDGAME), NetMsg.NETMSG_ENDGAME);
+    public void roundEndKeepsClockAndConnectionWithoutAnActivityReceiver() throws Exception {
+        connect();
+        send(control(NetMsg.NETMSG_ENDGAME), TcpServer.TCP_SERVER_PING);
+        expectPong();
+        assertTrue(client.actions.contains(NetMsg.NETMSG_ENDGAME));
+        assertTrue(client.isClockSynchronized());
+        assertTrue(flag("isListening"));
+        assertTrue(client.hasClientSession(Globals.getInstance().mServerIP));
+        assertFalse(client.actions.contains(NetMsg.NETMSG_NETWORKDISCONNECTED));
     }
 
     @Test
@@ -741,14 +748,14 @@ public class TcpClientSessionRegressionTest {
 
     @Test
     public void terminalEventIsRetainedUntilConsumedExactlyOnce() throws Exception {
-        assertTerminalMessage(control(NetMsg.NETMSG_ENDGAME), NetMsg.NETMSG_ENDGAME);
+        assertTerminalMessage(control(NetMsg.NETMSG_SERVERCANCEL), NetMsg.NETMSG_SERVERCANCEL);
         Intent notification = client.notifications.get(client.notifications.size() - 1);
         long eventId = notification.getLongExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID, 0);
         assertTrue(eventId > 0);
         assertNull(client.consumePendingTerminalEvent(eventId + 1));
         Intent pending = client.consumePendingTerminalEvent(eventId);
         assertNotNull(pending);
-        assertEquals(NetMsg.NETMSG_ENDGAME, pending.getAction());
+        assertEquals(NetMsg.NETMSG_SERVERCANCEL, pending.getAction());
         assertFalse(pending.hasExtra(TcpClient.EXTRA_TERMINAL_EVENT_ID));
         assertNull(client.consumePendingTerminalEvent());
         assertNull(client.consumePendingTerminalEvent(eventId));
@@ -786,7 +793,9 @@ public class TcpClientSessionRegressionTest {
 
     @Test
     public void destroyedServiceDiscardsUnconsumedTerminalEvent() throws Exception {
-        assertTerminalMessage(control(NetMsg.NETMSG_ENDGAME), NetMsg.NETMSG_ENDGAME);
+        connect();
+        send(control(NetMsg.NETMSG_ENDGAME), TcpServer.TCP_SERVER_PING);
+        expectPong();
         destroy(client);
         assertNull(client.consumePendingTerminalEvent());
     }

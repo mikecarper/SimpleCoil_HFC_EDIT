@@ -41,6 +41,7 @@ public final class SlowClientIsolationTest {
         verifyQueueBound("x".repeat(60_000), 4);
         verifyFinalFrameOrder();
         verifyRoundFinalBatch();
+        verifyRetainedLobbyAssignments();
         verifyFinalFrameDeadline();
         verifyClockSendTimestamp();
         verifyShutdownClosesUnregisteredWriter();
@@ -135,21 +136,54 @@ public final class SlowClientIsolationTest {
             blocked.awaitEntered();
             call(fixture.host, "endRound", String.class, "final-batch regression");
             check(!slow.socket.closed.get(), "Round end closed a phone before its report flushed");
-            check(!slow.send("late scoreboard"), "A late frame overtook the final round batch");
-            await(healthy.socket.closed::get, 1_000, "Slow phone blocked another phone's final report");
+            check(slow.send("post-round heartbeat"), "Round end closed the retained control connection");
+            await(() -> outboundEmpty(healthy.client), 1_000, "Slow phone blocked another phone's final report");
+            check(!healthy.socket.closed.get(), "Round completion disconnected a healthy phone");
             checkFinalRoundFrames(healthy.socket.output.frames(), 0);
             blocked.release.countDown();
-            await(slow.socket.closed::get, 1_000, "Final report never flushed to the recovered phone");
+            await(() -> outboundEmpty(slow.client), 1_000, "Final report never flushed to the recovered phone");
+            check(!slow.socket.closed.get(), "Round completion disconnected the recovered phone");
             checkFinalRoundFrames(slow.socket.output.frames(), 1);
+            check(slow.socket.output.frames().get(4).equals("post-round heartbeat"),
+                    "A retained connection interleaved traffic into the final batch");
         }
     }
 
     private static void checkFinalRoundFrames(List<String> frames, int prefix) {
-        check(frames.size() == prefix + 3 && frames.get(prefix).startsWith(JSON)
+        check(frames.size() >= prefix + 3 && frames.get(prefix).startsWith(JSON)
                         && frames.get(prefix).contains("\"playerdata\"")
                         && frames.get(prefix + 1).contains("\"roundreport\"")
                         && frames.get(prefix + 2).equals("SimpleCoil:31MESGENDGAME"),
                 "Final scoreboard, personal report and ENDGAME were lost or reordered: " + frames);
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void verifyRetainedLobbyAssignments() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            Phone first = fixture.phone(1, true), second = fixture.phone(2, true);
+            Phone benched = fixture.phone(17, true);
+            setField(first.client, "clockReady", true);setField(second.client, "clockReady", true);
+            setField(benched.client, "lobbyBenched", true);
+            setField(field(fixture.host, "config"), "balanced", true);
+            Map<Integer, Object> players = (Map<Integer, Object>) field(fixture.host, "players");
+            Map<String, Integer> retained = (Map<String, Integer>) field(fixture.host, "retainedBalancedTeams");
+            retained.put((String) field(players.get(1), "identity"), 2);
+            retained.put((String) field(players.get(2), "identity"), 1);
+            setField(fixture.host, "balancedTeams", Map.of(1, 2, 2, 1));
+            Object origin = com.simplecoil.protocol.GpsOffset.create(47.6, -122.1);
+            setField(fixture.host, "gpsOffset", origin);
+            Class<? extends Enum> state = (Class<? extends Enum>) field(fixture.host, "roundState").getClass();
+            setField(fixture.host, "roundState", Enum.valueOf(state, "FINISHED"));
+            synchronized (field(fixture.host, "stateLock")) { call(fixture.host, "resetForNewLobbyLocked"); }
+            check(field(fixture.host, "balancedTeams").equals(Map.of(1, 2, 2, 1)),
+                    "A retained lobby rebalanced identities without a new join or operator request");
+            check(((Map<?, ?>) field(fixture.host, "activeClients")).size() == 3
+                            && Boolean.TRUE.equals(field(first.client, "clockReady"))
+                            && Boolean.TRUE.equals(field(second.client, "clockReady"))
+                            && Boolean.TRUE.equals(field(benched.client, "lobbyBenched")),
+                    "Next-lobby preparation discarded clock readiness or participation");
+            check(field(fixture.host, "gpsOffset") == origin, "Next-lobby preparation replaced the GPS origin");
+        }
     }
 
     private static void verifyFinalFrameDeadline() throws Exception {

@@ -446,7 +446,7 @@ public class TcpServerDispatchRegressionTest {
     }
 
     @Test
-    public void endingGameKeepsRegistrationsLockedUntilSharedRosterIsCleared() throws Exception {
+    public void endingGameKeepsRegistrationsLockedUntilConnectedLobbyIsRestored() throws Exception {
         Semaphore locations = Globals.getInstance().mGPSDataSemaphore;
         clientsLock.acquire();
         locations.acquire();
@@ -458,15 +458,17 @@ public class TcpServerDispatchRegressionTest {
             clientsLock.release();
             clientLockHeld = false;
             assertQueued(locations);
-            assertEquals("New registrations could be erased by unfinished round cleanup", 0,
+            assertEquals("New registrations overtook unfinished round cleanup", 0,
                     clientsLock.availablePermits());
         } finally {
             if (clientLockHeld) clientsLock.release();
             locations.release();
             if (worker != null) worker.join(1000);
         }
-        assertTrue(clients.isEmpty());
-        assertTrue(Globals.getInstance().mTeamPlayerNameMap.isEmpty());
+        assertEquals(1, clients.size());
+        assertEquals("Player 1", Globals.getInstance().mTeamPlayerNameMap.get((byte) 1));
+        assertFalse("Ordinary round end closed the lobby connection", sockets.get(0).closed);
+        assertTrue(server.arePlayerClocksSynchronized());
         assertEquals(1, clientsLock.availablePermits());
         assertTrue(server.events.contains(NetMsg.NETMSG_ENDGAME));
     }
@@ -841,12 +843,15 @@ public class TcpServerDispatchRegressionTest {
 
     @Test
     public void aLaterRoundCanStillBeEndedAfterCleanupCompletes() throws Exception {
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         dispatchThenChange(server::endGame, () -> { });
         MemorySocket nextRound = new MemorySocket();
         addClient(2, nextRound);
+        dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         dispatchThenChange(server::endGame, () -> { });
-        assertTrue(nextRound.closed);
-        assertTrue(clients.isEmpty());
+        assertFalse(nextRound.closed);
+        assertEquals(2, clients.size());
+        assertTrue(server.arePlayerClocksSynchronized());
         assertEquals(2, java.util.Collections.frequency(server.events, NetMsg.NETMSG_ENDGAME));
     }
 
@@ -1257,6 +1262,17 @@ public class TcpServerDispatchRegressionTest {
         assertEquals(byIdentity, globals.mRetainedBalancedTeams);
         assertTrue(globals.mBalancedTeams.isEmpty());
         assertFalse(globals.mBalancedGamePrepared);
+        // These participants explicitly disconnect before returning in new
+        // seats. Ordinary round completion keeps their old sockets admitted.
+        Constructor<?> handlerConstructor = Class.forName(TcpServer.class.getName() + "$ClientThread")
+                .getDeclaredConstructor(TcpServer.class);
+        handlerConstructor.setAccessible(true);
+        Object handler = handlerConstructor.newInstance(server);
+        Method remove = handler.getClass().getDeclaredMethod("removeClient",
+                clients.get(1).getClass(), Integer.class, boolean.class);
+        remove.setAccessible(true);
+        for (int id : new ArrayList<>(clients.keySet())) remove.invoke(handler, clients.get(id), id, true);
+        awaitBalancedModeTasks();
         for (int index = 0; index < identities.size(); index++) {
             int id = index + 7;
             addClient(id, new MemorySocket());
@@ -2179,12 +2195,12 @@ public class TcpServerDispatchRegressionTest {
         assertTrue(report.complete);
         assertTrue(report.durationMs >= 1000);
         int previousBytes = shooter.bytes.size();
-        dispatchThenChange(server::endGame, () -> { });
+        assertFalse("Repeated completion queued another ENDGAME", server.requestOrderedRoundEnd());
         assertEquals(previousBytes, shooter.bytes.size());
         Map<?, ?> cached = (Map<?, ?>) get(server, "mCompletedRoundReports");
         RoundReport frozen = (RoundReport) cached.get(shooterIdentity);
-        // The original client map is cleared on end; compare the immutable report
-        // retained by identity rather than a new occupant of its old seat.
+        // The frozen report remains immutable while its lobby socket stays
+        // admitted, including repeated completion requests.
         assertEquals(token, frozen.roundToken);
         assertEquals(report.kills, frozen.kills);
     }

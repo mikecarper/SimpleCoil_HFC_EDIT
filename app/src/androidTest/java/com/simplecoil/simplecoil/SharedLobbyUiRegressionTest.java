@@ -26,6 +26,159 @@ import static androidx.test.espresso.matcher.ViewMatchers.withText;
 
 @RunWith(AndroidJUnit4.class)
 public class SharedLobbyUiRegressionTest {
+    @Test public void completedRoundKeepsTheClientAndPhoneHostInTheirLobby() throws Exception {
+        Globals globals = Globals.getInstance();
+        java.net.InetAddress previousHost = globals.mServerIP;
+        int previousState = globals.mGameState;
+        java.net.InetAddress host = java.net.InetAddress.getByName("192.0.2.10");
+        globals.mGameState = Globals.GAME_STATE_NONE;
+        try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
+            scenario.onActivity(activity -> {
+                ((Handler) get(activity, "mLobbyHandler")).removeCallbacksAndMessages(null);
+                invoke(activity, "leaveSharedLobby");
+                Object originalClient = get(activity, "mTcpClient");
+                Object originalServer = get(activity, "mTcpServer");
+                Object originalUdp = get(activity, "mUDPListenerService");
+                Object originalMatch = get(activity, "mMatchSession");
+                try {
+                    for (boolean hosting : new boolean[]{false, true}) {
+                        RetainedRoundClient client = new RetainedRoundClient(host);
+                        RetainedRoundServer server = new RetainedRoundServer();
+                        RetainedRoundUdp udp = new RetainedRoundUdp();
+                        set(activity, "mTcpClient", client);
+                        set(activity, "mTcpServer", server);
+                        set(activity, "mUDPListenerService", udp);
+                        set(activity, "mMatchSession", new MatchSessionLock(null, null));
+                        set(activity, "mUseNetwork", true);
+                        set(activity, "mReady", true);
+                        set(activity, "mLobbyJoined", true);
+                        set(activity, "mIsServer", hosting);
+                        // Exercise round teardown without writing a synthetic
+                        // completed result into the user's saved player history.
+                        set(activity, "mStartGameTimer", true);
+                        set(activity, "mActivePeerRoundToken", "11111111-2222-3333-4444-555555555555");
+                        globals.mServerIP = host;
+                        globals.mGameState = Globals.GAME_STATE_RUNNING;
+                        invoke(activity, "endGame");
+                        assertEquals(Globals.GAME_STATE_NONE, globals.mGameState);
+                        assertTrue((Boolean) get(activity, "mReady"));
+                        assertTrue((Boolean) get(activity, "mLobbyJoined"));
+                        assertEquals(hosting, get(activity, "mIsServer"));
+                        assertEquals(0, client.stops);
+                        assertEquals(0, server.stops);
+                        assertEquals(0, udp.stops);
+                        assertEquals(1, udp.finishedRounds);
+                        assertEquals(hosting, udp.hosting);
+                        if (hosting) {
+                            assertEquals(1, server.rosters);
+                            assertEquals(0, server.cancellations);
+                        } else {
+                            assertEquals(1, client.finishedRounds);
+                        }
+                        invoke(activity, "endGame", new Class<?>[]{boolean.class}, true);
+                        assertFalse((Boolean) get(activity, "mReady"));
+                        assertFalse((Boolean) get(activity, "mIsServer"));
+                        assertTrue(udp.stops > 0);
+                        assertTrue(hosting ? server.stops > 0 : client.stops > 0);
+                        client.onDestroy();
+                        server.onDestroy();
+                        udp.onDestroy();
+                    }
+                } finally {
+                    set(activity, "mTcpClient", originalClient);
+                    set(activity, "mTcpServer", originalServer);
+                    set(activity, "mUDPListenerService", originalUdp);
+                    set(activity, "mMatchSession", originalMatch);
+                    set(activity, "mReady", false);
+                    set(activity, "mIsServer", false);
+                    globals.mGameState = Globals.GAME_STATE_NONE;
+                }
+            });
+        } finally {
+            globals.mServerIP = previousHost;
+            globals.mGameState = previousState;
+        }
+    }
+
+    @Test public void completedUdpRoundReusesItsSocketAndReopensHosting() throws Exception {
+        java.net.DatagramSocket socket = new java.net.DatagramSocket();
+        try {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+                UDPListenerService udp = new UDPListenerService();
+                try {
+                    setUdp(udp, "keepListening", true);
+                    setUdp(udp, "mSocket", socket);
+                    setUdp(udp, "mReadyToScan", 1);
+                    setUdp(udp, "mPeerGame", true);
+                    setUdp(udp, "mGameRunning", true);
+                    setUdp(udp, "mStateGossipRound", true);
+                    setUdp(udp, "mStateAuthority", true);
+                    udp.finishRoundToLobby(true);
+                    assertFalse("Round completion closed the reusable UDP socket", socket.isClosed());
+                    assertTrue((Boolean) getUdp(udp, "keepListening"));
+                    assertTrue((Boolean) getUdp(udp, "mIsListService"));
+                    assertFalse((Boolean) getUdp(udp, "mGameRunning"));
+                    assertFalse((Boolean) getUdp(udp, "mPeerGame"));
+                    assertFalse((Boolean) getUdp(udp, "mStateAuthority"));
+                    assertSame(socket, getUdp(udp, "mSocket"));
+                    assertEquals(1, getUdp(udp, "mReadyToScan"));
+                } finally {
+                    udp.stopListen();
+                    udp.onDestroy();
+                }
+            });
+        } finally { socket.close(); }
+    }
+
+    private static final class RetainedRoundClient extends TcpClient {
+        final java.net.InetAddress host;
+        int stops, finishedRounds;
+        RetainedRoundClient(java.net.InetAddress host) { this.host = host; }
+        @Override synchronized boolean hasClientSession(java.net.InetAddress selected) {
+            return stops == 0 && host.equals(selected);
+        }
+        @Override public synchronized boolean hasLobbyConnection() { return stops == 0; }
+        @Override public void finishRoundToLobby(String token) { finishedRounds++; }
+        @Override public void stopTcpClient() { stops++; }
+        @Override public void leaveServer() { }
+    }
+
+    private static final class RetainedRoundServer extends TcpServer {
+        int stops, cancellations, rosters;
+        @Override boolean isTcpServerReady() { return stops == 0; }
+        @Override public void stopTcpServer() { stops++; }
+        @Override public void cancelServer(boolean quiet) { cancellations++; }
+        @Override public void sendAllGameInfo(int id) { rosters++; }
+    }
+
+    private static final class RetainedRoundUdp extends UDPListenerService {
+        int stops, finishedRounds;
+        boolean hosting;
+        @Override void stopListen() { stops++; }
+        @Override public void finishRoundToLobby(boolean hosting) {
+            this.hosting = hosting;
+            finishedRounds++;
+        }
+    }
+
+    private static Object getUdp(UDPListenerService target, String name) {
+        try {
+            Field field = UDPListenerService.class.getDeclaredField(name);
+            field.setAccessible(true);
+            return field.get(target);
+        }
+        catch (Exception e) { throw new AssertionError(e); }
+    }
+
+    private static void setUdp(UDPListenerService target, String name, Object value) {
+        try {
+            Field field = UDPListenerService.class.getDeclaredField(name);
+            field.setAccessible(true);
+            field.set(target, value);
+        }
+        catch (Exception e) { throw new AssertionError(e); }
+    }
+
     @Test public void automaticAndLateScoreboardUpdatesNeverOpenAPlayerList() throws Exception {
         try (ActivityScenario<FullscreenActivity> scenario = ActivityScenario.launch(FullscreenActivity.class)) {
             scenario.onActivity(activity -> {

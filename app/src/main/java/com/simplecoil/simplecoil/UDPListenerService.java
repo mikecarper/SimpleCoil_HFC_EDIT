@@ -3882,6 +3882,33 @@ public class UDPListenerService extends Service {
         }
     }
 
+    /** Retire only the completed round, keeping the shared lobby's UDP socket. */
+    public void finishRoundToLobby(boolean hosting) {
+        synchronized (mListenerStateLock) {
+            if (mDestroyed || !keepListening)
+                return;
+            cancelInviteListenerRequestLocked();
+            mPassiveInviteListener = false;
+            mInviteTemporarilyAllowsJoin = false;
+            mInviteWindowGeneration++;
+            mIsListService = hosting;
+            mPeerGame = false;
+            mGameRunning = false;
+            mPeerRoundToken = null;
+            mStateGossipRound = false;
+            mStateAuthority = false;
+            mStateRoundToken = null;
+            mStateRoundUuid = null;
+            mPendingPeerRoundToken = null;
+            mPendingPeerEndGame = null;
+            resetPeerGameSequences();
+            releaseGameplayWifiLocksLocked();
+            mMainHandler.removeCallbacks(mSharedLobbyBeacon);
+            if (hosting)
+                mMainHandler.post(mSharedLobbyBeacon);
+        }
+    }
+
     public void endGame() {
         commitRoundEnd(mStateRoundToken, 0);
         final String message;

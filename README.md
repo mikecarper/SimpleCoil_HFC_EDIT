@@ -330,6 +330,10 @@ does not turn an old fix into a new one. Expired fixes are removed from the map.
 
 - Lobby join immediately begins a 12-exchange clock-calibration burst before a
   start is accepted.
+- Normal round completion returns to the same lobby without closing the host
+  connection or discarding clock calibration. Final scores and personal reports
+  arrive before the end event; the next round uses a fresh token and scores.
+  Explicit Leave and host shutdown still close the connection.
 - During initial calibration, the host sends the first lobby snapshot and
   defers repeated roster/settings updates until that phone is synchronized.
   Clock-ready broadcasts are grouped briefly so 16-32 phones finishing together

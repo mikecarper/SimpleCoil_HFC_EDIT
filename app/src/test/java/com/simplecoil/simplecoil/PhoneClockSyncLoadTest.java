@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,6 +36,9 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 /** Runs the Android host's real polling loop and writers over ordered TCP sockets. */
@@ -49,6 +53,145 @@ public class PhoneClockSyncLoadTest {
     public void phoneHostCalibratesLargeLobbiesWithinFiveSeconds() throws Exception {
         for (int gpsMode : new int[] {Globals.GPS_TEAMMATE, Globals.GPS_ALL})
             for (int count : new int[] {16, 24, 32}) verifyLobby(count, gpsMode);
+    }
+
+    @Test
+    public void ordinaryRoundEndKeepsSocketsAndClocksForTheNextRound() throws Exception {
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        WallClock clock = new WallClock();
+        try (Fixture fixture = new Fixture(2, Globals.GPS_ALL)) {
+            Globals globals = Globals.getInstance();
+            globals.mAllowPlayerSettings = false;
+            CountDownLatch initialized = new CountDownLatch(2), start = new CountDownLatch(1);
+            List<Future<Result>> calibration = new ArrayList<>();
+            for (Phone phone : fixture.phones)
+                calibration.add(workers.submit(() -> phone.calibrate(2, initialized, start)));
+            fixture.server.sendAllGameInfo(TcpServer.SEND_ALL);
+            driveUntil(() -> initialized.getCount() == 0, clock, 3_000, "Initial roster missing");
+            fixture.startPolling();start.countDown();
+            driveUntil(() -> allDone(calibration), clock, 5_000, "Initial clocks did not synchronize");
+            for (Future<Result> future : calibration) assertEquals(12, future.get().accepted);
+            assertTrue(fixture.server.startGame());
+            driveUntil(() -> fixture.server.getScheduledGameStart() != null && settled(fixture.server),
+                    clock, 2_000, "First round did not start");
+            String firstToken = fixture.server.getScheduledGameStart()
+                    .getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+            for (Phone phone : fixture.phones) assertEquals(firstToken,
+                    phone.readStart().getString(TcpServer.JSON_ROUND_TOKEN));
+            // Make this a completed short round rather than a cancelled countdown.
+            Shadows.shadowOf(Looper.getMainLooper()).idleFor(2_000, TimeUnit.MILLISECONDS);
+            globals.mGameState = Globals.GAME_STATE_RUNNING;
+            set(fixture.server, "mScheduledStart", android.os.SystemClock.elapsedRealtime() - 1_000);
+            Object shooter = fixture.clients.get(1);
+            Socket original = (Socket) get(shooter, "clientSocket");
+            long lastProbe = (long) get(shooter, "lastClockRequestAt");
+            set(shooter, "points", 3);set(shooter, "eliminated", 1);
+            set(shooter, "shots", 6);set(shooter, "hits", 3);set(shooter, "awaitingRespawn", true);
+            Map<?, ?> analytics = (Map<?, ?>) get(fixture.server, "mRoundAnalytics");
+            Object stats = analytics.get(get(shooter, "playerIdentity"));
+            set(stats, "kills", 3);set(stats, "deaths", 1);
+            set(stats, "shots", 6);set(stats, "hits", 3);
+            List<Future<RoundReport>> endings = new ArrayList<>();
+            for (Phone phone : fixture.phones)
+                endings.add(workers.submit(() -> { return phone.readRoundEnd(); }));
+            assertTrue(fixture.server.requestOrderedRoundEnd());
+            driveUntil(() -> allDone(endings) && settled(fixture.server), clock, 2_000,
+                    "Final scores/report/ENDGAME did not arrive");
+            RoundReport report = endings.get(0).get();
+            assertEquals(firstToken, report.roundToken);
+            assertEquals(3, report.kills);assertEquals(1, report.deaths);
+            assertEquals(6, report.shots);assertEquals(3, report.hits);
+            for (Future<RoundReport> ending : endings) assertEquals(firstToken, ending.get().roundToken);
+            assertSame("Round end replaced the TCP socket", original, get(shooter, "clientSocket"));
+            assertFalse(original.isClosed());
+            assertEquals(2, fixture.clients.size());
+            assertEquals(2, globals.mTeamIPMap.size());
+            assertTrue(fixture.server.arePlayerClocksSynchronized());
+            assertEquals(12, get(shooter, "clockSamples"));
+            assertEquals(lastProbe, get(shooter, "lastClockRequestAt"));
+            assertEquals("Final scores disappeared before the local UI could save them", 3,
+                    fixture.server.getScore((byte) 1).points);
+            assertEquals(3, get(shooter, "priorKills"));
+            assertEquals(1, get(shooter, "priorDeaths"));
+            assertTrue(((Map<?, ?>) get(fixture.server, "mRoundAnalytics")).isEmpty());
+            int completions = 0;
+            for (Intent event : fixture.server.events)
+                if (NetMsg.NETMSG_ENDGAME.equals(event.getAction())) {
+                    assertTrue(event.getBooleanExtra(TcpServer.EXTRA_ROUND_REPORTS_DELIVERED, false));
+                    completions++;
+                }
+            assertEquals(1, completions);
+            assertFalse("A duplicate end replayed the old reports", fixture.server.requestOrderedRoundEnd());
+            // The Activity has not yet left RUNNING while it saves statistics.
+            // A trailing legacy combat frame must not mutate the frozen score.
+            globals.mGameMode = Globals.GAME_MODE_FFA;
+            Phone victim = fixture.phones.get(1);
+            victim.sendControl(NetMsg.NETMSG_ELIMINATED + "1");
+            victim.sendControl(NetMsg.NETMSG_PLAYERDATAREQUEST);
+            JSONObject finalScores;
+            do { finalScores = victim.read(); } while (!finalScores.has(TcpServer.JSON_PLAYERDATA));
+            JSONArray rows = finalScores.getJSONArray(TcpServer.JSON_PLAYERDATA);
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject row = rows.getJSONObject(i);
+                if (row.getInt(TcpServer.JSON_PLAYERID) == 1)
+                    assertEquals("Post-round combat changed the frozen score", 3,
+                            row.getInt(TcpServer.JSON_PLAYERPOINTS));
+            }
+            globals.mGameMode = Globals.GAME_MODE_2TEAMS;
+            fixture.server.sendAllGameInfo(TcpServer.SEND_ALL);
+            driveUntil(() -> settled(fixture.server), clock, 2_000, "Post-round lobby did not publish");
+            for (Phone phone : fixture.phones) {
+                JSONObject lobby;
+                do { lobby = phone.read(); } while (!lobby.has(TcpServer.JSON_PLAYERS));
+                assertEquals("Queued roster restarted a round before its UI finished saving",
+                        Globals.GAME_STATE_NONE, lobby.getInt(TcpServer.JSON_GAMESTATE));
+                assertFalse(lobby.getBoolean(TcpServer.JSON_LOBBY_PLAYING));
+                assertFalse(lobby.has(TcpServer.JSON_GAMESTART));
+            }
+            // The activity finishes saving statistics before returning the host
+            // to its existing lobby. No registration or clock probe is sent.
+            globals.mGameState = Globals.GAME_STATE_NONE;
+            fixture.server.clearScheduledStart();
+            globals.mInfectionMode = true;
+            globals.setPlayerInfected((byte) 2, true);
+            assertTrue(fixture.server.startGame());
+            driveUntil(() -> fixture.server.getScheduledGameStart() != null && settled(fixture.server),
+                    clock, 2_000, "Second round required clocks to synchronize again");
+            String nextToken = fixture.server.getScheduledGameStart()
+                    .getStringExtra(NetMsg.INTENT_ROUND_TOKEN);
+            assertNotEquals(firstToken, nextToken);
+            for (Phone phone : fixture.phones)
+                assertEquals(nextToken, phone.readStart().getString(TcpServer.JSON_ROUND_TOKEN));
+            assertSame(original, get(shooter, "clientSocket"));
+            assertEquals(lastProbe, get(shooter, "lastClockRequestAt"));
+            assertEquals(12, get(shooter, "clockSamples"));
+            assertEquals(0, fixture.server.getScore((byte) 1).points);
+            assertEquals(0, fixture.server.getScore((byte) 1).shots);
+            assertEquals(false, get(shooter, "awaitingRespawn"));
+            assertEquals("A previously infected survivor kept the old role", 2,
+                    globals.mRoundRoster.seat(2).team);
+            assertFalse(globals.mInfectedPlayers.contains((byte) 2));
+            List<Future<RoundReport>> cancelledCountdown = new ArrayList<>();
+            for (Phone phone : fixture.phones)
+                cancelledCountdown.add(workers.submit(() -> phone.readRoundEnd(false)));
+            assertTrue(fixture.server.requestOrderedRoundEnd());
+            driveUntil(() -> allDone(cancelledCountdown) && settled(fixture.server), clock, 2_000,
+                    "Next countdown cancellation did not return to the same lobby");
+            for (Future<RoundReport> cancelled : cancelledCountdown) assertNull(cancelled.get());
+            assertTrue(fixture.server.arePlayerClocksSynchronized());
+            fixture.server.cancelServer();
+            driveUntil(() -> original.isClosed() && settled(fixture.server), clock, 2_000,
+                    "Explicit cancellation did not close the lobby socket");
+        } finally {
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    private static boolean settled(TcpServer server) throws Exception {
+        synchronized (get(server, "mServerStateLock")) {
+            return ((Set<?>) get(server, "mClientTasks")).isEmpty();
+        }
     }
 
     private void verifyLobby(int count, int gpsMode) throws Exception {
@@ -160,12 +303,46 @@ public class PhoneClockSyncLoadTest {
         synchronized void send(JSONObject value) throws Exception {
             output.writeUTF(JSON + value);output.flush();
         }
+        synchronized void sendControl(String message) throws Exception {
+            output.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG + message);
+            output.flush();
+        }
         JSONObject read() throws Exception {
             while (true) {
                 String frame = input.readUTF();
                 if (frame.startsWith(JSON)) return new JSONObject(frame.substring(JSON.length()));
                 if (TcpServer.TCP_SERVER_PING.equals(frame)) {
                     synchronized (this) { output.writeUTF(TcpClient.TCP_CLIENT_PONG);output.flush(); }
+                }
+            }
+        }
+        JSONObject readStart() throws Exception {
+            while (true) {
+                JSONObject frame = read();
+                if (frame.has(TcpServer.JSON_GAMESTART)) return frame;
+            }
+        }
+        RoundReport readRoundEnd() throws Exception {
+            return readRoundEnd(true);
+        }
+        RoundReport readRoundEnd(boolean expectReport) throws Exception {
+            boolean scores = false;
+            RoundReport report = null;
+            while (true) {
+                String frame = input.readUTF();
+                if ((TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_MESG
+                        + NetMsg.NETMSG_ENDGAME).equals(frame)) {
+                    assertTrue("ENDGAME overtook final scores", scores);
+                    if (expectReport) assertTrue("ENDGAME overtook the personal report", report != null);
+                    else assertNull("A cancelled countdown replayed the previous round's report", report);
+                    return report;
+                }
+                if (!frame.startsWith(JSON)) continue;
+                JSONObject json = new JSONObject(frame.substring(JSON.length()));
+                if (json.has(TcpServer.JSON_PLAYERDATA)) scores = true;
+                if (json.has(RoundReport.KEY)) {
+                    assertTrue("Personal report overtook final scores", scores);
+                    report = RoundReport.fromJson(json.getJSONObject(RoundReport.KEY));
                 }
             }
         }
@@ -308,7 +485,8 @@ public class PhoneClockSyncLoadTest {
     }
 
     private static final class RecordingServer extends TcpServer {
-        @Override public void sendBroadcast(Intent intent) { }
+        final List<Intent> events = new CopyOnWriteArrayList<>();
+        @Override public void sendBroadcast(Intent intent) { events.add(new Intent(intent)); }
     }
 
     private static long millis() { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime()); }
