@@ -65,6 +65,84 @@ public class AppUpdateControllerTest {
         }
     }
 
+    @Test public void reconnectDuringFailedMetadataLookupRetriesOnceAfterItSettles() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.source.duringLookup = () -> {
+                fixture.source.duringLookup = null;
+                fixture.reconnect();
+                throw new IOException("The old metadata connection failed after Internet returned");
+            };
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+            assertEquals(1, fixture.source.downloads);
+            assertEquals(1, fixture.installer.commits);
+            fixture.advance(120_000);
+            fixture.finishWork();
+            assertEquals("A settled retry must not queue more checks", 2, fixture.source.lookups);
+        }
+    }
+
+    @Test public void reconnectDuringFailedDownloadRetriesAfterItSettles() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.source.beforeDownload = () -> {
+                fixture.source.beforeDownload = null;
+                fixture.reconnect();
+                throw new IOException("The old APK connection failed after Internet returned");
+            };
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+            assertEquals(2, fixture.source.downloads);
+            assertEquals(1, fixture.installer.commits);
+            assertEquals(0, fixture.ui.total());
+        }
+    }
+
+    @Test public void reconnectRetryWaitsForTheActiveGameBeforeDownloading() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.source.duringLookup = () -> {
+                fixture.source.duringLookup = null;
+                fixture.eligible = false;
+                fixture.reconnect();
+                throw new IOException("The old metadata connection failed during game startup");
+            };
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+            assertEquals(0, fixture.source.downloads);
+            assertEquals(0, fixture.installer.begins);
+            fixture.advance(120_000);
+            fixture.finishWork();
+            assertEquals(0, fixture.source.downloads);
+            fixture.eligible = true;
+            fixture.advance(2_000);
+            fixture.finishWork();
+            assertEquals(1, fixture.source.downloads);
+            assertEquals(1, fixture.installer.commits);
+        }
+    }
+
+    @Test public void reconnectRetryWaitsForResumeWhenTheOldRequestCompletesPaused() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.source.duringLookup = () -> {
+                fixture.source.duringLookup = null;
+                fixture.reconnect();
+                fixture.controller.onPause();
+                throw new IOException("The old request failed after this activity paused");
+            };
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(1, fixture.source.lookups);
+            assertEquals(0, fixture.source.downloads);
+            assertEquals(0, fixture.ui.total());
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+            assertEquals(1, fixture.installer.commits);
+        }
+    }
+
     @Test public void metadataAndDownloadFailuresRemainQuietAndNeverReachInstallation() throws Exception {
         for (boolean download : new boolean[] {false, true}) {
             try (Fixture fixture = new Fixture()) {
@@ -72,6 +150,11 @@ public class AppUpdateControllerTest {
                 fixture.source.failDownload = download;
                 fixture.controller.onResume();
                 fixture.finishWork();
+                fixture.advance(120_000);
+                fixture.finishWork();
+                assertEquals("A stable online failure must not trigger a retry loop", 1,
+                        fixture.source.lookups);
+                assertEquals(download ? 1 : 0, fixture.source.downloads);
                 assertEquals(0, fixture.installer.begins);
                 assertEquals(0, fixture.ui.total());
             }
@@ -350,6 +433,16 @@ public class AppUpdateControllerTest {
         }
 
         void idle() { Shadows.shadowOf(Looper.getMainLooper()).idle(); }
+
+        void reconnect() {
+            internet.available = false;
+            internet.changed.run();
+            idle();
+            internet.available = true;
+            internet.changed.run();
+            idle();
+        }
+
         void advance(long millis) {
             Shadows.shadowOf(Looper.getMainLooper()).idleFor(millis, TimeUnit.MILLISECONDS);
         }
@@ -384,14 +477,19 @@ public class AppUpdateControllerTest {
     }
 
     private static final class FakeSource implements AppUpdateController.Source {
+        interface NetworkStep { void run() throws IOException; }
+
         int lookups;
         int downloads;
         boolean noRelease;
         boolean failLookup;
         boolean failDownload;
+        NetworkStep duringLookup;
+        NetworkStep beforeDownload;
         Runnable duringDownload;
         @Override public ReleaseUpdate.Asset latest() throws IOException {
             lookups++;
+            if (duringLookup != null) duringLookup.run();
             if (failLookup) throw new IOException("Offline or release service unavailable");
             if (noRelease) return null;
             return ReleaseUpdate.parseLatest("{\"draft\":false,\"prerelease\":false,"
@@ -403,6 +501,7 @@ public class AppUpdateControllerTest {
         }
         @Override public void download(ReleaseUpdate.Asset asset, File destination) throws IOException {
             downloads++;
+            if (beforeDownload != null) beforeDownload.run();
             if (failDownload) throw new IOException("Connection lost during download");
             try (FileOutputStream output = new FileOutputStream(destination)) {
                 output.write(new byte[] {1, 2, 3});

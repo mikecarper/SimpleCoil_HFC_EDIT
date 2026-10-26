@@ -2024,7 +2024,7 @@ public final class LaptopHost {
             if (eventMode && voter != null) return false;
             updateRoundStateLocked();
             if (!isRoundActiveLocked() || roundToken == null) return false;
-            if (voter != null && (!roundToken.equals(token) || playerForClientLocked(voter) == null))
+            if (!roundToken.equals(token) || voter != null && playerForClientLocked(voter) == null)
                 return false;
             long participants = 0;
             for (ClientConnection client : playingClientsLocked())
@@ -4535,26 +4535,36 @@ public final class LaptopHost {
             sendJson(exchange, 405, mapOf("error", "Use POST."));
             return;
         }
-        synchronized (stateLock) {
-            // The laptop operator may cancel the shared countdown alone. Use
-            // the actual GO deadline, even if the periodic tick is still due.
-            updateRoundStateLocked();
-            if (roundState == RoundState.COUNTDOWN) {
-                endRound("host cancelled countdown");
-                sendJson(exchange, 200, mapOf("ok", true, "message", "Countdown cancelled by the host."));
-                return;
-            }
-            if (eventMode) {
-                boolean active = isRoundActiveLocked();
-                if (active) endRound("event host ended the round");
-                sendJson(exchange, active ? 200 : 409, mapOf("ok", active, "message", active ? "Round ended by the event host." : "No active round to end."));
-                return;
-            }
+        Map<String, String> query = queryParameters(exchange.getRequestURI());
+        String token = query.get("roundtoken"), action = query.get("action");
+        if (!validReportToken(token) || !Set.of("cancel-countdown", "end-round", "request-end-vote").contains(action == null ? "" : action)) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Reload the map and confirm the current round action."));
+            return;
         }
-        boolean requested = requestEndVote(null, null, false);
-        sendJson(exchange, requested ? 200 : 409, mapOf("ok", requested, "message",
-                requested ? "Waiting for two players to approve on their phones."
-                        : "No active round to end."));
+        int status = 409;
+        boolean accepted = false;
+        String message = "This round or action has changed. Review the current round and try again.";
+        synchronized (stateLock) {
+            // Bind the displayed confirmation to both its round and intent.
+            // Advance the actual GO deadline before allowing countdown cancellation.
+            updateRoundStateLocked();
+            if (token.equals(roundToken)) {
+                if ("cancel-countdown".equals(action) && roundState == RoundState.COUNTDOWN) {
+                    endRound("host cancelled countdown");
+                    accepted = true;
+                    message = "Countdown cancelled by the host.";
+                } else if ("end-round".equals(action) && eventMode && roundState == RoundState.RUNNING) {
+                    endRound("event host ended the round");
+                    accepted = true;
+                    message = "Round ended by the event host.";
+                } else if ("request-end-vote".equals(action) && !eventMode && roundState == RoundState.RUNNING) {
+                    accepted = requestEndVote(null, token, false);
+                    if (accepted) message = "Waiting for two players to approve on their phones.";
+                }
+            }
+            if (accepted) status = 200;
+        }
+        sendJson(exchange, status, mapOf("ok", accepted, "message", message));
     }
 
     private void handleRebalanceApi(HttpExchange exchange) throws IOException {
@@ -4627,6 +4637,7 @@ public final class LaptopHost {
 
             Map<String, Object> state = new LinkedHashMap<>();
             state.put("state", roundState.name().toLowerCase(Locale.ROOT));
+            state.put("roundtoken", roundToken);
             state.put("eventMode", eventMode);
             state.put("eventTitle", eventSettings.title());
             state.put("gameMode", config.gameMode.wireValue);
@@ -5545,7 +5556,8 @@ public final class LaptopHost {
             function valid(p){return p&&Number.isFinite(p.longitude)&&Number.isFinite(p.latitude)&&(p.longitude!==0||p.latitude!==0)&&p.longitude>=-180&&p.longitude<=180&&p.latitude>=-90&&p.latitude<=90}function ll(p){return[p.latitude,p.longitude]}
             async function setupTiles(){try{const r=await fetch('/api/map-config',{cache:'no-store'});mapConfig=await r.json();const tileUrl='/tiles/{z}/{x}/{y}.png'+(mapConfig.version?'?v='+encodeURIComponent(mapConfig.version):'');const tiles=L.tileLayer(tileUrl,{minZoom:mapConfig.minZoom,maxZoom:mapConfig.maxZoom+3,maxNativeZoom:mapConfig.maxZoom,bounds:mapConfig.bounds,attribution:mapConfig.attribution||'',noWrap:true,keepBuffer:4,updateWhenIdle:false});let loaded=false;tiles.on('tileload',()=>{if(!loaded){loaded=true;tileStatus.textContent='Offline map loaded.'}});tiles.addTo(map);tileStatus.textContent=mapConfig.available?'Offline tiles ready; move to the game area.':'No offline tiles installed; GPS and combat overlays still work.';if(!(state?.players||[]).some(valid)){if(mapConfig.center)map.setView(mapConfig.center,mapConfig.zoom);else if(mapConfig.bounds)map.fitBounds(mapConfig.bounds,{padding:[30,30],maxZoom:18})}}catch(e){tileStatus.textContent='Offline map configuration unavailable.'}}
             async function control(path){try{const r=await fetch(path,{method:'POST'}),j=await r.json();status.textContent=j.message||(j.ok?'Done.':'Unable to complete action.')}catch(e){status.textContent='Host control error.'}}
-            start.onclick=()=>control('/api/start');rebalance.onclick=()=>{if(confirm('Rebalance teams using player stats? Team QR check-ins will reset.'))control('/api/rebalance')};end.onclick=()=>{if(confirm(state?.state==='countdown'?'Cancel the countdown for all players?':state?.eventMode?'End the round for all players?':'Ask two participating players to approve ending the round?'))control('/api/end')};fitButton.onclick=()=>fitPlayers(true);
+            start.onclick=()=>control('/api/start');rebalance.onclick=()=>{if(confirm('Rebalance teams using player stats? Team QR check-ins will reset.'))control('/api/rebalance')};
+            end.onclick=()=>{const token=state?.roundtoken,action=state?.state==='countdown'?'cancel-countdown':state?.eventMode?'end-round':'request-end-vote',prompt=action==='cancel-countdown'?'Cancel the countdown for all players?':action==='end-round'?'End the round for all players?':'Ask two participating players to approve ending the round?';if(token&&confirm(prompt))control('/api/end?roundtoken='+encodeURIComponent(token)+'&action='+encodeURIComponent(action))};fitButton.onclick=()=>fitPlayers(true);
             function drawRespawns(s){respawns.replaceChildren();for(const p of s.players||[]){if(!p.canRespawn||p.benched||!p.connected)continue;const b=document.createElement('button');b.className='respawn';b.textContent=`Respawn ${p.name} #${p.id}`;b.onclick=()=>control('/api/respawn?id='+encodeURIComponent(p.id));respawns.append(b)}}
             function drawLobby(s){const visible=s.state==='lobby';lobbyPlayers.hidden=!visible;if(!visible){lobbySignature='';return}const list=[...(s.players||[])].sort((a,b)=>Number(a.benched)-Number(b.benched)||a.team-b.team||a.id-b.id);const sig=JSON.stringify(list.map(p=>[p.id,p.name,p.team,p.connected,p.gunReady,p.clockReady,p.benched]));if(sig===lobbySignature)return;lobbySignature=sig;lobbyPlayers.replaceChildren();for(const p of list){const row=document.createElement('div'),name=document.createElement('span'),b=document.createElement('button');row.style.cssText='display:flex;gap:8px;align-items:center;margin-top:6px';name.style.flex='1';const status=p.benched?'Sitting out':!p.connected?'Reconnecting':!p.gunReady?'Needs gun':!p.clockReady?'Syncing clock':'Ready';name.textContent=`Team ${p.team} / ${p.name} #${p.id} - ${status}`;b.textContent=p.benched?'Play':'Sit out';b.disabled=!p.connected;b.onclick=()=>{b.disabled=true;control('/api/bench?id='+encodeURIComponent(p.id)+'&benched='+(!p.benched)).finally(()=>{lobbySignature=''})};const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>window.open('/players?id='+encodeURIComponent(p.id),'simplecoil-players');row.append(name,edit,b);lobbyPlayers.append(row)}}
             function label(s){if(!s)return 'Connecting...';const p=s.playerCount||0,ready=s.clockReady||0;if(s.state==='countdown')return `Starting in ${Math.ceil(s.startInMs/1000)}s - ${p} players`;if(s.state==='running')return s.remainingMs?`Running - ${Math.ceil(s.remainingMs/1000)}s left - ${p} players`:`Running - ${p} players`;if(s.cooldownMs>0)return `Finished - next game in ${Math.ceil(s.cooldownMs/1000)}s`;if(s.state==='finished')return 'Finished - final scores visible';if(s.balancedQr&&s.checkInRemainingMs>0)return `Team QR check-ins ${s.checkedInCount}/${s.assignedCount}`;const missing=(s.players||[]).filter(x=>x.connected&&!x.benched&&!x.gunReady).map(x=>x.name+' #'+x.id);return `${p} players - guns ${s.gunsReady||0}/${p} - clocks ${ready}/${p}`+(missing.length?' - Needs gun: '+missing.join(', '):'')}

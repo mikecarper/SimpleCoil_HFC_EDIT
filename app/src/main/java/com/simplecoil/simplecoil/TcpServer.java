@@ -4710,8 +4710,8 @@ public class TcpServer extends Service {
             Globals globals = Globals.getInstance();
             RoundRoster roster = globals.mRoundRoster;
             boolean playing = mStartAnnounced || globals.mGameState != Globals.GAME_STATE_NONE;
-            if (playing && client.mPlayerID != 0 && !client.playerIdentity.equals(identity)) {
-                Log.w(TAG, "Ignoring a registered player's identity change during a round");
+            if (client.mPlayerID != 0 && !client.playerIdentity.equals(identity)) {
+                Log.w(TAG, "Ignoring a registered connection's identity change");
                 return;
             }
             if (playing && client.mPlayerID == 0) {
@@ -4758,11 +4758,11 @@ public class TcpServer extends Service {
                 mClientData.remove(client.clientID);
                 return;
             }
-            client.playerIdentity = identity;
             if (client.mPlayerID != 0 && client.mPlayerID != id) {
                 Log.w(TAG, "Ignoring an attempt to change a registered connection's player ID");
                 return;
             }
+            client.playerIdentity = identity;
             for (Map.Entry<Integer, ClientData> entry : mClientData.entrySet()) {
                 if (entry.getValue() != client && entry.getValue().mPlayerID == id) {
                     if (requestedTeam != 0) {
@@ -4780,6 +4780,15 @@ public class TcpServer extends Service {
                         client.close();
                         mClientData.remove(client.clientID);
                         return;
+                    }
+                    if (!entry.getValue().playerIdentity.equals(identity)) {
+                        // A failed native write can retire this socket before
+                        // the read loop removes its old lobby entry. Reusing
+                        // that seat does not transfer the former person's
+                        // identity, score, or reliable event queue.
+                        entry.getValue().close();
+                        mClientData.remove(entry.getKey(), entry.getValue());
+                        break;
                     }
                     Log.d(TAG, "rejoining " + client.clientID + " to " + entry.getValue().clientID);
                     synchronized (mServerStateLock) {

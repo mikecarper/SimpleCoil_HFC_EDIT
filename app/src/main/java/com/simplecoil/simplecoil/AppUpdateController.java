@@ -230,6 +230,9 @@ final class AppUpdateController implements AutoCloseable {
                 checking = false;
                 pendingAsset = next;
                 if (ReleaseUpdate.isStrictlyNewer(result, installedCode)) candidateCode = result;
+                // Connectivity may have returned while this older request was
+                // still running. Its checked=false retry must survive completion.
+                check();
                 drain();
             });
         }, () -> checking = false);
@@ -276,6 +279,7 @@ final class AppUpdateController implements AutoCloseable {
                 checking = false;
                 if (retryWhenIdle) pendingAsset = asset;
                 if (ReleaseUpdate.isStrictlyNewer(result, installedCode)) candidateCode = result;
+                check();
                 drain();
             });
         }, () -> { checking = false;pendingAsset = asset; });

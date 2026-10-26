@@ -103,7 +103,8 @@ public final class PlayerControlsTest {
             replacement.send(MESSAGE + "ELIMINATED17");
             await(() -> number(active(2).get("deaths")) == 2, "Second elimination was not recorded");
             check(post("/api/respawn?id=2",Map.of()).statusCode() == 409, "Host bypassed the edited lives limit");
-            check(post("/api/end",Map.of()).statusCode() == 200, "Event host could not end the round");
+            check(post("/api/end?roundtoken=" + nextRound + "&action=end-round",Map.of()).statusCode() == 200,
+                    "Event host could not end the round");
             check(state().get("state").equals("finished"), "Event end waited for phone approval");
         } finally { stop(host); }
         host = start();
@@ -245,7 +246,8 @@ public final class PlayerControlsTest {
                     relayed.until(game->rosterName(game,17).equals("Relay runner"));
                     relayed.send(MESSAGE+"ELIMINATED1");
                     await(()->number(active(17).get("deaths"))==1,"Relayed game event was lost");
-                    check(post("/api/end",Map.of()).statusCode()==200,"Host could not end the relayed game");
+                    check(post("/api/end?roundtoken=" + state().get("roundtoken") + "&action=end-round",Map.of()).statusCode()==200,
+                            "Host could not end the relayed game");
                     check(state().get("state").equals("finished"),"Relay created a separate round");
                 }
             }

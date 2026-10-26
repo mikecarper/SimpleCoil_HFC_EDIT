@@ -7,6 +7,7 @@ Android app and their BLE laser-tag hardware.
 It speaks the protocol-31 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
+Use this host with the 1.53 phone app; the network protocol remains 31.
 
 The map display bundles Leaflet and serves raster map tiles from the laptop.
 Nothing is fetched from the internet while a game is running. Player markers,
@@ -196,6 +197,13 @@ During the initial countdown, **Cancel countdown** lets the laptop host return
 everyone to the lobby without player approvals, in either event mode. The
 connections and clock sync stay ready for an immediate restart, and a canceled
 countdown does not replace the previous round's report.
+Confirmations apply only to the round and action shown when they opened. An
+old confirmation cannot cancel a replacement round, and **Cancel countdown**
+expires at the scheduled start instead of ending live play or requesting votes.
+Reload existing dashboard tabs after updating the host. The local `/api/end`
+control now requires the displayed `roundtoken` and an explicit `action`:
+`cancel-countdown`, `end-round` (live Event Mode), or `request-end-vote`
+(live play with `--no-event-mode`). Unscoped or expired requests are rejected.
 
 With `--no-event-mode`, after the scheduled start time the map's **End game**
 button asks participating players to approve an early end. Two different
@@ -619,7 +627,7 @@ java --add-modules jdk.httpserver -cp laptop-host/out \
   com.simplecoil.laptophost.LaptopHostProtocolSmokeTest --reports-only
 java --add-modules jdk.httpserver -cp laptop-host/out \
   com.simplecoil.laptophost.LargeLobbyClockSyncTest
-node --test laptop-host/src/test/js/round-report-page.test.cjs
+node --test laptop-host/src/test/js/*.test.cjs
 ```
 
 Report smoke tests use temporary report directories, not the operator's archive.
