@@ -245,6 +245,9 @@ public class UDPListenerService extends Service {
 
     private volatile boolean mScanRunning = false;
     private final Object mListenerStateLock = new Object();
+    private volatile long mListenerGeneration;
+    private long mActiveListenerGeneration;
+    private boolean mListenerRestartRequested;
     private boolean mDestroyed;
     // Idle player screens keep a lightweight listener for GAMEINVITE packets.
     // It is deliberately separate from a real discovery scan: an invite must
@@ -394,6 +397,11 @@ public class UDPListenerService extends Service {
     public static final String INTENT_GAME_INVITE_TOKEN = "gameinvitetoken";
 
     private void listenForMessage(InetAddress ip, Integer port, Integer timeout) throws Exception {
+        final long generation;
+        synchronized (mListenerStateLock) {
+            generation = Thread.currentThread() == mUDPMessageThread
+                    ? mActiveListenerGeneration : mListenerGeneration;
+        }
         byte[] recvBuf = new byte[RECEIVE_BUFFER_SIZE];
         DatagramSocket socket = mSocket;
         try {
@@ -408,7 +416,7 @@ public class UDPListenerService extends Service {
             if (BuildConfig.DEBUG)
                 Log.d(TAG, "Waiting for UDP messages on " + ip + ":" + port);
             synchronized (mListenerStateLock) {
-                if (!keepListening || mDestroyed)
+                if (!keepListening || mDestroyed || generation != mListenerGeneration)
                     return;
                 mSocket = socket;
                 // There is only one listener thread.  Readiness describes the
@@ -418,10 +426,20 @@ public class UDPListenerService extends Service {
                 mReadyToScan = 1;
                 doneListening = false;
             }
-            while (keepListening) {
+            long nextNetworkRefreshAt = 0;
+            while (keepListening && generation == mListenerGeneration) {
                 try {
+                    long now = SystemClock.elapsedRealtime();
+                    if (now >= nextNetworkRefreshAt) {
+                        synchronized (mListenerStateLock) {
+                            if (generation != mListenerGeneration || !keepListening) break;
+                            refreshNetworkAddressesLocked();
+                        }
+                        nextNetworkRefreshAt = now + LISTEN_TIMEOUT_MS;
+                    }
                     packet.setLength(recvBuf.length);
                     socket.receive(packet);
+                    if (generation != mListenerGeneration || !keepListening) break;
                     dispatchDatagram(packet.getAddress(), packet.getData(), packet.getOffset(), packet.getLength());
                 } catch (SocketTimeoutException e) {
                     // do nothing
@@ -2748,57 +2766,86 @@ public class UDPListenerService extends Service {
         return true;
     }
 
+    private boolean isListenerRetiringLocked() {
+        return mUDPMessageThread != null && mActiveListenerGeneration != mListenerGeneration;
+    }
+
     public void startListenForUDPMessage() {
         synchronized (mListenerStateLock) {
             if (mDestroyed)
                 return;
             if (mUDPMessageThread != null && mUDPMessageThread.isAlive()) {
-                Log.w(TAG, "UDP listener is already running");
+                // A stop can still be closing its worker when the next lobby
+                // requests a listener. Keep that latest request for its finally
+                // block instead of silently losing discovery until Wi-Fi resets.
+                keepListening = true;
+                if (mActiveListenerGeneration != mListenerGeneration)
+                    mListenerRestartRequested = true;
+                acquireListenerWifiLocksLocked();
                 return;
             }
             keepListening = true;
+            mListenerRestartRequested = false;
+            final long generation = mListenerGeneration;
+            mActiveListenerGeneration = generation;
             // Set this before starting the thread so a fast second Join/Create request cannot
             // start another listener while the first one is still binding its socket.
             doneListening = false;
-            {
-                if (wm == null)
-                    wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-                if (wm == null) {
-                    Log.e(TAG, "Failed to get wifi manager");
-                } else {
-                    if (multicastLock == null) {
-                        multicastLock = wm.createMulticastLock("SimpleCoil");
-                        multicastLock.setReferenceCounted(false);
-                    }
-                }
-                if (multicastLock != null && !multicastLock.isHeld()) multicastLock.acquire();
-            }
+            acquireListenerWifiLocksLocked();
 
             mUDPMessageThread = new Thread(() -> {
                 try {
-                    while (keepListening) {
+                    while (keepListening && generation == mListenerGeneration) {
                         try {
                             // Clients must hear AP broadcasts too, including lobby convergence.
                             InetAddress address = InetAddress.getByName("0.0.0.0");
                             listenForMessage(address, LISTEN_PORT, LISTEN_TIMEOUT_MS);
                         } catch (Exception e) {
                             Log.i(TAG, "no longer listening for UDP messages: " + e.getMessage());
-                            if (keepListening)
+                            if (keepListening && generation == mListenerGeneration)
                                 sleep(100);
                         }
                     }
                 } finally {
                     Log.i(TAG, "Stopped listening for UDP messages");
                     synchronized (mListenerStateLock) {
-                        releaseMulticastLockLocked();
                         if (Thread.currentThread() == mUDPMessageThread) {
                             mUDPMessageThread = null;
                             doneListening = true;
+                            boolean restart = mListenerRestartRequested && keepListening && !mDestroyed;
+                            mListenerRestartRequested = false;
+                            if (restart) {
+                                startListenForUDPMessage();
+                            } else {
+                                releaseMulticastLockLocked();
+                                releaseWifiLockLocked();
+                            }
                         }
                     }
                 }
             }, "SimpleCoil UDP listener");
             mUDPMessageThread.start();
+        }
+    }
+
+    InetAddress currentNetworkAddress() {
+        return Globals.getIPAddress(getBaseContext() == null ? null : getApplicationContext());
+    }
+
+    // Refresh interface-derived caches without discarding the lobby or round.
+    private void refreshNetworkAddressesLocked() {
+        InetAddress local = currentNetworkAddress();
+        InetAddress broadcast = getBroadcastAddress();
+        boolean changed = local != null && mMyIP != null && !local.equals(mMyIP);
+        if (local != null) mMyIP = local;
+        if (broadcast != null) mBroadcastAddress = broadcast;
+        if (changed) {
+            mSendGeneration++;
+            // Do not wait for mSendLock here: senders acquire it before this
+            // lifecycle lock. Closing the native socket also wakes a stale send.
+            DatagramSocket socket = mSendSocket;
+            mSendSocket = null;
+            if (socket != null) socket.close();
         }
     }
 
@@ -2947,7 +2994,7 @@ public class UDPListenerService extends Service {
             // host creation from an idle player time out after five seconds.
             final boolean reusingPassiveInviteListener = !doneListening
                     && canReusePassiveInviteListenerLocked();
-            if (!doneListening && !reusingPassiveInviteListener) {
+            if (!doneListening && !reusingPassiveInviteListener && !isListenerRetiringLocked()) {
                 Log.e(TAG, "Listening is still in progress");
                 // A new host request supersedes an unfinished discovery scan.
                 // Leaving the old scan alive lets a late SERVERREPLY join the
@@ -2999,9 +3046,9 @@ public class UDPListenerService extends Service {
     }
 
     private void finishServerCreation(long generation) {
-        long deadline = System.currentTimeMillis() + LISTENER_START_TIMEOUT_MS;
+        long deadline = SystemClock.elapsedRealtime() + LISTENER_START_TIMEOUT_MS;
         while (keepListening && generation == mJoinGeneration && !isListenerReady()
-                && System.currentTimeMillis() < deadline)
+                && SystemClock.elapsedRealtime() < deadline)
             sleep(50);
         synchronized (mListenerStateLock) {
             if (mDestroyed || !keepListening || generation != mJoinGeneration)
@@ -3044,7 +3091,7 @@ public class UDPListenerService extends Service {
             // even when Wi-Fi has already lost its DHCP lease. Otherwise a
             // late reply can attach this player to the abandoned server after
             // the new request has reported failure.
-            if (!doneListening && !mPassiveInviteListener) {
+            if (!doneListening && !mPassiveInviteListener && !isListenerRetiringLocked()) {
                 Log.e(TAG, "Listening is still in progress");
                 stopListen();
                 sendFailedJoin();
@@ -3073,7 +3120,7 @@ public class UDPListenerService extends Service {
                 sendFailedJoin();
                 return;
             }
-            if (!doneListening && !mPassiveInviteListener) {
+            if (!doneListening && !mPassiveInviteListener && !isListenerRetiringLocked()) {
                 // This request replaces the in-flight discovery. Leaving it
                 // active after reporting failure lets a late reply join the
                 // server the player just abandoned.
@@ -3133,7 +3180,7 @@ public class UDPListenerService extends Service {
             if (mDestroyed || serverIP == null) {
                 return false;
             }
-            if (!doneListening && !mPassiveInviteListener) {
+            if (!doneListening && !mPassiveInviteListener && !isListenerRetiringLocked()) {
                 Log.w(TAG, "Ignoring a stale game invitation while another network session is active");
                 return false;
             }
@@ -3147,7 +3194,7 @@ public class UDPListenerService extends Service {
         synchronized (mListenerStateLock) {
             if (mDestroyed || serverIP == null)
                 return false;
-            if (!doneListening && !mPassiveInviteListener) {
+            if (!doneListening && !mPassiveInviteListener && !isListenerRetiringLocked()) {
                 Log.w(TAG, "Ignoring a lobby invitation while another network session is active");
                 return false;
             }
@@ -3166,7 +3213,7 @@ public class UDPListenerService extends Service {
             if (mDestroyed || serverIP == null || mPeerGame)
                 return false;
             final boolean reusingActiveListener = !doneListening && isListenerReadyLocked();
-            if (!doneListening && !reusingActiveListener) {
+            if (!doneListening && !reusingActiveListener && !isListenerRetiringLocked()) {
                 Log.w(TAG, "Ignoring host takeover while UDP listener is not ready");
                 return false;
             }
@@ -3225,7 +3272,7 @@ public class UDPListenerService extends Service {
             // before startListenForUDPMessage() is a stale-state bug.
             final boolean reusingPassiveInviteListener = !doneListening
                     && canReusePassiveInviteListenerLocked();
-            if (!doneListening && !reusingPassiveInviteListener) {
+            if (!doneListening && !reusingPassiveInviteListener && !isListenerRetiringLocked()) {
                 Log.e(TAG, "Listening is still in progress");
                 // This request replaces the in-flight discovery. Leaving it
                 // active after reporting failure lets a late reply join the
@@ -3630,6 +3677,9 @@ public class UDPListenerService extends Service {
     void stopListen() {
         mMainHandler.removeCallbacks(mSharedLobbyBeacon);
         synchronized (mListenerStateLock) {
+            mListenerRestartRequested = false;
+            mListenerGeneration++;
+            keepListening = false;
             cancelInviteListenerRequestLocked();
             mPassiveInviteListener = false;
             mInviteTemporarilyAllowsJoin = false;
@@ -3649,7 +3699,6 @@ public class UDPListenerService extends Service {
             releaseGameplayWifiLocksLocked();
             releaseMulticastLockLocked();
             clearJoinAssignments();
-            keepListening = false;
             mReadyToScan = 0;
             closeListeningSocket();
         }
@@ -3710,10 +3759,33 @@ public class UDPListenerService extends Service {
     }
 
     private void releaseGameplayWifiLocksLocked() {
-        releaseWifiLockLocked();
+        // A retained lobby still owns live player connections between rounds.
+        // Keep Wi-Fi priority until Leave/Stop or a passive-only invite listener.
+        if (!mDestroyed && keepListening && !mPassiveInviteListener)
+            acquireGameplayWifiLocksLocked();
+        else
+            releaseWifiLockLocked();
         // The UDP listener owns the multicast lock in the lobby too. Reusing
         // its socket for hosting, joining, or handoff must keep beacons audible.
         // stopListen() and the listener's finally block release that lock.
+    }
+
+    private void acquireListenerWifiLocksLocked() {
+        if (!mPassiveInviteListener) {
+            acquireGameplayWifiLocksLocked();
+            return;
+        }
+        try {
+            if (wm == null) wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm == null) return;
+            if (multicastLock == null) {
+                multicastLock = wm.createMulticastLock("SimpleCoil lobby discovery");
+                multicastLock.setReferenceCounted(false);
+            }
+            if (!multicastLock.isHeld()) multicastLock.acquire();
+        } catch (SecurityException e) {
+            Log.w(TAG, "Unable to hold lobby discovery Wi-Fi lock", e);
+        }
     }
 
     // Caller holds mListenerStateLock. Both locks are non-reference-counted so
@@ -3844,6 +3916,7 @@ public class UDPListenerService extends Service {
             if (peerGame)
                 mPendingPeerRoundToken = null;
             acquireGameplayWifiLocksLocked();
+            refreshNetworkAddressesLocked();
             if (peerGame && mBroadcastAddress == null)
                 mBroadcastAddress = getBroadcastAddress();
             mMainHandler.removeCallbacks(mPeerStateHeartbeat);
@@ -3903,6 +3976,7 @@ public class UDPListenerService extends Service {
             mPendingPeerEndGame = null;
             resetPeerGameSequences();
             releaseGameplayWifiLocksLocked();
+            refreshNetworkAddressesLocked();
             mMainHandler.removeCallbacks(mSharedLobbyBeacon);
             if (hosting)
                 mMainHandler.post(mSharedLobbyBeacon);

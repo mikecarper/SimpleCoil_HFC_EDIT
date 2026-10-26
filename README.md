@@ -194,6 +194,15 @@ on all phones and Wi-Fi enabled on the phones within hub range. No phone-to-phon
 pairing or confirmation is required on the tested LG Android 5.1.1 phones. The
 app keeps these connections alive in the background.
 
+An active phone lobby keeps its Wi-Fi performance and multicast locks between
+rounds; passive invitation listening holds only the multicast lock. Leaving or
+stopping releases both. UDP discovery safely restarts if a new join arrives
+while the previous listener is stopping, and refreshes local/broadcast address
+caches as the network changes. Stale discovery errors for the connected host
+do not close its registered TCP lobby while fresh traffic proves it is healthy.
+Phone hosts close a client connection whose socket write stalls for one second,
+allowing other phones' clock replies, heartbeats and new joins to continue.
+
 Version 1.51 checks the current Wi-Fi RSSI once per second and prepares one
 Bluetooth buddy at -67 dBm or weaker, before hub coverage disappears. The weak
 signal state clears at -62 dBm; an established buddy stays connected, so signal

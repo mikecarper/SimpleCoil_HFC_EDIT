@@ -1735,6 +1735,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         clearManualPhoneHost();
     }
 
+    /** A queued UDP discovery failure cannot retire a newer, working TCP lobby. */
+    private boolean shouldIgnoreStaleDiscoveryFailure(Intent failure, boolean tcpTerminal) {
+        String action = failure.getAction();
+        if (tcpTerminal || !(NetMsg.NETMSG_FAILEDTOJOIN.equals(action)
+                || NetMsg.NETMSG_SERVERUNREACHABLE.equals(action))
+                || !mUseNetwork || !mReady || mIsServer || mLobbyTakeoverPending || mTcpClient == null)
+            return false;
+        InetAddress host = Globals.getInstance().mServerIP;
+        if (host == null || mLobbyTarget != null && !mLobbyTarget.equals(host)
+                || !mTcpClient.hasClientSession(host))
+            return false;
+        String failedAddress = failure.getStringExtra(UDPListenerService.INTENT_SERVERIP);
+        if (failedAddress != null && !host.getHostAddress().equals(failedAddress))
+            return false;
+        SharedLobby.Host connected = mTcpClient.lobbyHost(SystemClock.elapsedRealtime());
+        return connected != null && host.equals(connected.address);
+    }
+
     private void toggleManualPhoneHost() {
         Globals globals = Globals.getInstance();
         if (!mUseNetwork || !networkServicesReady() || !isGameNetworkAvailable()
@@ -10863,6 +10881,8 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return; // Already handled, or belongs to an earlier session/service.
             }
             final String action = intent.getAction();
+            if (shouldIgnoreStaleDiscoveryFailure(intent, tcpTerminal))
+                return;
             final boolean tcpRoundEnd = intent.getBooleanExtra(TcpClient.EXTRA_ROUND_END, false);
             if ((tcpTerminal || tcpRoundEnd) && !mIsServer && (NetMsg.NETMSG_ENDGAME.equals(action)
                     || NetMsg.NETMSG_SERVERCANCEL.equals(action) || NetMsg.NETMSG_VERSIONERROR.equals(action)))

@@ -63,6 +63,11 @@ import java.util.UUID;
 import java.util.Random;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class TcpServer extends Service {
     private static final String TAG = "TCPServer";
@@ -89,6 +94,36 @@ public class TcpServer extends Service {
     // never blocks on a slow socket. Bound queued tasks to prevent a chatty
     // client from exhausting the dedicated host's threads while writes stall.
     static final int MAX_PENDING_CLIENT_TASKS = 32;
+    private static final long CLIENT_WRITE_TIMEOUT_MS = 1000;
+
+    private static ScheduledThreadPoolExecutor createWriteWatchdog() {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, action -> {
+            Thread worker = new Thread(action, "SimpleCoil TCP write watchdog");
+            worker.setDaemon(true);
+            return worker;
+        });
+        executor.setRemoveOnCancelPolicy(true);
+        executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        return executor;
+    }
+
+    /** Own one write, rather than a socket which a later write may reuse. */
+    private static final class SocketWriteDeadline implements Runnable {
+        private static final int PENDING = 0, COMPLETED = 1, EXPIRED = 2;
+        private final Socket socket;
+        private final AtomicInteger state = new AtomicInteger(PENDING);
+
+        SocketWriteDeadline(Socket socket) { this.socket = socket; }
+        boolean complete() { return state.compareAndSet(PENDING, COMPLETED); }
+        @Override public void run() {
+            if (state.compareAndSet(PENDING, EXPIRED)) {
+                // A blocked writer holds its ClientData monitor and the shared
+                // client semaphore. Close only the captured socket, taking
+                // neither lock, so every other phone can keep making progress.
+                closeSocket(socket);
+            }
+        }
+    }
     public static final String TCP_SERVER_PING = "ping";
 
     public static final String TCPMESSAGE_PREFIX = NetMsg.MESSAGE_PREFIX + NetMsg.NETWORK_VERSION;
@@ -279,6 +314,7 @@ public class TcpServer extends Service {
     private volatile Thread mClientThread = null;
     private final Semaphore mClientDataSemaphore = new Semaphore(1);
     private final Semaphore mClientTaskSlots = new Semaphore(MAX_PENDING_CLIENT_TASKS);
+    private final ScheduledThreadPoolExecutor mWriteWatchdog = createWriteWatchdog();
     // Guarded by mServerStateLock, including registration before Thread.start().
     private final Set<Thread> mClientTasks = new HashSet<>();
     // Cancellation gets a bounded opportunity to notify clients before sockets
@@ -419,6 +455,7 @@ public class TcpServer extends Service {
             mGpsOriginReceiverRegistered = false;
         }
         stopTcpServer();
+        mWriteWatchdog.shutdownNow();
         super.onDestroy();
     }
 
@@ -3614,9 +3651,21 @@ public class TcpServer extends Service {
                     queueMessage(message);
                 return false;
             }
+            SocketWriteDeadline deadline = new SocketWriteDeadline(clientSocket);
+            final ScheduledFuture<?> timeout;
+            try {
+                timeout = mWriteWatchdog.schedule(deadline, CLIENT_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            } catch (RejectedExecutionException stopped) {
+                if (queueFailed) queueMessage(message);
+                return false;
+            }
             try {
                 out.writeUTF(message);
                 out.flush();
+                // If expiry won the race with a successful flush, retire this
+                // stream before another write can use the same native socket.
+                if (!deadline.complete())
+                    throw new SocketTimeoutException("TCP client write exceeded its deadline");
                 if (BuildConfig.DEBUG && !message.equals(TcpServer.TCP_SERVER_PING))
                     Log.i(TAG, "sent(" + clientID + "): " + message);
                 return true;
@@ -3630,6 +3679,9 @@ public class TcpServer extends Service {
                 close();
                 connectionFailed = true;
                 return false;
+            } finally {
+                deadline.complete();
+                timeout.cancel(false);
             }
         }
 
