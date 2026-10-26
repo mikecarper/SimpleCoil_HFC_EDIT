@@ -32,6 +32,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
 
     <application
         android:allowBackup="true"
@@ -43,6 +45,7 @@
         android:screenOrientation="portrait"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
+        <receiver android:name=".AppUpdateInstallReceiver" android:exported="false" />
         <receiver android:name=".EventDeviceAdminReceiver" android:exported="true"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
             android:label="@string/event_admin_label">

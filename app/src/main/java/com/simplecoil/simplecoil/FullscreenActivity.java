@@ -138,6 +138,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class FullscreenActivity extends AppCompatActivity implements PopupMenu.OnMenuItemClickListener {
     private static final String TAG = "scmain";
     private EventKioskController mEventKiosk;
+    private AppUpdateController mAppUpdates;
     private String mLastEventLockStatus;
     private boolean mEventWasRestricted;
     private long mLastHostBatteryAt;
@@ -3359,6 +3360,25 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         updatePlayerSettings();
         updateTeamAssignmentScanButton();
         initializeLobbyScreen();
+        mAppUpdates = new AppUpdateController(this, this::canInstallAppUpdate);
+    }
+
+    private boolean canInstallAppUpdate() {
+        Globals globals = Globals.getInstance();
+        if (!mActivityResumed || isFinishing() || isDestroyed()
+                || globals.mGameState != Globals.GAME_STATE_NONE
+                || globals.mLobbyRoundActive || globals.mWaitingForLobbyRoundEnd
+                || mMatchSession.active() || hasCommittedRound() || roundEndReportPending()
+                || mTriggerPairingActive || mCollectingNewWeaponCandidates
+                || mWeaponPairingDialog != null || isQrScannerActive() || mPowerupQrScannerActive)
+            return false;
+        if ((mLocationSettingsDialog != null && mLocationSettingsDialog.isShowing())
+                || (mStartWizardDialog != null && mStartWizardDialog.isShowing())
+                || (mGameInviteDialog != null && mGameInviteDialog.isShowing()))
+            return false;
+        boolean silent = mAppUpdates != null && mAppUpdates.canInstallSilently();
+        return silent || !eventControlsRestricted()
+                && (mEventKiosk == null || "none".equals(mEventKiosk.lockStatus()));
     }
 
     private static final int NETWORK_TYPE_ENABLED = 1;
@@ -7892,6 +7912,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             startInactivityVoiceReminder();
         mLobbyHandler.removeCallbacks(mLobbyPulse);
         mLobbyHandler.post(mLobbyPulse);
+        if (mAppUpdates != null) mAppUpdates.onResume();
     }
 
     /** Service discovery can also complete while the activity receiver is paused. */
@@ -7975,6 +7996,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     @Override
     protected void onPause() {
         mActivityResumed = false;
+        if (mAppUpdates != null) mAppUpdates.onPause();
         mPlayerDataRequestedUntil = 0;
         if (mPowerupRevealCurrent != 0) {
             speakRoundVoicePrompt(PowerupPresentation.voice(mPowerupRevealCurrent));
@@ -8029,6 +8051,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        if (mAppUpdates != null) mAppUpdates.close();
         if (isFinishing()) stopService(new Intent(this, GameRelayService.class));
         if (mGattReceiverRegistered) {
             mGattReceiverRegistered = false;

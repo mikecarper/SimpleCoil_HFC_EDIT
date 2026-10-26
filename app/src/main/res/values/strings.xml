@@ -577,4 +577,6 @@
     <string name="relay_ready">Connected to host · Nearby fallback is automatic</string>
     <string name="relay_connected">Connected through a nearby phone</string>
     <string name="relay_preparing">Reconnecting to host through nearby phones…</string>
+    <string name="app_update_install_failed">Android could not install the update. It will be checked again the next time you open the app.</string>
+    <string name="app_update_permission_hint">Allow LAZER GUN RUN to install updates, then return to the game.</string>
 </resources>

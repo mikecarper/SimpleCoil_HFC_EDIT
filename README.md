@@ -29,6 +29,29 @@ and player history, so save any information you need before switching.
 - Network games require all phones to use the same local Wi-Fi network with a
   usable IPv4/DHCP lease. Internet access is not required.
 
+## Phone updates
+
+When a release build opens with Internet access, it checks the latest stable GitHub
+release and downloads its matching `LAZER-GUN-RUN-<version>.apk` in the
+background. Offline games continue normally. Installation waits until the phone
+is idle; a saved match, countdown, running round, or pending round report keeps
+the current game in place.
+
+Android verifies the app update. The updater also requires the same package
+and signing certificate and a higher Android version code, so it preserves
+settings and player history and never downgrades the app. Android 5.x still
+requires tapping Install. Android 8 and newer may first ask to allow updates
+from this app. Device-owner event phones on Android 6 and newer can install
+silently; an ordinary pinned phone waits until it is unlocked.
+
+Every published APK update must increase `versionCode`, including a replacement
+asset under the same GitHub release. Changing only `versionName` or replacing
+the file with the same version code does not qualify as a newer update.
+GitHub's secure connection also needs a reasonably correct Android date and
+time. A badly wrong calendar can prevent update checks even though the game's
+independent clock synchronization still works.
+Debug and instrumentation builds skip automatic network checks.
+
 ## Multiplayer and synchronized starts
 
 ### Shared lobby (1.23)

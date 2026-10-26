@@ -554,4 +554,6 @@
     <string name="relay_ready">Mit dem Host verbunden · Ausweichverbindung automatisch</string>
     <string name="relay_connected">Über ein nahes Telefon verbunden</string>
     <string name="relay_preparing">Verbindung zum Host über nahe Telefone wird wiederhergestellt…</string>
+    <string name="app_update_install_failed">Android konnte das Update nicht installieren. Beim naechsten Oeffnen der App wird erneut nach Updates gesucht.</string>
+    <string name="app_update_permission_hint">Erlaube LAZER GUN RUN, Updates zu installieren, und kehre dann zum Spiel zurueck.</string>
 </resources>
