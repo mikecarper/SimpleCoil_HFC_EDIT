@@ -305,7 +305,8 @@ public class BluetoothQueueRegressionTest {
         assertTrue(isAvailable());
         completeWrite();
         assertEquals(3, service.broadcasts.size());
-        assertEquals(Arrays.asList("writeCharacteristic", "unregisterClient"), operations);
+        assertEquals(Arrays.asList("writeCharacteristic"), operations);
+        assertEquals(1, closedTransports);
     }
 
     @Test

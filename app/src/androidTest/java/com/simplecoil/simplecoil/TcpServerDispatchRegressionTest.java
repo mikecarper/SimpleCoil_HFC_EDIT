@@ -657,8 +657,18 @@ public class TcpServerDispatchRegressionTest {
         addClient(1, new MemorySocket());
         dispatchThenChange(() -> assertTrue(server.startGame()), () -> { });
         set(server, "mScheduledStart", SystemClock.elapsedRealtime() - 60_000);
-        dispatchThenChange(server::endGame, () -> { });
-        assertTrue(server.getNextGameStartWaitMillis() > 29_000);
+        long[] allowedAt = new long[1];
+        dispatchThenChange(() -> {
+            long requestedAt = SystemClock.elapsedRealtime();
+            server.endGame();
+            allowedAt[0] = (long) get(server, "mNextGameStartAllowedAt");
+            long reservedAt = SystemClock.elapsedRealtime();
+            assertTrue(allowedAt[0] >= requestedAt + com.simplecoil.protocol.RoundRestart.NORMAL_WAIT_MS);
+            assertTrue(allowedAt[0] <= reservedAt + com.simplecoil.protocol.RoundRestart.NORMAL_WAIT_MS);
+        }, () -> { });
+        assertEquals("Delivery time changed the reserved cooldown deadline", allowedAt[0],
+                get(server, "mNextGameStartAllowedAt"));
+        assertTrue(server.getNextGameStartWaitMillis() > 0);
         addClient(1, new MemorySocket());
         assertFalse("A full round must keep its cooldown", server.startGame());
     }
@@ -691,6 +701,8 @@ public class TcpServerDispatchRegressionTest {
             assertTrue(listening.getBoolean(server));
         } finally { clientsLock.release(); }
         start.join(1000);
+        assertFalse("START dispatch did not finish", start.isAlive());
+        awaitOutboundWrites();
         assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
         assertTrue(server.hasPendingOrAnnouncedStart());
         assertFalse(server.stopIdleLobbyForHandoff());
@@ -839,6 +851,8 @@ public class TcpServerDispatchRegressionTest {
             start = queuedWorker();
         } finally { clientsLock.release(); }
         start.join(1000);
+        assertFalse("Retry START dispatch did not finish", start.isAlive());
+        awaitOutboundWrites();
         assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
         assertFalse(server.events.contains(NetMsg.NETMSG_ENDGAME));
     }
@@ -1260,6 +1274,7 @@ public class TcpServerDispatchRegressionTest {
                 assertFalse("Balanced start task did not finish", task.isAlive());
             }
         }
+        awaitOutboundWrites();
         assertEquals(teams, globals.mBalancedTeams);
         assertTrue(server.events.contains(NetMsg.NETMSG_STARTGAME));
         assertTrue(globals.mBalancedGamePrepared);
@@ -2080,6 +2095,51 @@ public class TcpServerDispatchRegressionTest {
     @Test
     public void queuedPersonalizedLobbyUpdateCannotCancelANewerSynchronizedStart() throws Exception {
         assertQueuedRosterKeepsStart(1);
+    }
+
+    @Test
+    public void pendingFirstFlushDefersBothPersonalizedAndBroadcastRosters() throws Exception {
+        GateSocket playing = new GateSocket();
+        addClient(1, playing);
+        MemorySocket benched = new MemorySocket();
+        addClient(2, benched);
+        set(clients.get(2), "lobbyBenched", true);
+        try {
+            assertTrue(server.startGame());
+            assertTrue("START never reached the controlled native writer",
+                    playing.writing.await(1, TimeUnit.SECONDS));
+            server.sendAllGameInfo(1);
+            server.sendAllGameInfo(TcpServer.SEND_ALL);
+            long deadline = SystemClock.elapsedRealtime() + 1000;
+            while (!captureClientTasks().isEmpty() && SystemClock.elapsedRealtime() < deadline)
+                Thread.sleep(1);
+            assertTrue("Pending snapshot dispatch still held the client semaphore", captureClientTasks().isEmpty());
+            assertEquals(0, playing.bytes.size());
+            assertFalse("A queued START was prematurely announced", server.events.contains(NetMsg.NETMSG_STARTGAME));
+            DataInputStream before = new DataInputStream(new ByteArrayInputStream(benched.bytes.toByteArray()));
+            while (before.available() > 0) {
+                String frame = before.readUTF();
+                JSONObject json = new JSONObject(frame.substring(
+                        TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length()));
+                assertFalse("A sitting-out phone received a speculative running roster", json.has(TcpServer.JSON_PLAYERS));
+            }
+        } finally { playing.released.countDown(); }
+        awaitOutboundWrites();
+        DataInputStream frames = new DataInputStream(new ByteArrayInputStream(playing.bytes.toByteArray()));
+        int prefix = TcpServer.TCPMESSAGE_PREFIX.length() + TcpServer.TCPPREFIX_JSON.length();
+        JSONObject start = new JSONObject(frames.readUTF().substring(prefix));
+        int rosters = 0, personalized = 0;
+        while (frames.available() > 0) {
+            JSONObject roster = new JSONObject(frames.readUTF().substring(prefix));
+            assertTrue(roster.has(TcpServer.JSON_PLAYERS));
+            assertEquals(Globals.GAME_STATE_RUNNING, roster.getInt(TcpServer.JSON_GAMESTATE));
+            assertEquals(start.getString(TcpServer.JSON_ROUND_TOKEN), roster.getString(TcpServer.JSON_ROUND_TOKEN));
+            assertEquals(start.getLong(TcpServer.JSON_GAMESTART), roster.getLong(TcpServer.JSON_GAMESTART));
+            rosters++;
+            if (roster.has(TcpServer.JSON_PLAYERGAMEUPDATE)) personalized++;
+        }
+        assertEquals(2, rosters);
+        assertEquals(1, personalized);
     }
 
     private void assertQueuedRosterKeepsStart(int playerID) throws Exception {

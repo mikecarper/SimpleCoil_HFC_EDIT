@@ -943,6 +943,7 @@ public class TcpServer extends Service {
         final String token;
         int pending = 1;
         boolean enqueued, flushed, confirmed;
+        final Map<Integer, List<ClientRecipient>> deferredGameInfo = new HashMap<>();
 
         StartDelivery(long roundID, String token, long startAt, long duration) {
             this.roundID = roundID;this.token = token;this.startAt = startAt;this.duration = duration;
@@ -954,6 +955,7 @@ public class TcpServer extends Service {
             complete(false);
         }
         void complete(boolean success) {
+            Map<Integer, List<ClientRecipient>> deferred = null;
             synchronized (mServerStateLock) {
                 flushed |= success;
                 pending--;
@@ -970,13 +972,49 @@ public class TcpServer extends Service {
                     mStartAnnounced = true;
                     cancelBalancedCheckInTimeoutLocked();
                     sendBroadcast(getScheduledGameStart());
+                    if (!deferredGameInfo.isEmpty()) {
+                        deferred = new HashMap<>(deferredGameInfo);
+                        deferredGameInfo.clear();
+                    }
                 }
                 if (pending == 0) {
                     mPendingStartDelivery = null;
                     mStartingGame = false;
                 }
             }
+            if (deferred != null) publishDeferredStartInfo(this, deferred);
         }
+    }
+
+    private boolean isAnnouncedStartLocked(StartDelivery delivery) {
+        return keepListening && !mDestroyed && !mEndingGame && mCancellationThread == null
+                && mStartAnnounced && delivery.roundID == mRoundSequence
+                && delivery.token.equals(mRoundToken);
+    }
+
+    private void publishDeferredStartInfo(StartDelivery delivery,
+                                          Map<Integer, List<ClientRecipient>> deferred) {
+        Runnable publish = new Runnable() {
+            @Override public void run() {
+                synchronized (mServerStateLock) {
+                    if (!isAnnouncedStartLocked(delivery)) return;
+                    if (!runClientTask(() -> {
+                        synchronized (mServerStateLock) {
+                            if (!isAnnouncedStartLocked(delivery)) return;
+                        }
+                        for (Map.Entry<Integer, List<ClientRecipient>> request : deferred.entrySet()) {
+                            if (!isClientTaskActive()) return;
+                            sendGameInfo(request.getKey(), request.getValue());
+                        }
+                    })) {
+                        // One round-owned job retries without growing its bounded
+                        // request map while ordinary sender slots are full.
+                        mShutdownHandler.postDelayed(this, CLOCK_ROSTER_UPDATE_DELAY_MS);
+                    }
+                }
+            }
+        };
+        publish.run();
     }
 
     public long getNextGameStartWaitMillis() {
@@ -2200,6 +2238,23 @@ public class TcpServer extends Service {
     // roll back a later score/roster update. Keep the original recipient identities
     // so a new connection cannot inherit work queued for a previous player.
     private void sendGameInfo(int id, List<ClientRecipient> recipients) {
+        synchronized (mServerStateLock) {
+            if (mPendingStartDelivery != null && !mStartAnnounced) {
+                // START frames already occupy each playing recipient's FIFO,
+                // but their actual flush has not committed the round yet. A
+                // lobby frame built here would follow START and undo it. Keep
+                // the original recipients and rebuild only after real success.
+                int key = id >= 1 && id <= Globals.MAX_PLAYER_ID ? id : SEND_ALL;
+                if (!mPendingStartDelivery.deferredGameInfo.containsKey(key)) {
+                    List<ClientRecipient> registered = new ArrayList<>();
+                    for (ClientRecipient recipient : recipients)
+                        if (recipient.playerID > 0 && Globals.isValidPlayerID(recipient.playerID))
+                            registered.add(recipient);
+                    if (!registered.isEmpty()) mPendingStartDelivery.deferredGameInfo.put(key, registered);
+                }
+                return;
+            }
+        }
         boolean hasRecipient = false;
         for (ClientRecipient recipient : recipients)
             hasRecipient |= recipient.isCurrent() && !deferLobbySnapshot(recipient.client);

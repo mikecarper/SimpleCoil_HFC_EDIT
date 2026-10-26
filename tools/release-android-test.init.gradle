@@ -1,0 +1,15 @@
+// Opt-in release instrumentation build. Normal app builds do not load this file.
+gradle.beforeProject { project ->
+    project.pluginManager.withPlugin('com.android.application') {
+        project.android.testBuildType = 'release'
+        project.tasks.configureEach { task ->
+            if (task.name == 'l8DexDesugarLibReleaseAndroidTest') {
+                // Instrumentation can load its j$ classes ahead of the app's.
+                // Trace both components so the test copy preserves every API
+                // required by the tested app as well as the tests themselves.
+                def testedAppL8 = project.tasks.named('l8DexDesugarLibRelease')
+                task.dexFiles.from(testedAppL8.map { testedTask -> testedTask.dexFiles })
+            }
+        }
+    }
+}

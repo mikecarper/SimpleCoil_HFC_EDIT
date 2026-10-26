@@ -19,6 +19,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -175,22 +176,41 @@ public class TcpServerSessionRegressionTest {
         out.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
                 + new JSONObject().put(TcpServer.JSON_LOBBY_BENCHED, false));
         out.flush();
-        server.sendTCPMessageAll("bench-barrier");
         DataInputStream in = new DataInputStream(peer.getInputStream());
-        boolean advertised = false;
-        String frame;
-        do {
-            frame = in.readUTF();
-            if (frame.contains("\"lobbybenched\":true")) advertised = true;
-        } while (!"bench-barrier".equals(frame));
-        assertTrue("Sitting-out status was not published", advertised);
+        // Clock replies prove that the earlier self-unbench request was read.
+        // Completing calibration also releases the deliberately deferred roster.
+        long calibrationDeadline = SystemClock.elapsedRealtime() + 5000;
+        for (int sample = 0; sample < GameClock.SAMPLES_PER_SYNC; sample++) {
+            final long request = SystemClock.elapsedRealtime();
+            out.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                    + new JSONObject().put(TcpServer.JSON_CLOCK_REQUEST, request));
+            out.flush();
+            awaitNativeFrame(in, out, calibrationDeadline,
+                    reply -> reply.optLong(TcpServer.JSON_CLOCK_REQUEST, -1) == request,
+                    "Clock calibration did not complete");
+        }
+        out.writeUTF(TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON
+                + new JSONObject().put(TcpServer.JSON_CLOCK_READY, true));
+        out.flush();
+        JSONObject advertised = awaitNativeFrame(in, out, calibrationDeadline, roster -> {
+            JSONObject player = rosterPlayer(roster, 2);
+            return player != null && player.getBoolean(TcpServer.JSON_CLOCK_READY)
+                    && player.getBoolean(TcpServer.JSON_LOBBY_BENCHED);
+        }, "Sitting-out status was not published after clock calibration");
+        assertFalse("Sitting out unexpectedly made the gun ready",
+                rosterPlayer(advertised, 2).getBoolean(TcpServer.JSON_LOBBY_READY));
         assertTrue("Client unbenched itself", server.getLobbyPlayersSnapshot().get((byte) 2).benched);
         assertTrue(server.setLobbyPlayerBenched((byte) 2, false));
-        deadline = SystemClock.elapsedRealtime() + 3000;
-        while (server.getLobbyPlayersSnapshot().get((byte) 2).benched
-                && SystemClock.elapsedRealtime() < deadline) Thread.sleep(10);
+        awaitNativeFrame(in, out, SystemClock.elapsedRealtime() + 3000, roster -> {
+            JSONObject player = rosterPlayer(roster, 2);
+            return player != null && !player.getBoolean(TcpServer.JSON_LOBBY_BENCHED)
+                    && player.getBoolean(TcpServer.JSON_CLOCK_READY)
+                    && !player.getBoolean(TcpServer.JSON_LOBBY_READY);
+        }, "Host unbench did not retain clock calibration and gun readiness");
+        assertFalse(server.getLobbyPlayersSnapshot().get((byte) 2).benched);
         assertFalse(server.areLobbyPlayersReady());
-        assertFalse(server.arePlayerClocksSynchronized());
+        assertTrue("Host unbench discarded the phone's completed clock calibration",
+                server.arePlayerClocksSynchronized());
     }
 
     @Test
@@ -748,6 +768,46 @@ public class TcpServerSessionRegressionTest {
 
     private interface CheckedAction {
         void run() throws Exception;
+    }
+
+    private interface NativeFrameCondition {
+        boolean matches(JSONObject frame) throws Exception;
+    }
+
+    private JSONObject awaitNativeFrame(DataInputStream in, DataOutputStream out, long deadline,
+                                       NativeFrameCondition condition, String failure) throws Exception {
+        String prefix = TcpServer.TCPMESSAGE_PREFIX + TcpServer.TCPPREFIX_JSON;
+        int previousTimeout = peer.getSoTimeout();
+        try {
+            while (SystemClock.elapsedRealtime() < deadline) {
+                peer.setSoTimeout((int) Math.max(1, Math.min(2000,
+                        deadline - SystemClock.elapsedRealtime())));
+                String frame = in.readUTF();
+                if (TcpServer.TCP_SERVER_PING.equals(frame)) {
+                    out.writeUTF(TcpClient.TCP_CLIENT_PONG);
+                    out.flush();
+                } else if (frame.startsWith(prefix)) {
+                    JSONObject json = new JSONObject(frame.substring(prefix.length()));
+                    if (condition.matches(json)) return json;
+                }
+            }
+            throw new AssertionError(failure);
+        } catch (SocketTimeoutException timeout) {
+            throw new AssertionError(failure, timeout);
+        } finally {
+            if (!peer.isClosed()) peer.setSoTimeout(previousTimeout);
+        }
+    }
+
+    private static JSONObject rosterPlayer(JSONObject frame, int playerID) {
+        org.json.JSONArray players = frame.optJSONArray(TcpServer.JSON_PLAYERS);
+        if (players == null) return null;
+        for (int index = 0; index < players.length(); index++) {
+            JSONObject player = players.optJSONObject(index);
+            if (player != null && player.optInt(TcpServer.JSON_PLAYERID, -1) == playerID)
+                return player;
+        }
+        return null;
     }
 
     private Runnable scheduleGpsUpdate() throws Exception {

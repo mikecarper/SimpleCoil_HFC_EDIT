@@ -7,7 +7,7 @@ Android app and their BLE laser-tag hardware.
 It speaks the protocol-31 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
-Use this host with the 1.53 phone app; the network protocol remains 31.
+Use this host with the 1.54 phone app; the network protocol remains 31.
 
 The map display bundles Leaflet and serves raster map tiles from the laptop.
 Nothing is fetched from the internet while a game is running. Player markers,

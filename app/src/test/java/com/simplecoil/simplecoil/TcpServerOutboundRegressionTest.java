@@ -75,6 +75,117 @@ public class TcpServerOutboundRegressionTest {
         }
     }
 
+    @Test public void pendingPersonalizedAndBroadcastRostersWaitForTheActualStartFlush() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            HeldSocket playing = new HeldSocket();
+            fixture.add(1, playing);
+            MemorySocket benched = fixture.add(17, new MemorySocket());
+            set(fixture.clients.get(17), "lobbyBenched", true);
+            assertTrue(fixture.server.startGame());
+            assertTrue(playing.entered.await(1, TimeUnit.SECONDS));
+            MemorySocket unregistered = fixture.add(9, 0, new MemorySocket());
+            fixture.server.sendAllGameInfo(1);
+            fixture.server.sendAllGameInfo(TcpServer.SEND_ALL);
+            await(fixture::tasksEmpty, "Snapshot requests did not reach the pending START");
+            assertEquals(0, playing.bytes.size());
+            assertTrue(unregistered.frames().isEmpty());
+            assertNoRoster(benched.frames());
+            assertFalse(fixture.server.events.contains(NetMsg.NETMSG_STARTGAME));
+            playing.released.countDown();
+            await(() -> hasRoster(playing) && hasRoster(benched), "Deferred snapshots were not recovered");
+            fixture.settle();
+            List<String> frames = playing.frames();
+            JSONObject start = new JSONObject(frames.get(0).substring(JSON.length()));
+            int rosters = 0, personalized = 0;
+            for (String frame : frames) {
+                if (!frame.startsWith(JSON)) continue;
+                JSONObject snapshot = new JSONObject(frame.substring(JSON.length()));
+                if (!snapshot.has(TcpServer.JSON_PLAYERS)) continue;
+                rosters++;
+                if (snapshot.has(TcpServer.JSON_PLAYERGAMEUPDATE)) personalized++;
+                assertEquals(Globals.GAME_STATE_RUNNING, snapshot.getInt(TcpServer.JSON_GAMESTATE));
+                for (String field : new String[] {TcpServer.JSON_ROUND_ID, TcpServer.JSON_ROUND_TOKEN,
+                        TcpServer.JSON_GAMESTART, TcpServer.JSON_GAMEDURATION})
+                    assertEquals(start.get(field), snapshot.get(field));
+            }
+            assertEquals("Broadcast and personalized requests were not kept separately", 2, rosters);
+            assertEquals(1, personalized);
+            assertTrue("A newly accepted unregistered socket inherited the pending round",
+                    unregistered.frames().isEmpty());
+            for (String frame : benched.frames()) {
+                JSONObject snapshot = new JSONObject(frame.substring(JSON.length()));
+                assertFalse("A sitting-out phone received a playing START frame",
+                        snapshot.has(TcpServer.JSON_GAMESTART) && !snapshot.has(TcpServer.JSON_PLAYERS));
+            }
+        }
+    }
+
+    @Test public void failedPendingStartNeverPublishesDeferredRunningStateToABenchedPhone() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            HeldSocket failed = new HeldSocket();
+            fixture.add(1, failed);
+            MemorySocket benched = fixture.add(17, new MemorySocket());
+            set(fixture.clients.get(17), "lobbyBenched", true);
+            assertTrue(fixture.server.startGame());
+            assertTrue(failed.entered.await(1, TimeUnit.SECONDS));
+            fixture.server.sendAllGameInfo(1);
+            fixture.server.sendAllGameInfo(TcpServer.SEND_ALL);
+            await(fixture::tasksEmpty, "Snapshot requests did not reach the pending START");
+            assertNoRoster(benched.frames());
+            failed.close();failed.released.countDown();
+            fixture.settle();
+            assertTrue(failed.frames().isEmpty());
+            assertNoRoster(benched.frames());
+            assertFalse(fixture.server.events.contains(NetMsg.NETMSG_STARTGAME));
+            assertTrue(fixture.server.getScheduledGameStart() == null);
+        }
+    }
+
+    @Test public void deferredSnapshotRetryCannotFollowTheRoundPastItsEnd() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            HeldSocket phone = new HeldSocket();
+            fixture.add(1, phone);
+            assertTrue(fixture.server.startGame());
+            assertTrue(phone.entered.await(1, TimeUnit.SECONDS));
+            fixture.server.sendAllGameInfo(1);
+            await(fixture::tasksEmpty, "Snapshot request did not defer");
+            TrackingTaskSlots slots = new TrackingTaskSlots();
+            set(fixture.server, "mClientTaskSlots", slots);
+            slots.acquire(TcpServer.MAX_PENDING_CLIENT_TASKS);
+            try {
+                phone.released.countDown();
+                await(() -> fixture.server.events.contains(NetMsg.NETMSG_STARTGAME), "START did not confirm");
+                assertTrue("Deferred recovery never attempted the full task queue",
+                        slots.rejected.await(1, TimeUnit.SECONDS));
+                fixture.settle();
+                assertNoRoster(phone.frames());
+                assertTrue(fixture.server.requestOrderedRoundEnd());
+                await(() -> fixture.server.events.contains(NetMsg.NETMSG_ENDGAME) && fixture.tasksEmpty(),
+                        "Round end did not pass the full ordinary task queue");
+            } finally { slots.release(TcpServer.MAX_PENDING_CLIENT_TASKS); }
+            Shadows.shadowOf(Looper.getMainLooper()).idleFor(200, TimeUnit.MILLISECONDS);
+            fixture.settle();
+            assertNoRoster(phone.frames());
+            List<String> frames = phone.frames();
+            assertEquals(MESSAGE + NetMsg.NETMSG_ENDGAME, frames.get(frames.size() - 1));
+        }
+    }
+
+    private static boolean hasRoster(MemorySocket socket) {
+        try {
+            for (String frame : socket.frames())
+                if (frame.startsWith(JSON) && new JSONObject(frame.substring(JSON.length())).has(TcpServer.JSON_PLAYERS))
+                    return true;
+            return false;
+        } catch (Exception failure) { throw new AssertionError(failure); }
+    }
+
+    private static void assertNoRoster(List<String> frames) throws Exception {
+        for (String frame : frames)
+            if (frame.startsWith(JSON)) assertFalse("An uncommitted or ended START published a roster",
+                    new JSONObject(frame.substring(JSON.length())).has(TcpServer.JSON_PLAYERS));
+    }
+
     @Test public void terminalCancellationFlushesBeforeClosingTheHealthySocket() throws Exception {
         try (Fixture fixture = new Fixture()) {
             MemorySocket phone = fixture.add(1, new MemorySocket());
@@ -146,6 +257,8 @@ public class TcpServerOutboundRegressionTest {
             fixture.add(1, phone);
             assertTrue(fixture.server.startGame());
             assertTrue(phone.entered.await(1, TimeUnit.SECONDS));
+            fixture.server.sendAllGameInfo(1);
+            await(fixture::tasksEmpty, "Snapshot request did not reach the pending START");
             fixture.server.endGame();
             await(() -> fixture.server.events.contains(NetMsg.NETMSG_ENDGAME) && fixture.tasksEmpty(),
                     "Round completion waited for the held socket");
@@ -154,6 +267,7 @@ public class TcpServerOutboundRegressionTest {
             assertFalse("An obsolete START flush revived an ended local round",
                     fixture.server.events.contains(NetMsg.NETMSG_STARTGAME));
             List<String> frames = phone.frames();
+            assertNoRoster(frames);
             assertTrue(frames.get(0).startsWith(JSON));
             assertEquals(MESSAGE + NetMsg.NETMSG_ENDGAME, frames.get(frames.size() - 1));
             assertFalse("Normal round completion closed the retained lobby socket", phone.closed);
@@ -384,6 +498,16 @@ public class TcpServerOutboundRegressionTest {
     private static final class RecordingServer extends TcpServer {
         final CopyOnWriteArrayList<String> events = new CopyOnWriteArrayList<>();
         @Override public void sendBroadcast(Intent intent) { events.add(intent.getAction()); }
+    }
+
+    private static final class TrackingTaskSlots extends Semaphore {
+        final CountDownLatch rejected = new CountDownLatch(1);
+        TrackingTaskSlots() { super(TcpServer.MAX_PENDING_CLIENT_TASKS); }
+        @Override public boolean tryAcquire() {
+            boolean acquired = super.tryAcquire();
+            if (!acquired) rejected.countDown();
+            return acquired;
+        }
     }
 
     private static class MemorySocket extends Socket {

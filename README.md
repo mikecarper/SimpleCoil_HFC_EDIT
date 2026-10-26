@@ -4,23 +4,25 @@ SimpleCoil is an Android companion app for supported Bluetooth LE laser-tag
 hardware. This fork is based on [Dees-Troy/SimpleCoil](https://github.com/Dees-Troy/SimpleCoil)
 and retains the project's Apache-2.0 license.
 
-## Latest release (1.53)
+## Latest release (1.54)
 
-[Download version 1.53](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.53)
+[Download version 1.54](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.54)
 for faster large-lobby joins and clock sync, retained connections between rounds,
 gun and reload recovery, scanning of existing QR posters, and host countdown
 cancellation. This release also fixes disconnected-player ownership, stale
 laptop cancellation dialogs, and update checks interrupted by Internet loss.
+Version 1.54 keeps lobby updates consistent with a start message that is still
+being delivered, so a late lobby update cannot return a starting phone to idle.
 Release builds check GitHub on launch and install future updates while idle.
 
 Update every phone and use the matching laptop host from this release's source
-download. Versions 1.53 and 1.52 use network protocol 31; version 1.51 uses
+download. Versions 1.54, 1.53 and 1.52 use network protocol 31; version 1.51 uses
 protocol 30 and cannot join the same game. Android 5.0 or newer is required.
 
-Version 1.53 updates the signed 1.52 APK in place and preserves settings and
-player history. Both use the configured release signing key, which differs
+Version 1.54 updates signed 1.53 and 1.52 APKs in place and preserves settings and
+player history. These use the configured release signing key, which differs
 from the debug key used for the published 1.51 APK. Android cannot install
-1.53 in place over 1.51. Reinstalling removes the old app's local settings
+1.54 in place over 1.51. Reinstalling removes the old app's local settings
 and player history, so save any information you need before switching.
 
 ## Platform support
@@ -213,7 +215,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.53 on every phone for this build.
+messages cannot end a new round. Install 1.54 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
 remains the primary connection. If it fails, Bluetooth Classic links can forward
