@@ -21,11 +21,27 @@ public final class EventMode {
     public static final String TRANSFERRED_OUT = "playertransferred";
     public static final String BATTERY = "batterystatus";
     public static final String BATTERY_REQUEST = "requestbatterystatus";
+    public static final int DEFAULT_PIN_DIGITS = 2;
+    public static final int MIN_PIN_DIGITS = 2;
+    public static final int MAX_PIN_DIGITS = 6;
+    public static final int LEGACY_MAX_PIN_DIGITS = 8;
 
     private EventMode() { }
 
     public static boolean validPin(String pin) {
-        return pin != null && pin.matches("[0-9]{6,8}");
+        return numericPin(pin, MAX_PIN_DIGITS);
+    }
+
+    /** Retain existing organizer PINs and offline unlocks from older releases. */
+    public static boolean validStoredPin(String pin) {
+        return numericPin(pin, LEGACY_MAX_PIN_DIGITS);
+    }
+
+    private static boolean numericPin(String pin, int maximum) {
+        if (pin == null || pin.length() < MIN_PIN_DIGITS || pin.length() > maximum) return false;
+        for (int index = 0; index < pin.length(); index++)
+            if (pin.charAt(index) < '0' || pin.charAt(index) > '9') return false;
+        return true;
     }
 
     public static boolean validTitle(String title) {
@@ -53,7 +69,7 @@ public final class EventMode {
     }
 
     public static boolean matchesPin(String identity, String pin, String expectedHash) {
-        return validPin(pin) && validHash(expectedHash) && MessageDigest.isEqual(
+        return validStoredPin(pin) && validHash(expectedHash) && MessageDigest.isEqual(
                 pinHash(identity, pin).getBytes(StandardCharsets.US_ASCII),
                 expectedHash.getBytes(StandardCharsets.US_ASCII));
     }

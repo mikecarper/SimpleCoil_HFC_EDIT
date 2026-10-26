@@ -29,8 +29,8 @@ final class EventSettings {
         if (!EventMode.validTitle(title)) title = EventMode.APP_NAME;
         enabled = Boolean.parseBoolean(saved.getProperty("enabled", "true"));
         kiosk = Boolean.parseBoolean(saved.getProperty("kiosk", "true"));
-        if (!EventMode.validPin(pin)) {
-            pin = String.format(java.util.Locale.ROOT, "%06d", new SecureRandom().nextInt(1_000_000));
+        if (!EventMode.validStoredPin(pin)) {
+            pin = String.format(java.util.Locale.ROOT, "%02d", new SecureRandom().nextInt(100));
             try { save(pin, title, enabled, kiosk); }
             catch (IOException exception) {
                 throw new IllegalStateException("Cannot save the event recovery PIN: " + exception.getMessage(), exception);
@@ -43,9 +43,13 @@ final class EventSettings {
     synchronized boolean enabled() { return enabled; }
     synchronized boolean kiosk() { return kiosk; }
 
+    synchronized boolean acceptsPin(String value) {
+        return EventMode.validPin(value) || EventMode.validStoredPin(value) && value.equals(pin);
+    }
+
     synchronized void save(String value, String title, boolean enabled, boolean kiosk) throws IOException {
-        if (!EventMode.validPin(value)) throw new IllegalArgumentException("Use an organizer PIN with 6–8 digits.");
-        if (!EventMode.validTitle(title)) throw new IllegalArgumentException("Use an event name with 1–80 characters.");
+        if (!acceptsPin(value)) throw new IllegalArgumentException("Use an organizer PIN with 2-6 digits.");
+        if (!EventMode.validTitle(title)) throw new IllegalArgumentException("Use an event name with 1-80 characters.");
         Files.createDirectories(file.getParent());
         boolean posix = Files.getFileStore(file.getParent()).supportsFileAttributeView("posix");
         if (posix) Files.setPosixFilePermissions(file.getParent(), PosixFilePermissions.fromString("rwx------"));

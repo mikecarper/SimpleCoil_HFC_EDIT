@@ -1296,14 +1296,14 @@ public class TcpGameInfoRegressionTest {
                 .put(com.simplecoil.protocol.EventMode.ENABLED, true)
                 .put(com.simplecoil.protocol.EventMode.PINNING, true)
                 .put(com.simplecoil.protocol.EventMode.REVISION, revision)
-                .put(com.simplecoil.protocol.EventMode.PIN_HASH, com.simplecoil.protocol.EventMode.pinHash(identity, "123456"))
+                .put(com.simplecoil.protocol.EventMode.PIN_HASH, com.simplecoil.protocol.EventMode.pinHash(identity, "07"))
                 .put(com.simplecoil.protocol.EventMode.TITLE, "LAZER GUN RUN Finals");
         parse(game);
         assertEquals("Host name", globals.mPlayerName);
         assertEquals(identity, globals.mHostPlayerIdentity);
         assertTrue(globals.mEventMode);assertTrue(globals.mEventPinning);
         assertEquals("LAZER GUN RUN Finals", globals.mEventTitle);
-        assertTrue(com.simplecoil.protocol.EventMode.matchesPin(identity, "123456", globals.mEventPinHash));
+        assertTrue(com.simplecoil.protocol.EventMode.matchesPin(identity, "07", globals.mEventPinHash));
         game.put(TcpServer.JSON_PLAYERS, new JSONArray().put(player(1).put(TcpServer.JSON_PLAYERNAME, "Rejected name")))
                 .put(com.simplecoil.protocol.EventMode.PIN_HASH, "invalid");
         parse(game);

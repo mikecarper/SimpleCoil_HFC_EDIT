@@ -4301,16 +4301,18 @@ public final class LaptopHost {
             if (!(parsed instanceof Map)) throw new IllegalArgumentException();
             request = castObject(parsed);
             if (!(request.get("enabled") instanceof Boolean) || !(request.get("kiosk") instanceof Boolean)
-                    || !(request.get("pin") instanceof String) || !EventMode.validPin((String) request.get("pin"))
+                    || !(request.get("pin") instanceof String)
                     || request.containsKey("title") && !EventMode.validTitle(request.get("title") instanceof String ? (String) request.get("title") : null)
                     || !Set.of("enabled", "kiosk", "pin", "title").containsAll(request.keySet()))
                 throw new IllegalArgumentException();
         } catch (IllegalArgumentException exception) {
-            sendJson(exchange, 400, mapOf("ok", false, "message", "Choose Event Mode, Kiosk Mode, and an organizer PIN with 6–8 digits."));
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Choose Event Mode, Kiosk Mode, and an organizer PIN with 2-6 digits."));
             return;
         }
         try {
             synchronized (stateLock) {
+                if (!eventSettings.acceptsPin((String) request.get("pin")))
+                    throw new IllegalArgumentException("Use an organizer PIN with 2-6 digits.");
                 eventSettings.save((String) request.get("pin"), request.containsKey("title") ? (String) request.get("title") : eventSettings.title(),
                         Boolean.TRUE.equals(request.get("enabled")), Boolean.TRUE.equals(request.get("kiosk")));
                 eventMode = Boolean.TRUE.equals(request.get("enabled"));
@@ -4319,6 +4321,9 @@ public final class LaptopHost {
                 eventRevision = UUID.randomUUID().toString();
                 playerEventRevisions.clear();
             }
+        } catch (IllegalArgumentException exception) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Use an organizer PIN with 2-6 digits, or keep the existing PIN unchanged."));
+            return;
         } catch (IOException exception) {
             sendJson(exchange, 503, mapOf("ok", false, "message", "Unable to save the organizer PIN."));
             return;

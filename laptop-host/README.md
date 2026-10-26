@@ -7,7 +7,7 @@ Android app and their BLE laser-tag hardware.
 It speaks the protocol-31 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
-Use this host with the 1.55 phone app; the network protocol remains 31.
+Use this host with the 1.56 phone app; the network protocol remains 31.
 
 The map display bundles Leaflet and serves raster map tiles from the laptop.
 Nothing is fetched from the internet while a game is running. Player markers,
@@ -371,6 +371,12 @@ Expand **Event name, Event Mode & Kiosk Mode** to rename the event and control
 phone restrictions. The launcher is **LAZER GUN RUN**; the event name changes
 inside the phone app and on the host displays. The event settings and organizer
 PIN are kept privately in `~/.config/simplecoil/event.properties`.
+New event settings generate a two-digit organizer PIN. Existing configured PINs
+stay unchanged; choose a new two-to-six-digit PIN in event settings to shorten
+one, including leading zeros. Previously configured seven- or eight-digit PINs
+remain valid after a restart and may be kept unchanged while editing other
+event settings; replacements must use two to six digits. Update phones to
+1.56 before choosing a PIN shorter than six digits so offline unlock accepts it.
 
 Kiosk Mode uses Android lock task mode on provisioned device-owner phones.
 Ordinary phones show Android's screen-pinning confirmation and retain the

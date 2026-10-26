@@ -19,6 +19,11 @@ public final class PlayerControlsTest {
     private static Path root;
     public static void main(String[] args) throws Exception {
         root = Files.createTempDirectory("simplecoil-player-controls");
+        verifyEventPins();
+        if (args.length == 1 && "--event-pin-only".equals(args[0])) {
+            System.out.println("Event PIN defaults, leading zeros, legacy compatibility, and API validation passed");
+            return;
+        }
         verifyDirectory();
         verifyReturningIdentityHasOnlyOneSeat();
         verifyRelay();
@@ -128,6 +133,70 @@ public final class PlayerControlsTest {
             check(number(object(active(2).get("settings")).get("health")) == 2, "Saved custom health overwrote the hunter profile");
         } finally { stop(host); }
         System.out.println("Player controls, battery rounds, event policies, phone transfers, and persistence passed");
+    }
+
+    private static void verifyEventPins() throws Exception {
+        Path previousRoot = root;root = Files.createTempDirectory("simplecoil-event-pin-controls");
+        try {
+            Process host = start();
+            String generated;
+            try {
+                generated = organizerPin();
+                check(generated.matches("[0-9]{2}"), "New event did not generate exactly two ASCII digits");
+                check(get("/players").contains("pattern=\"[0-9]{2,6}\" minlength=\"2\" maxlength=\"6\""),
+                        "Players page did not advertise the new PIN bounds");
+            } finally { stop(host); }
+            host = start();
+            try {
+                check(generated.equals(organizerPin()), "Restart rotated the generated recovery PIN");
+                for (String pin : List.of("00", "007", "0012", "00123", "001234")) {
+                    check(post("/api/event",Map.of("title","PIN test","enabled",true,"kiosk",true,"pin",pin))
+                            .statusCode() == 200, "A valid PIN length was rejected");
+                    check(pin.equals(organizerPin()), "PIN leading zeros were lost");
+                }
+                for (Object invalid : List.of("1", "1234567", "12345678", "12 34", "+12", "12.0", "\u0661\u0662", 12)) {
+                    check(post("/api/event",Map.of("title","Must not apply","enabled",false,"kiosk",false,"pin",invalid))
+                            .statusCode() == 400, "An invalid newly assigned PIN was accepted");
+                    check("001234".equals(organizerPin()) && "PIN test".equals(state().get("eventTitle")),
+                            "Rejected PIN settings partially applied");
+                }
+            } finally { stop(host); }
+            host = start();
+            try { check("001234".equals(organizerPin()), "Restart changed a configured six-digit PIN"); }
+            finally { stop(host); }
+            for (String legacy : List.of("0012345", "00123456")) {
+                Properties saved = new Properties();saved.setProperty("pin",legacy);saved.setProperty("title","Legacy event");
+                try (OutputStream output = Files.newOutputStream(root.resolve("event.properties"))) {
+                    saved.store(output,"Isolated test event");
+                }
+                host = start();
+                try {
+                    check(legacy.equals(organizerPin()), "Restart rotated a configured legacy PIN");
+                    check(post("/api/event",Map.of("title","Legacy renamed","enabled",true,"kiosk",false,"pin",legacy))
+                            .statusCode() == 200, "An unchanged legacy PIN blocked unrelated event edits");
+                    for (String replacement : List.of("7654321", "87654321")) {
+                        check(post("/api/event",Map.of("title","Must not apply","enabled",false,"kiosk",true,"pin",replacement))
+                                .statusCode() == 400, "A newly assigned legacy-length PIN was accepted");
+                        check(legacy.equals(organizerPin()) && "Legacy renamed".equals(state().get("eventTitle")),
+                                "Rejected legacy replacement partially applied");
+                    }
+                } finally { stop(host); }
+                host = start();
+                try {
+                    check(legacy.equals(organizerPin()) && "Legacy renamed".equals(state().get("eventTitle")),
+                            "Restart did not retain the unchanged legacy settings");
+                    check(post("/api/event",Map.of("title","Short PIN","enabled",true,"kiosk",true,"pin","07"))
+                            .statusCode() == 200, "A legacy PIN could not be replaced with two digits");
+                    check(post("/api/event",Map.of("title","Must not apply","enabled",true,"kiosk",true,"pin",legacy))
+                            .statusCode() == 400, "A replaced legacy PIN could be newly assigned again");
+                    check("07".equals(organizerPin()), "A rejected old PIN overwrote the replacement");
+                } finally { stop(host); }
+            }
+        } finally { root = previousRoot; }
+    }
+
+    private static String organizerPin() throws Exception {
+        return (String) object(LaptopHost.Json.parse(get("/api/players"))).get("organizerPin");
     }
     private static void verifyReturningIdentityHasOnlyOneSeat() throws Exception {
         Path previousRoot = root;root = Files.createTempDirectory("simplecoil-returning-player");
