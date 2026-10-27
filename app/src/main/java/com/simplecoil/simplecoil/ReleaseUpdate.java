@@ -64,7 +64,7 @@ final class ReleaseUpdate {
     }
 
     ReleaseUpdate() {
-        this(url -> (HttpURLConnection) url.openConnection());
+        this(ReleaseUpdateTls::open);
     }
 
     ReleaseUpdate(ConnectionOpener connections) {

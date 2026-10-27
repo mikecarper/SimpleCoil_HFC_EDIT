@@ -4,9 +4,9 @@ SimpleCoil is an Android companion app for supported Bluetooth LE laser-tag
 hardware. This fork is based on [Dees-Troy/SimpleCoil](https://github.com/Dees-Troy/SimpleCoil)
 and retains the project's Apache-2.0 license.
 
-## Latest release (1.56)
+## Latest release (1.57)
 
-[Download version 1.56](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.56)
+[Download version 1.57](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.57)
 for faster large-lobby joins and clock sync, retained connections between rounds,
 gun and reload recovery, scanning of existing QR posters, and host countdown
 cancellation. This release also fixes disconnected-player ownership, stale
@@ -19,16 +19,21 @@ team poster and assigns an available player slot without creating a team.
 Version 1.56 generates two-digit organizer PINs by default and accepts custom
 PINs with two to six digits. Existing saved PINs remain unchanged.
 Update phones to 1.56 before choosing a PIN shorter than six digits.
+Version 1.57 fixes GitHub APK downloads on older Android 5-7.1 phones by including
+the download server's trusted ISRG Root X1 certificate in the updater's checks.
+Certificate, hostname, APK digest and installed signing-key checks remain enabled.
+If an older app cannot download its update on these phones, install 1.57 manually
+once; later updates use the repaired GitHub updater.
 Release builds check GitHub on launch and install future updates while idle.
 
 Update every phone and use the matching laptop host from this release's source
-download. Versions 1.52 through 1.56 use network protocol 31; version 1.51 uses
+download. Versions 1.52 through 1.57 use network protocol 31; version 1.51 uses
 protocol 30 and cannot join the same game. Android 5.0 or newer is required.
 
-Version 1.56 updates signed 1.52 through 1.55 APKs in place and preserves settings and
+Version 1.57 updates signed 1.52 through 1.56 APKs in place and preserves settings and
 player history. These use the configured release signing key, which differs
 from the debug key used for the published 1.51 APK. Android cannot install
-1.56 in place over 1.51. Reinstalling removes the old app's local settings
+1.57 in place over 1.51. Reinstalling removes the old app's local settings
 and player history, so save any information you need before switching.
 
 ## Platform support
@@ -228,7 +233,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.56 on every phone for this build.
+messages cannot end a new round. Install 1.57 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
 remains the primary connection. If it fails, Bluetooth Classic links can forward
