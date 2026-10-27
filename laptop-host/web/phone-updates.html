@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SimpleCoil Phone Updates</title>
+  <style>
+    :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:16px system-ui,sans-serif}
+    main{max-width:1000px;margin:36px auto;padding:0 24px 40px}nav{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:30px}a{color:#74b9f5}
+    h1{font-size:30px;margin:8px 0}h2{font-size:21px;margin:0 0 14px}p,li{line-height:1.55;color:#b8c8d8}.card{background:#111c27;border:1px solid #274257;border-radius:14px;padding:24px;margin-top:24px}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.badge{border-radius:99px;background:#344658;padding:6px 12px;font-size:14px;font-weight:700}.badge.on{background:#245a40;color:#b5f5cf}
+    button{border:0;border-radius:7px;padding:10px 14px;background:#267ec8;color:white;font:inherit;cursor:pointer}button.secondary{background:#2d4256}button:disabled{opacity:.45;cursor:default}
+    label{display:flex;gap:12px;align-items:center;line-height:1.5;font-weight:700}input[type=checkbox]{width:22px;height:22px;accent-color:#267ec8}.muted{font-size:14px}.warning,#message.error{color:#ffd18d}#message{min-height:24px}
+    .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left;font-size:14px}th,td{padding:13px 10px;border-bottom:1px solid #274257;vertical-align:top}th{color:#b8c8d8}td:first-child,th:first-child{padding-left:0}td:last-child,th:last-child{padding-right:0}.details{display:block;color:#b8c8d8;overflow-wrap:anywhere;margin-top:5px}.actions{display:flex;gap:8px;flex-wrap:wrap}
+    @media(max-width:600px){main{margin-top:24px;padding:0 16px 32px}.card{padding:20px}nav{gap:14px}th,td{padding:10px 7px}}
+  </style>
+</head>
+<body>
+<main>
+  <nav><a href="/">Host dashboard</a><a href="/players">Players</a><a href="/wifi">Game Wi-Fi</a></nav>
+  <h1>Phone updates</h1>
+  <p>Let this laptop install the latest cached game app on enrolled phones over game Wi-Fi. After the USB setup, these updates do not need an Install tap on each phone.</p>
+  <section class="card" aria-labelledby="automatic-title">
+    <h2 id="automatic-title">Automatic Wi-Fi updates</h2>
+    <div class="row"><span id="update-status" class="badge">Checking updates...</span><span id="cached-release"></span></div>
+    <p id="service-message"></p>
+    <label><input id="auto-enabled" type="checkbox" disabled>Automatically update enrolled phones</label>
+    <p class="muted">Installs run one phone at a time while the host and phone are idle. The game app's package, signing certificate, and newer version must match before installation; app data stays in place.</p>
+    <p id="round-note" class="warning" hidden>A round or countdown is active. Updates and USB enrollment will wait until the lobby.</p>
+    <p id="adb-note" class="warning" hidden>Install Android SDK Platform-Tools on this laptop so <code>adb</code> is available, then restart the host.</p>
+    <p id="message" role="status" aria-live="polite"></p>
+  </section>
+  <section class="card" aria-labelledby="setup-title">
+    <h2 id="setup-title">One-time USB setup</h2>
+    <p>Install game app 1.59 or newer once before using automatic Wi-Fi installation. Older apps do not provide the idle check required by this host.</p>
+    <ol>
+      <li>Join this laptop's game Wi-Fi on the phone. Enable Developer options and USB debugging.</li>
+      <li>Connect USB, unlock the phone, and accept <strong>Allow USB debugging?</strong> Choose <strong>Always allow from this computer</strong>.</li>
+      <li>Select <strong>Enroll</strong> beside that phone below. Keep USB connected until its enrolled status confirms Wi-Fi access, then unplug it.</li>
+    </ol>
+    <p class="muted">Use a trusted game Wi-Fi and do not forward the debugging port through a router. On older Android phones, Wi-Fi debugging usually turns off after a reboot; reconnect USB and enroll again when that happens.</p>
+    <div class="table-wrap"><table><thead><tr><th scope="col">USB phone</th><th scope="col">Debugging status</th><th scope="col">Action</th></tr></thead><tbody id="usb-phones"></tbody></table></div>
+    <p id="usb-empty" class="muted">Checking for USB phones...</p>
+  </section>
+  <section class="card" aria-labelledby="phones-title">
+    <h2 id="phones-title">Enrolled phones</h2>
+    <div class="table-wrap"><table><thead><tr><th scope="col">Phone</th><th scope="col">Update status</th><th scope="col">Actions</th></tr></thead><tbody id="enrolled-phones"></tbody></table></div>
+    <p id="phones-empty" class="muted">No phones enrolled yet.</p>
+    <p class="muted">Retry checks a phone again. Remove stops this host's automatic updates for that phone; it does not erase the phone or turn off Android debugging.</p>
+  </section>
+  <p class="muted">These controls are available only on this laptop. Ordinary app downloads from the laptop remain available separately; Android may still ask for Install when using that method.</p>
+</main>
+<script>
+  const byId=id=>document.getElementById(id),toggle=byId('auto-enabled'),message=byId('message');
+  let status=null,changing=false,refreshing=false,revision=0,usbSignature='',phoneSignature='';
+  const labels={checking:'Checking',ready:'Ready',updating:'Installing update',updated:'Up to date',offline:'Offline',unauthorized:'Authorization needed',error:'Needs attention',enrolling:'Enrolling',waiting:'Waiting',paused:'Paused',device:'Authorized',online:'Connected'};
+  function notice(text,error=false){message.textContent=text;message.classList.toggle('error',error)}
+  function statusLabel(value){return labels[value]||String(value||'Checking')}
+  function cell(row,text){const td=document.createElement('td');td.textContent=text;row.append(td);return td}
+  function detail(parent,text){if(!text)return;const span=document.createElement('span');span.className='details';span.textContent=text;parent.append(span)}
+  function actionButton(parent,text,action,serial,disabled){const button=document.createElement('button');button.type='button';button.textContent=text;button.disabled=disabled;button.dataset.action=action;button.dataset.serial=serial;button.onclick=()=>control({action,serial});if(action==='remove')button.className='secondary';parent.append(button)}
+  function render(){
+    if(!status)return;
+    const busy=changing||Boolean(status.busy),available=Boolean(status.available),gameActive=Boolean(status.gameActive),enabled=Boolean(status.enabled);
+    toggle.checked=enabled;toggle.disabled=changing||(!enabled&&(busy||!available));
+    const badge=byId('update-status');badge.textContent=!available?'ADB unavailable':busy?'Working...':gameActive?'Waiting for lobby':enabled?'Automatic updates on':'Automatic updates off';badge.classList.toggle('on',enabled&&available&&!gameActive);
+    byId('cached-release').textContent=status.cachedUpdate?.version?'Cached game app: '+status.cachedUpdate.version:'No verified update cached yet';
+    byId('service-message').textContent=status.message||'';byId('round-note').hidden=!gameActive;byId('adb-note').hidden=available;
+    const usb=Array.isArray(status.usbPhones)?status.usbPhones:[],phones=Array.isArray(status.phones)?status.phones:[];
+    const usbKey=JSON.stringify([usb,busy,available,gameActive]);
+    if(usbKey!==usbSignature){const body=byId('usb-phones');body.replaceChildren();for(const phone of usb){const row=document.createElement('tr'),name=cell(row,phone.label||phone.serial||'USB phone');detail(name,phone.serial);const state=cell(row,statusLabel(phone.state));if(phone.state==='unauthorized')detail(state,'Unlock the phone and accept Allow USB debugging.');else if(phone.state!=='device')detail(state,phone.message||'Check the cable, USB debugging, and phone screen.');const buttons=cell(row,'');actionButton(buttons,'Enroll','enroll-usb',phone.serial,busy||!available||gameActive||phone.state!=='device'||!phone.serial);body.append(row)}usbSignature=usbKey}
+    byId('usb-empty').hidden=usb.length>0;byId('usb-empty').textContent=available?'No USB phones found. Connect a phone with USB debugging enabled.':'USB phones appear here when ADB is available.';
+    const phoneKey=JSON.stringify([phones,busy,available,gameActive,enabled]);
+    if(phoneKey!==phoneSignature){const body=byId('enrolled-phones');body.replaceChildren();for(const phone of phones){const row=document.createElement('tr'),name=cell(row,phone.label||phone.serial||'Phone');detail(name,phone.serial);detail(name,phone.address);const state=cell(row,statusLabel(phone.state));detail(state,phone.message);if(phone.installedVersion)detail(state,'Installed: '+phone.installedVersion);const buttons=cell(row,'');buttons.className='actions';actionButton(buttons,'Retry','retry',phone.serial,busy||!available||gameActive||!enabled||!phone.serial);actionButton(buttons,'Remove','remove',phone.serial,busy||!phone.serial);body.append(row)}phoneSignature=phoneKey}
+    byId('phones-empty').hidden=phones.length>0;
+  }
+  async function readResponse(response){let data;try{data=await response.json()}catch{throw Error('The host returned an unreadable update status.')}if(!response.ok)throw Error(data.message||'Unable to read phone update status.');return data}
+  async function refresh(){
+    if(refreshing||changing)return;refreshing=true;const requestedRevision=revision;
+    try{const response=await fetch('/api/phone-updates',{cache:'no-store',mode:'same-origin',credentials:'same-origin',redirect:'error'}),data=await readResponse(response);if(requestedRevision!==revision||changing)return;status=data;render()}
+    catch(error){if(requestedRevision===revision)notice(error.message,true)}finally{refreshing=false}
+  }
+  async function control(body){
+    if(changing||!status)return;changing=true;revision++;render();notice(body.action==='enroll-usb'?'Enrolling the selected USB phone...':body.action==='retry'?'Checking the selected phone...':body.action==='remove'?'Removing the selected phone...':'Saving automatic update preference...');
+    try{const response=await fetch('/api/phone-updates',{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',headers:{'Content-Type':'application/json','X-SimpleCoil-Control':'1'},body:JSON.stringify(body)}),data=await readResponse(response);if(data.status)status=data.status;if(!data.ok)throw Error(data.message||'Phone update action failed.');notice(data.message||'Request accepted.')}
+    catch(error){notice(error.message,true)}finally{changing=false;render();await refresh()}
+  }
+  toggle.onchange=()=>control({action:'set-enabled',enabled:toggle.checked});
+  refresh();setInterval(refresh,3000);
+</script>
+</body>
+</html>

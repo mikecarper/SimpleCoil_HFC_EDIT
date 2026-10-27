@@ -13,6 +13,7 @@ javac --release 17 --add-modules jdk.httpserver -d "$output_dir" "$source_file" 
     "$script_dir/src/main/java/com/simplecoil/laptophost/EventSettings.java" \
     "$script_dir/src/main/java/com/simplecoil/laptophost/PlayerDirectory.java" \
     "$script_dir/src/main/java/com/simplecoil/laptophost/PhoneUpdateCache.java" \
+    "$script_dir/src/main/java/com/simplecoil/laptophost/AdbPhoneUpdater.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/EventMode.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RelayConfig.java" \
     "$script_dir/../shared/src/main/java/com/simplecoil/protocol/RelayMesh.java" \

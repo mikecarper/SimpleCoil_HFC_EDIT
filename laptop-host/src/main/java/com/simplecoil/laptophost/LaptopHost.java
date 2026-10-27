@@ -303,6 +303,13 @@ public final class LaptopHost {
     private HttpServer dashboard;
     private HttpServer tileServer;
     private final PhoneUpdateCache phoneUpdates = new PhoneUpdateCache(this::phoneUpdatesIdle);
+    private final AdbPhoneUpdater adbPhoneUpdates = new AdbPhoneUpdater(
+            Path.of(System.getProperty("simplecoil.adb.updates.file", Path.of(
+                    System.getProperty("user.home"), ".config", "simplecoil", "adb-phone-updates.json").toString())),
+            this::phoneUpdatesIdle, phoneUpdates::adbRelease, this::acquireAdbPhoneLease);
+    // Guarded by stateLock. START and Wi-Fi changes wait for a prepared phone install.
+    private Object adbPhoneLease;
+    private String lastAdbUpdatePolicy = "";
     private Thread tcpAcceptThread;
     private Thread udpThread;
 
@@ -384,12 +391,14 @@ public final class LaptopHost {
         dashboard.createContext("/map", exchange -> sendHtml(exchange, MAP_PAGE));
         dashboard.createContext("/leaderboard", exchange -> sendHtml(exchange, LEADERBOARD_PAGE));
         dashboard.createContext("/wifi", this::handleWifiPage);
+        dashboard.createContext("/phone-updates", this::handlePhoneUpdatesPage);
         dashboard.createContext("/players", this::handlePlayersPage);
         dashboard.createContext("/event-setup", exchange -> sendFile(exchange,
                 config.webDirectory.resolve("event-setup.html"), "text/html; charset=utf-8", "no-store"));
         dashboard.createContext("/assets/players.js", exchange -> sendFile(exchange,
                 config.webDirectory.resolve("players.js"), "text/javascript; charset=utf-8", "no-store"));
         dashboard.createContext("/api/wifi", this::handleWifiApi);
+        dashboard.createContext("/api/phone-updates", this::handlePhoneUpdatesApi);
         dashboard.createContext("/api/players", this::handlePlayersApi);
         dashboard.createContext("/api/event", this::handleEventApi);
         dashboard.createContext("/round-report", exchange -> sendHtml(exchange, ROUND_REPORT_PAGE));
@@ -413,6 +422,7 @@ public final class LaptopHost {
         tileServer.createContext("/api/app-update/", phoneUpdates::handle);
         tileServer.start();
         phoneUpdates.start();
+        adbPhoneUpdates.start();
 
         tcpAcceptThread = new Thread(this::runTcpAcceptLoop, "SimpleCoil laptop TCP accept");
         tcpAcceptThread.setDaemon(true);
@@ -429,6 +439,7 @@ public final class LaptopHost {
         scheduler.scheduleAtFixedRate(this::advanceRoundClock, 100, 100, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(this::disconnectUnresponsiveClients, 5, 5, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(this::broadcastSharedLobby, 0, 2, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::publishAdbUpdatePolicy, 0, 2, TimeUnit.SECONDS);
         if (config.takeover)
             scheduler.scheduleAtFixedRate(this::broadcastHostTakeover, 0, 1, TimeUnit.SECONDS);
     }
@@ -439,6 +450,7 @@ public final class LaptopHost {
         synchronized (stateLock) { savePlayerDirectoryLocked(); }
         if (relayMesh != null) relayMesh.close();
         stopping = true;
+        adbPhoneUpdates.close();
         phoneUpdates.close();
         closeQuietly(tcpServer);
         if (udpServer != null)
@@ -1744,6 +1756,8 @@ public final class LaptopHost {
         String token;
         boolean publishedAssignment = false;
         synchronized (stateLock) {
+            if (adbPhoneLease != null)
+                return StartResult.error("Wait for the phone update to finish.", false);
             if (hotspot.isBusy())
                 return StartResult.error("Wait for the Wi-Fi change to finish.", false);
             updateRoundStateLocked();
@@ -1785,6 +1799,8 @@ public final class LaptopHost {
         if (publishedAssignment)
             broadcastRoster();
         synchronized (stateLock) {
+            if (adbPhoneLease != null)
+                return StartResult.error("Wait for the phone update to finish.", false);
             if (hotspot.isBusy())
                 return StartResult.error("Wait for the Wi-Fi change to finish.", false);
             updateRoundStateLocked();
@@ -2498,6 +2514,9 @@ public final class LaptopHost {
             game.put("infectionmode", config.infection);
             game.put("dedicatedserver", true);
             game.put("maptileport", config.tilePort);
+            Player updateTarget = players.get(targetPlayerID);
+            game.put("adbmanagedupdates", updateTarget != null && updateTarget.address != null
+                    && adbPhoneUpdates.managesAddress(updateTarget.address.getHostAddress()));
             game.put("gamestate", isRoundActiveLocked() ? 1 : 0);
             if (config.useGps)
                 game.put("usegps", config.gpsMode.wireValue);
@@ -2773,6 +2792,58 @@ public final class LaptopHost {
 
     private boolean phoneUpdatesIdle() {
         return !stopping && roundState != RoundState.COUNTDOWN && roundState != RoundState.RUNNING;
+    }
+
+    private AdbPhoneUpdater.Lease acquireAdbPhoneLease(String serial, String address) throws IOException {
+        synchronized (stateLock) {
+            if (!phoneUpdatesIdle() || hotspot.isBusy() || adbPhoneLease != null || balancedCheckInDeadline > 0)
+                throw new IOException("Finish the round and any Wi-Fi change before updating phones.");
+            ClientConnection registered = null;
+            for (Player player : players.values()) {
+                ClientConnection client = player.connection;
+                if (player.connected && client != null && !client.closed && client.initialRosterSent
+                        && player.address != null && address.equals(player.address.getHostAddress())
+                        && !(client.socket instanceof com.simplecoil.protocol.RelayMesh.VirtualSocket)
+                        && elapsedMillis() - client.lastReceivedAt <= 10_000) {
+                    if (registered != null) throw new IOException("More than one player is using this phone address.");
+                    registered = client;
+                }
+            }
+            if (registered == null) throw new IOException("Join this laptop's idle lobby before updating the phone.");
+            String hostAddress = registered.socket.getLocalAddress().getHostAddress();
+            Object reservation = new Object();
+            adbPhoneLease = reservation;
+            return new AdbPhoneUpdater.Lease() {
+                @Override public String hostAddress() { return hostAddress; }
+                @Override public boolean stillAllowed() {
+                    synchronized (stateLock) {
+                        return adbPhoneLease == reservation && phoneUpdatesIdle() && !hotspot.isBusy();
+                    }
+                }
+                @Override public void close() {
+                    synchronized (stateLock) {
+                        if (adbPhoneLease == reservation) adbPhoneLease = null;
+                    }
+                }
+            };
+        }
+    }
+
+    private void publishAdbUpdatePolicy() {
+        boolean changed;
+        synchronized (stateLock) {
+            if (stopping) return;
+            StringBuilder policy = new StringBuilder();
+            for (Player player : players.values()) {
+                if (player.connected && player.address != null
+                        && adbPhoneUpdates.managesAddress(player.address.getHostAddress()))
+                    policy.append(player.id).append(':').append(player.address.getHostAddress()).append(';');
+            }
+            String current = policy.toString();
+            changed = !lastAdbUpdatePolicy.equals(current);
+            lastAdbUpdatePolicy = current;
+        }
+        if (changed) broadcastRoster();
     }
 
     private int secondsRemainingLocked() {
@@ -4029,6 +4100,83 @@ public final class LaptopHost {
         sendFile(exchange, config.webDirectory.resolve("wifi.html"), "text/html; charset=utf-8", "no-store");
     }
 
+    private void handlePhoneUpdatesPage(HttpExchange exchange) throws IOException {
+        if (!"/phone-updates".equals(exchange.getRequestURI().getRawPath())
+                || exchange.getRequestURI().getRawQuery() != null) {
+            sendJson(exchange, 404, mapOf("ok", false, "message", "Not found."));
+            return;
+        }
+        if (!localWifiRequest(exchange)) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Open phone update controls on this laptop."));
+            return;
+        }
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("ok", false, "message", "Use GET."));
+            return;
+        }
+        sendFile(exchange, config.webDirectory.resolve("phone-updates.html"), "text/html; charset=utf-8", "no-store");
+    }
+
+    private void handlePhoneUpdatesApi(HttpExchange exchange) throws IOException {
+        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        if (!"/api/phone-updates".equals(exchange.getRequestURI().getRawPath())
+                || exchange.getRequestURI().getRawQuery() != null) {
+            sendJson(exchange, 404, mapOf("ok", false, "message", "Not found."));
+            return;
+        }
+        if (!localWifiRequest(exchange)) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Phone updates are controlled only on this laptop."));
+            return;
+        }
+        if ("GET".equals(exchange.getRequestMethod())) {
+            sendJson(exchange, 200, adbPhoneUpdates.snapshot());
+            return;
+        }
+        if (!"POST".equals(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, mapOf("ok", false, "message", "Use GET or POST."));
+            return;
+        }
+        String type = exchange.getRequestHeaders().getFirst("Content-Type");
+        if (type == null || !type.split(";", 2)[0].trim().equalsIgnoreCase("application/json")
+                || !"1".equals(exchange.getRequestHeaders().getFirst("X-SimpleCoil-Control"))) {
+            sendJson(exchange, 403, mapOf("ok", false, "message", "Use this laptop's phone update controls."));
+            return;
+        }
+        byte[] body = exchange.getRequestBody().readNBytes(4097);
+        if (body.length > 4096) {
+            sendJson(exchange, 413, mapOf("ok", false, "message", "Phone update request is too large."));
+            return;
+        }
+        Map<?, ?> request;
+        try {
+            Object parsed = Json.parse(new String(body, StandardCharsets.UTF_8));
+            if (!(parsed instanceof Map<?, ?>)) throw new IllegalArgumentException();
+            request = (Map<?, ?>) parsed;
+        } catch (IllegalArgumentException invalid) {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Provide a valid phone update request."));
+            return;
+        }
+        Object action = request.get("action"), serial = request.get("serial");
+        boolean accepted;
+        if ("set-enabled".equals(action) && request.size() == 2 && request.get("enabled") instanceof Boolean)
+            accepted = adbPhoneUpdates.setEnabled((Boolean) request.get("enabled"));
+        else if (request.size() == 2 && serial instanceof String && "enroll-usb".equals(action))
+            accepted = adbPhoneUpdates.enrollUsb((String) serial);
+        else if (request.size() == 2 && serial instanceof String && "retry".equals(action))
+            accepted = adbPhoneUpdates.retry((String) serial);
+        else if (request.size() == 2 && serial instanceof String && "remove".equals(action))
+            accepted = adbPhoneUpdates.remove((String) serial);
+        else {
+            sendJson(exchange, 400, mapOf("ok", false, "message", "Unknown phone update action or invalid fields."));
+            return;
+        }
+        if (accepted) broadcastRoster();
+        sendJson(exchange, accepted ? 200 : 409, mapOf("ok", accepted,
+                "message", accepted ? "Phone update request accepted."
+                        : "Phone update request deferred. Check the phone's status and try again.",
+                "status", adbPhoneUpdates.snapshot()));
+    }
+
     private void handlePlayersPage(HttpExchange exchange) throws IOException {
         if (!localWifiRequest(exchange)) {
             sendJson(exchange, 403, mapOf("ok", false, "message", "Open player controls on this laptop."));
@@ -4376,6 +4524,10 @@ public final class LaptopHost {
             return;
         }
         synchronized (stateLock) {
+            if (adbPhoneLease != null) {
+                sendJson(exchange, 409, mapOf("ok", false, "message", "Wait for the phone update to finish before changing Wi-Fi."));
+                return;
+            }
             if (isRoundActiveLocked() && !"apply".equals(request.get("action"))) {
                 sendJson(exchange, 409, mapOf("ok", false, "message", "Finish the round before changing Wi-Fi."));
                 return;
@@ -4674,7 +4826,8 @@ public final class LaptopHost {
             state.put("remainingMs", roundEndAt > 0 && isRoundActiveLocked()
                     ? Math.max(0, roundEndAt - now) : 0);
             state.put("cooldownMs", Math.max(0, nextRoundStartAllowedAt - now));
-            state.put("canStart", !hotspot.isBusy()
+            state.put("phoneUpdateInProgress", adbPhoneLease != null);
+            state.put("canStart", adbPhoneLease == null && !hotspot.isBusy()
                     && (roundState == RoundState.LOBBY || roundState == RoundState.FINISHED)
                     && playing.size() >= 2
                     && now >= nextRoundStartAllowedAt
@@ -5551,7 +5704,7 @@ public final class LaptopHost {
             <!doctype html><html><head><meta charset="utf-8"><title>LAZER GUN RUN · Laptop Host</title>
             <style>body{margin:0;background:#10141b;color:#eef3f8;font:18px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}main{max-width:660px;padding:32px}h1{margin-top:0}.buttons{display:flex;gap:14px;flex-wrap:wrap}a,button{border:0;border-radius:8px;background:#2585d8;color:white;padding:14px 18px;font:inherit;text-decoration:none;cursor:pointer}p{line-height:1.5;color:#c6d1dc}.note{font-size:.9em;color:#9dadbc}</style></head>
             <body><main><h1 id="event-title">LAZER GUN RUN</h1><p>Open the live map and leaderboard as two independent display windows. Keep this page local to the laptop; game controls are available on the map display.</p>
-            <div class="buttons"><a href="/map" target="simplecoil-map">Open map display</a><a href="/leaderboard" target="simplecoil-leaderboard">Open leaderboard</a><button onclick="openDisplays()">Open both displays</button><a href="/wifi" target="simplecoil-wifi">Wi-Fi hotspot</a><a href="/players" target="simplecoil-players">Players &amp; Event Mode</a></div>
+            <div class="buttons"><a href="/map" target="simplecoil-map">Open map display</a><a href="/leaderboard" target="simplecoil-leaderboard">Open leaderboard</a><button onclick="openDisplays()">Open both displays</button><a href="/wifi" target="simplecoil-wifi">Wi-Fi hotspot</a><a href="/phone-updates" target="simplecoil-phone-updates">Phone updates</a><a href="/players" target="simplecoil-players">Players &amp; Event Mode</a></div>
             <p class="note">Phones join the laptop's printed LAN IP from <em>Join Game</em>. The dashboard uses the local browser only unless the host was started with <code>--dashboard-bind 0.0.0.0</code>.</p>
             <script>fetch('/api/state',{cache:'no-store'}).then(r=>r.json()).then(s=>{document.querySelector('#event-title').textContent=s.eventTitle||'LAZER GUN RUN'}).catch(()=>{});function openDisplays(){window.open('/map','simplecoil-map','popup=yes');window.open('/leaderboard','simplecoil-leaderboard','popup=yes')}</script></main></body></html>
             """;
@@ -5561,7 +5714,7 @@ public final class LaptopHost {
             <link rel="stylesheet" href="/assets/leaflet/leaflet.css">
             <style>
             :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0a1017;color:#eef4f9;font:15px system-ui,sans-serif;overflow:hidden}header{height:60px;display:flex;align-items:center;gap:12px;padding:9px 14px;background:#111c27;border-bottom:1px solid #274257}h1{font-size:20px;margin:0;white-space:nowrap}#status{color:#b8c8d8;flex:1}button{border:0;border-radius:7px;padding:9px 12px;background:#267ec8;color:#fff;font:inherit;cursor:pointer}button.danger{background:#b83d46}button:disabled{opacity:.45;cursor:not-allowed}#map{width:100vw;height:calc(100vh - 60px);background-color:#0d1720;background-image:linear-gradient(#203445 1px,transparent 1px),linear-gradient(90deg,#203445 1px,transparent 1px);background-size:50px 50px}.legend{position:fixed;z-index:1000;right:16px;bottom:16px;max-width:340px;background:#101a25e8;border:1px solid #34516a;border-radius:8px;padding:10px;line-height:1.7}.swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}.team1{background:#49a5ff}.team2{background:#ff5d67}#tile-status{color:#ffd98a;font-size:12px}#respawns:empty{display:none}#respawns{border-top:1px solid #34516a;margin-top:7px;padding-top:7px}.respawn{font-size:12px;padding:5px 7px;margin:3px 3px 0 0;background:#466c32}.player-label{background:#101a25e8;border:1px solid #7890a5;color:#fff;font-weight:700;box-shadow:none}.player-label:before{border-top-color:#7890a5}.leaflet-control-zoom a{background:#152332;color:#fff;border-color:#35516a}.leaflet-control-zoom a:hover{background:#22384b;color:#fff}@media(max-width:760px){header{gap:6px;padding:7px}h1{font-size:15px}#status{font-size:11px}button{padding:7px 8px;font-size:12px}}
-            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button onclick="window.open('/players','simplecoil-players')">Players</button><button onclick="window.open('/wifi','simplecoil-wifi')">Wi-Fi</button><button id="fit">Fit players</button><button id="rebalance" hidden disabled>Rebalance teams</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
+            </style></head><body><header><h1>Tactical GPS Map</h1><span id="status">Connecting...</span><button onclick="window.open('/players','simplecoil-players')">Players</button><button onclick="window.open('/wifi','simplecoil-wifi')">Wi-Fi</button><button onclick="window.open('/phone-updates','simplecoil-phone-updates')">Phone updates</button><button id="fit">Fit players</button><button id="rebalance" hidden disabled>Rebalance teams</button><button id="start">Start game</button><button id="end" class="danger">End game</button></header><div id="map"></div><div class="legend"><span class="swatch team1"></span>Team 1 &nbsp;<span class="swatch team2"></span>Team 2<br>Bright lines are verified hits; red lines are eliminations.<br>Red circles are grenade hits; a red dot estimates the center after 4 mapped hits.<br><span id="tile-status">Checking offline maps...</span><div id="respawns"></div><div id="lobby-players" style="max-height:40vh;overflow:auto"></div></div>
             <script src="/assets/leaflet/leaflet.js"></script><script>
             const status=document.querySelector('#status'),start=document.querySelector('#start'),rebalance=document.querySelector('#rebalance'),end=document.querySelector('#end'),fitButton=document.querySelector('#fit'),respawns=document.querySelector('#respawns'),tileStatus=document.querySelector('#tile-status'),lobbyPlayers=document.querySelector('#lobby-players');let lobbySignature='';
             const map=L.map('map',{preferCanvas:true,zoomControl:true,attributionControl:true}).setView([20,0],2),players=new Map();let state=null,laserLayers=[],grenadeLayers=[],fitted=false,mapConfig={maxZoom:19};

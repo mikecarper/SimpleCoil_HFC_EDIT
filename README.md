@@ -4,9 +4,9 @@ SimpleCoil is an Android companion app for supported Bluetooth LE laser-tag
 hardware. This fork is based on [Dees-Troy/SimpleCoil](https://github.com/Dees-Troy/SimpleCoil)
 and retains the project's Apache-2.0 license.
 
-## Latest release (1.58)
+## Latest release (1.59)
 
-[Download version 1.58](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.58)
+[Download version 1.59](https://github.com/mikecarper/SimpleCoil_HFC_EDIT/releases/tag/1.59)
 for faster large-lobby joins and clock sync, retained connections between rounds,
 gun and reload recovery, scanning of existing QR posters, and host countdown
 cancellation. This release also fixes disconnected-player ownership, stale
@@ -30,13 +30,13 @@ the phones have no internet access.
 Release builds check GitHub on launch and install future updates while idle.
 
 Update every phone and use the matching laptop host from this release's source
-download. Versions 1.52 through 1.58 use network protocol 31; version 1.51 uses
+download. Versions 1.52 through 1.59 use network protocol 31; version 1.51 uses
 protocol 30 and cannot join the same game. Android 5.0 or newer is required.
 
-Version 1.58 updates signed 1.52 through 1.57 APKs in place and preserves settings and
+Version 1.59 updates signed 1.52 through 1.58 APKs in place and preserves settings and
 player history. These use the configured release signing key, which differs
 from the debug key used for the published 1.51 APK. Android cannot install
-1.58 in place over 1.51. Reinstalling removes the old app's local settings
+1.59 in place over 1.51. Reinstalling removes the old app's local settings
 and player history, so save any information you need before switching.
 
 ## Platform support
@@ -67,6 +67,13 @@ settings and player history and never downgrades the app. Android 5.x still
 requires tapping Install. Android 8 and newer may first ask to allow updates
 from this app. Device-owner event phones on Android 6 and newer can install
 silently; an ordinary pinned phone waits until it is unlocked.
+
+Version 1.59 adds automatic installation through the laptop host's **Phone updates**
+page. Enroll each USB-authorized phone once, then enable automatic Wi-Fi ADB
+updates. The host installs its verified cached release one phone at a time,
+without an Install tap, after reserving the idle phone and blocking new games
+until verification finishes. Install 1.59 once before enrolling; see the
+[laptop setup instructions](laptop-host/README.md#automatic-installation-over-wi-fi-adb).
 
 Every published APK update must increase `versionCode`, including a replacement
 asset under the same GitHub release. Changing only `versionName` or replacing
@@ -242,7 +249,7 @@ for voluntary re-entry; simply waiting in the lobby does not pull you back in.
 End decisions are acknowledged and retried per phone for up to 30 seconds,
 independently of gameplay/lobby socket restarts. Completed-round receipts are
 retained for 10 minutes to repair a returning player's stale round. Old end
-messages cannot end a new round. Install 1.58 on every phone for this build.
+messages cannot end a new round. Install 1.59 on every phone for this build.
 
 Phones prepare a nearby relay after joining the same host. Normal hub Wi-Fi
 remains the primary connection. If it fails, Bluetooth Classic links can forward

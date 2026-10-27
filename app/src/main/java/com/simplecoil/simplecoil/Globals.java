@@ -618,6 +618,7 @@ public class Globals {
     public volatile InetAddress mServerIP = null;
     // Zero means the current host did not advertise an offline map tile service.
     public volatile int mMapTilePort = 0;
+    public volatile boolean mAdbManagedUpdates;
 
     protected Globals(){}
 

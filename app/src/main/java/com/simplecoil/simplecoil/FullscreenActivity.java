@@ -1241,6 +1241,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void toggleLobbyPairing() {
+        if (AdbUpdateReceiver.held()) return;
         if (isLobbyPairingBusy()) {
             cancelPrimaryReconnect();
             cancelNewWeaponPairing();
@@ -1496,6 +1497,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void updateSharedLobby() {
+        if (AdbUpdateReceiver.held()) return;
         Globals globals = Globals.getInstance();
         if (hasCommittedRound()) {
             // The UDP service can accept a same-round handoff while the screen
@@ -2501,6 +2503,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void showGameInvite(Intent invite) {
+        if (AdbUpdateReceiver.held()) return;
         if (invite == null || !mUseNetwork || !mActivityResumed || !mCommunicating || mReady || mIsServer
                 || Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
             return;
@@ -3092,6 +3095,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mStartGameButton = findViewById(R.id.start_game_button);
         if (mStartGameButton != null) {
             mStartGameButton.setOnClickListener((v -> {
+                if (AdbUpdateReceiver.held()) return;
                 if (mMatchSession.active()) return;
                 if (Globals.getInstance().mPlayerID == 0) {
                     Toast.makeText(getApplicationContext(), getString(R.string.error_select_team), Toast.LENGTH_SHORT).show();
@@ -3415,6 +3419,24 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private boolean canInstallAppUpdate() {
+        return !AdbUpdateReceiver.held() && !hasManagedAdbUpdates() && canInstallAppUpdateWhileIdle();
+    }
+
+    boolean hasManagedAdbUpdates() {
+        return Globals.getInstance().mAdbManagedUpdates && connectedLaptopUpdateEndpoint() != null;
+    }
+
+    boolean hasAdbUpdateHost(String host) {
+        LaptopUpdateSource.Endpoint endpoint = connectedLaptopUpdateEndpoint();
+        return endpoint != null && endpoint.host.getHostAddress().equals(host);
+    }
+
+    boolean canPrepareAdbUpdate(String host) {
+        return hasAdbUpdateHost(host) && hasWindowFocus() && !mGrenadePairingInProgress
+                && !mScanningSecondary && canInstallAppUpdateWhileIdle();
+    }
+
+    private boolean canInstallAppUpdateWhileIdle() {
         Globals globals = Globals.getInstance();
         if (!mActivityResumed || isFinishing() || isDestroyed()
                 || globals.mGameState != Globals.GAME_STATE_NONE
@@ -3471,6 +3493,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 //TODDO add presets ?
     @Override
     public boolean onMenuItemClick(MenuItem item) {
+        if (AdbUpdateReceiver.held()) return true;
         if (mMatchSession.active()) return true;
         if (eventControlsRestricted()) {mEventKiosk.showOrganizerUnlock();return true;}
 
@@ -4957,6 +4980,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     private void startGame() { startGame(null); }
 
     private void startGame(Intent start) {
+        if (AdbUpdateReceiver.held()) return;
         if (mMatchSession.active() && (!mUseNetwork || start == null
                 || !start.hasExtra(NetMsg.INTENT_START_AT)
                 || !allowsMatchHost(Globals.getInstance().mServerIP))) return;
@@ -7105,6 +7129,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     };
 
     private void openPowerupQrScanner() {
+        if (AdbUpdateReceiver.held()) return;
         if (!isPowerupScanAvailable() || isQrScannerActive()
                 || isFinishing() || isDestroyed())
             return;
@@ -7202,6 +7227,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void openRespawnQrScanner() {
+        if (AdbUpdateReceiver.held()) return;
         if (!isTeamQrRespawnActive() || mRespawnQrRequestPending || isFinishing() || isDestroyed())
             return;
         if (!mActivityResumed) {
@@ -7239,6 +7265,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void openTeamAssignmentQrScanner() {
+        if (AdbUpdateReceiver.held()) return;
         if (eventControlsRestricted() && !isEventModeLateTeamQrJoinAvailable()) return;
         if (!isTeamAssignmentScanAvailable() || isFinishing() || isDestroyed())
             return;
@@ -7279,6 +7306,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     }
 
     private void openCtfQrScanner() {
+        if (AdbUpdateReceiver.held()) return;
         if (!isCtfScanAvailable() || isFinishing() || isDestroyed())
             return;
         if (!mActivityResumed) {
@@ -7901,6 +7929,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
     @Override
     protected void onResume() {
         super.onResume();
+        AdbUpdateReceiver.bind(this);
         syncEventControls();
         mActivityResumed = true;
         if (Globals.getInstance().mGameState != Globals.GAME_STATE_NONE)
@@ -8129,6 +8158,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
 
     @Override
     protected void onDestroy() {
+        AdbUpdateReceiver.unbind(this);
         if (mAppUpdates != null) mAppUpdates.close();
         if (isFinishing()) stopService(new Intent(this, GameRelayService.class));
         if (mGattReceiverRegistered) {
@@ -8207,9 +8237,18 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         mFragmentTransc.commit();
     }
 
+    @Override public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+        return AdbUpdateReceiver.held() || super.dispatchTouchEvent(event);
+    }
+
+    @Override public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        return AdbUpdateReceiver.held() || super.dispatchKeyEvent(event);
+    }
+
     @Override
     public void onBackPressed()
     {
+        if (AdbUpdateReceiver.held()) return;
         // Back cannot bypass respawn, but a player may confirm leaving the round.
         if (mRespawnQrScannerActive && isTeamQrRespawnActive()) {
             confirmQuitGame();

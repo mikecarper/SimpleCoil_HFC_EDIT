@@ -2241,6 +2241,8 @@ public class TcpClient extends Service {
                 if (hostPlayerIdentity != null && !RoundRoster.validIdentity(hostPlayerIdentity))
                     throw new JSONException("Invalid hosted player identity");
                 boolean eventMode = hostKind == SharedLobby.Kind.LAPTOP && game.optBoolean(EventMode.ENABLED, false);
+                boolean adbManagedUpdates = hostKind == SharedLobby.Kind.LAPTOP && dedicatedServer
+                        && game.optBoolean("adbmanagedupdates", false);
                 String eventTitle = hostKind == SharedLobby.Kind.LAPTOP ? game.optString(EventMode.TITLE, EventMode.APP_NAME) : EventMode.APP_NAME;
                 if (!EventMode.validTitle(eventTitle)) throw new JSONException("Invalid event name");
                 boolean eventPinning = eventMode && game.optBoolean(EventMode.PINNING, false);
@@ -2280,6 +2282,7 @@ public class TcpClient extends Service {
                                     globals.mHostPlayerIdentity = hostPlayerIdentity;
                                     if (admittedRelay != null) GameRelayService.configure(this, admittedRelay);
                                     globals.mEventMode = eventMode;
+                                    globals.mAdbManagedUpdates = adbManagedUpdates;
                                     globals.mEventTitle = eventTitle;
                                     globals.mEventPinning = eventPinning;
                                     globals.mEventRevision = eventRevision;

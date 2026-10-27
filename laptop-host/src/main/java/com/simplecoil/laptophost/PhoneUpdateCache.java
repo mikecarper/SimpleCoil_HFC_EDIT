@@ -108,6 +108,14 @@ final class PhoneUpdateCache implements AutoCloseable {
         }
     }
 
+    /** The ADB worker copies and re-verifies these immutable bytes before installation. */
+    AdbPhoneUpdater.ReleaseApk adbRelease() {
+        refreshIfStale();
+        Snapshot snapshot = latest;
+        return snapshot == null ? null : new AdbPhoneUpdater.ReleaseApk(
+                snapshot.apk, snapshot.asset.size, snapshot.asset.digest);
+    }
+
     void handle(HttpExchange exchange) throws IOException {
         String path = exchange.getRequestURI().getRawPath();
         if (!"GET".equals(exchange.getRequestMethod())) { error(exchange, 405, "Use GET");return; }

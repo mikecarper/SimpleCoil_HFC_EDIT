@@ -7,7 +7,7 @@ Android app and their BLE laser-tag hardware.
 It speaks the protocol-31 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
-Use this host with the 1.58 phone app; the network protocol remains 31.
+Use this host with the 1.59 phone app; the network protocol remains 31.
 
 The map display bundles Leaflet and serves raster map tiles from the laptop.
 Nothing is fetched from the internet while a game is running. Player markers,
@@ -429,6 +429,47 @@ workers. Leave the host running in the lobby while updating phones.
 For isolated deployments or tests, `simplecoil.phoneupdates.cache` overrides the
 cache directory and `simplecoil.phoneupdates.enabled=false` disables background
 update fetching. These are JVM system properties; they do not change game rules.
+
+### Automatic installation over Wi-Fi ADB
+
+Open **Phone updates** on the host dashboard
+(`http://127.0.0.1:17511/phone-updates`) to enroll event phones and enable
+automatic installation. This is separate from the app's 1.58 laptop-download
+feature: the laptop uses authorized Wi-Fi ADB to install a newer cached APK
+without asking for an Install tap on each phone. Install phone app 1.59 or newer
+once first; older apps cannot provide the idle check this updater requires.
+
+Install [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools)
+on the laptop and make `adb` available on its PATH. Then, for each phone:
+
+1. Join the same game Wi-Fi as the laptop. Enable Developer options and USB
+   debugging, then connect the phone with USB.
+2. Unlock the phone and accept **Allow USB debugging?**, selecting
+   **Always allow from this computer**.
+3. On **Phone updates**, choose **Enroll** beside that authorized USB phone.
+   Keep USB connected until its enrolled status confirms Wi-Fi access, then
+   unplug it.
+4. Enable **Automatically update enrolled phones**. Leave the laptop host and
+   phones running in the lobby while they update.
+
+The updater installs one phone at a time, only while the host and that phone
+are idle. It uses the verified GitHub cache described above, checks the installed
+package and newer version, and lets Android enforce the existing app's signing
+certificate. It replaces the app in place and preserves its data. Unknown,
+unauthorized, incompatible, or unreachable phones are reported rather than
+erased or force-installed. **Retry** checks a phone again; **Remove** stops this
+host's automatic updates for that phone without changing its Android settings.
+
+Use a trusted game LAN and do not forward ADB port 5555 through a router.
+On older Android phones, Wi-Fi debugging usually turns off after a reboot;
+reconnect USB and enroll again if the phone no longer responds. A new debugging
+approval must be accepted on the phone. For the underlying USB-to-Wi-Fi workflow,
+see [Android's ADB guide](https://developer.android.com/tools/adb#wireless).
+
+Phone-update controls use only the local dashboard, with the same loopback and
+same-origin checks as the other operator controls. They are not exposed by the
+LAN map-tile or read-only APK server. Disabling automatic installation leaves
+ordinary app downloads and Android's manual Install confirmation available.
 
 On Linux with NetworkManager, open **Wi-Fi hotspot** on the landing page or
 **Wi-Fi** on the tactical map (`http://127.0.0.1:17511/wifi`). Choose an

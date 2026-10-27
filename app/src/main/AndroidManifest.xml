@@ -46,6 +46,8 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <receiver android:name=".AppUpdateInstallReceiver" android:exported="false" />
+        <receiver android:name=".AdbUpdateReceiver" android:exported="true"
+            android:permission="android.permission.DUMP" />
         <receiver android:name=".EventDeviceAdminReceiver" android:exported="true"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
             android:label="@string/event_admin_label">
