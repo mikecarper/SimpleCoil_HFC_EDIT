@@ -18,6 +18,7 @@ public final class PlayerControlsTest {
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
     private static Path root;
     public static void main(String[] args) throws Exception {
+        System.setProperty("simplecoil.phoneupdates.enabled", "false");
         root = Files.createTempDirectory("simplecoil-player-controls");
         verifyEventPins();
         if (args.length == 1 && "--event-pin-only".equals(args[0])) {
@@ -364,6 +365,7 @@ public final class PlayerControlsTest {
 
     private static Process start(String... extra) throws Exception {
         ProcessBuilder builder=new ProcessBuilder(Path.of(System.getProperty("java.home"),"bin/java").toString(),
+                "-Dsimplecoil.phoneupdates.enabled=false",
                 "-Dsimplecoil.players.file="+root.resolve("players.json"),"-Dsimplecoil.event.file="+root.resolve("event.properties"),
                 "-Dsimplecoil.reports="+root.resolve("reports"),
                 "--add-modules","jdk.httpserver","-cp",Path.of("laptop-host/out").toAbsolutePath().toString(),

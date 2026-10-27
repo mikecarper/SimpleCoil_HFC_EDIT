@@ -2240,6 +2240,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                     return;
                 mTcpClient = ((TcpClient.LocalBinder) service).getService();
                 consumePendingServerEvent();
+                if (mAppUpdates != null) mAppUpdates.onSourceChanged();
             }
 
             @Override
@@ -2248,6 +2249,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
                         || isFinishing() || isDestroyed())
                     return;
                 mTcpClient = null;
+                if (mAppUpdates != null) mAppUpdates.onSourceChanged();
             }
         };
     }
@@ -2345,6 +2347,7 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             mTcpClientServiceBound = false;
             mTcpClientServiceConnection = null;
             mTcpClient = null;
+            if (mAppUpdates != null) mAppUpdates.onSourceChanged();
         }
     }
 
@@ -3395,7 +3398,20 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
         updatePlayerSettings();
         updateTeamAssignmentScanButton();
         initializeLobbyScreen();
-        mAppUpdates = new AppUpdateController(this, this::canInstallAppUpdate);
+        mAppUpdates = new AppUpdateController(this, this::canInstallAppUpdate,
+                this::connectedLaptopUpdateEndpoint);
+    }
+
+    private LaptopUpdateSource.Endpoint connectedLaptopUpdateEndpoint() {
+        Globals globals = Globals.getInstance();
+        if (!mUseNetwork || mIsServer || mTcpClient == null || !mTcpClient.isDedicatedServer()
+                || !mTcpClient.hasClientSession(globals.mServerIP)) return null;
+        SharedLobby.Host host = mTcpClient.lobbyHost(SystemClock.elapsedRealtime());
+        if (host == null || host.kind != SharedLobby.Kind.LAPTOP
+                || !host.address.equals(globals.mServerIP)) return null;
+        int port = globals.mMapTilePort > 0 && globals.mMapTilePort <= 65535
+                ? globals.mMapTilePort : LaptopUpdateSource.DEFAULT_PORT;
+        return new LaptopUpdateSource.Endpoint(host.address, port);
     }
 
     private boolean canInstallAppUpdate() {
@@ -11001,6 +11017,14 @@ public class FullscreenActivity extends AppCompatActivity implements PopupMenu.O
             final String action = intent.getAction();
             if (shouldIgnoreStaleDiscoveryFailure(intent, tcpTerminal))
                 return;
+            if (mAppUpdates != null && (NetMsg.NETMSG_LISTPLAYERS.equals(action)
+                    || NetMsg.NETMSG_NETWORKCONNECTED.equals(action) || NetMsg.NETMSG_NETWORKDISCONNECTED.equals(action)
+                    || NetMsg.NETMSG_PEERHOSTCHANGED.equals(action) || NetMsg.NETMSG_PLAYERTRANSFERRED.equals(action)
+                    || NetMsg.NETMSG_STARTGAME.equals(action) || NetMsg.NETMSG_ENDGAME.equals(action)
+                    || NetMsg.NETMSG_ROUNDCOMPLETE.equals(action) || NetMsg.NETMSG_HOSTTAKEOVER.equals(action)
+                    || NetMsg.NETMSG_SERVERCANCEL.equals(action) || NetMsg.NETMSG_SERVERUNREACHABLE.equals(action)
+                    || NetMsg.NETMSG_VERSIONERROR.equals(action) || NetMsg.NETMSG_FAILEDTOJOIN.equals(action)
+                    || NetMsg.NETMSG_QRJOINREJECTED.equals(action))) mAppUpdates.onSourceChanged();
             final boolean tcpRoundEnd = intent.getBooleanExtra(TcpClient.EXTRA_ROUND_END, false);
             if ((tcpTerminal || tcpRoundEnd) && !mIsServer && (NetMsg.NETMSG_ENDGAME.equals(action)
                     || NetMsg.NETMSG_SERVERCANCEL.equals(action) || NetMsg.NETMSG_VERSIONERROR.equals(action)))

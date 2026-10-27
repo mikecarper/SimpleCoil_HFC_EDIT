@@ -22,11 +22,13 @@ import android.widget.Toast;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 /** Checks releases without blocking game startup; only an idle foreground may install. */
 final class AppUpdateController implements AutoCloseable {
@@ -48,6 +50,12 @@ final class AppUpdateController implements AutoCloseable {
     interface Source {
         ReleaseUpdate.Asset latest() throws IOException;
         void download(ReleaseUpdate.Asset asset, File destination) throws IOException;
+        default void download(ReleaseUpdate.Asset asset, File destination, BooleanSupplier allowed)
+                throws IOException { download(asset, destination); }
+        default boolean available(boolean internet) { return internet; }
+        default String key() { return "github"; }
+        default Source snapshot() { return this; }
+        default long retryAfterMillis() { return 0; }
     }
 
     interface Installation {
@@ -93,6 +101,10 @@ final class AppUpdateController implements AutoCloseable {
     private long candidateCode = -1;
     private String shownFailure;
     private ReleaseUpdate.Asset pendingAsset;
+    private Source pendingSource;
+    private String sourceKey;
+    private volatile long sourceGeneration;
+    private long nextSourceRetryAt;
     private Intent pendingConfirmation;
     private FutureTask<Void> ownWork;
     private final Runnable installationListener = () -> post(() -> {
@@ -108,18 +120,24 @@ final class AppUpdateController implements AutoCloseable {
             if (!closed && resumed) drain();
         }
     };
+    private final Runnable localRetry = () -> {
+        if (!closed && resumed) drain();
+    };
 
     AppUpdateController(Activity activity, BooleanSupplier eligible) {
-        this(activity, BuildConfig.DEBUG ? -1 : installedVersion(activity), eligible, new AndroidInternet(activity),
-                new Source() {
-                    private final ReleaseUpdate releases = new ReleaseUpdate();
-                    @Override public ReleaseUpdate.Asset latest() throws IOException {
-                        return releases.fetchLatest();
-                    }
-                    @Override public void download(ReleaseUpdate.Asset asset, File file) throws IOException {
-                        releases.download(asset, file);
-                    }
-                }, installation(activity), new AndroidUi(activity), WORKER);
+        this(activity, eligible, () -> null);
+    }
+
+    AppUpdateController(Activity activity, BooleanSupplier eligible,
+                        Supplier<LaptopUpdateSource.Endpoint> connectedLaptop) {
+        this(activity, eligible, connectedLaptop, new AndroidInternet(activity));
+    }
+
+    private AppUpdateController(Activity activity, BooleanSupplier eligible,
+                                Supplier<LaptopUpdateSource.Endpoint> connectedLaptop, Internet internet) {
+        this(activity, BuildConfig.DEBUG ? -1 : installedVersion(activity), eligible, internet,
+                new LaptopUpdateSource(connectedLaptop, internet::available),
+                installation(activity), new AndroidUi(activity), WORKER);
     }
 
     AppUpdateController(Context context, long installedCode, BooleanSupplier eligible,
@@ -131,6 +149,7 @@ final class AppUpdateController implements AutoCloseable {
         this.installer = installer;
         this.ui = ui;
         this.worker = worker;
+        sourceKey = currentSourceKey();
         Context application = context.getApplicationContext();
         cache = application.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE);
         apk = new File(new File(application.getNoBackupFilesDir(), "updates"), "latest.apk");
@@ -139,10 +158,24 @@ final class AppUpdateController implements AutoCloseable {
 
     boolean canInstallSilently() { return installer.canInstallSilently(); }
 
+    /** Roster/policy and transport changes can make a laptop available without Internet. */
+    void onSourceChanged() {
+        // The activity must apply an incoming START/end/policy event before
+        // this callback may consider opening Android's installer UI.
+        post(() -> {
+            refreshSource();
+            if (resumed) {
+                check();
+                drain();
+            }
+        });
+    }
+
     void onResume() {
         if (closed) return;
         boolean returnedFromPermission = permissionWaiting;
         resumed = true;
+        boolean changedSource = refreshSource();
         if (returnedFromPermission) {
             permissionWaiting = false;
             permissionDenied = installer.needsUnknownSourcePermission();
@@ -158,7 +191,7 @@ final class AppUpdateController implements AutoCloseable {
         wasOnline = online();
         try { internet.start(networkListener); }
         catch (RuntimeException unavailable) { /* The normal resume check can still run. */ }
-        if (!returnedFromPermission) check();
+        if (!returnedFromPermission || changedSource) check();
         drain();
     }
 
@@ -167,6 +200,7 @@ final class AppUpdateController implements AutoCloseable {
         resumed = false;
         pausedAt = SystemClock.elapsedRealtime();
         main.removeCallbacks(pulse);
+        main.removeCallbacks(localRetry);
         try { internet.stop(); }
         catch (RuntimeException unavailable) { /* Connectivity is optional. */ }
     }
@@ -196,25 +230,59 @@ final class AppUpdateController implements AutoCloseable {
         catch (RuntimeException unavailable) { return false; }
     }
 
+    private String currentSourceKey() {
+        try { return source.key(); }
+        catch (RuntimeException unavailable) { return "unavailable"; }
+    }
+
+    private boolean refreshSource() {
+        String current = currentSourceKey();
+        if (Objects.equals(sourceKey, current)) return false;
+        sourceKey = current;
+        sourceGeneration++;
+        checked = false;
+        candidateCode = -1;
+        pendingAsset = null;
+        pendingSource = null;
+        nextSourceRetryAt = 0;
+        if (!beginning && !installer.isInstalling()) attempted = false;
+        return true;
+    }
+
+    private boolean sourceCurrent(long generation, String key) {
+        return !closed && generation == sourceGeneration && Objects.equals(key, currentSourceKey());
+    }
+
+    private boolean sourceAvailable() {
+        try { return source.available(online()); }
+        catch (RuntimeException unavailable) { return false; }
+    }
+
     private void check() {
+        refreshSource();
         if (closed || !resumed || checked || checking || beginning || attempted
-                || installer.isInstalling() || !online() || installedCode < 0) return;
+                || installer.isInstalling() || !sourceAvailable() || installedCode < 0) return;
+        final Source selected = source.snapshot();
+        final String key = selected.key();
+        final long generation = sourceGeneration;
         checked = true;
         checking = true;
+        nextSourceRetryAt = SystemClock.elapsedRealtime() + Math.max(0, source.retryAfterMillis());
         // A fresh foreground must consult current release metadata before
         // retrying an older candidate retained by this same activity.
         candidateCode = -1;
         pendingAsset = null;
+        pendingSource = null;
         execute(() -> {
             long verified = -1;
             ReleaseUpdate.Asset toPrepare = null;
             try {
-                ReleaseUpdate.Asset asset = source.latest();
-                if (asset != null && !closed) {
-                    String key = asset.cacheKey();
+                ReleaseUpdate.Asset asset = selected.latest();
+                if (asset != null && sourceCurrent(generation, key)) {
+                    String assetKey = asset.cacheKey();
                     String knownKey = cache.getString("asset", "");
                     long knownCode = cache.getLong("code", -1);
-                    if (key.equals(knownKey) && knownCode >= 0 && knownCode <= installedCode) {
+                    if (assetKey.equals(knownKey) && knownCode >= 0 && knownCode <= installedCode) {
                         verified = knownCode;
                     } else {
                         toPrepare = asset;
@@ -228,8 +296,11 @@ final class AppUpdateController implements AutoCloseable {
             final ReleaseUpdate.Asset next = toPrepare;
             post(() -> {
                 checking = false;
-                pendingAsset = next;
-                if (ReleaseUpdate.isStrictlyNewer(result, installedCode)) candidateCode = result;
+                if (sourceCurrent(generation, key)) {
+                    pendingAsset = next;
+                    pendingSource = next == null ? null : selected;
+                    if (ReleaseUpdate.isStrictlyNewer(result, installedCode)) candidateCode = result;
+                }
                 // Connectivity may have returned while this older request was
                 // still running. Its checked=false retry must survive completion.
                 check();
@@ -241,7 +312,11 @@ final class AppUpdateController implements AutoCloseable {
     private void prepareIfReady() {
         if (pendingAsset == null || checking || beginning || attempted || !allowed()) return;
         ReleaseUpdate.Asset asset = pendingAsset;
+        final Source selected = pendingSource == null ? source.snapshot() : pendingSource;
+        final String selectedKey = selected.key();
+        final long generation = sourceGeneration;
         pendingAsset = null;
+        pendingSource = null;
         checking = true;
         execute(() -> {
             long verified = -1;
@@ -249,7 +324,7 @@ final class AppUpdateController implements AutoCloseable {
             try {
                 // A game can start after the metadata callback queued this job.
                 // Check again before taking bandwidth from its live Wi-Fi session.
-                if (!freshAllowed()) {
+                if (!freshAllowed(generation, selectedKey)) {
                     deferred = true;
                 } else {
                     String key = asset.cacheKey();
@@ -263,30 +338,43 @@ final class AppUpdateController implements AutoCloseable {
                         File directory = apk.getParentFile();
                         if (!directory.isDirectory() && !directory.mkdirs())
                             throw new IOException("Cannot prepare the private update directory");
-                        source.download(asset, apk);
+                        selected.download(asset, apk, () -> freshAllowed(generation, selectedKey));
                         if (closed || Thread.currentThread().isInterrupted()) return;
                         verified = installer.inspect(apk);
                     }
                     if (verified < 0) throw new IOException("Invalid update archive version");
-                    if (!closed) cache.edit().putString("asset", key).putLong("code", verified).commit();
+                    if (sourceCurrent(generation, selectedKey))
+                        cache.edit().putString("asset", key).putLong("code", verified).commit();
                 }
             } catch (IOException | RuntimeException unavailable) {
                 // A failed download or archive verification never opens installation UI.
+                deferred = sourceCurrent(generation, selectedKey) && !freshAllowed(generation, selectedKey);
             }
             final long result = verified;
             final boolean retryWhenIdle = deferred;
             post(() -> {
                 checking = false;
-                if (retryWhenIdle) pendingAsset = asset;
-                if (ReleaseUpdate.isStrictlyNewer(result, installedCode)) candidateCode = result;
+                if (sourceCurrent(generation, selectedKey)) {
+                    if (retryWhenIdle) { pendingAsset = asset;pendingSource = selected; }
+                    else if (result < 0)
+                        nextSourceRetryAt = SystemClock.elapsedRealtime() + Math.max(0, source.retryAfterMillis());
+                    if (ReleaseUpdate.isStrictlyNewer(result, installedCode)) candidateCode = result;
+                }
                 check();
                 drain();
             });
-        }, () -> { checking = false;pendingAsset = asset; });
+        }, () -> { checking = false;pendingAsset = asset;pendingSource = selected; });
     }
 
     private void drain() {
         if (closed || !resumed) return;
+        if (refreshSource()) check();
+        if (source.retryAfterMillis() > 0 && allowed() && checked && !checking && !beginning
+                && !attempted && !permissionDenied && pendingAsset == null && candidateCode <= installedCode
+                && SystemClock.elapsedRealtime() >= nextSourceRetryAt) {
+            checked = false;
+            check();
+        }
         String failure = "installer:" + installer.error();
         if ("failure".equals(installer.status()) && allowed()
                 && !failure.equals(shownFailure)) {
@@ -312,6 +400,12 @@ final class AppUpdateController implements AutoCloseable {
         if (!closed && resumed && (pendingConfirmation != null || installer.isInstalling()
                 || (pendingAsset != null || candidateCode > installedCode) && !attempted && !permissionDenied))
             main.postDelayed(pulse, DRAIN_AFTER_MS);
+        main.removeCallbacks(localRetry);
+        long retry = source.retryAfterMillis();
+        if (installedCode >= 0 && retry > 0 && !attempted && !permissionDenied && !installer.isInstalling()) {
+            long remaining = nextSourceRetryAt - SystemClock.elapsedRealtime();
+            main.postDelayed(localRetry, checking || !allowed() || remaining <= 0 ? retry : remaining);
+        }
     }
 
     private void beginIfReady() {
@@ -332,24 +426,27 @@ final class AppUpdateController implements AutoCloseable {
         }
         beginning = true;
         attempted = true;
+        final long generation = sourceGeneration;
+        final String selectedKey = sourceKey;
         execute(() -> {
             boolean failed = false;
             try {
                 if (!ReleaseUpdate.isStrictlyNewer(installer.inspect(apk), installedCode))
                     throw new IOException("The verified update is no longer newer");
-                if (!closed) installer.begin(apk, this::freshAllowed);
+                if (!closed) installer.begin(apk, () -> freshAllowed(generation, selectedKey));
             } catch (IOException | RuntimeException failure) {
                 failed = true;
             }
             final boolean didFail = failed;
             post(() -> {
                 beginning = false;
-                if (didFail) {
+                if (didFail && sourceCurrent(generation, selectedKey)) {
                     if (allowed()) showFailure("failure".equals(installer.status())
                             ? "installer:" + installer.error() : "begin");
                 } else if (!installer.isInstalling() && "idle".equals(installer.status())) {
                     attempted = false; // The final main-thread gate deferred the session.
                 }
+                check();
                 drain();
             });
         }, () -> { beginning = false;attempted = false; });
@@ -368,10 +465,10 @@ final class AppUpdateController implements AutoCloseable {
     }
 
     /** PackageInstaller calls this worker-side after copying the APK, just before commit. */
-    private boolean freshAllowed() {
+    private boolean freshAllowed(long generation, String key) {
         if (closed || !resumed) return false;
-        if (Looper.myLooper() == main.getLooper()) return allowed();
-        FutureTask<Boolean> check = new FutureTask<>(this::allowed);
+        if (Looper.myLooper() == main.getLooper()) return allowed() && sourceCurrent(generation, key);
+        FutureTask<Boolean> check = new FutureTask<>(() -> allowed() && sourceCurrent(generation, key));
         if (!main.post(check)) return false;
         try { return check.get(1, TimeUnit.SECONDS); }
         catch (Exception interruptedOrBusy) {

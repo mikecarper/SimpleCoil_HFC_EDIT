@@ -7,7 +7,7 @@ Android app and their BLE laser-tag hardware.
 It speaks the protocol-31 TCP lobby, clock synchronization, GPS,
 score, respawn, grenade-pairing, and UDP discovery protocols. No Node, Python,
 database, cloud service, or internet connection is required.
-Use this host with the 1.57 phone app; the network protocol remains 31.
+Use this host with the 1.58 phone app; the network protocol remains 31.
 
 The map display bundles Leaflet and serves raster map tiles from the laptop.
 Nothing is fetched from the internet while a game is running. Player markers,
@@ -402,6 +402,34 @@ permission alone does not grant device-owner kiosk authority.
 
 ## Host the game Wi-Fi
 
+### Phone updates from the laptop
+
+Updated phones check their connected laptop host for app updates over the game
+Wi-Fi. Only the laptop needs internet access to fetch the latest stable GitHub
+release. It downloads one exact release APK in the background and verifies its
+size and GitHub SHA-256 digest before offering either metadata or APK bytes.
+Phones still verify the package, signing certificate, version, and digest before
+asking Android to install it. Android's installation approval is still required.
+
+The read-only phone service uses the existing map-tile port, normally `17512`:
+`GET /api/app-update/latest` and `GET /api/app-update/apk/<asset-id>`. The metadata
+keeps the original GitHub download URL; the phone derives the local APK route
+from the verified numeric asset ID. There is no upload or arbitrary-file route.
+An empty or warming cache returns `503`, so phones retry while the laptop works.
+
+The verified cache survives host restarts and can serve phones with no internet
+connection, including when the laptop is offline. It lives in
+`~/.cache/simplecoil/phone-updates` and retains three immutable APKs, each at most
+100 MiB. A refresh checks GitHub at most once per minute and preserves the last
+good release if the network fails. Cache validation, upstream downloads, and LAN
+APK transfers pause or abort during countdowns and running rounds. Two separate
+update stream slots keep slow update downloads out of the game and dashboard
+workers. Leave the host running in the lobby while updating phones.
+
+For isolated deployments or tests, `simplecoil.phoneupdates.cache` overrides the
+cache directory and `simplecoil.phoneupdates.enabled=false` disables background
+update fetching. These are JVM system properties; they do not change game rules.
+
 On Linux with NetworkManager, open **Wi-Fi hotspot** on the landing page or
 **Wi-Fi** on the tactical map (`http://127.0.0.1:17511/wifi`). Choose an
 AP-capable adapter, set the network name and 2.4 GHz channel, then
@@ -633,10 +661,16 @@ java --add-modules jdk.httpserver -cp laptop-host/out \
   com.simplecoil.laptophost.LaptopHostProtocolSmokeTest --reports-only
 java --add-modules jdk.httpserver -cp laptop-host/out \
   com.simplecoil.laptophost.LargeLobbyClockSyncTest
+java --add-modules jdk.httpserver -cp laptop-host/out \
+  com.simplecoil.laptophost.PhoneUpdateCacheTest
 node --test laptop-host/src/test/js/*.test.cjs
 ```
 
 Report smoke tests use temporary report directories, not the operator's archive.
+The phone-update checks use an injected upstream, temporary cache, and real local
+HTTP clients. When running other host suites, set
+`JAVA_TOOL_OPTIONS=-Dsimplecoil.phoneupdates.enabled=false` to keep their host
+subprocesses from fetching live GitHub releases.
 The JavaScript checks exercise the actual embedded review code with a minimal
 DOM harness, including SVG lanes/events, filters, partial-data notices, and safe
 names. They complement rather than replace a browser or physical-gun check.

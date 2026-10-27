@@ -302,10 +302,11 @@ public final class LaptopHost {
     private DatagramSocket udpServer;
     private HttpServer dashboard;
     private HttpServer tileServer;
+    private final PhoneUpdateCache phoneUpdates = new PhoneUpdateCache(this::phoneUpdatesIdle);
     private Thread tcpAcceptThread;
     private Thread udpThread;
 
-    private RoundState roundState = RoundState.LOBBY;
+    private volatile RoundState roundState = RoundState.LOBBY;
     private long roundID;
     private String roundToken;
     private long roundStartAt;
@@ -409,7 +410,9 @@ public final class LaptopHost {
         tileServer.setExecutor(dashboardExecutor);
         tileServer.createContext("/tiles/", this::handleMapTile);
         tileServer.createContext("/api/map-config", this::handleMapConfigApi);
+        tileServer.createContext("/api/app-update/", phoneUpdates::handle);
         tileServer.start();
+        phoneUpdates.start();
 
         tcpAcceptThread = new Thread(this::runTcpAcceptLoop, "SimpleCoil laptop TCP accept");
         tcpAcceptThread.setDaemon(true);
@@ -436,6 +439,7 @@ public final class LaptopHost {
         synchronized (stateLock) { savePlayerDirectoryLocked(); }
         if (relayMesh != null) relayMesh.close();
         stopping = true;
+        phoneUpdates.close();
         closeQuietly(tcpServer);
         if (udpServer != null)
             udpServer.close();
@@ -2765,6 +2769,10 @@ public final class LaptopHost {
 
     private boolean isRoundActiveLocked() {
         return roundState == RoundState.COUNTDOWN || roundState == RoundState.RUNNING;
+    }
+
+    private boolean phoneUpdatesIdle() {
+        return !stopping && roundState != RoundState.COUNTDOWN && roundState != RoundState.RUNNING;
     }
 
     private int secondsRemainingLocked() {

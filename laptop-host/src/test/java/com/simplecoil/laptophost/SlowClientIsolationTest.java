@@ -36,6 +36,7 @@ public final class SlowClientIsolationTest {
     }
 
     public static void main(String[] args) throws Exception {
+        System.setProperty("simplecoil.phoneupdates.enabled", "false");
         if (args.length == 1 && "--clock-epoch-only".equals(args[0])) {
             verifyClockEpochResume();
             System.out.println("Clock epoch resume tests passed.");

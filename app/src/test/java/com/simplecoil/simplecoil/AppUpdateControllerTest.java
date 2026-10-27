@@ -31,6 +31,166 @@ import static org.junit.Assert.assertTrue;
 @Config(manifest = Config.NONE, sdk = 28)
 @LooperMode(LooperMode.Mode.PAUSED)
 public class AppUpdateControllerTest {
+    @Test public void joiningALaptopStartsAnOfflineLanCheckWithoutAnotherResume() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(0, fixture.source.lookups);
+            fixture.source.localAvailable = true;
+            fixture.source.sourceKey = "laptop:192.168.1.2:17512";
+            fixture.controller.onSourceChanged();
+            fixture.finishWork();
+            assertEquals(1, fixture.source.lookups);
+            assertEquals(1, fixture.source.downloads);
+            assertEquals(1, fixture.installer.commits);
+        }
+    }
+
+    @Test public void aWarmingLaptopCacheRetriesEveryTwentySecondsOnlyWhileIdle() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.source.localAvailable = true;
+            fixture.source.sourceKey = "laptop:192.168.1.2:17512";
+            fixture.source.failLookup = true;
+            fixture.controller.onResume();
+            fixture.finishWork();
+            fixture.advance(19_999);
+            fixture.finishWork();
+            assertEquals(1, fixture.source.lookups);
+            fixture.advance(1);
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+            fixture.eligible = false;
+            fixture.advance(60_000);
+            fixture.finishWork();
+            assertEquals("A running round repeatedly queried the laptop", 2, fixture.source.lookups);
+            assertEquals(0, fixture.source.downloads);
+            fixture.source.failLookup = false;
+            fixture.eligible = true;
+            fixture.advance(20_000);
+            fixture.finishWork();
+            assertEquals(3, fixture.source.lookups);
+            assertEquals(1, fixture.installer.commits);
+        }
+    }
+
+    @Test public void rosterTrafficDoesNotPostponeTheLaptopRetryDeadline() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.source.localAvailable = true;
+            fixture.source.sourceKey = "laptop:192.168.1.2:17512";
+            fixture.source.failLookup = true;
+            fixture.controller.onResume();
+            fixture.finishWork();
+            for (int i = 0; i < 10; i++) {
+                fixture.advance(2_000);
+                fixture.controller.onSourceChanged();
+                fixture.finishWork();
+            }
+            assertEquals(2, fixture.source.lookups);
+            fixture.controller.onPause();
+            fixture.advance(60_000);
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+        }
+    }
+
+    @Test public void changingLaptopsRejectsOldMetadataAndRefetchesBeforeDownloading() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.source.localAvailable = true;
+            fixture.source.sourceKey = "laptop:A";
+            fixture.source.duringLookup = () -> {
+                fixture.source.duringLookup = null;
+                fixture.source.sourceKey = "laptop:B";
+                fixture.controller.onSourceChanged();
+            };
+            fixture.source.beforeDownload = () -> assertEquals("laptop:B", fixture.source.sourceKey);
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+            assertEquals(1, fixture.source.downloads);
+            assertEquals(1, fixture.installer.commits);
+        }
+    }
+
+    @Test public void changingLaptopsDuringDownloadDoesNotCacheOrInstallTheOldResult() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.source.localAvailable = true;
+            fixture.source.sourceKey = "laptop:A";
+            fixture.source.duringLookup = () -> {
+                if (fixture.source.lookups == 2)
+                    assertFalse(fixture.context.getSharedPreferences(AppUpdateController.CACHE_PREFS,
+                            Context.MODE_PRIVATE).contains("asset"));
+            };
+            fixture.source.duringDownload = () -> {
+                fixture.source.duringDownload = null;
+                fixture.source.sourceKey = "laptop:B";
+                fixture.controller.onSourceChanged();
+            };
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(2, fixture.source.lookups);
+            assertEquals(2, fixture.source.downloads);
+            assertEquals(1, fixture.installer.commits);
+        }
+    }
+
+    @Test public void finalCommitRejectsAHandoffAfterAndroidHasCopiedTheApk() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.source.localAvailable = true;
+            fixture.source.sourceKey = "laptop:A";
+            fixture.installer.beforeCommit = () -> {
+                fixture.source.sourceKey = "laptop:B";
+                fixture.source.noRelease = true;
+                fixture.controller.onSourceChanged();
+            };
+            fixture.controller.onResume();
+            fixture.finishWork();
+            assertEquals(1, fixture.installer.begins);
+            assertEquals(0, fixture.installer.commits);
+            assertEquals(2, fixture.source.lookups);
+        }
+    }
+
+    @Test public void aDisconnectedLaptopCannotInstallItsPreviouslyReadyCandidate() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.source.localAvailable = true;
+            fixture.source.sourceKey = "laptop:A";
+            fixture.source.duringDownload = () -> fixture.eligible = false;
+            fixture.controller.onResume();
+            fixture.finishWork();
+            fixture.source.localAvailable = false;
+            fixture.source.sourceKey = "github";
+            fixture.controller.onSourceChanged();
+            fixture.eligible = true;
+            fixture.finishWork();
+            fixture.advance(60_000);
+            fixture.finishWork();
+            assertEquals(1, fixture.source.lookups);
+            assertEquals(0, fixture.installer.begins);
+        }
+    }
+
+    @Test public void sourceBroadcastFinishesApplyingAStartBeforeOpeningInstallerUi() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.internet.available = false;
+            fixture.installer.installing = true;
+            fixture.controller.onResume();
+            fixture.installer.pending = new Intent("android.install.CONFIRM");
+            fixture.controller.onSourceChanged();
+            assertEquals(0, fixture.ui.confirmations);
+            fixture.eligible = false;
+            fixture.idle();
+            assertEquals(0, fixture.ui.confirmations);
+            assertNotNull(fixture.installer.pending);
+        }
+    }
+
     @Test public void launchQueuesAllNetworkAndArchiveWorkWithoutBlockingTheCaller() throws Exception {
         try (Fixture fixture = new Fixture()) {
             fixture.controller.onResume();
@@ -484,9 +644,14 @@ public class AppUpdateControllerTest {
         boolean noRelease;
         boolean failLookup;
         boolean failDownload;
+        boolean localAvailable;
+        String sourceKey = "github";
         NetworkStep duringLookup;
         NetworkStep beforeDownload;
         Runnable duringDownload;
+        @Override public boolean available(boolean internet) { return localAvailable || internet; }
+        @Override public String key() { return sourceKey; }
+        @Override public long retryAfterMillis() { return localAvailable ? 20_000 : 0; }
         @Override public ReleaseUpdate.Asset latest() throws IOException {
             lookups++;
             if (duringLookup != null) duringLookup.run();

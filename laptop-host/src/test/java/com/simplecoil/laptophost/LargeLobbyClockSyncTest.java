@@ -35,6 +35,7 @@ public final class LargeLobbyClockSyncTest {
     private static final long METADATA_PROCESSING_MS = 60;
 
     public static void main(String[] args) throws Exception {
+        System.setProperty("simplecoil.phoneupdates.enabled", "false");
         for (int count : new int[] {16, 24, 32}) verifyLobby(count);
         System.out.println("Large-lobby clock synchronization tests passed.");
     }

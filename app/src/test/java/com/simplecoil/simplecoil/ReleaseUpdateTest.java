@@ -11,16 +11,26 @@ import org.robolectric.annotation.Config;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketAddress;
+import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -264,6 +274,176 @@ public class ReleaseUpdateTest {
         }
         assertFalse(destination.exists());
         assertTrue(server.urls.isEmpty());
+    }
+
+    @Test public void laptopMetadataUsesOnlyTheConnectedNumericPeerAndOriginalGithubValidation() throws Exception {
+        FakeConnection data = response(200, release().toString().getBytes(StandardCharsets.UTF_8));
+        Server server = new Server(data);
+        ReleaseUpdate.Asset selected = new ReleaseUpdate(server).fetchLaptopLatest(
+                InetAddress.getByName("192.168.42.1"), 17512);
+        assertEquals(APK_URL, selected.url.toExternalForm());
+        assertEquals("http://192.168.42.1:17512/api/app-update/latest", server.urls.get(0).toExternalForm());
+        assertEquals("GET", data.getRequestMethod());
+        assertNull(data.getRequestProperty("Authorization"));
+        assertFalse(data.getInstanceFollowRedirects());
+        assertTrue(data.getConnectTimeout() > 0 && data.getConnectTimeout() <= 2000);
+        assertTrue(data.closed && data.disconnected);
+        JSONObject forged = release();
+        forged.getJSONArray("assets").getJSONObject(0).put("browser_download_url", "http://192.168.42.9/evil.apk");
+        FakeConnection untrusted = response(200, forged.toString().getBytes(StandardCharsets.UTF_8));
+        expectFailure(() -> new ReleaseUpdate(new Server(untrusted)).fetchLaptopLatest(
+                InetAddress.getLoopbackAddress(), 17512));
+        assertTrue(untrusted.disconnected);
+    }
+
+    @Test public void laptopMissingAndWarmingCachesStayDistinctAndNeverFollowRedirects() throws Exception {
+        FakeConnection unavailable = response(404, new byte[0]);
+        assertNull(new ReleaseUpdate(new Server(unavailable)).fetchLaptopLatest(
+                InetAddress.getLoopbackAddress(), 17512));
+        assertTrue(unavailable.disconnected);
+        FakeConnection warming = response(503, new byte[0]);
+        try {
+            new ReleaseUpdate(new Server(warming)).fetchLaptopLatest(InetAddress.getLoopbackAddress(), 17512);
+            fail("Cache warming must defer rather than look like an old laptop endpoint");
+        } catch (ReleaseUpdate.LaptopHttpException expected) {
+            assertEquals(503, expected.status);
+        }
+        assertTrue(warming.disconnected);
+        for (int status : new int[] {301, 302, 303, 307, 308}) {
+            FakeConnection redirect = response(status, new byte[0]);
+            redirect.location = "http://192.168.42.9/api/app-update/latest";
+            Server server = new Server(redirect);
+            expectFailure(() -> new ReleaseUpdate(server).fetchLaptopLatest(InetAddress.getLoopbackAddress(), 17512));
+            assertEquals(1, server.urls.size());
+            assertTrue(redirect.disconnected);
+        }
+    }
+
+    @Test public void laptopMetadataRequiresDigestAndRemainsSizeBounded() throws Exception {
+        JSONObject noDigest = release();
+        noDigest.getJSONArray("assets").getJSONObject(0).remove("digest");
+        FakeConnection missing = response(200, noDigest.toString().getBytes(StandardCharsets.UTF_8));
+        expectFailure(() -> new ReleaseUpdate(new Server(missing)).fetchLaptopLatest(
+                InetAddress.getLoopbackAddress(), 17512));
+        FakeConnection oversized = response(200, new byte[ReleaseUpdate.MAX_METADATA_BYTES + 1]);
+        expectFailure(() -> new ReleaseUpdate(new Server(oversized)).fetchLaptopLatest(
+                InetAddress.getLoopbackAddress(), 17512));
+        assertTrue(oversized.closed && oversized.disconnected);
+        FakeConnection truncated = response(200, release().toString().getBytes(StandardCharsets.UTF_8));
+        truncated.length = String.valueOf(truncated.body.length + 1);
+        expectFailure(() -> new ReleaseUpdate(new Server(truncated)).fetchLaptopLatest(
+                InetAddress.getLoopbackAddress(), 17512));
+        assertTrue(truncated.closed && truncated.disconnected);
+    }
+
+    @Test public void laptopApkComesFromTheSamePeerByAssetIdWithThePublishedDigest() throws Exception {
+        ReleaseUpdate.Asset selected = ReleaseUpdate.parseLatest(release().toString());
+        FakeConnection bytes = response(200, "abc".getBytes(StandardCharsets.US_ASCII));
+        bytes.length = "3";
+        Server server = new Server(bytes);
+        File target = temporary.newFile("laptop.apk");
+        new ReleaseUpdate(server).downloadFromLaptop(selected, target, InetAddress.getByName("192.168.42.1"), 17512);
+        assertArrayEquals("abc".getBytes(StandardCharsets.US_ASCII), read(target));
+        assertEquals(1, server.urls.size());
+        assertEquals("http://192.168.42.1:17512/api/app-update/apk/25", server.urls.get(0).toExternalForm());
+        assertFalse(bytes.getInstanceFollowRedirects());
+        assertTrue(bytes.closed && bytes.disconnected);
+        FakeConnection ipv6 = response(200, release().toString().getBytes(StandardCharsets.UTF_8));
+        Server ipv6Server = new Server(ipv6);
+        assertNotNull(new ReleaseUpdate(ipv6Server).fetchLaptopLatest(InetAddress.getByName("::1"), 17512));
+        assertEquals("http://[0:0:0:0:0:0:0:1]:17512/api/app-update/latest",
+                ipv6Server.urls.get(0).toExternalForm());
+    }
+
+    @Test public void laptopDownloadRejectsCorruptionRedirectsAndMissingDigestsWithoutLeavingAnApk() throws Exception {
+        ReleaseUpdate.Asset selected = ReleaseUpdate.parseLatest(release().toString());
+        for (String body : new String[] {"ab", "abcd", "xyz"}) {
+            File target = temporary.newFile();
+            FakeConnection bad = response(200, body.getBytes(StandardCharsets.US_ASCII));
+            expectFailure(() -> new ReleaseUpdate(new Server(bad)).downloadFromLaptop(
+                    selected, target, InetAddress.getLoopbackAddress(), 17512));
+            assertFalse(target.exists());
+            assertTrue(bad.closed && bad.disconnected);
+        }
+        for (int status : new int[] {302, 503}) {
+            FakeConnection bad = response(status, new byte[0]);
+            bad.location = APK_URL;
+            Server server = new Server(bad);
+            File target = temporary.newFile();
+            expectFailure(() -> new ReleaseUpdate(server).downloadFromLaptop(
+                    selected, target, InetAddress.getLoopbackAddress(), 17512));
+            assertFalse(target.exists());
+            assertEquals(1, server.urls.size());
+            assertTrue(bad.disconnected);
+        }
+        JSONObject noDigest = release();
+        noDigest.getJSONArray("assets").getJSONObject(0).remove("digest");
+        ReleaseUpdate.Asset unsignedMetadata = ReleaseUpdate.parseLatest(noDigest.toString());
+        File target = temporary.newFile();
+        Server server = new Server();
+        expectFailure(() -> new ReleaseUpdate(server).downloadFromLaptop(unsignedMetadata, target,
+                InetAddress.getLoopbackAddress(), 17512));
+        assertFalse(target.exists());
+        assertTrue(server.urls.isEmpty());
+    }
+
+    @Test public void invalidLaptopEndpointsCannotOpenConnectionsOrRetainCandidateFiles() throws Exception {
+        ReleaseUpdate.Asset selected = ReleaseUpdate.parseLatest(release().toString());
+        for (InetAddress address : new InetAddress[] {null, InetAddress.getByName("0.0.0.0"),
+                InetAddress.getByName("224.0.0.1")}) {
+            Server server = new Server();
+            expectFailure(() -> new ReleaseUpdate(server).fetchLaptopLatest(address, 17512));
+            File target = temporary.newFile();
+            expectFailure(() -> new ReleaseUpdate(server).downloadFromLaptop(selected, target, address, 17512));
+            assertFalse(target.exists());
+            assertTrue(server.urls.isEmpty());
+        }
+        for (int port : new int[] {0, -1, 65536}) {
+            Server server = new Server();
+            expectFailure(() -> new ReleaseUpdate(server).fetchLaptopLatest(InetAddress.getLoopbackAddress(), port));
+            assertTrue(server.urls.isEmpty());
+        }
+    }
+
+    @Test public void defaultLaptopTransportContactsThePeerWithoutUsingTheSystemWebProxy() throws Exception {
+        byte[] body = release().toString().getBytes(StandardCharsets.UTF_8);
+        AtomicReference<Throwable> serverFailure = new AtomicReference<>();
+        try (ServerSocket listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            listener.setSoTimeout(5000);
+            Thread server = new Thread(() -> {
+                try (Socket socket = listener.accept()) {
+                    socket.setSoTimeout(5000);
+                    BufferedReader input = new BufferedReader(new InputStreamReader(
+                            socket.getInputStream(), StandardCharsets.US_ASCII));
+                    String line;
+                    while ((line = input.readLine()) != null && !line.isEmpty()) { }
+                    if (line == null) throw new IOException("No complete laptop metadata request");
+                    socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nContent-Length: " + body.length
+                            + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+                    socket.getOutputStream().write(body);
+                    socket.getOutputStream().flush();
+                } catch (Throwable failure) { serverFailure.set(failure); }
+            }, "Laptop update direct-peer regression");
+            server.setDaemon(true);
+            server.start();
+            ProxySelector previous = ProxySelector.getDefault();
+            try {
+                ProxySelector.setDefault(new ProxySelector() {
+                    @Override public List<Proxy> select(URI uri) {
+                        throw new AssertionError("A local update attempted to use the system proxy: " + uri);
+                    }
+                    @Override public void connectFailed(URI uri, SocketAddress address, IOException failure) { }
+                });
+                assertNotNull(new ReleaseUpdate().fetchLaptopLatest(
+                        InetAddress.getByName("127.0.0.1"), listener.getLocalPort()));
+            } finally {
+                ProxySelector.setDefault(previous);
+                listener.close();
+                server.join(6000);
+            }
+            assertFalse("Local metadata fixture survived cleanup", server.isAlive());
+            if (serverFailure.get() != null) throw new AssertionError("Local metadata fixture failed", serverFailure.get());
+        }
     }
 
     private static JSONObject release() throws Exception {

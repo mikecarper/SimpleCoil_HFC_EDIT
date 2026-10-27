@@ -11,6 +11,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.Proxy;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -28,12 +30,23 @@ final class ReleaseUpdate {
     private static final int CONNECT_TIMEOUT_MS = 5000;
     private static final int READ_TIMEOUT_MS = 10000;
     private static final long METADATA_TIMEOUT_MS = 15000L;
+    private static final long LAPTOP_METADATA_TIMEOUT_MS = 5000L;
     private static final long DOWNLOAD_TIMEOUT_MS = 120000L;
     private static final int MAX_REDIRECTS = 5;
     private final ConnectionOpener connections;
 
     interface ConnectionOpener {
         HttpURLConnection open(URL url) throws IOException;
+        default HttpURLConnection openLocal(URL url) throws IOException { return open(url); }
+    }
+
+    static final class LaptopHttpException extends IOException {
+        final int status;
+
+        LaptopHttpException(int status) {
+            super("Laptop update server returned HTTP " + status);
+            this.status = status;
+        }
     }
 
     static final class Asset {
@@ -64,7 +77,15 @@ final class ReleaseUpdate {
     }
 
     ReleaseUpdate() {
-        this(ReleaseUpdateTls::open);
+        this(new ConnectionOpener() {
+            @Override public HttpURLConnection open(URL url) throws IOException {
+                return ReleaseUpdateTls.open(url);
+            }
+            @Override public HttpURLConnection openLocal(URL url) throws IOException {
+                // Only the literal joined peer is contacted; a system web proxy must not relay LAN updates.
+                return (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+            }
+        });
     }
 
     ReleaseUpdate(ConnectionOpener connections) {
@@ -90,6 +111,32 @@ final class ReleaseUpdate {
                 throw new IOException("Incomplete release metadata");
             }
             return parseLatest(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
+        } finally {
+            disconnect(connection);
+        }
+    }
+
+    /** Reads only the joined laptop's cache; its original GitHub metadata stays strictly validated. */
+    Asset fetchLaptopLatest(InetAddress host, int port) throws IOException {
+        long deadline = deadlineAfter(LAPTOP_METADATA_TIMEOUT_MS);
+        HttpURLConnection connection = openLaptopResponse(
+                laptopUrl(host, port, "/api/app-update/latest"), false, deadline);
+        try {
+            int status = connection.getResponseCode();
+            if (status == HttpURLConnection.HTTP_NOT_FOUND) return null;
+            requireLaptopSuccess(status);
+            long declaredLength = contentLength(connection);
+            if (declaredLength > MAX_METADATA_BYTES) throw new IOException("Release metadata is too large");
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (InputStream input = connection.getInputStream()) {
+                copyBounded(connection, input, bytes, MAX_METADATA_BYTES, deadline, null);
+            }
+            if (declaredLength >= 0 && bytes.size() != declaredLength)
+                throw new IOException("Incomplete laptop release metadata");
+            Asset asset = parseLatest(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
+            if (asset != null && asset.sha256 == null)
+                throw new IOException("The laptop update requires a SHA-256 digest");
+            return asset;
         } finally {
             disconnect(connection);
         }
@@ -144,6 +191,16 @@ final class ReleaseUpdate {
 
     /** Downloads into a private caller-owned file, removing it on every unsuccessful attempt. */
     void download(Asset asset, File destination) throws IOException {
+        downloadAsset(asset, destination, false, null, 0);
+    }
+
+    /** Local transport is restricted to the connected peer; APK signer/version checks remain mandatory. */
+    void downloadFromLaptop(Asset asset, File destination, InetAddress host, int port) throws IOException {
+        downloadAsset(asset, destination, true, host, port);
+    }
+
+    private void downloadAsset(Asset asset, File destination, boolean fromLaptop, InetAddress host, int port)
+            throws IOException {
         if (destination == null) throw new IllegalArgumentException("Missing download destination");
         boolean complete = false;
         HttpURLConnection connection = null;
@@ -152,9 +209,14 @@ final class ReleaseUpdate {
                 throw new IOException("Invalid release APK");
             }
             validateInitialAssetUrl(asset.url, asset.tag, asset.name);
+            if (fromLaptop && asset.sha256 == null)
+                throw new IOException("The laptop update requires a SHA-256 digest");
             long deadline = deadlineAfter(DOWNLOAD_TIMEOUT_MS);
-            connection = openResponse(asset.url, true, deadline);
-            requireSuccess(connection.getResponseCode());
+            connection = fromLaptop
+                    ? openLaptopResponse(laptopUrl(host, port, "/api/app-update/apk/" + asset.id), true, deadline)
+                    : openResponse(asset.url, true, deadline);
+            if (fromLaptop) requireLaptopSuccess(connection.getResponseCode());
+            else requireSuccess(connection.getResponseCode());
             long declaredLength = contentLength(connection);
             if (declaredLength >= 0 && declaredLength != asset.size) {
                 throw new IOException("Release APK length does not match metadata");
@@ -184,6 +246,36 @@ final class ReleaseUpdate {
     static boolean isStrictlyNewer(long archiveVersionCode, long installedVersionCode) {
         return archiveVersionCode > 0 && installedVersionCode >= 0
                 && archiveVersionCode > installedVersionCode;
+    }
+
+    private static URL laptopUrl(InetAddress host, int port, String path) throws IOException {
+        if (host == null || host.isAnyLocalAddress() || host.isMulticastAddress() || port < 1 || port > 65535)
+            throw new IOException("Invalid connected laptop endpoint");
+        // A numeric address from the TCP peer avoids DNS rebinding and metadata-selected destinations.
+        return new URL("http", host.getHostAddress(), port, path);
+    }
+
+    private HttpURLConnection openLaptopResponse(URL url, boolean download, long deadline) throws IOException {
+        HttpURLConnection connection = connections.openLocal(url);
+        if (connection == null) throw new IOException("Could not open laptop release connection");
+        boolean retained = false;
+        try {
+            int remaining = remainingMillis(deadline);
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(Math.min(2000, remaining));
+            connection.setReadTimeout(Math.min(download ? READ_TIMEOUT_MS : 2000, remaining));
+            connection.setUseCaches(false);
+            connection.setRequestMethod("GET");
+            connection.setRequestProperty("User-Agent", "LAZER-GUN-RUN-updater");
+            connection.setRequestProperty("Accept-Encoding", "identity");
+            connection.setRequestProperty("Accept", download ? "application/octet-stream" : "application/json");
+            if (isRedirect(connection.getResponseCode()))
+                throw new IOException("Laptop update redirects are not allowed");
+            retained = true;
+            return connection;
+        } finally {
+            if (!retained) disconnect(connection);
+        }
     }
 
     private HttpURLConnection openResponse(URL initial, boolean download, long deadline)
@@ -342,6 +434,10 @@ final class ReleaseUpdate {
         if (status != HttpURLConnection.HTTP_OK) {
             throw new IOException("Release server returned HTTP " + status);
         }
+    }
+
+    private static void requireLaptopSuccess(int status) throws LaptopHttpException {
+        if (status != HttpURLConnection.HTTP_OK) throw new LaptopHttpException(status);
     }
 
     private static void disconnect(HttpURLConnection connection) {
